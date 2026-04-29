@@ -1,6 +1,62 @@
-import { SlashCommandBuilder } from 'discord.js';
+import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
+import { getTopText, getTopVoice, getUserTextRank, getUserVoiceRank } from './db.js';
 
 export const commands = [
+  {
+    data: new SlashCommandBuilder()
+      .setName('top')
+      .setDescription('サーバーのスコアランキングを表示します。'),
+    async execute(interaction) {
+      const userId = interaction.user.id;
+      const guildId = interaction.guildId;
+      
+      if (!guildId) {
+        return interaction.reply({ content: 'このコマンドはサーバー内でのみ使用できます。', ephemeral: true });
+      }
+
+      // DBから上位とユーザーのランクを取得
+      const topText = getTopText(guildId, 5);
+      const topVoice = getTopVoice(guildId, 5);
+      const userText = getUserTextRank(guildId, userId);
+      const userVoice = getUserVoiceRank(guildId, userId);
+
+      // 上位リストを文字列に整形する関数
+      const formatTopList = (list, xpKey) => {
+        if (list.length === 0) return '該当なし';
+        return list.map((user, i) => `#${i + 1} | <@${user.id}> XP: \`${user[xpKey]}\``).join('\n');
+      };
+
+      const textValue = [
+        formatTopList(topText, 'xp_text'),
+        `**#${userText.rank} | <@${userId}> XP:** \`${userText.xp}\``,
+        '✨ **More?** `/top text`'
+      ].join('\n');
+
+      const voiceValue = [
+        formatTopList(topVoice, 'xp_voice'),
+        `**#${userVoice.rank} | <@${userId}> XP:** \`${userVoice.xp}\``,
+        '✨ **More?** `/top voice`'
+      ].join('\n');
+
+      const embed = new EmbedBuilder()
+        .setColor('#2b2d31')
+        .setTitle('📋 Guild Score Leaderboards')
+        .addFields(
+          {
+            name: 'TOP 5 TEXT 💬',
+            value: textValue,
+            inline: true
+          },
+          {
+            name: 'TOP 5 VOICE 🎙️',
+            value: voiceValue,
+            inline: true
+          }
+        );
+
+      await interaction.reply({ embeds: [embed] });
+    }
+  },
   {
     data: new SlashCommandBuilder()
       .setName('ping')

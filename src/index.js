@@ -2,15 +2,19 @@ import 'dotenv/config';
 import {
   Client,
   Events,
-  GatewayIntentBits
+  GatewayIntentBits,
+  EmbedBuilder
 } from 'discord.js';
+import cron from 'node-cron';
 import { commandMap } from './commands.js';
 import { handleEmotionRequest, isEmotionRequest } from './emotion.js';
+import { addTextXP, addVoiceXP, getTopText, getTopVoice } from './db.js';
 
 const token = process.env.DISCORD_TOKEN;
 const ossTargetUsername = process.env.OSS_TARGET_USERNAME ?? 'kurage.1';
 const ossTriggerText = process.env.OSS_TRIGGER_TEXT ?? 'oss';
 const ossResponseText = process.env.OSS_RESPONSE_TEXT ?? 'oss!';
+const leaderboardChannelId = process.env.LEADERBOARD_CHANNEL_ID; // 毎日送信するチャンネルIDを指定
 
 if (!token) {
   console.error('DISCORD_TOKEN is missing. Copy .env.example to .env and set your bot token.');
@@ -21,17 +25,69 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates
   ]
 });
 
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
+
+  // 毎日0時00分20秒に特定のチャンネルへランキングを送信
+  cron.schedule('20 0 0 * * *', async () => {
+    if (!leaderboardChannelId) {
+      console.log('LEADERBOARD_CHANNEL_ID is not set in .env. Skipping daily leaderboard.');
+      return;
+    }
+
+    const channel = await client.channels.fetch(leaderboardChannelId).catch(() => null);
+    if (!channel || !channel.isTextBased()) return;
+
+    const guildId = channel.guildId;
+    const topText = getTopText(guildId, 5);
+    const topVoice = getTopVoice(guildId, 5);
+
+    const formatTopList = (list, xpKey) => {
+      if (list.length === 0) return '該当なし';
+      return list.map((user, i) => `#${i + 1} | <@${user.id}> XP: \`${user[xpKey]}\``).join('\n');
+    };
+
+    const embed = new EmbedBuilder()
+      .setColor('#2b2d31')
+      .setTitle('📋 Daily Guild Score Leaderboards')
+      .addFields(
+        {
+          name: 'TOP 5 TEXT 💬',
+          value: formatTopList(topText, 'xp_text') || '該当なし',
+          inline: true
+        },
+        {
+          name: 'TOP 5 VOICE 🎙️',
+          value: formatTopList(topVoice, 'xp_voice') || '該当なし',
+          inline: true
+        }
+      );
+
+    await channel.send({ embeds: [embed] }).catch(console.error);
+  });
 });
 
+const textCooldowns = new Map(); // guildId-userId -> timestamp
+
 client.on(Events.MessageCreate, async (message) => {
-  if (message.author.bot) {
+  if (message.author.bot || !message.guildId) {
     return;
+  }
+
+  // メッセージ送信時にText XPを付与 (ProBot仕様: 1分に1回, 15〜25XPをランダム付与)
+  const now = Date.now();
+  const cooldownKey = `${message.guildId}-${message.author.id}`;
+  const lastTextTime = textCooldowns.get(cooldownKey) || 0;
+
+  if (now - lastTextTime >= 60000) {
+    const xp = Math.floor(Math.random() * 11) + 15; // 15〜25のランダム値
+    addTextXP(message.guildId, message.author.id, xp);
+    textCooldowns.set(cooldownKey, now);
   }
 
   if (isEmotionRequest(message)) {
@@ -51,6 +107,42 @@ client.on(Events.MessageCreate, async (message) => {
     await message.channel.send(ossResponseText);
   } catch (error) {
     console.error('Failed to send oss response:', error);
+  }
+});
+
+// 通話の入退室時間を記録するMap
+const voiceSessions = new Map(); // guildId-userId -> timestamp
+
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  const memberId = newState.member?.id;
+  const guildId = newState.guild?.id || oldState.guild?.id;
+  if (!memberId || !guildId || newState.member?.user.bot) return;
+
+  const joined = !oldState.channelId && newState.channelId;
+  const left = oldState.channelId && !newState.channelId;
+  const switched = oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId;
+
+  const sessionKey = `${guildId}-${memberId}`;
+
+  if (joined || (switched && !voiceSessions.has(sessionKey))) {
+    // 参加時にタイムスタンプを記録
+    voiceSessions.set(sessionKey, Date.now());
+  } else if (left) {
+    // 退出時に滞在時間からVoice XPを計算して付与
+    const joinTime = voiceSessions.get(sessionKey);
+    if (joinTime) {
+      const durationMs = Date.now() - joinTime;
+      const minutes = Math.floor(durationMs / 60000);
+      if (minutes > 0) {
+        // ProBot風: 1分ごとに15〜25のXPを計算して合算
+        let totalXP = 0;
+        for (let i = 0; i < minutes; i++) {
+          totalXP += Math.floor(Math.random() * 11) + 15;
+        }
+        addVoiceXP(guildId, memberId, totalXP);
+      }
+      voiceSessions.delete(sessionKey);
+    }
   }
 });
 
