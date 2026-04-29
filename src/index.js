@@ -8,7 +8,7 @@ import {
 import cron from 'node-cron';
 import { commandMap } from './commands.js';
 import { handleEmotionRequest, isEmotionRequest } from './emotion.js';
-import { addTextXP, addVoiceXP, getTopText, getTopVoice } from './db.js';
+import { addTextXP, addVoiceXP, getTopXP } from './db.js';
 
 const token = process.env.DISCORD_TOKEN;
 const ossTargetUsername = process.env.OSS_TARGET_USERNAME ?? 'kurage.1';
