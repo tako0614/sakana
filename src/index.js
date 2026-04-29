@@ -26,7 +26,8 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildVoiceStates
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMembers
   ]
 });
 
@@ -44,32 +45,46 @@ client.once(Events.ClientReady, (readyClient) => {
     if (!channel || !channel.isTextBased()) return;
 
     const guildId = channel.guildId;
-    const topText = getTopText(guildId, 5);
-    const topVoice = getTopVoice(guildId, 5);
 
-    const formatTopList = (list, xpKey) => {
+    // 期間は 'all' ではなく 'day' を指定して24時間のランキングを送信する
+    const topText = getTopXP(guildId, 'text', 'day', 5);
+    const topVoice = getTopXP(guildId, 'voice', 'day', 5);
+
+    const formatTopList = (list) => {
       if (list.length === 0) return '該当なし';
-      return list.map((user, i) => `#${i + 1} | <@${user.id}> XP: \`${user[xpKey]}\``).join('\n');
+      return list.map((user, i) => `#${i + 1} | <@${user.id}> XP: \`${user.xp}\``).join('\n');
     };
 
     const embed = new EmbedBuilder()
       .setColor('#2b2d31')
-      .setTitle('📋 Daily Guild Score Leaderboards')
+      .setTitle('📋 Daily Guild Score Leaderboards (Past 24h)')
       .addFields(
         {
           name: 'TOP 5 TEXT 💬',
-          value: formatTopList(topText, 'xp_text') || '該当なし',
+          value: formatTopList(topText) || '該当なし',
           inline: true
         },
         {
           name: 'TOP 5 VOICE 🎙️',
-          value: formatTopList(topVoice, 'xp_voice') || '該当なし',
+          value: formatTopList(topVoice) || '該当なし',
           inline: true
         }
       );
 
     await channel.send({ embeds: [embed] }).catch(console.error);
   });
+});
+
+client.on(Events.GuildMemberAdd, async (member) => {
+  const targetGuildId = '1255359848644608035';
+  const targetChannelId = '1445478071221223515';
+
+  if (member.guild.id === targetGuildId) {
+    const channel = await member.guild.channels.fetch(targetChannelId).catch(() => null);
+    if (channel && channel.isTextBased()) {
+      await channel.send(`<@${member.id}> さん\nEvex Developersへようこそ！\nここで自己紹介してって言ってほしいかも`);
+    }
+  }
 });
 
 const textCooldowns = new Map(); // guildId-userId -> timestamp
