@@ -77,7 +77,7 @@ client.once(Events.ClientReady, (readyClient) => {
 
 client.on(Events.GuildMemberAdd, async (member) => {
   const targetGuildId = '1255359848644608035';
-  const targetChannelId = '1445478071221223515';
+  const targetChannelId = '1487488490697658408';
 
   if (member.guild.id === targetGuildId) {
     const channel = await member.guild.channels.fetch(targetChannelId).catch(() => null);
