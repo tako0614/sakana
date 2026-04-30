@@ -21,6 +21,14 @@ if (!token) {
   process.exit(1);
 }
 
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error);
+});
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -31,65 +39,97 @@ const client = new Client({
   ]
 });
 
+client.on('error', (error) => {
+  console.error('Discord client error:', error);
+});
+
+client.on('shardError', (error) => {
+  console.error('Discord shard error:', error);
+});
+
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
 
   // 毎日0時00分20秒に特定のチャンネルへランキングを送信
   cron.schedule('20 0 0 * * *', async () => {
-    if (!leaderboardChannelId) {
-      console.log('LEADERBOARD_CHANNEL_ID is not set in .env. Skipping daily leaderboard.');
-      return;
+    try {
+      if (!leaderboardChannelId) {
+        console.log('LEADERBOARD_CHANNEL_ID is not set in .env. Skipping daily leaderboard.');
+        return;
+      }
+
+      const channel = await client.channels.fetch(leaderboardChannelId).catch(() => null);
+      if (!channel || !channel.isTextBased()) return;
+
+      const guildId = channel.guildId;
+
+      // 期間は 'all' ではなく 'day' を指定して24時間のランキングを送信する
+      const topText = getTopXP(guildId, 'text', 'day', 5);
+      const topVoice = getTopXP(guildId, 'voice', 'day', 5);
+
+      const formatTopList = (list) => {
+        if (list.length === 0) return '該当なし';
+        return list.map((user, i) => `#${i + 1} | <@${user.id}> XP: \`${user.xp}\``).join('\n');
+      };
+
+      const embed = new EmbedBuilder()
+        .setColor('#2b2d31')
+        .setTitle('📋 Daily Guild Score Leaderboards (Past 24h)')
+        .addFields(
+          {
+            name: 'TOP 5 TEXT 💬',
+            value: formatTopList(topText) || '該当なし',
+            inline: true
+          },
+          {
+            name: 'TOP 5 VOICE 🎙️',
+            value: formatTopList(topVoice) || '該当なし',
+            inline: true
+          }
+        );
+
+      await channel.send({ embeds: [embed] }).catch(console.error);
+    } catch (error) {
+      console.error('Failed to send daily leaderboard:', error);
     }
-
-    const channel = await client.channels.fetch(leaderboardChannelId).catch(() => null);
-    if (!channel || !channel.isTextBased()) return;
-
-    const guildId = channel.guildId;
-
-    // 期間は 'all' ではなく 'day' を指定して24時間のランキングを送信する
-    const topText = getTopXP(guildId, 'text', 'day', 5);
-    const topVoice = getTopXP(guildId, 'voice', 'day', 5);
-
-    const formatTopList = (list) => {
-      if (list.length === 0) return '該当なし';
-      return list.map((user, i) => `#${i + 1} | <@${user.id}> XP: \`${user.xp}\``).join('\n');
-    };
-
-    const embed = new EmbedBuilder()
-      .setColor('#2b2d31')
-      .setTitle('📋 Daily Guild Score Leaderboards (Past 24h)')
-      .addFields(
-        {
-          name: 'TOP 5 TEXT 💬',
-          value: formatTopList(topText) || '該当なし',
-          inline: true
-        },
-        {
-          name: 'TOP 5 VOICE 🎙️',
-          value: formatTopList(topVoice) || '該当なし',
-          inline: true
-        }
-      );
-
-    await channel.send({ embeds: [embed] }).catch(console.error);
   });
 });
 
 client.on(Events.GuildMemberAdd, async (member) => {
+  try {
+    await handleGuildMemberAdd(member);
+  } catch (error) {
+    console.error('Unhandled error in guild member add handler:', error);
+  }
+});
+
+async function handleGuildMemberAdd(member) {
   const targetGuildId = '1255359848644608035';
   const targetChannelId = '1487488490697658408';
 
   if (member.guild.id === targetGuildId) {
     const channel = await member.guild.channels.fetch(targetChannelId).catch(() => null);
     if (channel && channel.isTextBased()) {
-      await channel.send(`<@${member.id}> さん\nEvex Developersへようこそ！\nここで自己紹介してって言ってほしいかも`);
+      await channel
+        .send(`<@${member.id}> さん\nEvex Developersへようこそ！\nここで自己紹介してって言ってほしいかも`)
+        .catch((error) => {
+          console.error('Failed to send welcome message:', error);
+        });
     }
   }
-});
+}
 
 const textCooldowns = new Map(); // guildId-userId -> timestamp
 
 client.on(Events.MessageCreate, async (message) => {
+  try {
+    await handleMessageCreate(message);
+  } catch (error) {
+    console.error('Unhandled error in message handler:', error);
+  }
+});
+
+async function handleMessageCreate(message) {
   if (message.author.bot || !message.guildId) {
     return;
   }
@@ -123,12 +163,20 @@ client.on(Events.MessageCreate, async (message) => {
   } catch (error) {
     console.error('Failed to send oss response:', error);
   }
-});
+}
 
 // 通話の入退室時間を記録するMap
 const voiceSessions = new Map(); // guildId-userId -> timestamp
 
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  try {
+    handleVoiceStateUpdate(oldState, newState);
+  } catch (error) {
+    console.error('Unhandled error in voice state handler:', error);
+  }
+});
+
+function handleVoiceStateUpdate(oldState, newState) {
   const memberId = newState.member?.id;
   const guildId = newState.guild?.id || oldState.guild?.id;
   if (!memberId || !guildId || newState.member?.user.bot) return;
@@ -159,9 +207,17 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
       voiceSessions.delete(sessionKey);
     }
   }
-});
+}
 
 client.on(Events.InteractionCreate, async (interaction) => {
+  try {
+    await handleInteractionCreate(interaction);
+  } catch (error) {
+    console.error('Unhandled error in interaction handler:', error);
+  }
+});
+
+async function handleInteractionCreate(interaction) {
   if (!interaction.isChatInputCommand()) {
     return;
   }
@@ -185,12 +241,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
       ephemeral: true
     };
 
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp(response);
-    } else {
-      await interaction.reply(response);
+    try {
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp(response);
+      } else {
+        await interaction.reply(response);
+      }
+    } catch (replyError) {
+      console.error(`Failed to send /${interaction.commandName} error response:`, replyError);
     }
   }
-});
+}
 
 client.login(token);

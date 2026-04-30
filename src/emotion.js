@@ -23,19 +23,13 @@ export async function handleEmotionRequest(message) {
     targetMessage = await message.fetchReference();
   } catch (error) {
     console.error('Failed to fetch referenced message:', error);
-    await message.reply({
-      content: 'リプライ先のメッセージを取得できませんでした。',
-      allowedMentions: { repliedUser: false }
-    });
+    await replySafely(message, 'リプライ先のメッセージが削除されているか、取得できませんでした。');
     return;
   }
 
-  const targetText = targetMessage.content.trim();
+  const targetText = targetMessage?.content?.trim() ?? '';
   if (!targetText) {
-    await message.reply({
-      content: 'リプライ先に分析できるテキストがありません。',
-      allowedMentions: { repliedUser: false }
-    });
+    await replySafely(message, 'リプライ先に分析できるテキストがありません。');
     return;
   }
 
@@ -50,13 +44,13 @@ export async function handleEmotionRequest(message) {
     });
 
     const attachment = new AttachmentBuilder(image, { name: 'kimochi.png' });
-    await message.reply({
+    await replySafely(message, {
       files: [attachment],
       allowedMentions: { repliedUser: false }
     });
   } catch (error) {
     console.error('Failed to analyze emotion:', error);
-    await message.reply({
+    await replySafely(message, {
       content: [
         '気持ち分析に失敗しました。',
         'Python 依存関係が未設定の場合は `pip install -r requirements.txt` を実行してください。'
@@ -147,4 +141,22 @@ function getMessageAuthorAvatarUrl(message) {
   };
 
   return message.member?.displayAvatarURL(avatarOptions) ?? message.author.displayAvatarURL(avatarOptions);
+}
+
+async function replySafely(message, response) {
+  const replyOptions = typeof response === 'string'
+    ? {
+      content: response,
+      allowedMentions: { repliedUser: false }
+    }
+    : {
+      allowedMentions: { repliedUser: false },
+      ...response
+    };
+
+  try {
+    await message.reply(replyOptions);
+  } catch (error) {
+    console.error('Failed to reply to emotion request:', error);
+  }
 }
