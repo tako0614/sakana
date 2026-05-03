@@ -111,7 +111,7 @@ async function handleGuildMemberAdd(member) {
     const channel = await member.guild.channels.fetch(targetChannelId).catch(() => null);
     if (channel && channel.isTextBased()) {
       await channel
-        .send(`<@${member.id}> さん\nEvex Developersへようこそ！\nここで自己紹介してって言ってほしいかも`)
+        .send(`<@${member.id}> さん\nEvex Developersへようこそ！\nここで自己紹介してって言ってほしいかも\nhttps://discord.com/channels/1255359848644608035/1445478071221223515`)
         .catch((error) => {
           console.error('Failed to send welcome message:', error);
         });
