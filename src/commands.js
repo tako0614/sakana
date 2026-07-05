@@ -40,10 +40,29 @@ export const commands = [
       // 期間の表示用文字
       const periodLabel = period === 'day' ? '(Past 24h)' : period === 'week' ? '(Past 7d)' : period === 'month' ? '(Past 30d)' : '';
 
-      // 上位リストを文字列に整形する関数
-      const formatTopList = (list) => {
-        if (list.length === 0) return '該当なし';
-        return list.map((user, i) => `#${i + 1} | <@${user.id}> XP: \`${user.xp}\``).join('\n');
+      // ランキング表示用のフィールド値を生成するヘルパー
+      const buildFieldValue = (topList, userRank, listType) => {
+        if (topList.length === 0) {
+          // 誰もいない場合は「該当なし」＋自分の行（元の挙動を維持）
+          const userLine = `**#${userRank.rank} | <@${userId}> XP:** \`${userRank.xp}\``;
+          return `該当なし\n${userLine}`;
+        }
+
+        const isInTop = topList.some(u => u.id === userId);
+        const formattedList = topList.map((user, i) => {
+          const entry = `#${i + 1} | <@${user.id}> XP: \`${user.xp}\``;
+          // 自分がTOP Nにいる場合は太字に
+          return user.id === userId ? `**${entry}**` : entry;
+        }).join('\n');
+
+        if (isInTop) {
+          // TOP N内にいるので追加行は不要
+          return formattedList;
+        } else {
+          // TOP N外なので末尾に自分の行を追加
+          const userLine = `**#${userRank.rank} | <@${userId}> XP:** \`${userRank.xp}\``;
+          return `${formattedList}\n${userLine}`;
+        }
       };
 
       const embed = new EmbedBuilder()
@@ -57,10 +76,7 @@ export const commands = [
 
         embed.addFields({
           name: 'TOP TEXT 💬',
-          value: [
-            formatTopList(topText),
-            `**#${userText.rank} | <@${userId}> XP:** \`${userText.xp}\``
-          ].join('\n'),
+          value: buildFieldValue(topText, userText),
           inline: type === 'all'
         });
       }
@@ -69,13 +85,9 @@ export const commands = [
         const limit = type === 'voice' ? 10 : 5; // voiceのみ指定時は10件表示
         const topVoice = getTopXP(guildId, 'voice', period, limit);
         const userVoice = getUserRank(guildId, userId, 'voice', period);
-
         embed.addFields({
           name: 'TOP VOICE 🎙️',
-          value: [
-            formatTopList(topVoice),
-            `**#${userVoice.rank} | <@${userId}> XP:** \`${userVoice.xp}\``
-          ].join('\n'),
+          value: buildFieldValue(topVoice, userVoice),
           inline: type === 'all'
         });
       }
