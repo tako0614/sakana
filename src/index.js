@@ -3,12 +3,18 @@ import {
   Client,
   Events,
   GatewayIntentBits,
-  EmbedBuilder
+  EmbedBuilder,
+  Partials
 } from 'discord.js';
 import cron from 'node-cron';
 import { commandMap } from './commands.js';
 import { handleEmotionRequest, isEmotionRequest } from './emotion.js';
 import { addTextXP, addVoiceXP, getTopXP } from './db.js';
+import { handleArchiveComponent } from './archive/commands.js';
+import { indexLiveEdit, indexLiveMessage, markLiveDelete, syncLiveReactions } from './archive/indexer.js';
+import { handleAgentRequest, isAgentRequest } from './agent/index.js';
+import { agentEnabled } from './agent/config.js';
+import { pruneCalls } from './agent/ratelimit.js';
 
 const token = process.env.DISCORD_TOKEN;
 const ossTargetUsername = process.env.OSS_TARGET_USERNAME ?? 'kurage.1';
@@ -35,8 +41,11 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMembers
-  ]
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessageReactions
+  ],
+  // 編集/削除/リアクションはキャッシュに無いメッセージにも届くので partial を有効にする
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
 
 client.on('error', (error) => {
@@ -49,6 +58,14 @@ client.on('shardError', (error) => {
 
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
+  console.log(
+    agentEnabled
+      ? 'AI agent is enabled. Mention the bot to use it.'
+      : 'DEEPSEEK_API_KEY is not set. The AI agent is disabled.'
+  );
+
+  // 古い呼び出し履歴を毎日掃除する (制限の窓より十分長く残す)
+  cron.schedule('0 30 4 * * *', () => pruneCalls());
 
   // 毎日0時00分20秒に特定のチャンネルへランキングを送信
   cron.schedule('20 0 0 * * *', async () => {
@@ -130,7 +147,15 @@ client.on(Events.MessageCreate, async (message) => {
 });
 
 async function handleMessageCreate(message) {
-  if (message.author.bot || !message.guildId) {
+  if (!message.guildId) {
+    return;
+  }
+
+  // インデックス済みのサーバーなら、新しい発言もそのままアーカイブに足していく。
+  // bot の発言も検索対象にしたいのでここで先に呼ぶ。
+  indexLiveMessage(message);
+
+  if (message.author.bot) {
     return;
   }
 
@@ -150,6 +175,12 @@ async function handleMessageCreate(message) {
     return;
   }
 
+  // @bot と直接メンションされたら AI エージェントに渡す。
+  if (isAgentRequest(message, client)) {
+    await handleAgentRequest(message, client);
+    return;
+  }
+
   if (message.author.username !== ossTargetUsername) {
     return;
   }
@@ -164,6 +195,47 @@ async function handleMessageCreate(message) {
     console.error('Failed to send oss response:', error);
   }
 }
+
+client.on(Events.MessageUpdate, async (_oldMessage, newMessage) => {
+  try {
+    const message = newMessage.partial ? await newMessage.fetch() : newMessage;
+    indexLiveEdit(message);
+  } catch (error) {
+    console.error('Unhandled error in message update handler:', error);
+  }
+});
+
+client.on(Events.MessageDelete, (message) => {
+  try {
+    markLiveDelete(message);
+  } catch (error) {
+    console.error('Unhandled error in message delete handler:', error);
+  }
+});
+
+client.on(Events.MessageBulkDelete, (messages) => {
+  try {
+    for (const message of messages.values()) {
+      markLiveDelete(message);
+    }
+  } catch (error) {
+    console.error('Unhandled error in bulk delete handler:', error);
+  }
+});
+
+async function handleReactionChange(reaction) {
+  try {
+    const message = reaction.message.partial ? await reaction.message.fetch() : reaction.message;
+    syncLiveReactions(message);
+  } catch (error) {
+    console.error('Unhandled error in reaction handler:', error);
+  }
+}
+
+client.on(Events.MessageReactionAdd, (reaction) => handleReactionChange(reaction));
+client.on(Events.MessageReactionRemove, (reaction) => handleReactionChange(reaction));
+client.on(Events.MessageReactionRemoveEmoji, (reaction) => handleReactionChange(reaction));
+client.on(Events.MessageReactionRemoveAll, (message) => handleReactionChange({ message }));
 
 // 通話の入退室時間を記録するMap
 const voiceSessions = new Map(); // guildId-userId -> timestamp
@@ -218,6 +290,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 async function handleInteractionCreate(interaction) {
+  if (interaction.isButton()) {
+    await handleArchiveComponent(interaction);
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) {
     return;
   }

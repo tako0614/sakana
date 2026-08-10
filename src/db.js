@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 
 // dbファイルを /home/tako/Desktop/github/sakana などに保存
-const db = new Database('database.sqlite');
+export const db = new Database('database.sqlite');
 db.pragma('journal_mode = WAL');
 
 // guild_id と user_id ごとのテキストとボイスXPを保持するテーブル

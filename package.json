@@ -7,7 +7,7 @@
   "scripts": {
     "start": "tsx src/index.js",
     "deploy": "node scripts/deploy-commands.js",
-    "check": "node --check src/index.js && tsx --no-cache -e \"Promise.all([import('./src/emotion.js'), import('./src/emotion-image.jsx')])\" && node --check scripts/deploy-commands.js && python3 -m py_compile scripts/analyze-emotions.py"
+    "check": "node --check src/index.js && tsx --no-cache -e \"Promise.all([import('./src/emotion.js'), import('./src/emotion-image.jsx')])\" && ARCHIVE_DB_PATH=/tmp/sakana-check.sqlite node -e \"import('./src/commands.js').then(({ commandData }) => console.log(commandData.length + ' commands built'))\" && ARCHIVE_DB_PATH=/tmp/sakana-check.sqlite DEEPSEEK_API_KEY=check node -e \"import('./src/agent/index.js').then(({ isAgentRequest }) => console.log('agent module ok: ' + typeof isAgentRequest))\" && node --check scripts/deploy-commands.js && python3 -m py_compile scripts/analyze-emotions.py"
   },
   "keywords": [
     "discord",
