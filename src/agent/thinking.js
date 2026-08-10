@@ -23,6 +23,9 @@ export class ThinkingIndicator {
     // Discord のメッセージ編集はチャンネル単位で絞られるので、詰まらせない。
     this.busy = false;
     this.stopped = false;
+    // 更新を諦めたあとでも削除はできるように、編集可否と message を別に持つ。
+    this.editable = true;
+    this.editFailures = 0;
   }
 
   render() {
@@ -53,7 +56,7 @@ export class ThinkingIndicator {
   }
 
   async tick() {
-    if (this.stopped || this.busy || !this.message) return;
+    if (this.stopped || this.busy || !this.message || !this.editable) return;
 
     // 表示が変わらないなら編集しない。無駄な API 呼び出しでレート制限を削らないため。
     const content = this.render();
@@ -63,10 +66,24 @@ export class ThinkingIndicator {
     try {
       await this.message.edit({ content, allowedMentions: NO_MENTIONS });
       this.lastRendered = content;
-    } catch {
-      // 消されていたら経過表示は諦める (本体の処理は続ける)
-      this.stopTimer();
-      this.message = null;
+      this.editFailures = 0;
+    } catch (error) {
+      // メッセージ自体が消えているときだけ本当に諦める (10008 = Unknown Message)。
+      if (error?.code === 10008 || error?.status === 404) {
+        this.editable = false;
+        this.message = null;
+        this.stopTimer();
+        return;
+      }
+
+      // レート制限などの一時的な失敗で諦めてはいけない。ここで message を捨てると
+      // stop() が削除できなくなり、「thinking」が残り続ける。次のティックで復帰する。
+      this.editFailures += 1;
+      if (this.editFailures >= 5) {
+        // 何度も失敗するなら更新だけ止める。message は消さないので削除はできる。
+        this.editable = false;
+        this.stopTimer();
+      }
     } finally {
       this.busy = false;
     }

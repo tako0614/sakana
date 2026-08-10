@@ -9,6 +9,7 @@ import { agentConfig } from './config.js';
 import {
   activatePage,
   closePage,
+  createIsolatedPage,
   createPage,
   getSession,
   listPages
@@ -89,17 +90,25 @@ function normalizeUrl(input) {
   return parsed.href;
 }
 
-/** 隔離タブを用意する。信頼されていない人はこのタブしか触れない。 */
+/**
+ * 隔離タブを用意する。信頼されていない人はこのタブしか触れない。
+ *
+ * 重要: 共有プロファイルに普通のタブを作ると Cookie を引き継ぐので、
+ * オーナーがログイン済みのサイト (管理画面や決済ダッシュボード) を
+ * 誰でも開いて読めてしまう。必ず独立コンテキストで作る。
+ */
 async function getSandboxSession() {
   const pages = await listPages();
 
   if (sandboxTargetId && !pages.some((page) => page.id === sandboxTargetId)) {
     sandboxTargetId = null;
+    sandboxContextId = null;
   }
 
   if (!sandboxTargetId) {
-    const created = await createPage('about:blank');
-    sandboxTargetId = created?.id ?? null;
+    const created = await createIsolatedPage('about:blank');
+    sandboxTargetId = created?.targetId ?? null;
+    sandboxContextId = created?.browserContextId ?? null;
     if (!sandboxTargetId) throw new Error('ブラウザのタブを開けませんでした。');
   }
 

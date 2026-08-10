@@ -81,6 +81,52 @@ export async function createPage(url = 'about:blank') {
   return fetchJson(`/json/new?${encodeURIComponent(url)}`, { method: 'PUT' });
 }
 
+// ブラウザ全体に繋ぐ接続。タブの作成/破棄と、独立コンテキストの作成に使う。
+let browserSession = null;
+
+async function getBrowserSession() {
+  if (browserSession && !browserSession.closed && browserSession.socket.readyState === 1) {
+    return browserSession;
+  }
+
+  const version = await fetchJson('/json/version');
+  const url = version?.webSocketDebuggerUrl;
+  if (!url) throw new Error('ブラウザの DevTools エンドポイントが取れませんでした。');
+
+  const socket = await createSocket(url);
+  await waitForOpen(socket);
+  browserSession = new CdpSession(socket, 'browser');
+  return browserSession;
+}
+
+/**
+ * Cookie も storage も共有しない独立コンテキストにタブを作る。
+ *
+ * 共有プロファイルにタブを足すだけでは、オーナーのログイン状態をそのまま
+ * 引き継いでしまう (誰でも Stripe や管理画面を開いて読めてしまう)。
+ * 信頼していない相手にブラウザを触らせるときは必ずこちらを使う。
+ */
+export async function createIsolatedPage(url = 'about:blank') {
+  const browser = await getBrowserSession();
+
+  const { browserContextId } = await browser.send('Target.createBrowserContext', {
+    disposeOnDetach: false
+  });
+
+  const { targetId } = await browser.send('Target.createTarget', { url, browserContextId });
+  return { targetId, browserContextId };
+}
+
+export async function disposeBrowserContext(browserContextId) {
+  if (!browserContextId) return;
+  try {
+    const browser = await getBrowserSession();
+    await browser.send('Target.disposeBrowserContext', { browserContextId });
+  } catch {
+    // 既に消えている場合は何もしない
+  }
+}
+
 export async function closePage(targetId) {
   await fetchJson(`/json/close/${targetId}`);
   sessions.get(targetId)?.close();
