@@ -390,6 +390,8 @@ export function countSearch(options) {
   ));
 }
 
+// 「話題 (term)」はここに入れられない。1行1件の scalar 式ではなく、本文を
+// トークン化して行を増やす処理なので terms.js に分けている。
 const GROUP_EXPRESSIONS = {
   author: 'm.author_id',
   channel: 'm.channel_id',
@@ -424,6 +426,72 @@ export function aggregateSearch(options, groupBy, { limit = 10, orderByKey = fal
       LIMIT ?
     `).all(...built.params, limit)
   ));
+}
+
+const SAMPLE_SLICES = Number(process.env.ARCHIVE_TERM_SLICES ?? 48);
+
+/**
+ * 検索条件に一致した本文を「時間で層化した標本」として取り出す。
+ *
+ * ORDER BY RANDOM() は数百万行だと全走査になるので使わない。期間を等分して
+ * (guild_id, created_at) インデックスの範囲スキャンを何本か引く。
+ * 直近だけを見ると「昔の話題」が落ちてしまい、立場の変遷が検出できなくなるので、
+ * 期間全体から均等に拾うことが要件。
+ *
+ * is_bot の除外は SQL ではなく呼び出し側の JS でやる。is_bot は索引に無く、
+ * WHERE に入れて LIMIT と併用すると bot が連投したスライスを無制限に走査する。
+ */
+export function sampleMessages(options, { cap = 4000, range = null, slices = SAMPLE_SLICES } = {}) {
+  const built = buildSearch(options);
+
+  return withRegexGuard(built.usesRegex, () => {
+    const spread = range
+      && Number.isFinite(range.from)
+      && Number.isFinite(range.to)
+      && Number(range.total) > cap
+      && range.to > range.from;
+
+    if (!spread) {
+      const rows = db.prepare(`
+        SELECT m.content AS content, m.is_bot AS is_bot
+        FROM messages m WHERE ${built.where} LIMIT ?
+      `).all(...built.params, cap);
+      return { rows, mode: rows.length >= cap ? 'head' : 'all' };
+    }
+
+    const per = Math.max(1, Math.ceil(cap / slices));
+    const width = Math.max(1, Math.ceil((range.to - range.from + 1) / slices));
+    const statement = db.prepare(`
+      SELECT m.content AS content, m.is_bot AS is_bot
+      FROM messages m
+      WHERE ${built.where} AND m.created_at >= ? AND m.created_at < ?
+      ORDER BY m.created_at
+      LIMIT ?
+    `);
+
+    const rows = [];
+    for (let i = 0; i < slices && rows.length < cap; i += 1) {
+      const from = range.from + i * width;
+      rows.push(...statement.all(...built.params, from, from + width, per));
+    }
+
+    return { rows, mode: 'stratified' };
+  });
+}
+
+/** ギルド全体の期間。層化サンプリングの範囲決めに使う。 */
+export function guildTimeRange(guildId) {
+  // MIN/MAX を1本の集計にすると索引が使われないことがあるので2本に分ける
+  const first = db.prepare(
+    'SELECT created_at AS at FROM messages WHERE guild_id = ? ORDER BY created_at ASC LIMIT 1'
+  ).get(guildId);
+  const last = db.prepare(
+    'SELECT created_at AS at FROM messages WHERE guild_id = ? ORDER BY created_at DESC LIMIT 1'
+  ).get(guildId);
+  const total = db.prepare('SELECT COUNT(*) AS count FROM messages WHERE guild_id = ?').get(guildId).count;
+
+  if (!first || !last) return null;
+  return { from: first.at, to: last.at, total };
 }
 
 export function searchSummary(options) {

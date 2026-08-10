@@ -8,6 +8,7 @@ import { db as archiveDb, getGuildState } from '../archive/db.js';
 import { MESSAGE_CHANNEL_TYPES, canRead } from '../archive/permissions.js';
 import { QueryError } from '../archive/query.js';
 import { aggregateSearch, search, searchSummary } from '../archive/search.js';
+import { topTerms } from '../archive/terms.js';
 import { browserToolDefinition, runBrowserAction } from './browser.js';
 import { cdpAvailable } from './cdp.js';
 import { agentConfig } from './config.js';
@@ -544,7 +545,7 @@ async function readChannel(ctx, args) {
 // ---------------------------------------------------------------- aggregate_messages
 
 // 説明文と検証で同じ配列を使う。片方だけ増やすと、モデルは存在しない軸を投げてくる。
-const AGGREGATE_AXES = ['author', 'channel', 'year', 'month', 'day', 'hour', 'weekday'];
+const AGGREGATE_AXES = ['author', 'channel', 'year', 'month', 'day', 'hour', 'weekday', 'term'];
 
 const aggregateDefinition = {
   type: 'function',
@@ -552,7 +553,12 @@ const aggregateDefinition = {
     name: 'aggregate_messages',
     description: [
       '検索条件に一致した発言を集計する。「一番言っているのは誰か」「いつ増えたか」を',
-      '数で示したいときに使う。個別の発言は返らないので件数を知りたいときはこちらが安い。'
+      '数で示したいときに使う。個別の発言は返らないので件数を知りたいときはこちらが安い。',
+      'by:term はその条件でよく話している話題を抽出する。サーバー全体との比で並ぶので',
+      '「する」「です」のような一般語は出ない。探す語が事前に分からないとき',
+      '(例: ある人の主張の食い違いを探す) は、まず by:term で題材を出し、',
+      '出てきた語を query に入れて search_messages すれば、その話題について',
+      'いつ何と言っていたかを時期を分けて追える。'
     ].join(''),
     parameters: {
       type: 'object',
@@ -567,6 +573,45 @@ const aggregateDefinition = {
     }
   }
 };
+
+/**
+ * 話題 (特徴語) の集計。
+ *
+ * 標本であることを必ず書く。ここに無い語を「言っていない」と読まれると、
+ * ダブスタ判定のような用途で結論が逆になる。
+ */
+function formatTermAggregate(options, summary) {
+  const result = topTerms(options, {
+    range: { from: summary.first_at, to: summary.last_at, total: summary.count }
+  });
+
+  if (result.rows.length === 0) {
+    return [
+      `${result.messages} 件を走査しましたが、特徴的な語は見つかりませんでした。`,
+      '(発言が少ないか、サーバー全体と傾向が同じ)'
+    ].join('');
+  }
+
+  const lines = [
+    `合計 ${summary.count} 件 / 走査 ${result.messages} 件`
+      + (result.mode === 'stratified' ? ' (期間全体から等間隔に抽出した標本)' : ''),
+    `期間: ${shortTime(summary.first_at)} 〜 ${shortTime(summary.last_at)}`,
+    `--- 話題 (サーバー全体 ${result.baseline.messages} 件との比較) ---`,
+    result.rows.map((row) => `${row.term}: ${row.count}件 (全体比 ${row.ratio.toFixed(1)}倍)`).join('\n'),
+    '件数はその語を含む発言数。頻度順ではなく「この条件で偏って多い語」順。',
+    '実際の発言はこの語を query に入れて search_messages で読むこと。'
+  ];
+
+  if (result.weakBaseline) {
+    lines.push('(注記) 比較する母集団が小さいので、ほぼ単純な頻度順です。');
+  }
+
+  if (summary.count > result.messages) {
+    lines.push('(注記) 全件ではなく標本です。ここに無い語を「言っていない」と結論しないこと。after: / before: で期間を絞ると精度が上がります。');
+  }
+
+  return lines.join('\n');
+}
 
 async function aggregateMessages(ctx, args) {
   const options = {
@@ -591,6 +636,9 @@ async function aggregateMessages(ctx, args) {
 
   const summary = searchSummary(options);
   if (!summary.count) return '該当するメッセージはありませんでした。';
+
+  // term は SQL の GROUP BY ではなく本文のトークン化なので別処理
+  if (by === 'term') return formatTermAggregate(options, summary);
 
   const rows = aggregateSearch(options, by, { limit: by === 'month' ? 24 : 15 });
 
