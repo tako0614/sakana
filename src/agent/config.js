@@ -26,7 +26,7 @@ export const agentConfig = {
 
   // --- トークン節約のための上限 ---
   // ツールを呼ぶたびに会話全体を再送するので、往復回数が費用に直結する。
-  maxRounds: number(process.env.AGENT_MAX_ROUNDS, 8),
+  maxRounds: number(process.env.AGENT_MAX_ROUNDS, 10),
   // 1回の実行でツール出力に使える合計文字数。超えたらツールが打ち切る。
   maxToolChars: number(process.env.AGENT_MAX_TOOL_CHARS, 24_000),
   // ツール出力に載せる1メッセージあたりの本文文字数。

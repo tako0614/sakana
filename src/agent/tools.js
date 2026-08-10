@@ -5,7 +5,7 @@
 // (アーカイブ未構築なら検索系を出さない / Chrome が居なければブラウザを出さない)。
 
 import { db as archiveDb, getGuildState } from '../archive/db.js';
-import { canRead } from '../archive/permissions.js';
+import { MESSAGE_CHANNEL_TYPES, canRead } from '../archive/permissions.js';
 import { QueryError } from '../archive/query.js';
 import { aggregateSearch, search, searchSummary } from '../archive/search.js';
 import { browserToolDefinition, runBrowserAction } from './browser.js';
@@ -60,11 +60,18 @@ function authorLabel(ctx, authorId) {
   return `user:${authorId}`;
 }
 
-function resolveChannel(ctx, value) {
+async function resolveChannel(ctx, value) {
   if (!value) return ctx.channel;
 
   const id = /(\d{16,21})/.exec(String(value))?.[1];
-  if (id) return ctx.guild.channels.cache.get(id) ?? null;
+  if (id) {
+    const cached = ctx.guild.channels.cache.get(id);
+    if (cached) return cached;
+
+    // アーカイブ済みスレッドはキャッシュに載っていない。ID が分かっているなら取りに行く。
+    // これが無いと、検索でスレッドの発言が出ても前後を読めない。
+    return ctx.guild.channels.fetch(id).catch(() => null);
+  }
 
   const name = String(value).replace(/^#/, '').toLowerCase();
   const channels = [...ctx.guild.channels.cache.values()];
@@ -72,6 +79,74 @@ function resolveChannel(ctx, value) {
   return channels.find((channel) => channel.name?.toLowerCase() === name)
     ?? channels.find((channel) => channel.name?.toLowerCase().includes(name))
     ?? null;
+}
+
+/** チャンネル指定を配列にそろえる。"a, b" でも ["a","b"] でも受ける。 */
+function normalizeChannelArg(value) {
+  if (value === null || value === undefined || value === '') return null;
+
+  const list = Array.isArray(value)
+    ? value
+    : String(value).split(/[,、]/);
+
+  const cleaned = list.map((entry) => String(entry).trim()).filter(Boolean);
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+function compactCount(value) {
+  const n = Number(value ?? 0);
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 10_000) return `${Math.round(n / 1000)}k`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
+
+/**
+ * 実行者が読めるチャンネルの一覧。system prompt に載せる。
+ *
+ * モデルはこれが無いとチャンネル名を当てずっぽうで書くしかない。
+ * 毎回送るが、内容が安定しているので DeepSeek のコンテキストキャッシュに乗る。
+ * 発言数の多い順に並べて、多すぎるときは切る。
+ */
+export function describeChannels(ctx, { limit = 30 } = {}) {
+  let counts = new Map();
+  try {
+    const rows = archiveDb
+      .prepare('SELECT channel_id, message_count FROM channels WHERE guild_id = ?')
+      .all(ctx.guild.id);
+    counts = new Map(rows.map((row) => [row.channel_id, row.message_count]));
+  } catch {
+    // アーカイブが無い構成でも動く
+  }
+
+  const visible = [];
+  for (const channel of ctx.guild.channels.cache.values()) {
+    if (!MESSAGE_CHANNEL_TYPES.has(channel.type)) continue;
+    if (!canRead(channel, ctx.member)) continue;
+    visible.push({ channel, count: counts.get(channel.id) ?? 0 });
+  }
+
+  if (visible.length === 0) return null;
+
+  const hasCounts = visible.some((entry) => entry.count > 0);
+  visible.sort((a, b) => (
+    hasCounts
+      ? b.count - a.count
+      : (a.channel.rawPosition ?? 0) - (b.channel.rawPosition ?? 0)
+  ));
+
+  const shown = visible.slice(0, limit);
+  const names = shown.map((entry) => (
+    hasCounts && entry.count > 0
+      ? `#${entry.channel.name}(${compactCount(entry.count)})`
+      : `#${entry.channel.name}`
+  ));
+
+  return {
+    total: visible.length,
+    truncated: visible.length > shown.length,
+    text: names.join(' ')
+  };
 }
 
 /** 実行者に見えないチャンネルは、ツール経由でも絶対に見せない。 */
@@ -184,7 +259,7 @@ async function searchViaDiscord(ctx, args, limit) {
   }
 
   if (args.channel) {
-    const channel = assertReadable(ctx, resolveChannel(ctx, args.channel));
+    const channel = assertReadable(ctx, await resolveChannel(ctx, args.channel));
     query.set('channel_id', channel.id);
   }
 
@@ -266,12 +341,14 @@ const readChannelDefinition = {
       '別チャンネルを読みたいときに使う。',
       'search_messages のヒット番号をそのまま around に渡せば、その発言の前後の流れが読める',
       '(別チャンネルのヒットでも channel の指定は不要。自動でそのチャンネルを読む)。',
-      '検索結果だけでは文脈が分からないときは、まずこれで周辺を読むこと。'
+      '検索結果だけでは文脈が分からないときは、まずこれで周辺を読むこと。',
+      'channel は "general, dev, random" のように複数まとめて渡せる (最大5つ)。',
+      '複数チャンネルを見比べたいときは1件ずつ呼ばず、まとめて渡すこと。'
     ].join(''),
     parameters: {
       type: 'object',
       properties: {
-        channel: { type: 'string', description: 'チャンネル (省略時は参照番号のチャンネル、無ければ呼ばれたチャンネル)' },
+        channel: { type: 'string', description: 'チャンネル。カンマ区切りで複数可 (最大5)。省略時は参照番号のチャンネル、無ければ呼ばれたチャンネル' },
         after: { type: 'string', description: 'この参照番号より後を読む' },
         before: { type: 'string', description: 'この参照番号より前を読む' },
         around: { type: 'string', description: 'この参照番号の前後を読む (検索ヒットの文脈を追うのに使う)' },
@@ -281,7 +358,74 @@ const readChannelDefinition = {
   }
 };
 
+const MAX_CHANNELS_PER_READ = 5;
+
+/** 1回の呼び出しで複数チャンネルを読む。往復を増やさずに横断できるようにするため。 */
+async function readManyChannels(ctx, wanted, args) {
+  const targets = wanted.slice(0, MAX_CHANNELS_PER_READ);
+  const total = clampLimit(args.limit, 30, 100);
+  const perChannel = Math.max(5, Math.floor(total / targets.length));
+
+  const sections = [];
+  const problems = [];
+
+  for (const name of targets) {
+    let channel;
+    try {
+      channel = assertReadable(ctx, await resolveChannel(ctx, name));
+    } catch (error) {
+      problems.push(`${name}: ${error.message}`);
+      continue;
+    }
+
+    if (typeof channel.messages?.fetch !== 'function') {
+      problems.push(`#${channel.name}: メッセージを取得できない種類のチャンネルです`);
+      continue;
+    }
+
+    let fetched;
+    try {
+      fetched = await channel.messages.fetch({ limit: perChannel });
+    } catch (error) {
+      problems.push(`#${channel.name}: ${truncate(error.message, 80)}`);
+      continue;
+    }
+
+    const messages = [...fetched.values()]
+      .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+      .map((message) => fromDiscordMessage(message, channel.name));
+
+    sections.push([
+      `--- #${channel.name} (${messages.length}件) ---`,
+      messages.length === 0
+        ? '(発言なし)'
+        : formatMessages(messages, {
+          refs: ctx.refs,
+          showChannel: false,
+          bodyChars: agentConfig.messageChars
+        })
+    ].join('\n'));
+  }
+
+  if (wanted.length > MAX_CHANNELS_PER_READ) {
+    problems.push(`一度に読めるのは ${MAX_CHANNELS_PER_READ} チャンネルまでなので、残りは省きました`);
+  }
+
+  if (sections.length === 0) {
+    return problems.length > 0 ? problems.join('\n') : 'メッセージがありませんでした。';
+  }
+
+  return [...sections, ...(problems.length > 0 ? [`(注記) ${problems.join(' / ')}`] : [])].join('\n\n');
+}
+
 async function readChannel(ctx, args) {
+  const wanted = normalizeChannelArg(args.channel);
+
+  // 複数チャンネル指定は横断読みに回す (anchor は1チャンネル前提なので使わない)
+  if (wanted && wanted.length > 1) {
+    return readManyChannels(ctx, wanted, args);
+  }
+
   // before / after / around は同時に使えない。指定された順で1つだけ採る。
   let anchor = null;
   let anchorKey = null;
@@ -301,10 +445,11 @@ async function readChannel(ctx, args) {
   // 参照番号から来た channel_id は確定値なので、名前解決を通さず直接引く。
   const channel = assertReadable(
     ctx,
-    args.channel
-      ? resolveChannel(ctx, args.channel)
+    wanted
+      ? await resolveChannel(ctx, wanted[0])
       : anchor?.channelId
-        ? ctx.guild.channels.cache.get(anchor.channelId) ?? null
+        ? ctx.guild.channels.cache.get(anchor.channelId)
+          ?? await ctx.guild.channels.fetch(anchor.channelId).catch(() => null)
         : ctx.channel
   );
 

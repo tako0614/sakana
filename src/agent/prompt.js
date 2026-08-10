@@ -5,8 +5,11 @@
 
 import { agentConfig } from './config.js';
 import { formatMessages, shortTime } from './format.js';
+import { describeChannels } from './tools.js';
 
 export function buildSystemPrompt(ctx, toolset) {
+  const channels = describeChannels(ctx);
+
   const lines = [
     'あなたは Discord サーバーの中で動くアシスタントです。サーバーの会話を読んで、事実に基づいて答えます。',
     '',
@@ -15,7 +18,20 @@ export function buildSystemPrompt(ctx, toolset) {
     `チャンネル: #${ctx.channel.name ?? ctx.channel.id}`,
     `現在時刻: ${shortTime(Date.now())} (UTC+9)`,
     `呼んだ人: ${ctx.member?.displayName ?? 'unknown'}`,
-    '',
+    ''
+  ];
+
+  if (channels) {
+    lines.push(
+      `## 読めるチャンネル (${channels.total}件${channels.truncated ? '、発言数の多い順に抜粋' : ''}、括弧内は発言数)`,
+      channels.text,
+      '',
+      'この一覧はあなたが読める範囲です。ここに無いチャンネルは呼んだ人に閲覧権限がないので触れません。',
+      ''
+    );
+  }
+
+  lines.push(
     '## 得意な仕事',
     '- **議論のまとめ**: 誰がどの立場か、論点は何か、どこまで合意したか、未解決は何かを整理する。',
     '- **口論の判定**: 双方の主張を並べ、事実で裏づく部分と価値観の相違を切り分ける。',
@@ -36,10 +52,21 @@ export function buildSystemPrompt(ctx, toolset) {
     '',
     '## ツールの使い方',
     `- 直近 ${agentConfig.preloadMessages} 件の会話は既に下に渡してある。足りるならツールを呼ばずに答える。`,
-    '- 呼ぶのは必要最小限 (多くて2〜3回)。同じ検索を条件を変えて何度も試さない。',
     '- 検索でヒットした発言は、それ単体では前後が分からない。何を指しているか曖昧なときは `read_channel` に',
-    '  そのヒット番号を `around` で渡して周辺を読む (別チャンネルでも channel の指定は不要)。'
-  ];
+    '  そのヒット番号を `around` で渡して周辺を読む (別チャンネルでも channel の指定は不要)。',
+    '',
+    '## チャンネルをまたぐとき',
+    'サーバー全体を調べる用事では、チャンネルを1つずつ覗いて回らないこと。往復するほど遅く高くなる。',
+    '1. `search_messages` は最初から**全チャンネル横断**で引く。まずこれを撃つ。',
+    toolset.archiveAvailable
+      ? '2. どのチャンネルの話題かを知りたいだけなら `aggregate_messages` に `by:channel` を渡す。本文が返らないので安い。'
+      : '2. ヒットした行にチャンネル名が出るので、それでどこの話題か分かる。',
+    '3. 中身を読む必要があるチャンネルが複数あるなら、`read_channel` の `channel` に',
+    '   `"general, dev, random"` のようにまとめて渡す (1回で最大5つ)。1つずつ呼ばない。',
+    '4. そこから特定の発言を掘るときだけ `around` で周辺を読む。',
+    '',
+    '- 呼ぶのは必要最小限。上の手順なら2〜3回で足りる。同じ検索を条件だけ変えて繰り返さない。'
+  );
 
   if (toolset.archiveAvailable) {
     lines.push('- このサーバーは過去ログを取り込み済み。`search_messages` で全期間を検索できる。件数だけ知りたいなら `aggregate_messages` のほうが安い。');
