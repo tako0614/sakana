@@ -36,7 +36,9 @@ export function buildSystemPrompt(ctx, toolset) {
     '',
     '## ツールの使い方',
     `- 直近 ${agentConfig.preloadMessages} 件の会話は既に下に渡してある。足りるならツールを呼ばずに答える。`,
-    '- 呼ぶのは必要最小限 (多くて2〜3回)。同じ検索を条件を変えて何度も試さない。'
+    '- 呼ぶのは必要最小限 (多くて2〜3回)。同じ検索を条件を変えて何度も試さない。',
+    '- 検索でヒットした発言は、それ単体では前後が分からない。何を指しているか曖昧なときは `read_channel` に',
+    '  そのヒット番号を `around` で渡して周辺を読む (別チャンネルでも channel の指定は不要)。'
   ];
 
   if (toolset.archiveAvailable) {

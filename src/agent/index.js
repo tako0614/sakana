@@ -23,8 +23,25 @@ import { buildToolset } from './tools.js';
 
 const NO_MENTIONS = { parse: [], repliedUser: false };
 
+// エージェントが投稿した回答の ID。これへのリプライを会話の続きとして扱う。
+// リプライ元をいちいち fetch すると、返信のたびに API を1回叩くことになるので、
+// 自分が送ったものだけ覚えておいて突き合わせる。
+const OWN_REPLY_LIMIT = 500;
+const ownReplies = new Set();
+
+function rememberOwnReply(messageId) {
+  if (!messageId) return;
+  ownReplies.add(messageId);
+  // 古いものから落とす (Set は挿入順を保つ)
+  while (ownReplies.size > OWN_REPLY_LIMIT) {
+    ownReplies.delete(ownReplies.values().next().value);
+  }
+}
+
 /**
- * bot への直接メンションだけを入口にする。
+ * 入口は2つ。
+ *   1. bot への直接メンション
+ *   2. エージェントの回答へのリプライ (会話の続き)
  * @everyone / ロールメンション / リプライの自動メンションでは起動しない。
  */
 export function isAgentRequest(message, client) {
@@ -32,12 +49,24 @@ export function isAgentRequest(message, client) {
   if (!message.guildId || message.author?.bot) return false;
   if (!client.user) return false;
 
-  return message.mentions.has(client.user, {
+  const mentioned = message.mentions.has(client.user, {
     ignoreDirect: false,
     ignoreRoles: true,
     ignoreEveryone: true,
     ignoreRepliedUser: true
   });
+
+  if (mentioned) return true;
+
+  // エージェントの回答へのリプライなら、メンション無しでも続きとして扱う。
+  const repliedTo = message.reference?.messageId;
+  if (!repliedTo) return false;
+
+  if (ownReplies.has(repliedTo)) return true;
+
+  // 再起動を挟むと ownReplies は空になる。リプライの通知が付いていれば
+  // それで bot 宛だと分かるので、そちらも見る (追加の API 呼び出しは無し)。
+  return message.mentions.repliedUser?.id === client.user.id;
 }
 
 function stripMention(content, clientId) {
@@ -181,8 +210,12 @@ export async function handleAgentRequest(message, client) {
         ...(index === chunks.length - 1 && files.length > 0 ? { files } : {})
       };
 
-      if (index === 0) await message.reply(payload);
-      else await message.channel.send(payload);
+      const sent = index === 0
+        ? await message.reply(payload)
+        : await message.channel.send(payload);
+
+      // これへのリプライを会話の続きとして受け付ける
+      rememberOwnReply(sent?.id);
     }
   } catch (error) {
     const aborted = error.name === 'AbortError';

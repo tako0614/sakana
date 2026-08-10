@@ -263,15 +263,18 @@ const readChannelDefinition = {
     description: [
       'チャンネルのメッセージを時系列で読む。呼ばれたチャンネルの直近の流れは既に渡してあるので、',
       'それより前 (before) / 後 (after) / ある発言の周辺 (around) を追いたいときや、',
-      '別チャンネルを読みたいときに使う。'
+      '別チャンネルを読みたいときに使う。',
+      'search_messages のヒット番号をそのまま around に渡せば、その発言の前後の流れが読める',
+      '(別チャンネルのヒットでも channel の指定は不要。自動でそのチャンネルを読む)。',
+      '検索結果だけでは文脈が分からないときは、まずこれで周辺を読むこと。'
     ].join(''),
     parameters: {
       type: 'object',
       properties: {
-        channel: { type: 'string', description: 'チャンネル (省略時は呼ばれたチャンネル)' },
+        channel: { type: 'string', description: 'チャンネル (省略時は参照番号のチャンネル、無ければ呼ばれたチャンネル)' },
         after: { type: 'string', description: 'この参照番号より後を読む' },
         before: { type: 'string', description: 'この参照番号より前を読む' },
-        around: { type: 'string', description: 'この参照番号の前後を読む' },
+        around: { type: 'string', description: 'この参照番号の前後を読む (検索ヒットの文脈を追うのに使う)' },
         limit: { type: 'number', description: '件数 (既定 30、最大 100)' }
       }
     }
@@ -279,7 +282,31 @@ const readChannelDefinition = {
 };
 
 async function readChannel(ctx, args) {
-  const channel = assertReadable(ctx, resolveChannel(ctx, args.channel));
+  // before / after / around は同時に使えない。指定された順で1つだけ採る。
+  let anchor = null;
+  let anchorKey = null;
+
+  for (const key of ['around', 'after', 'before']) {
+    const entry = ctx.refs.resolve(args[key]);
+    if (entry?.messageId) {
+      anchor = entry;
+      anchorKey = key;
+      break;
+    }
+  }
+
+  // 検索結果の番号を渡されたら、その発言があったチャンネルを読む。
+  // 呼ばれたチャンネルを既定にしてしまうと、別チャンネルのヒットの前後が
+  // 追えない (そのチャンネルに無い ID を引いて失敗する)。
+  // 参照番号から来た channel_id は確定値なので、名前解決を通さず直接引く。
+  const channel = assertReadable(
+    ctx,
+    args.channel
+      ? resolveChannel(ctx, args.channel)
+      : anchor?.channelId
+        ? ctx.guild.channels.cache.get(anchor.channelId) ?? null
+        : ctx.channel
+  );
 
   if (typeof channel.messages?.fetch !== 'function') {
     return 'そのチャンネルからはメッセージを取得できません。';
@@ -287,15 +314,7 @@ async function readChannel(ctx, args) {
 
   const limit = clampLimit(args.limit, 30, 100);
   const options = { limit };
-
-  // before / after / around は同時に使えない。指定された順で1つだけ採る。
-  for (const key of ['around', 'after', 'before']) {
-    const entry = ctx.refs.resolve(args[key]);
-    if (entry?.messageId) {
-      options[key] = entry.messageId;
-      break;
-    }
-  }
+  if (anchor && anchorKey) options[anchorKey] = anchor.messageId;
 
   let fetched;
   try {
