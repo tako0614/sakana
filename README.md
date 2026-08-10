@@ -72,7 +72,7 @@ Discord のメッセージ編集はチャンネルあたり 5回/5秒あたり�
 | `search_messages` | 常時 | 過去ログ検索。取り込み済みならローカルの DSL 検索 (API 消費ゼロ)、未取り込みなら Discord の検索 API |
 | `read_channel` | 常時 | チャンネルを時系列で読む。ある発言の前 / 後 / 周辺も追える |
 | `aggregate_messages` | 取り込み済みのとき | 「一番言っているのは誰か」「いつ増えたか」を件数で出す。本文を返さないので安い |
-| `browser` | 9222 に Chrome が居るとき | 外付け Chrome の操作 (下記) |
+| `browser` | 9222 に Chrome が居るとき | 専用 Chrome の操作 (下記) |
 
 `/index build` で過去ログを取り込んでおくと、`search_messages` が `OR` / 除外 / 正規表現 / `reactions:>5` / `hour:22-4` などを使えるようになり、Discord の検索 API を消費しません。取り込んでいない場合は Discord の検索 API を使うので、単純なキーワードのみです (Discord 側のインデックス構築中は少し待つ必要があります)。
 
@@ -80,14 +80,38 @@ Discord のメッセージ編集はチャンネルあたり 5回/5秒あたり�
 
 ### 外付け Chrome (CDP)
 
-[deckide](https://github.com/tako0614/ide) が `9222` に常駐させている共有ブラウザに、CDP でそのまま相乗りします。**この bot は Chrome を起動も終了もしません。** 居なければブラウザツールを出さないだけです。
+bot のプロセスに Chrome を埋め込まず、**別プロセスの Chrome に CDP (既定 `127.0.0.1:9222`) で繋ぐ**だけの構成です。**この bot は Chrome を起動も終了もしません。** 居なければブラウザツールを出さないので、無ければ無いなりに動きます。
+
+**推奨は bot と同じホストに専用 Chrome を1つ置くことです。** 人が普段使っているブラウザに相乗りさせると、そのログインセッションを Discord 経由で触らせることになり、タブを壊す事故も起きます。専用にすれば両方消えます。
+
+起動方法は [deckide](https://github.com/tako0614/ide) の `agent-browser` に合わせています。要点は「headless を使わず、実 Google Chrome を Xvfb 上で headful 起動する」ことで、これは自動化検知 (Cloudflare の Managed Challenge 等) で弾かれにくくするためです。
+
+```ini
+# /etc/systemd/system/sakana-chrome.service の ExecStart で使う起動フラグ
+xvfb-run -a --server-args="-screen 0 1280x720x24 -nolisten tcp" \
+  /usr/bin/google-chrome \
+  --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
+  --user-data-dir=/var/lib/sakana-chrome/profile \
+  --no-first-run --no-default-browser-check --disable-dev-shm-usage \
+  --in-process-gpu --disable-gpu-sandbox \
+  --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader \
+  --disable-blink-features=AutomationControlled \
+  --lang=ja-JP --window-size=1280,720 --no-sandbox about:blank
+```
+
+- `--in-process-gpu --disable-gpu-sandbox` … GPU の無いサーバで headful 起動すると GPU プロセスが落ちて即死するのを回避。
+- `--use-angle=swiftshader --enable-unsafe-swiftshader` … WebGL を実際に動かす。WebGL が無いのは実 Chrome として不自然で、検知の信号になる。
+- `--disable-blink-features=AutomationControlled` … `navigator.webdriver` を立てない。
+- `--no-sandbox` … unprivileged LXC で必要 (コンテナ側の権限を緩める代わりにこれで済む)。
+
+CDP 側でも `navigator.webdriver` を `undefined` に保ち、`navigator.languages` を `Accept-Language` と揃える程度の補正を入れています。plugins や WebGL ベンダの**偽装はしません** — 不整合はかえって検知材料になるためです。
 
 `browser` ツール1つに全機能を載せています: `open` / `text` / `links` / `html` / `screenshot` / `click` / `type` / `key` / `scroll` / `wait` / `eval` / `back` / `forward` / `reload` / `tabs` / `tab` / `new_tab` / `close_tab` / `console` / `network`、そして生の CDP を直接叩く `cdp` (`Page.printToPDF` など、ここに実装していないものはこれで呼べます)。
 
-共有ブラウザにはオーナーのログインセッションが載っているので、既定では権限を2段に分けています。
+権限は2段に分けています。
 
-- **誰でも**: `open` / `text` / `links` / `screenshot` / `scroll` / `wait` / `back` / `forward` / `reload` / `console` / `network`。ただしこの bot が作った専用タブの中だけで動きます。オーナーが開いている他のタブは読めません。
-- **「サーバー管理」権限か `AGENT_BROWSER_TRUSTED_USERS`**: 上記に加えて `click` / `type` / `key` / `eval` / `cdp` / タブ操作。共有ブラウザの既存タブも触れます。
+- **誰でも**: `open` / `text` / `links` / `screenshot` / `scroll` / `wait` / `back` / `forward` / `reload` / `console` / `network`。ただし **Cookie を共有しない独立コンテキスト** (`Target.createBrowserContext`) に作った専用タブの中だけです。既存タブは読めず、ログイン済みサイトも引き継ぎません。
+- **「サーバー管理」権限か `AGENT_BROWSER_TRUSTED_USERS`**: 上記に加えて `click` / `type` / `key` / `eval` / `cdp` / タブ操作。既定プロファイルの既存タブも触れます。
 
 全員に全機能を許すなら `AGENT_BROWSER_FULL_FOR_ALL=true` にしてください。`file:` とローカル/内部ネットワークへのアクセスは既定で拒否します (`AGENT_BROWSER_ALLOW_LOCAL=true` で解除)。
 
@@ -120,7 +144,7 @@ AGENT_TIMEOUT_MS=150000
 AGENT_PROGRESS_INTERVAL_MS=1000     # 「-# thinking (10s)」の更新間隔
 
 AGENT_BROWSER=true
-AGENT_BROWSER_CDP_PORT=9222         # deckide と同じ変数名なので設定を共有できる
+AGENT_BROWSER_CDP_PORT=9222         # 専用 Chrome の CDP ポート (deckide と同じ変数名)
 AGENT_BROWSER_FULL_FOR_ALL=false
 AGENT_BROWSER_TRUSTED_USERS=
 AGENT_BROWSER_ALLOW_LOCAL=false

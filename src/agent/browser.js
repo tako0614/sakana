@@ -33,6 +33,7 @@ const MAX_SCREENSHOTS = 2;
 // 信頼されていない人向けの隔離タブ。オーナーが開いている業務タブを読ませないため、
 // この bot が自分で作ったタブだけを触らせる。
 let sandboxTargetId = null;
+let sandboxContextId = null;
 
 export const browserToolDefinition = {
   type: 'function',

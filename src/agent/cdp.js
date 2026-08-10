@@ -352,7 +352,36 @@ export async function getSession(targetId) {
     session.send('Network.enable').catch(() => {})
   ]);
 
+  await applyStealth(session);
+
   return session;
+}
+
+// 反検知。deckide と同じ方針で「正直で整合の取れた実 Chrome」に寄せる。
+// plugins や WebGL ベンダを偽装すると、かえって不整合が検知信号になるのでやらない。
+// navigator.webdriver は起動フラグ --disable-blink-features=AutomationControlled で
+// 既に落ちているが、保険として undefined を維持する。
+const STEALTH_SOURCE = `
+  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  if (!window.chrome) { window.chrome = { runtime: {} }; }
+  Object.defineProperty(navigator, 'languages', { get: () => ['ja-JP', 'ja', 'en-US', 'en'] });
+  try {
+    const q = window.navigator.permissions && window.navigator.permissions.query;
+    if (q) {
+      window.navigator.permissions.query = (p) => (
+        p && p.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : q(p)
+      );
+    }
+  } catch (e) { /* ignore */ }
+`;
+
+async function applyStealth(session) {
+  // best-effort。失敗してもブラウジング自体は続ける。
+  await session
+    .send('Page.addScriptToEvaluateOnNewDocument', { source: STEALTH_SOURCE })
+    .catch(() => {});
 }
 
 export function getActiveTargetId() {
