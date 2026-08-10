@@ -5,7 +5,6 @@ import {
   EmbedBuilder,
   InteractionContextType,
   MessageFlags,
-  PermissionFlagsBits,
   SlashCommandBuilder
 } from 'discord.js';
 
@@ -161,7 +160,9 @@ const indexCommand = {
   data: new SlashCommandBuilder()
     .setName('index')
     .setDescription('サーバーの過去ログを検索インデックスに取り込みます (管理者用)')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    // Discord の default_member_permissions で絞ると、ARCHIVE_ADMIN_USERS で
+    // 許可した人からもコマンド自体が見えなくなる (入力候補に出ない)。
+    // 可視性は開けて、実行可否は execute 側の canManageIndex で判定する。
     .setContexts(InteractionContextType.Guild)
     .addSubcommand((sub) => sub
       .setName('build')
@@ -195,7 +196,7 @@ const indexCommand = {
     const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
     if (!canManageIndex(member)) {
       await interaction.reply({
-        content: 'このコマンドは「サーバー管理」権限を持つ人だけが使えます。',
+        content: 'このコマンドは「サーバー管理」権限を持つ人か、`ARCHIVE_ADMIN_USERS` に登録された人だけが使えます。',
         flags: MessageFlags.Ephemeral
       });
       return;

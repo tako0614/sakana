@@ -93,7 +93,15 @@ export function getChannelScope(guild, member) {
     : { mode: 'include', ids: [...allowed] };
 }
 
+// /index を使える人を ID で明示的に足せるようにする。
+// サーバーの ManageGuild を渡すとサーバー名変更・Webhook・連携まで付いてしまうので、
+// 「bot の管理コマンドだけ渡したい」ときはこちらを使う。
+const ARCHIVE_ADMIN_USERS = String(process.env.ARCHIVE_ADMIN_USERS ?? '')
+  .split(/[\s,]+/)
+  .filter(Boolean);
+
 export function canManageIndex(member) {
+  if (member?.id && ARCHIVE_ADMIN_USERS.includes(member.id)) return true;
   return Boolean(member?.permissions?.has(Flags.Administrator) || member?.permissions?.has(Flags.ManageGuild));
 }
 
