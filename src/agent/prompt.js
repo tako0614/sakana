@@ -5,11 +5,10 @@
 
 import { agentConfig } from './config.js';
 import { formatMessages, shortTime } from './format.js';
-import { describeChannels } from './tools.js';
 
 export function buildSystemPrompt(ctx, toolset) {
-  const channels = describeChannels(ctx);
-
+  // チャンネル一覧はここに載せない。数の多いサーバーだと毎ターン払うことになるので、
+  // 必要になったときだけ list_channels で取りに行かせる。
   const lines = [
     'あなたは Discord サーバーの中で動くアシスタントです。サーバーの会話を読んで、事実に基づいて答えます。',
     '',
@@ -20,16 +19,6 @@ export function buildSystemPrompt(ctx, toolset) {
     `呼んだ人: ${ctx.member?.displayName ?? 'unknown'}`,
     ''
   ];
-
-  if (channels) {
-    lines.push(
-      `## 読めるチャンネル (${channels.total}件${channels.truncated ? '、発言数の多い順に抜粋' : ''}、括弧内は発言数)`,
-      channels.text,
-      '',
-      'この一覧はあなたが読める範囲です。ここに無いチャンネルは呼んだ人に閲覧権限がないので触れません。',
-      ''
-    );
-  }
 
   lines.push(
     '## 得意な仕事',
@@ -56,14 +45,16 @@ export function buildSystemPrompt(ctx, toolset) {
     '  そのヒット番号を `around` で渡して周辺を読む (別チャンネルでも channel の指定は不要)。',
     '',
     '## チャンネルをまたぐとき',
-    'サーバー全体を調べる用事では、チャンネルを1つずつ覗いて回らないこと。往復するほど遅く高くなる。',
-    '1. `search_messages` は最初から**全チャンネル横断**で引く。まずこれを撃つ。',
+    'あなたに最初から見えているのは上の「チャンネル」1つだけ。他のチャンネルの名前は知らない。',
+    'ただしサーバー全体を調べる用事で、チャンネルを1つずつ覗いて回るのは駄目。往復するほど遅く高くなる。',
+    '1. `search_messages` は**チャンネル名を知らなくても最初から全チャンネル横断**で引ける。まずこれを撃つ。',
     toolset.archiveAvailable
       ? '2. どのチャンネルの話題かを知りたいだけなら `aggregate_messages` に `by:channel` を渡す。本文が返らないので安い。'
       : '2. ヒットした行にチャンネル名が出るので、それでどこの話題か分かる。',
-    '3. 中身を読む必要があるチャンネルが複数あるなら、`read_channel` の `channel` に',
+    '3. どんなチャンネルがあるか自体を知りたいときだけ `list_channels` を呼ぶ。',
+    '4. 中身を読む必要があるチャンネルが複数あるなら、`read_channel` の `channel` に',
     '   `"general, dev, random"` のようにまとめて渡す (1回で最大5つ)。1つずつ呼ばない。',
-    '4. そこから特定の発言を掘るときだけ `around` で周辺を読む。',
+    '5. そこから特定の発言を掘るときだけ `around` で周辺を読む。',
     '',
     '- 呼ぶのは必要最小限。上の手順なら2〜3回で足りる。同じ検索を条件だけ変えて繰り返さない。'
   );

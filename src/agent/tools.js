@@ -102,13 +102,13 @@ function compactCount(value) {
 }
 
 /**
- * 実行者が読めるチャンネルの一覧。system prompt に載せる。
+ * 実行者が読めるチャンネルの一覧。
  *
- * モデルはこれが無いとチャンネル名を当てずっぽうで書くしかない。
- * 毎回送るが、内容が安定しているので DeepSeek のコンテキストキャッシュに乗る。
- * 発言数の多い順に並べて、多すぎるときは切る。
+ * system prompt には載せない。チャンネル数の多いサーバーだと毎ターン払うことに
+ * なるので、必要になったときだけ list_channels 経由で取りに行かせる。
+ * 発言数の多い順に並べる (どこに話が溜まっているかの判断材料になる)。
  */
-export function describeChannels(ctx, { limit = 30 } = {}) {
+export function describeChannels(ctx, { limit = 30, filter = null } = {}) {
   let counts = new Map();
   try {
     const rows = archiveDb
@@ -119,10 +119,20 @@ export function describeChannels(ctx, { limit = 30 } = {}) {
     // アーカイブが無い構成でも動く
   }
 
+  const needle = filter ? String(filter).replace(/^#/, '').toLowerCase() : null;
+
   const visible = [];
+  let hiddenByFilter = 0;
+
   for (const channel of ctx.guild.channels.cache.values()) {
     if (!MESSAGE_CHANNEL_TYPES.has(channel.type)) continue;
     if (!canRead(channel, ctx.member)) continue;
+
+    if (needle && !channel.name?.toLowerCase().includes(needle)) {
+      hiddenByFilter += 1;
+      continue;
+    }
+
     visible.push({ channel, count: counts.get(channel.id) ?? 0 });
   }
 
@@ -144,9 +154,54 @@ export function describeChannels(ctx, { limit = 30 } = {}) {
 
   return {
     total: visible.length,
+    hiddenByFilter,
     truncated: visible.length > shown.length,
     text: names.join(' ')
   };
+}
+
+const listChannelsDefinition = {
+  type: 'function',
+  function: {
+    name: 'list_channels',
+    description: [
+      '読めるチャンネルの一覧を発言数の多い順に返す。あなたは呼ばれたチャンネル以外の名前を',
+      '知らないので、どこを読むか決めたいときに使う。',
+      'ただし search_messages はチャンネル名を知らなくても全チャンネル横断で引けるので、',
+      '「どこで話していたか」を知りたいだけならこれを呼ぶ必要はない。'
+    ].join(''),
+    parameters: {
+      type: 'object',
+      properties: {
+        filter: { type: 'string', description: '名前に含む文字で絞る (例: dev)' },
+        limit: { type: 'number', description: '件数 (既定 30、最大 100)' }
+      }
+    }
+  }
+};
+
+function listChannels(ctx, args) {
+  const limit = clampLimit(args.limit, 30, 100);
+  const result = describeChannels(ctx, { limit, filter: args.filter ?? null });
+
+  if (!result) {
+    return args.filter
+      ? `"${args.filter}" に一致する、読めるチャンネルはありませんでした。`
+      : '読めるチャンネルがありませんでした。';
+  }
+
+  const lines = [
+    `読めるチャンネル ${result.total} 件${result.truncated ? ` (発言数の多い順に ${limit} 件だけ表示)` : ''}・括弧内は発言数`,
+    result.text
+  ];
+
+  // 見えないチャンネルがあること自体は隠さないが、名前は出さない
+  if (result.hiddenByFilter > 0) {
+    lines.push(`(filter で ${result.hiddenByFilter} 件を除外)`);
+  }
+
+  lines.push('ここに無いチャンネルは呼んだ人に閲覧権限がないので読めない。');
+  return lines.join('\n');
 }
 
 /** 実行者に見えないチャンネルは、ツール経由でも絶対に見せない。 */
@@ -564,12 +619,17 @@ export async function buildToolset(ctx) {
   const archiveAvailable = Boolean(getGuildState(ctx.guild.id));
   const browserAvailable = await cdpAvailable();
 
-  const definitions = [searchToolDefinition(archiveAvailable), readChannelDefinition];
+  const definitions = [
+    searchToolDefinition(archiveAvailable),
+    readChannelDefinition,
+    listChannelsDefinition
+  ];
   const handlers = {
     search_messages: (args) => (archiveAvailable
       ? searchViaArchive(ctx, args, clampLimit(args.limit, 10, 25))
       : searchViaDiscord(ctx, args, clampLimit(args.limit, 10, 25))),
-    read_channel: (args) => readChannel(ctx, args)
+    read_channel: (args) => readChannel(ctx, args),
+    list_channels: (args) => listChannels(ctx, args)
   };
 
   if (archiveAvailable) {
