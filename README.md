@@ -93,13 +93,15 @@ xvfb-run -a --server-args="-screen 0 1280x720x24 -nolisten tcp" \
   --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
   --user-data-dir=/var/lib/sakana-chrome/profile \
   --no-first-run --no-default-browser-check --disable-dev-shm-usage \
-  --in-process-gpu --disable-gpu-sandbox \
+  --autoplay-policy=no-user-gesture-required \
+  --disable-gpu-sandbox \
   --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader \
   --disable-blink-features=AutomationControlled \
   --lang=ja-JP --window-size=1280,720 --no-sandbox about:blank
 ```
 
-- `--in-process-gpu --disable-gpu-sandbox` … GPU の無いサーバで headful 起動すると GPU プロセスが落ちて即死するのを回避。
+- `--disable-gpu-sandbox` … GPU の無いサーバで headful 起動するために必要。
+- **`--in-process-gpu` は付けないこと。** deckide は付けていますが (Chrome 149 では GPU プロセスの起動失敗で即死するのを回避するため必要だった)、Chrome 151 では逆効果です。GPU を browser プロセス内で動かすと ANGLE/Vulkan の初期化失敗がそのまま browser プロセスを殺し、`DevTools listening on ws://...` を出した直後に SIGTRAP (exit 133) で落ちます。GPU を別プロセスに残せば初期化失敗は無害に終わり、WebGL は SwiftShader で動きます。
 - `--use-angle=swiftshader --enable-unsafe-swiftshader` … WebGL を実際に動かす。WebGL が無いのは実 Chrome として不自然で、検知の信号になる。
 - `--disable-blink-features=AutomationControlled` … `navigator.webdriver` を立てない。
 - `--no-sandbox` … unprivileged LXC で必要 (コンテナ側の権限を緩める代わりにこれで済む)。
