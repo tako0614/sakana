@@ -10,7 +10,7 @@ import {
 } from 'discord.js';
 
 import { countMessages, getGuildState, listChannelStates, purgeGuild } from './db.js';
-import { cancelJob, getRunningJob, runIndexJob } from './indexer.js';
+import { cancelJob, coverageReport, getRunningJob, runCoverageJob, runIndexJob } from './indexer.js';
 import { canManageIndex, canSeeDeleted, getChannelScope } from './permissions.js';
 import { QueryError } from './query.js';
 import {
@@ -168,6 +168,9 @@ const indexCommand = {
       .setName('update')
       .setDescription('前回の続きから最新のメッセージだけを取り込みます'))
     .addSubcommand((sub) => sub
+      .setName('verify')
+      .setDescription('取りこぼした期間 (bot 停止中など) を探して埋めます'))
+    .addSubcommand((sub) => sub
       .setName('status')
       .setDescription('インデックスの状態を表示します'))
     .addSubcommand((sub) => sub
@@ -194,6 +197,7 @@ const indexCommand = {
     if (sub === 'status') return showStatus(interaction);
     if (sub === 'cancel') return cancelIndex(interaction);
     if (sub === 'reset') return confirmReset(interaction);
+    if (sub === 'verify') return startVerify(interaction);
 
     return startIndex(interaction, sub === 'build' ? 'full' : 'update');
   }
@@ -235,6 +239,20 @@ async function showStatus(interaction) {
     embed.addFields({ name: '最終実行', value: relativeTime(state.finished_at), inline: true });
   }
 
+  // 「取りこぼしが無いか」に答えられるようにする。単一カーソルだった頃は
+  // 落ちていた期間の穴が見えなかった。
+  const coverage = coverageReport(guildId);
+  embed.addFields({
+    name: '被覆',
+    value: coverage.gapCount === 0
+      ? '穴なし (記録済みの区間が連続しています)'
+      : [
+        `⚠️ 穴 ${coverage.gapCount} 件 (合計 ${formatDuration(coverage.gapMs)})`,
+        ...coverage.worst.map((entry) => `<#${entry.channelId}> ${entry.gaps}件 / ${formatDuration(entry.ms)}`),
+        '`/index verify` で埋められます (削除済みメッセージは復元できません)'
+      ].join('\n')
+  });
+
   if (incomplete.length > 0) {
     embed.addFields({
       name: `未完了のチャンネル (${incomplete.length})`,
@@ -259,6 +277,91 @@ async function showStatus(interaction) {
   }
 
   await interaction.reply({ embeds: [embed], allowedMentions: NO_MENTIONS });
+}
+
+function formatDuration(ms) {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return `${minutes}分`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}時間${minutes % 60}分`;
+  return `${Math.floor(hours / 24)}日${hours % 24}時間`;
+}
+
+async function startVerify(interaction) {
+  if (!getGuildState(interaction.guildId)) {
+    await interaction.reply({ embeds: [emptyArchiveEmbed()], flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (getRunningJob(interaction.guildId)) {
+    await interaction.reply({ content: '既に別のジョブが実行中です。`/index status` で確認できます。', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const before = coverageReport(interaction.guildId);
+
+  await interaction.reply({
+    content: before.gapCount === 0
+      ? '🔍 記録済みの穴はありませんが、末尾の取りこぼしがないか確認します。'
+      : `🔍 穴 ${before.gapCount} 件 (合計 ${formatDuration(before.gapMs)}) を埋めます。`
+  });
+
+  // 進捗は interaction ではなく通常メッセージに出す (トークンは15分で切れる)
+  const statusMessage = await interaction.channel
+    ?.send({ embeds: [verifyEmbed(null)] })
+    .catch(() => null);
+
+  let lastEdit = 0;
+  const onProgress = (job) => {
+    const now = Date.now();
+    if (now - lastEdit < 5000) return;
+    lastEdit = now;
+    statusMessage?.edit({ embeds: [verifyEmbed(job)] }).catch(() => {});
+  };
+
+  try {
+    const job = await runCoverageJob(interaction.guild, { mode: 'verify', onProgress });
+    const after = coverageReport(interaction.guildId);
+    await statusMessage?.edit({ embeds: [verifyEmbed(job, after, true)] }).catch(() => {});
+  } catch (error) {
+    console.error('Verify job failed:', error);
+    await statusMessage?.edit({
+      embeds: [new EmbedBuilder().setColor('#ed4245').setTitle('確認に失敗しました').setDescription(String(error.message ?? error).slice(0, 2000))]
+    }).catch(() => {});
+  }
+}
+
+function verifyEmbed(job, after = null, done = false) {
+  const embed = new EmbedBuilder()
+    .setColor(done ? '#3ba55d' : '#2b2d31')
+    .setTitle(done ? '✅ 取りこぼしの確認が終わりました' : '🔍 取りこぼしを確認中…');
+
+  if (!job) {
+    embed.setDescription('チャンネルを走査しています…');
+    return embed;
+  }
+
+  const ratio = job.channelsTotal > 0 ? job.channelsDone / job.channelsTotal : 0;
+
+  embed.setDescription([
+    `${bar(ratio * 100, 100, 20)} ${Math.round(ratio * 100)}%`,
+    '',
+    `チャンネル: **${job.channelsDone} / ${job.channelsTotal}**`,
+    `取り込み: **${formatNumber(job.messagesIndexed)}** 件`,
+    `埋めた穴: **${job.gapsClosed}**`,
+    job.cancelled ? '⏹️ 中止しました' : `現在: ${job.currentChannel ?? '-'}`
+  ].join('\n'));
+
+  if (done && after) {
+    embed.addFields({
+      name: '残りの穴',
+      value: after.gapCount === 0
+        ? 'なし'
+        : `${after.gapCount} 件 (合計 ${formatDuration(after.gapMs)})。削除済みメッセージは Discord 側にも無いので埋まりません。`
+    });
+  }
+
+  return embed;
 }
 
 async function cancelIndex(interaction) {

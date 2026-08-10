@@ -115,12 +115,140 @@ db.exec(`
 
   -- 本文が変わったときだけ張り直す。リアクション数や削除フラグの更新で
   -- FTS を作り直すと、リアクションが付くたびに無駄な書き込みが走るため。
+  --
+  -- WHEN が要るのは、saveMessages の upsert が中身が同じでも content/extra を
+  -- 毎回 SET するから。これが無いと /index update を回すたびに全件の FTS を
+  -- 作り直すことになる (UPDATE OF だけでは防げない)。
   DROP TRIGGER IF EXISTS messages_fts_au;
-  CREATE TRIGGER messages_fts_au AFTER UPDATE OF content, extra ON messages BEGIN
+  CREATE TRIGGER messages_fts_au AFTER UPDATE OF content, extra ON messages
+  WHEN old.content <> new.content OR old.extra <> new.extra BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, content, extra) VALUES ('delete', old.rowid, old.content, old.extra);
     INSERT INTO messages_fts(rowid, content, extra) VALUES (new.rowid, new.content, new.extra);
   END;
 `);
+
+// 取り切った区間を明示的に持つ。
+//
+// 単一カーソル (channels.newest_id) だけだと、bot が落ちている間に流れた分を
+// 復帰後の最初の1通がカーソルごと飛び越えてしまい、その穴は二度と埋まらない。
+// 「どこからどこまでは実際に取った」を区間で持てば、穴を列挙して塞げる。
+db.exec(`
+  CREATE TABLE IF NOT EXISTS channel_spans (
+    channel_id TEXT NOT NULL,
+    from_ms    INTEGER NOT NULL,
+    to_ms      INTEGER NOT NULL,
+    from_id    TEXT NOT NULL,
+    to_id      TEXT NOT NULL,
+    PRIMARY KEY (channel_id, from_ms)
+  );
+  CREATE INDEX IF NOT EXISTS idx_span_channel ON channel_spans(channel_id, from_ms);
+`);
+
+const DISCORD_EPOCH_MS = 1420070400000n;
+
+/**
+ * snowflake から生成時刻 (ms) を取り出す。
+ *
+ * 区間演算を ID の文字列比較でやってはいけない。snowflake は 17〜19 桁あり、
+ * 桁数が違うと文字列比較の大小が実際の時系列と逆になる。
+ * 数値化しても 2^53 を超えるので BigInt で shift してから ms に落とす。
+ */
+export function snowflakeToMs(id) {
+  try {
+    return Number((BigInt(String(id)) >> 22n) + DISCORD_EPOCH_MS);
+  } catch {
+    return null;
+  }
+}
+
+const selectOverlappingSpans = db.prepare(`
+  SELECT from_ms, to_ms, from_id, to_id FROM channel_spans
+  WHERE channel_id = ? AND to_ms >= ? AND from_ms <= ?
+  ORDER BY from_ms
+`);
+const deleteSpanStmt = db.prepare('DELETE FROM channel_spans WHERE channel_id = ? AND from_ms = ?');
+const insertSpanStmt = db.prepare(`
+  INSERT OR REPLACE INTO channel_spans (channel_id, from_ms, to_ms, from_id, to_id)
+  VALUES (?, ?, ?, ?, ?)
+`);
+
+/**
+ * 「fromId から toId までは取り切った」を記録する。
+ * 既存区間と重なっていれば1本にまとめる (連続取得なら必ず端で重なる)。
+ */
+export const recordSpan = db.transaction((channelId, fromId, toId) => {
+  let fromMs = snowflakeToMs(fromId);
+  let toMs = snowflakeToMs(toId);
+  if (fromMs === null || toMs === null) return;
+
+  if (fromMs > toMs) {
+    [fromId, toId] = [toId, fromId];
+    [fromMs, toMs] = [toMs, fromMs];
+  }
+
+  let from = { ms: fromMs, id: fromId };
+  let to = { ms: toMs, id: toId };
+
+  for (const span of selectOverlappingSpans.all(channelId, fromMs, toMs)) {
+    if (span.from_ms < from.ms) from = { ms: span.from_ms, id: span.from_id };
+    if (span.to_ms > to.ms) to = { ms: span.to_ms, id: span.to_id };
+    deleteSpanStmt.run(channelId, span.from_ms);
+  }
+
+  insertSpanStmt.run(channelId, from.ms, to.ms, from.id, to.id);
+});
+
+export function listSpans(channelId) {
+  return db.prepare(`
+    SELECT from_ms, to_ms, from_id, to_id FROM channel_spans
+    WHERE channel_id = ? ORDER BY from_ms
+  `).all(channelId);
+}
+
+/**
+ * 区間の隙間 = 取りこぼしている期間。
+ * 末尾 (最後の区間より後) は起動時のキャッチアップが担当するのでここには含めない。
+ */
+export function channelGaps(channelId) {
+  const spans = listSpans(channelId);
+  const gaps = [];
+
+  for (let i = 1; i < spans.length; i += 1) {
+    gaps.push({
+      afterId: spans[i - 1].to_id,
+      beforeId: spans[i].from_id,
+      fromMs: spans[i - 1].to_ms,
+      toMs: spans[i].from_ms
+    });
+  }
+
+  return gaps;
+}
+
+/**
+ * 最後の区間より後に既知のメッセージがあるなら、その間は「取ったと言えない」。
+ *
+ * 停止中に流れた分は、復帰後の live メッセージが先に入るのでここに現れる。
+ * 区間の隙間 (channelGaps) は前後を区間で挟まれた穴しか拾えないので、
+ * 末尾はこちらで別に見る必要がある。追いつきが済めば区間が伸びて消える。
+ */
+export function channelTailGap(channelId) {
+  const spans = listSpans(channelId);
+  if (spans.length === 0) return null;
+
+  const last = spans[spans.length - 1];
+  const row = db
+    .prepare('SELECT MAX(created_at) AS at FROM messages WHERE channel_id = ? AND deleted = 0')
+    .get(channelId);
+
+  if (!row?.at || row.at <= last.to_ms) return null;
+
+  return { afterId: last.to_id, fromMs: last.to_ms, toMs: row.at };
+}
+
+export function clearSpans(channelId) {
+  db.prepare('DELETE FROM channel_spans WHERE channel_id = ?').run(channelId);
+}
 
 // 正規表現検索用。SQLite 側から呼べるようにしておく。
 // 暴走を防ぐため、1クエリあたりの評価回数に上限を設ける。
@@ -303,6 +431,9 @@ export function purgeGuild(guildId) {
     `).run(guildId);
     db.prepare(`
       DELETE FROM message_links WHERE message_id IN (SELECT message_id FROM messages WHERE guild_id = ?)
+    `).run(guildId);
+    db.prepare(`
+      DELETE FROM channel_spans WHERE channel_id IN (SELECT channel_id FROM channels WHERE guild_id = ?)
     `).run(guildId);
     db.prepare('DELETE FROM messages WHERE guild_id = ?').run(guildId);
     db.prepare('DELETE FROM channels WHERE guild_id = ?').run(guildId);

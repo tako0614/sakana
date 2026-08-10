@@ -11,7 +11,14 @@ import { commandMap } from './commands.js';
 import { handleEmotionRequest, isEmotionRequest } from './emotion.js';
 import { addTextXP, addVoiceXP, getTopXP } from './db.js';
 import { handleArchiveComponent } from './archive/commands.js';
-import { indexLiveEdit, indexLiveMessage, markLiveDelete, syncLiveReactions } from './archive/indexer.js';
+import {
+  catchupAllGuilds,
+  indexLiveEdit,
+  indexLiveMessage,
+  markLiveDelete,
+  resetCatchup,
+  syncLiveReactions
+} from './archive/indexer.js';
 import { handleAgentRequest, isAgentRequest } from './agent/index.js';
 import { agentEnabled } from './agent/config.js';
 import { pruneCalls } from './agent/ratelimit.js';
@@ -56,6 +63,25 @@ client.on('shardError', (error) => {
   console.error('Discord shard error:', error);
 });
 
+// 切断した時点で「連続して繋がっている」保証が切れる。
+// 以降の新着で区間を伸ばすと、切れていた間の穴を取ったことにしてしまうので、
+// 追いつき済みの印を捨てて再接続後のキャッチアップに任せる。
+client.on(Events.ShardDisconnect, () => {
+  console.log('Shard disconnected. Coverage tracking will re-verify on reconnect.');
+  resetCatchup();
+});
+
+client.on(Events.ShardReconnecting, () => {
+  resetCatchup();
+});
+
+// 再接続 (resume ではなく再 identify) のあとは取りこぼしを取りに行く
+client.on(Events.ShardReady, () => {
+  catchupAllGuilds(client).catch((error) => {
+    console.error('Catch-up after reconnect failed:', error);
+  });
+});
+
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
   console.log(
@@ -66,6 +92,13 @@ client.once(Events.ClientReady, (readyClient) => {
 
   // 古い呼び出し履歴を毎日掃除する (制限の窓より十分長く残す)
   cron.schedule('0 30 4 * * *', () => pruneCalls());
+
+  // 落ちていた間に流れたメッセージを取りに行く。
+  // live indexing は追いつくまで区間を伸ばさないので、ここで埋めないと
+  // 停止していた期間が穴のまま残る。時間がかかるので待たない。
+  catchupAllGuilds(readyClient).catch((error) => {
+    console.error('Catch-up failed:', error);
+  });
 
   // 毎日0時00分20秒に特定のチャンネルへランキングを送信
   cron.schedule('20 0 0 * * *', async () => {

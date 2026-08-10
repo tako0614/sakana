@@ -1,13 +1,19 @@
 import { ChannelType } from 'discord.js';
 import {
+  channelGaps,
+  channelTailGap,
   countChannelMessages,
   getChannelState,
   getGuildState,
+  listChannelStates,
+  listSpans,
   markMessageDeleted,
+  recordSpan,
   replaceReactions,
   saveMessage,
   saveMessages,
   setGuildState,
+  snowflakeToMs,
   updateChannelState,
   upsertChannel
 } from './db.js';
@@ -222,6 +228,9 @@ async function indexChannel(channel, { mode, job }) {
       const messages = [...batch.values()].sort((a, b) => (a.createdTimestamp - b.createdTimestamp));
       persist(messages);
 
+      // 区間はページごとに書く。落ちても直前のページまでは「取った」と言える。
+      recordSpan(channel.id, newest, messages[messages.length - 1].id);
+
       newest = messages[messages.length - 1].id;
       updateChannelState(channel.id, { newest_id: newest });
 
@@ -248,6 +257,10 @@ async function indexChannel(channel, { mode, job }) {
       const messages = [...batch.values()].sort((a, b) => (b.createdTimestamp - a.createdTimestamp));
       persist(messages);
 
+      // 新しい側の端は before (無ければ今回の最新)。ページ内は連続しているので
+      // その範囲を1区間として記録する。
+      recordSpan(channel.id, messages[messages.length - 1].id, before ?? messages[0].id);
+
       if (!newest) {
         newest = messages[0].id;
         updateChannelState(channel.id, { newest_id: newest });
@@ -273,6 +286,223 @@ async function indexChannel(channel, { mode, job }) {
   });
 
   return indexed;
+}
+
+// 追いつきが済んだチャンネル。プロセス内だけの状態で、切断のたびに捨てる。
+// これが入っているチャンネルは gateway が連続して繋がっているので、
+// 新着メッセージで区間を伸ばしてよい。
+const catchupDone = new Set();
+
+export function resetCatchup() {
+  catchupDone.clear();
+}
+
+export function markCatchupDone(channelId) {
+  catchupDone.add(channelId);
+}
+
+/**
+ * 記録済み区間の末尾から今まで取りに行く。
+ *
+ * bot が落ちている間の分はここでしか埋まらない。live indexing は
+ * 追いつきが済むまで区間を伸ばさないので、停止中の穴が消えずに残っている。
+ */
+async function catchupChannel(channel, { job }) {
+  const state = getChannelState(channel.id);
+  const spans = listSpans(channel.id);
+  // 区間が無い = まだ一度も取り込んでいない。/index build の仕事なので触らない。
+  const anchor = spans.length > 0 ? spans[spans.length - 1].to_id : null;
+  if (!anchor) {
+    if (state?.newest_id) markCatchupDone(channel.id);
+    return 0;
+  }
+
+  let cursor = anchor;
+  let indexed = 0;
+
+  for (;;) {
+    if (job.cancelled) return indexed;
+
+    const batch = await channel.messages.fetch({ after: cursor, limit: PAGE_SIZE });
+    if (batch.size === 0) break;
+
+    const messages = [...batch.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+    saveMessages(messages.map(toRecord));
+    indexed += messages.length;
+    job.messagesIndexed += messages.length;
+
+    recordSpan(channel.id, cursor, messages[messages.length - 1].id);
+    cursor = messages[messages.length - 1].id;
+    updateChannelState(channel.id, { newest_id: cursor });
+
+    if (batch.size < PAGE_SIZE) break;
+    await sleep(FETCH_DELAY_MS);
+  }
+
+  if (indexed > 0) {
+    updateChannelState(channel.id, { message_count: countChannelMessages(channel.id) });
+  }
+
+  // ここまで来たら現在時刻に追いついている。以降は live で伸ばしてよい。
+  markCatchupDone(channel.id);
+  return indexed;
+}
+
+/**
+ * 区間の隙間を埋める。ダウンが複数回あった場合など、末尾以外に空いた穴が対象。
+ */
+async function fillGaps(channel, { job }) {
+  let filled = 0;
+
+  for (const gap of channelGaps(channel.id)) {
+    let cursor = gap.afterId;
+
+    for (;;) {
+      if (job.cancelled) return filled;
+
+      const batch = await channel.messages.fetch({ after: cursor, limit: PAGE_SIZE });
+      if (batch.size === 0) break;
+
+      const messages = [...batch.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+      saveMessages(messages.map(toRecord));
+      filled += messages.length;
+      job.messagesIndexed += messages.length;
+
+      const last = messages[messages.length - 1].id;
+      recordSpan(channel.id, cursor, last);
+      cursor = last;
+
+      // 穴の向こう側に届いたら、recordSpan が両側を1本にまとめている
+      if (snowflakeToMs(last) >= gap.toMs) break;
+      if (batch.size < PAGE_SIZE) break;
+      await sleep(FETCH_DELAY_MS);
+    }
+  }
+
+  if (filled > 0) {
+    updateChannelState(channel.id, { message_count: countChannelMessages(channel.id) });
+  }
+
+  return filled;
+}
+
+/**
+ * 起動直後の追いつき / 穴埋め。mode: 'catchup' | 'verify'
+ * verify は隙間まで面倒を見る (catchup は末尾だけ)。
+ */
+export async function runCoverageJob(guild, { mode = 'catchup', onProgress = () => {} } = {}) {
+  if (!getGuildState(guild.id)) return null;
+  if (runningJobs.has(guild.id)) {
+    throw new Error('このサーバーでは既にインデックス作成が実行中です。');
+  }
+
+  const job = {
+    guildId: guild.id,
+    mode,
+    cancelled: false,
+    startedAt: Date.now(),
+    messagesIndexed: 0,
+    channelsDone: 0,
+    channelsTotal: 0,
+    currentChannel: null,
+    gapsClosed: 0
+  };
+
+  runningJobs.set(guild.id, job);
+
+  try {
+    // インデックス済みのチャンネルだけが対象。新規発見は /index build の仕事。
+    const known = listChannelStates(guild.id);
+    job.channelsTotal = known.length;
+    onProgress(job);
+
+    for (const row of known) {
+      if (job.cancelled) break;
+
+      const channel = guild.channels.cache.get(row.channel_id)
+        ?? await guild.channels.fetch(row.channel_id).catch(() => null);
+
+      if (channel && typeof channel.messages?.fetch === 'function') {
+        job.currentChannel = channel.name ?? channel.id;
+        onProgress(job);
+
+        try {
+          // 末尾の未検証ぶんも「穴」として数える (停止中の欠損はここに出る)
+          const countGaps = () => channelGaps(channel.id).length + (channelTailGap(channel.id) ? 1 : 0);
+          const before = countGaps();
+          await catchupChannel(channel, { job });
+          if (mode === 'verify') await fillGaps(channel, { job });
+          job.gapsClosed += Math.max(0, before - countGaps());
+        } catch (error) {
+          console.error(`Failed to catch up channel ${row.channel_id}:`, error);
+          updateChannelState(row.channel_id, { last_error: String(error.message ?? error).slice(0, 300) });
+        }
+      }
+
+      job.channelsDone += 1;
+      onProgress(job);
+    }
+
+    return job;
+  } finally {
+    runningJobs.delete(guild.id);
+  }
+}
+
+// 起動時は ShardReady と ClientReady の両方から呼ばれるので、二重に走らせない。
+let catchupRunning = false;
+
+/** 全ギルドの追いつき。起動直後と再接続後に呼ぶ。 */
+export async function catchupAllGuilds(client) {
+  if (catchupRunning) return;
+  catchupRunning = true;
+
+  try {
+    await catchupGuilds(client);
+  } finally {
+    catchupRunning = false;
+  }
+}
+
+async function catchupGuilds(client) {
+  for (const guild of client.guilds.cache.values()) {
+    if (!getGuildState(guild.id)) continue;
+
+    try {
+      const job = await runCoverageJob(guild, { mode: 'catchup' });
+      if (job?.messagesIndexed > 0) {
+        console.log(`Catch-up indexed ${job.messagesIndexed} message(s) in ${guild.name}.`);
+      }
+    } catch (error) {
+      console.error(`Catch-up failed for ${guild.id}:`, error);
+    }
+  }
+}
+
+/**
+ * チャンネルごとの被覆状況。/index status 用。
+ * 区間の隙間だけでなく、未検証の末尾 (停止中に流れた分) も数える。
+ */
+export function coverageReport(guildId) {
+  const channels = listChannelStates(guildId);
+  let gapCount = 0;
+  let gapMs = 0;
+  const worst = [];
+
+  for (const row of channels) {
+    const gaps = [...channelGaps(row.channel_id)];
+    const tail = channelTailGap(row.channel_id);
+    if (tail) gaps.push(tail);
+    if (gaps.length === 0) continue;
+
+    const total = gaps.reduce((sum, gap) => sum + Math.max(0, gap.toMs - gap.fromMs), 0);
+    gapCount += gaps.length;
+    gapMs += total;
+    worst.push({ channelId: row.channel_id, gaps: gaps.length, ms: total });
+  }
+
+  worst.sort((a, b) => b.ms - a.ms);
+  return { gapCount, gapMs, worst: worst.slice(0, 5) };
 }
 
 export function getRunningJob(guildId) {
@@ -383,8 +613,17 @@ export function indexLiveMessage(message) {
       upsertChannel(channelRow(message.channel));
     }
 
+    const previous = getChannelState(message.channelId)?.newest_id ?? null;
+
     saveMessage(toRecord(message));
     updateChannelState(message.channelId, { newest_id: message.id });
+
+    // 区間を伸ばすのは「このチャンネルの追いつきが済んでいる」ときだけ。
+    // 接続が切れている間の分は gateway から届かないので、追いつき前に伸ばすと
+    // 落ちていた期間を「取った」ことにしてしまい、穴が永久に隠れる。
+    if (previous && catchupDone.has(message.channelId)) {
+      recordSpan(message.channelId, previous, message.id);
+    }
   } catch (error) {
     console.error('Failed to index live message:', error);
   }
