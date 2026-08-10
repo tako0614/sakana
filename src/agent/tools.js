@@ -178,7 +178,7 @@ function clampLimit(value, fallback, max) {
 
 const ARCHIVE_QUERY_HELP = [
   'query の書き方: 空白で AND / `OR` / `-除外` / `"引用符で句"` / `(括弧)` /',
-  '`regex:/pattern/` / `reactions:>5` / `reaction:👍` / `len:>200` / `hour:22-4` /',
+  '`regex:/pattern/` (本文のみ。空白を含むときは `regex:"/a b/"`) / `reactions:>5` / `reaction:👍` / `len:>200` / `hour:22-4` /',
   '`weekday:sat,sun` / `domain:github.com` / `mentions:@user` / `is:bot|human|edited|pinned`。'
 ].join(' ');
 
@@ -488,6 +488,9 @@ async function readChannel(ctx, args) {
 
 // ---------------------------------------------------------------- aggregate_messages
 
+// 説明文と検証で同じ配列を使う。片方だけ増やすと、モデルは存在しない軸を投げてくる。
+const AGGREGATE_AXES = ['author', 'channel', 'year', 'month', 'day', 'hour', 'weekday'];
+
 const aggregateDefinition = {
   type: 'function',
   function: {
@@ -500,7 +503,7 @@ const aggregateDefinition = {
       type: 'object',
       properties: {
         query: { type: 'string', description: '検索語 (search_messages と同じ書き方)' },
-        by: { type: 'string', description: 'author / channel / year / month / day / hour / weekday' },
+        by: { type: 'string', description: `集計軸 (既定 author): ${AGGREGATE_AXES.join(' / ')}` },
         author: { type: 'string', description: '投稿者で絞る' },
         channel: { type: 'string', description: 'チャンネルで絞る' },
         after: { type: 'string', description: 'この日より後' },
@@ -520,9 +523,16 @@ async function aggregateMessages(ctx, args) {
     sort: 'new'
   };
 
-  const by = ['author', 'channel', 'year', 'month', 'day', 'hour', 'weekday'].includes(args.by)
-    ? args.by
-    : 'author';
+  // 未知の軸を黙って author にすり替えると、モデルは「頼んだ軸の集計を得た」と
+  // 思い込んで別の数字を読む。間違ったデータを渡すより、言い直させるほうが安い。
+  // 省略は許す (モデルは by をよく省くし、その場合の既定は自明)。
+  const by = args.by === undefined || args.by === null || args.by === ''
+    ? 'author'
+    : String(args.by);
+
+  if (!AGGREGATE_AXES.includes(by)) {
+    return `by が不正です: ${by}。使えるのは ${AGGREGATE_AXES.join(' / ')} です。`;
+  }
 
   const summary = searchSummary(options);
   if (!summary.count) return '該当するメッセージはありませんでした。';

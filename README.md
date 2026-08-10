@@ -207,7 +207,7 @@ Discord 標準の検索と違って、こういう条件が使えます。
 | `hour:22-4` | 深夜帯の発言だけ |
 | `weekday:sat,sun` | 土日の発言だけ |
 | `domain:github.com` | 特定サイトの URL が貼られたもの |
-| `regex:/^\d+$/` | 正規表現 |
+| `regex:/^\d+$/` | 正規表現 (本文のみ。空白や `)` 単体を含むなら `regex:"/a b/"` と引用符で囲む) |
 | `sort:reactions` | 反応が多い順に並べる |
 
 標準検索と同じ条件も一通り使えます: `from:` `in:` `mentions:` `replyto:` `before:` `after:` `during:` `has:` `is:`。

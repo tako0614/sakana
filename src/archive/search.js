@@ -169,15 +169,20 @@ class Compiler {
 
       case 'regex':
       case 're': {
-        if (!value) throw new QueryError('regex: にはパターンを指定してください。');
+        // /.../ で囲まれているときだけ trim する。regex:"foo " のような裸のパターンでは
+        // 末尾の空白に意味があるので、共通の trim を通してはいけない。
+        // なお regexp() は m.content だけを見る (m.extra は見ない)。
+        // extra まで広げると regexp の評価回数が倍になり、共有の走査上限を食い潰す。
+        const pattern = /^\s*\/.*\/[a-z]*\s*$/s.test(rawValue) ? rawValue.trim() : rawValue;
+        if (!pattern.trim()) throw new QueryError('regex: にはパターンを指定してください。');
         try {
-          const [, body, flags] = /^\/(.*)\/([a-z]*)$/s.exec(value) ?? [null, value, 'i'];
+          const [, body, flags] = /^\/(.*)\/([a-z]*)$/s.exec(pattern) ?? [null, pattern, 'i'];
           new RegExp(body, flags);
         } catch (error) {
           throw new QueryError(`正規表現が不正です: ${error.message}`);
         }
         this.usesRegex = true;
-        return `regexp(${this.push(value)}, m.content)`;
+        return `regexp(${this.push(pattern)}, m.content)`;
       }
 
       default:

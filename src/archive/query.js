@@ -45,6 +45,61 @@ const WEEKDAYS = {
 
 export class QueryError extends Error {}
 
+// 先頭の - は tokenize で数える。classify で数えると -"foo bar" の - が
+// 引用符処理に食われて否定が落ちる。
+// ( の直前の - は従来どおり素の語として残す (-(a OR b) は今も否定にならない)。
+const LEADING_DASHES = /^(-+)(?=[^\s()])/;
+const FILTER_HEAD = /^([A-Za-z_]+):/;
+
+/**
+ * フィルタの値を「そのまま」読む。
+ *
+ *   ・空白で終わる (従来どおり。from:a in:b を2語に割るため)
+ *   ・"..." で囲めば空白も値に入る (regex:"/a b/i")
+ *   ・括弧は対応が取れている限り値の一部。(from:@a OR from:@b) の閉じ括弧は値にしない
+ *   ・\ の次の1文字はそのまま (regex の \( \) を括弧として数えないため)
+ */
+function readFilterValue(input, start) {
+  let index = start;
+  let text = '';
+  let quoted = false;
+  let depth = 0;
+
+  while (index < input.length) {
+    const char = input[index];
+
+    if (/\s/.test(char)) break;
+
+    if (char === '"') {
+      quoted = true;
+      index += 1;
+      while (index < input.length && input[index] !== '"') {
+        text += input[index];
+        index += 1;
+      }
+      index += 1; // 閉じ引用符 (無ければ末尾)
+      continue;
+    }
+
+    if (char === '\\' && index + 1 < input.length) {
+      text += char + input[index + 1];
+      index += 2;
+      continue;
+    }
+
+    if (char === '(') depth += 1;
+    if (char === ')') {
+      if (depth === 0) break; // グループの閉じ括弧なので値には入れない
+      depth -= 1;
+    }
+
+    text += char;
+    index += 1;
+  }
+
+  return { text, quoted, index };
+}
+
 function tokenize(input) {
   const tokens = [];
   let index = 0;
@@ -60,6 +115,34 @@ function tokenize(input) {
     if (char === '(' || char === ')') {
       tokens.push({ type: char, text: char });
       index += 1;
+      continue;
+    }
+
+    let dashes = 0;
+    const dash = LEADING_DASHES.exec(input.slice(index));
+    if (dash) {
+      dashes = dash[1].length;
+      index += dash[1].length;
+    }
+
+    // 既知のフィルタ / 指示子だと分かった時点で、値を丸ごと読む。
+    // regex:/(べき|絶対)/ の括弧やスラッシュを壊さないため。
+    // 知らないキー (http: や 12: など) は従来の語スキャンに落として挙動を変えない。
+    const head = FILTER_HEAD.exec(input.slice(index));
+    const key = head ? head[1].toLowerCase() : null;
+
+    if (key && (FILTER_KEYS.has(key) || DIRECTIVE_KEYS.has(key))) {
+      const value = readFilterValue(input, index + head[0].length);
+      index = value.index;
+      tokens.push({
+        type: 'word',
+        // フィルタ扱いしないときに使う素の語。従来と同じ見え方にするため元の大小を保つ
+        text: `${head[1]}:${value.text}`,
+        quoted: value.quoted,
+        dashes,
+        key,
+        value: value.text
+      });
       continue;
     }
 
@@ -89,45 +172,31 @@ function tokenize(input) {
     }
 
     if (text.length > 0 || quoted) {
-      tokens.push({ type: 'word', text, quoted });
+      tokens.push({ type: 'word', text, quoted, dashes });
     }
   }
 
   return tokens;
 }
 
-function splitFilter(text) {
-  const separator = text.indexOf(':');
-  if (separator <= 0) return null;
-
-  const key = text.slice(0, separator).toLowerCase();
-  if (!/^[a-z_]+$/.test(key)) return null;
-
-  return { key, value: text.slice(separator + 1) };
-}
-
 function classify(token) {
-  if (!token.quoted) {
+  // 演算子と見なすのは素の語だけ。-OR は昔から「OR を含まない」の意味なので
+  // dashes が付いていたら演算子にしない。
+  if (!token.quoted && token.dashes === 0) {
     const upper = token.text.toUpperCase();
     if (upper === 'OR' || upper === '|' || upper === '||') return { type: 'or' };
     if (upper === 'AND' || upper === '&' || upper === '&&') return { type: 'and' };
     if (upper === 'NOT') return { type: 'not' };
   }
 
-  let text = token.text;
-  let negated = false;
+  const negated = token.dashes % 2 === 1;
 
-  while (!token.quoted && text.startsWith('-') && text.length > 1) {
-    negated = !negated;
-    text = text.slice(1);
+  if (token.key && FILTER_KEYS.has(token.key)) {
+    return { type: 'leaf', negated, node: { type: 'filter', key: token.key, value: token.value } };
   }
 
-  const filter = token.quoted ? null : splitFilter(text);
-  if (filter && FILTER_KEYS.has(filter.key)) {
-    return { type: 'leaf', negated, node: { type: 'filter', key: filter.key, value: filter.value } };
-  }
-
-  return { type: 'leaf', negated, node: { type: 'term', value: text } };
+  // sort: のようにフィルタでないキーは従来どおり素の語として扱う
+  return { type: 'leaf', negated, node: { type: 'term', value: token.text } };
 }
 
 export function parseQuery(input) {
@@ -135,12 +204,10 @@ export function parseQuery(input) {
   const tokens = [];
 
   for (const token of tokenize(input ?? '')) {
-    if (token.type === 'word' && !token.quoted) {
-      const filter = splitFilter(token.text);
-      if (filter && DIRECTIVE_KEYS.has(filter.key)) {
-        directives[filter.key] = filter.value.toLowerCase();
-        continue;
-      }
+    // sort: は AST に載せない。-sort:new / sort:"new" は従来どおり検索語扱い。
+    if (token.key && token.dashes === 0 && !token.quoted && DIRECTIVE_KEYS.has(token.key)) {
+      directives[token.key] = token.value.toLowerCase();
+      continue;
     }
     tokens.push(token);
   }

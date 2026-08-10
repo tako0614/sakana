@@ -714,7 +714,8 @@ const searchHelpCommand = {
             '`hour:22-4` … 深夜帯の発言だけ',
             '`weekday:sat,sun` … 土日の発言だけ',
             '`domain:github.com` … 特定サイトのURLが貼られたもの',
-            '`regex:/^\\d+$/` … 正規表現'
+            '`regex:/^\\d+$/` … 正規表現 (本文のみ。添付名や埋め込み文言は見ません)',
+            '`regex:"/a b/i"` … 空白や `)` 単体を含むパターンは引用符で囲む'
           ].join('\n')
         },
         {
