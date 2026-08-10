@@ -174,7 +174,7 @@ export function fromRawMessage(raw, guildId, channelName) {
  * メッセージ列を1行1件で書き出す。
  *   3) [08/10 14:32 たこ #general] 本文… ⭐2 ↩1
  */
-export function formatMessages(messages, { refs, showChannel = false, bodyChars = 300 } = {}) {
+export function formatMessages(messages, { refs, showChannel = false, bodyChars = 300, tailOf = null } = {}) {
   const now = Date.now();
   const lines = [];
 
@@ -185,6 +185,9 @@ export function formatMessages(messages, { refs, showChannel = false, bodyChars 
     if (message.isBot) head.push('bot');
 
     const tail = [];
+    // 呼び出し側が行末に足したいもの (意味検索の近さ順位など)
+    const extra = tailOf ? tailOf(message) : null;
+    if (extra) tail.push(extra);
     if (message.reactionCount > 0) tail.push(`⭐${message.reactionCount}`);
     if (message.editedAt) tail.push('編集済');
     if (message.deleted) tail.push('削除済');

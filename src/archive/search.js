@@ -349,7 +349,9 @@ export function buildSearch({ guildId, query = '', extra = [], channelScope, all
   };
 }
 
-function withRegexGuard(usesRegex, run) {
+// vectors.js の走査も buildSearch 由来の SQL を使うので、regex: が混ざったときに
+// 走査上限を素通りしないよう共有する。予算の実装を二重に持たない。
+export function withRegexGuard(usesRegex, run) {
   if (!usesRegex) return run();
 
   setRegexBudget(REGEX_SCAN_BUDGET);

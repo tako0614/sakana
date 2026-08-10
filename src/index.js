@@ -22,6 +22,8 @@ import {
 import { handleAgentRequest, isAgentRequest } from './agent/index.js';
 import { agentEnabled } from './agent/config.js';
 import { pruneCalls } from './agent/ratelimit.js';
+import { sweepEnabledGuilds } from './archive/embed-job.js';
+import { embedConfig } from './embed/config.js';
 
 const token = process.env.DISCORD_TOKEN;
 const ossTargetUsername = process.env.OSS_TARGET_USERNAME ?? 'kurage.1';
@@ -92,6 +94,15 @@ client.once(Events.ClientReady, (readyClient) => {
 
   // 古い呼び出し履歴を毎日掃除する (制限の窓より十分長く残す)
   cron.schedule('0 30 4 * * *', () => pruneCalls());
+
+  // 意味検索のベクトルを夜間に追随させる。
+  // on-write にすると 1GiB の Python を24時間常駐させ、MessageCreate の
+  // ホットパスに往復を足すことになるので、まとめて夜にやる。
+  cron.schedule(embedConfig.sweepCron, () => {
+    sweepEnabledGuilds(readyClient).catch((error) => {
+      console.error('Embed sweep failed:', error);
+    });
+  });
 
   // 落ちていた間に流れたメッセージを取りに行く。
   // live indexing は追いつくまで区間を伸ばさないので、ここで埋めないと

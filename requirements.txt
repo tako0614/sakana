@@ -1,3 +1,7 @@
+# CPU 版を明示的に入れる。既定の index だと未使用の CUDA wheel が 2.7GB 入る。
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   pip install -r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
 torch
 transformers
 sentencepiece

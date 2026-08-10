@@ -9,7 +9,9 @@ import { MESSAGE_CHANNEL_TYPES, canRead } from '../archive/permissions.js';
 import { QueryError } from '../archive/query.js';
 import { aggregateSearch, search, searchSummary } from '../archive/search.js';
 import { topTerms } from '../archive/terms.js';
+import { prewarm } from '../embed/worker.js';
 import { browserToolDefinition, runBrowserAction } from './browser.js';
+import { runSemanticSearch, semanticAvailable, semanticToolDefinition } from './semantic.js';
 import { cdpAvailable } from './cdp.js';
 import { agentConfig } from './config.js';
 import {
@@ -683,6 +685,15 @@ export async function buildToolset(ctx) {
   if (archiveAvailable) {
     definitions.push(aggregateDefinition);
     handlers.aggregate_messages = (args) => aggregateMessages(ctx, args);
+  }
+
+  // ベクトルがあるときだけ出す。無いギルドでツール定義ぶんのトークンを払わない。
+  if (archiveAvailable && await semanticAvailable(ctx.guild.id)) {
+    definitions.push(semanticToolDefinition);
+    handlers.semantic_search = (args) => runSemanticSearch(ctx, args);
+    // モデルのロードに数秒かかるので、await せず先に温めておく。
+    // モデルが「ツールを呼ぶ」と判断する往復の間に間に合う。
+    prewarm();
   }
 
   if (browserAvailable) {

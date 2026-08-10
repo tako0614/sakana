@@ -392,9 +392,6 @@ async function fillGaps(channel, { job }) {
  */
 export async function runCoverageJob(guild, { mode = 'catchup', onProgress = () => {} } = {}) {
   if (!getGuildState(guild.id)) return null;
-  if (runningJobs.has(guild.id)) {
-    throw new Error('このサーバーでは既にインデックス作成が実行中です。');
-  }
 
   const job = {
     guildId: guild.id,
@@ -408,7 +405,7 @@ export async function runCoverageJob(guild, { mode = 'catchup', onProgress = () 
     gapsClosed: 0
   };
 
-  runningJobs.set(guild.id, job);
+  claimJob(guild.id, job);
 
   try {
     // インデックス済みのチャンネルだけが対象。新規発見は /index build の仕事。
@@ -445,7 +442,7 @@ export async function runCoverageJob(guild, { mode = 'catchup', onProgress = () 
 
     return job;
   } finally {
-    runningJobs.delete(guild.id);
+    releaseJob(guild.id);
   }
 }
 
@@ -505,6 +502,22 @@ export function coverageReport(guildId) {
   return { gapCount, gapMs, worst: worst.slice(0, 5) };
 }
 
+/**
+ * ジョブの単一フライト。取り込みと埋め込みで共有する。
+ * 7.8GiB のコンテナで10万件フェッチと埋め込みを同時に走らせたくないし、
+ * 共有すれば /index cancel と /index status が両方に無改造で効く。
+ */
+export function claimJob(guildId, job) {
+  if (runningJobs.has(guildId)) {
+    throw new Error('このサーバーでは既に別のジョブが実行中です。');
+  }
+  runningJobs.set(guildId, job);
+}
+
+export function releaseJob(guildId) {
+  runningJobs.delete(guildId);
+}
+
 export function getRunningJob(guildId) {
   return runningJobs.get(guildId);
 }
@@ -521,10 +534,6 @@ export function cancelJob(guildId) {
  * mode: 'full' = 最古まで遡る / 'update' = 前回の続きだけ
  */
 export async function runIndexJob(guild, { mode = 'full', onProgress = () => {} } = {}) {
-  if (runningJobs.has(guild.id)) {
-    throw new Error('このサーバーでは既にインデックス作成が実行中です。');
-  }
-
   const job = {
     guildId: guild.id,
     mode,
@@ -536,7 +545,7 @@ export async function runIndexJob(guild, { mode = 'full', onProgress = () => {} 
     currentChannel: null
   };
 
-  runningJobs.set(guild.id, job);
+  claimJob(guild.id, job);
   setGuildState(guild.id, {
     status: 'running',
     mode,
@@ -596,7 +605,7 @@ export async function runIndexJob(guild, { mode = 'full', onProgress = () => {} 
     });
     throw error;
   } finally {
-    runningJobs.delete(guild.id);
+    releaseJob(guild.id);
   }
 }
 

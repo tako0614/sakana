@@ -9,8 +9,10 @@ import {
   SlashCommandBuilder
 } from 'discord.js';
 
-import { countMessages, getGuildState, listChannelStates, purgeGuild } from './db.js';
+import { countMessages, getEmbedState, getGuildState, listChannelStates, purgeGuild } from './db.js';
 import { cancelJob, coverageReport, getRunningJob, runCoverageJob, runIndexJob } from './indexer.js';
+import { embedPreflight, runEmbedJob } from './embed-job.js';
+import { coverage as vectorCoverage } from './vectors.js';
 import { canManageIndex, canSeeDeleted, getChannelScope } from './permissions.js';
 import { QueryError } from './query.js';
 import {
@@ -171,6 +173,13 @@ const indexCommand = {
       .setName('verify')
       .setDescription('取りこぼした期間 (bot 停止中など) を探して埋めます'))
     .addSubcommand((sub) => sub
+      .setName('embed')
+      .setDescription('意味検索用のベクトルを作ります (時間がかかります)')
+      .addBooleanOption((option) => option
+        .setName('rebuild')
+        .setDescription('既存のベクトルを捨てて作り直す (モデルを変えたとき)')
+        .setRequired(false)))
+    .addSubcommand((sub) => sub
       .setName('status')
       .setDescription('インデックスの状態を表示します'))
     .addSubcommand((sub) => sub
@@ -198,6 +207,7 @@ const indexCommand = {
     if (sub === 'cancel') return cancelIndex(interaction);
     if (sub === 'reset') return confirmReset(interaction);
     if (sub === 'verify') return startVerify(interaction);
+    if (sub === 'embed') return startEmbed(interaction);
 
     return startIndex(interaction, sub === 'build' ? 'full' : 'update');
   }
@@ -252,6 +262,25 @@ async function showStatus(interaction) {
         '`/index verify` で埋められます (削除済みメッセージは復元できません)'
       ].join('\n')
   });
+
+  // 意味検索の被覆。部分的なまま「無い=言っていない」と読まれないように数字を出す。
+  const embedState = getEmbedState(guildId);
+  if (embedState?.model_id) {
+    try {
+      const vec = vectorCoverage(guildId, embedState.model_id);
+      embed.addFields({
+        name: '意味検索',
+        value: [
+          `${formatNumber(vec.done)} / ${formatNumber(vec.embeddable)} 件 (${Math.round(vec.ratio * 100)}%)`,
+          vec.stale > 0 ? `旧モデルのベクトル ${formatNumber(vec.stale)} 件 (無視されます)` : '',
+          embedState.status === 'error' ? `⚠️ ${embedState.last_error ?? 'エラー'}` : ''
+        ].filter(Boolean).join('\n'),
+        inline: true
+      });
+    } catch {
+      // 埋め込み未使用の構成でも status は出せるようにする
+    }
+  }
 
   if (incomplete.length > 0) {
     embed.addFields({
@@ -360,6 +389,101 @@ function verifyEmbed(job, after = null, done = false) {
         : `${after.gapCount} 件 (合計 ${formatDuration(after.gapMs)})。削除済みメッセージは Discord 側にも無いので埋まりません。`
     });
   }
+
+  return embed;
+}
+
+function formatBytes(bytes) {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)}GB`;
+  if (bytes >= 1024 ** 2) return `${Math.round(bytes / 1024 ** 2)}MB`;
+  return `${Math.round(bytes / 1024)}KB`;
+}
+
+async function startEmbed(interaction) {
+  if (!getGuildState(interaction.guildId)) {
+    await interaction.reply({ embeds: [emptyArchiveEmbed()], flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (getRunningJob(interaction.guildId)) {
+    await interaction.reply({ content: '既に別のジョブが実行中です。`/index status` で確認できます。', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const rebuild = interaction.options.getBoolean('rebuild') ?? false;
+
+  await interaction.deferReply();
+
+  let preflight;
+  try {
+    preflight = await embedPreflight(interaction.guildId);
+  } catch (error) {
+    await interaction.editReply({
+      content: [
+        '意味検索の準備に失敗しました。Python 側の依存が揃っていない可能性があります。',
+        `\`\`\`${String(error.message ?? error).slice(0, 500)}\`\`\``,
+        '`pip install -r requirements.txt` を確認してください。'
+      ].join('\n')
+    });
+    return;
+  }
+
+  // 見積りは推定値ではなく SQL で数えた実数を出す
+  const target = rebuild ? preflight.embeddable : preflight.remaining;
+  await interaction.editReply({
+    content: [
+      `🧠 埋め込み対象 **${formatNumber(target)} 件**`,
+      `推定 **${Math.max(1, Math.round(preflight.estimatedMs / 60_000))} 分** / 追加ディスク **${formatBytes(target * (preflight.dim + 76))}**`,
+      `モデル: \`${preflight.dim}次元\` ・ 既に完了: ${formatNumber(preflight.done)} 件`,
+      rebuild ? '⚠️ rebuild:true なので既存のベクトルを捨てて作り直します。' : ''
+    ].filter(Boolean).join('\n')
+  });
+
+  const statusMessage = await interaction.channel
+    ?.send({ embeds: [embedJobEmbed(null)] })
+    .catch(() => null);
+
+  let lastEdit = 0;
+  const onProgress = (job) => {
+    const now = Date.now();
+    if (now - lastEdit < 5000) return;
+    lastEdit = now;
+    statusMessage?.edit({ embeds: [embedJobEmbed(job)] }).catch(() => {});
+  };
+
+  try {
+    const job = await runEmbedJob(interaction.guild, { mode: 'forward', rebuild, onProgress });
+    await statusMessage?.edit({ embeds: [embedJobEmbed(job, true)] }).catch(() => {});
+  } catch (error) {
+    console.error('Embed job failed:', error);
+    await statusMessage?.edit({
+      embeds: [new EmbedBuilder().setColor('#ed4245').setTitle('埋め込みに失敗しました').setDescription(String(error.message ?? error).slice(0, 2000))]
+    }).catch(() => {});
+  }
+}
+
+function embedJobEmbed(job, done = false) {
+  const embed = new EmbedBuilder()
+    .setColor(done ? '#3ba55d' : '#2b2d31')
+    .setTitle(done ? '✅ 埋め込みが完了しました' : '🧠 埋め込み中…');
+
+  if (!job) {
+    embed.setDescription('モデルを読み込んでいます (初回はダウンロードに時間がかかります)…');
+    return embed;
+  }
+
+  const total = job.channelsTotal;
+  const ratio = total > 0 ? Math.min(1, job.messagesIndexed / total) : 0;
+  const remaining = Math.max(0, total - job.messagesIndexed);
+  const eta = job.rate > 0 ? Math.round(remaining / job.rate / 60) : null;
+
+  embed.setDescription([
+    `${bar(ratio * 100, 100, 20)} ${Math.round(ratio * 100)}%`,
+    '',
+    `埋め込み: **${formatNumber(job.embedded)}** 件 / 対象外: ${formatNumber(job.skipped)} 件`,
+    job.rate > 0 ? `速度: **${job.rate} 件/秒**${eta !== null && !done ? ` (残り約 ${eta} 分)` : ''}` : '',
+    job.cancelled ? '⏹️ 中止しました' : ''
+  ].filter(Boolean).join('\n'));
 
   return embed;
 }

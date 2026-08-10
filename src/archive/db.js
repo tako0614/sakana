@@ -144,6 +144,84 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_span_channel ON channel_spans(channel_id, from_ms);
 `);
 
+// 意味検索用のベクトル。
+//
+// messages.rowid を主キーにする。権限フィルタと絞り込みは buildSearch() の SQL に
+// あるので、「SQL で絞ってから生き残った行のベクトルを引く」形になり、これは JOIN。
+// rowid は INTEGER PRIMARY KEY なので追加索引ゼロで最速に引ける。
+// FTS5 も content_rowid='rowid' で同じ前提に乗っているので、新しい露出は作らない。
+db.exec(`
+  CREATE TABLE IF NOT EXISTS embed_models (
+    model_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL,
+    dim            INTEGER NOT NULL,
+    quant          TEXT NOT NULL,
+    prefix_query   TEXT NOT NULL DEFAULT '',
+    prefix_passage TEXT NOT NULL DEFAULT '',
+    max_length     INTEGER NOT NULL DEFAULT 192,
+    created_at     INTEGER NOT NULL,
+    UNIQUE (name, dim, quant, prefix_query, prefix_passage)
+  );
+
+  -- text_len = 0 は「対象外として飛ばした」印。印を残さないとスイープが同じ行を
+  -- 毎回引き直し、被覆率も推測になる。
+  CREATE TABLE IF NOT EXISTS message_vectors (
+    rowid      INTEGER PRIMARY KEY,
+    model_id   INTEGER NOT NULL,
+    scale      REAL NOT NULL DEFAULT 1,
+    vec        BLOB NOT NULL,
+    text_len   INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  -- messages が消えたらベクトルも消す。SQLite は DELETE で空いた rowid を
+  -- 使い回すので、残すと別のメッセージに他人のベクトルが付く。
+  CREATE TRIGGER IF NOT EXISTS messages_vec_ad AFTER DELETE ON messages BEGIN
+    DELETE FROM message_vectors WHERE rowid = old.rowid;
+  END;
+
+  -- 本文が「実際に変わったとき」だけ捨てる。WHEN を付けないと saveMessages の
+  -- upsert が毎回 content を SET するせいで、/index update を回すたびに
+  -- 全ベクトルが消えて数時間の再埋め込みになる。
+  CREATE TRIGGER IF NOT EXISTS messages_vec_au AFTER UPDATE OF content ON messages
+  WHEN old.content <> new.content BEGIN
+    DELETE FROM message_vectors WHERE rowid = old.rowid;
+  END;
+
+  CREATE TABLE IF NOT EXISTS embed_state (
+    guild_id     TEXT PRIMARY KEY,
+    model_id     INTEGER,
+    status       TEXT NOT NULL DEFAULT 'idle',
+    cursor_rowid INTEGER NOT NULL DEFAULT 0,
+    embedded     INTEGER NOT NULL DEFAULT 0,
+    skipped      INTEGER NOT NULL DEFAULT 0,
+    started_at   INTEGER,
+    finished_at  INTEGER,
+    swept_at     INTEGER,
+    last_error   TEXT,
+    enabled      INTEGER NOT NULL DEFAULT 0
+  );
+`);
+
+export function getEmbedState(guildId) {
+  return db.prepare('SELECT * FROM embed_state WHERE guild_id = ?').get(guildId);
+}
+
+export function setEmbedState(guildId, patch) {
+  db.prepare('INSERT OR IGNORE INTO embed_state (guild_id) VALUES (?)').run(guildId);
+
+  const keys = Object.keys(patch);
+  if (keys.length === 0) return;
+
+  const assignments = keys.map((key) => `${key} = @${key}`).join(', ');
+  db.prepare(`UPDATE embed_state SET ${assignments} WHERE guild_id = @guild_id`)
+    .run({ ...patch, guild_id: guildId });
+}
+
+export function listEmbedGuilds() {
+  return db.prepare('SELECT * FROM embed_state WHERE enabled = 1').all();
+}
+
 const DISCORD_EPOCH_MS = 1420070400000n;
 
 /**
@@ -435,8 +513,10 @@ export function purgeGuild(guildId) {
     db.prepare(`
       DELETE FROM channel_spans WHERE channel_id IN (SELECT channel_id FROM channels WHERE guild_id = ?)
     `).run(guildId);
+    // ベクトルは messages_vec_ad トリガで連鎖して消える
     db.prepare('DELETE FROM messages WHERE guild_id = ?').run(guildId);
     db.prepare('DELETE FROM channels WHERE guild_id = ?').run(guildId);
     db.prepare('DELETE FROM guild_index_state WHERE guild_id = ?').run(guildId);
+    db.prepare('DELETE FROM embed_state WHERE guild_id = ?').run(guildId);
   })();
 }
