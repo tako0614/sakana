@@ -246,8 +246,17 @@ function searchToolDefinition(archiveAvailable) {
     function: {
       name: 'search_messages',
       description: archiveAvailable
-        ? `このサーバーの過去ログを検索する。過去の言動を調べるときはこれ。${ARCHIVE_QUERY_HELP}`
-        : 'このサーバーの過去ログを Discord の検索 API で検索する。query は単純なキーワードのみ。',
+        ? [
+          `このサーバーの過去ログを検索する。過去の言動を調べるときはこれ。${ARCHIVE_QUERY_HELP}`,
+          '検索元は2つある。既定 (source:archive) はローカルの取り込み済みログで、上の書き方が全部使える。',
+          'source:discord は Discord 本体の検索で、`sort:relevance` (Discord の関連度順) と',
+          'ローカルに無い絞り込みが使える代わりに、query は単純なキーワードのみ。',
+          'ローカルで0件だったときに「本当に言っていないのか、取り込みの穴なのか」を確かめる用途にも使える。'
+        ].join('')
+        : [
+          'このサーバーの過去ログを Discord の検索 API で検索する。query は単純なキーワードのみ。',
+          'まだローカルへの取り込みが済んでいないので、OR / 正規表現 / リアクション数などは使えない。'
+        ].join(''),
       parameters: {
         type: 'object',
         properties: {
@@ -257,12 +266,28 @@ function searchToolDefinition(archiveAvailable) {
           after: { type: 'string', description: 'この日より後 (2024-05-01 / 2024-05 / 7d / today)' },
           before: { type: 'string', description: 'この日より前' },
           has: { type: 'string', description: 'link / image / video / file / embed / reaction / code' },
-          sort: { type: 'string', description: 'new / old / reactions / long (既定 new)' },
+          sort: { type: 'string', description: 'new / old / reactions / long / relevance (relevance は source:discord のみ)' },
+          source: { type: 'string', description: 'archive (既定・高機能) / discord (関連度順や裏取りに)' },
           limit: { type: 'number', description: '件数 (既定 10、最大 25)' }
         }
       }
     }
   };
+}
+
+/**
+ * どちらの検索元を使うか決める。
+ * 取り込み済みなら archive を既定にする (機能が多く API を消費しない)。
+ * relevance は Discord 側にしか無いので、指定されたらそちらへ回す。
+ */
+function pickSearchSource(args, archiveAvailable) {
+  const asked = String(args.source ?? '').trim().toLowerCase();
+
+  if (asked === 'discord') return 'discord';
+  if (asked === 'archive') return archiveAvailable ? 'archive' : 'unavailable';
+  if (String(args.sort ?? '').toLowerCase() === 'relevance') return 'discord';
+
+  return archiveAvailable ? 'archive' : 'discord';
 }
 
 async function searchViaArchive(ctx, args, limit) {
@@ -280,13 +305,19 @@ async function searchViaArchive(ctx, args, limit) {
   }
 
   const summary = searchSummary(options);
-  if (!summary.count) return '該当するメッセージはありませんでした。';
+  if (!summary.count) {
+    // 0件を「言っていない」と読まれると困る。取り込みの穴の可能性を示す。
+    return [
+      '該当するメッセージはありませんでした (ローカルの取り込み済みログ内)。',
+      '取り込みの穴かどうかを確かめるなら source:discord で Discord 本体を引ける。'
+    ].join('');
+  }
 
   const { rows } = search(options, { limit, offset: 0 });
   const messages = rows.map((row) => fromArchiveRow(row, channelName(ctx, row.channel_id)));
 
   return [
-    `${summary.count} 件ヒット (${summary.authors} 人 / ${channelCountLabel(summary)}) ・ 表示 ${messages.length} 件`,
+    `${summary.count} 件ヒット (${summary.authors} 人 / ${channelCountLabel(summary)}) ・ 表示 ${messages.length} 件 ・ 検索元: ローカル`,
     `期間: ${shortTime(summary.first_at)} 〜 ${shortTime(summary.last_at)}`,
     formatMessages(messages, {
       refs: ctx.refs,
@@ -328,6 +359,8 @@ async function searchViaDiscord(ctx, args, limit) {
     return '検索条件を1つ以上指定してください。';
   }
 
+  // relevance は Discord 側にしか無い並び順
+  if (args.sort === 'relevance') query.set('sort_by', 'relevance');
   if (args.sort === 'old') query.set('sort_order', 'asc');
 
   let data;
@@ -359,7 +392,8 @@ async function searchViaDiscord(ctx, args, limit) {
   if (messages.length === 0) return '該当するメッセージはありませんでした。';
 
   return [
-    `${data?.total_results ?? messages.length} 件ヒット ・ 表示 ${messages.length} 件`,
+    `${data?.total_results ?? messages.length} 件ヒット ・ 表示 ${messages.length} 件 ・ 検索元: Discord`
+      + (args.sort === 'relevance' ? ' (関連度順)' : ''),
     formatMessages(messages, {
       refs: ctx.refs,
       showChannel: true,
@@ -675,9 +709,18 @@ export async function buildToolset(ctx) {
     listChannelsDefinition
   ];
   const handlers = {
-    search_messages: (args) => (archiveAvailable
-      ? searchViaArchive(ctx, args, clampLimit(args.limit, 10, 25))
-      : searchViaDiscord(ctx, args, clampLimit(args.limit, 10, 25))),
+    search_messages: (args) => {
+      const limit = clampLimit(args.limit, 10, 25);
+      const source = pickSearchSource(args, archiveAvailable);
+
+      if (source === 'unavailable') {
+        return 'このサーバーはまだローカルに取り込まれていません。管理者が `/index build` を実行するまでは source:discord だけ使えます。';
+      }
+
+      return source === 'archive'
+        ? searchViaArchive(ctx, args, limit)
+        : searchViaDiscord(ctx, args, limit);
+    },
     read_channel: (args) => readChannel(ctx, args),
     list_channels: (args) => listChannels(ctx, args)
   };

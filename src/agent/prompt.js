@@ -60,7 +60,7 @@ export function buildSystemPrompt(ctx, toolset) {
   );
 
   if (toolset.archiveAvailable) {
-    lines.push('- このサーバーは過去ログを取り込み済み。`search_messages` で全期間を検索できる。件数だけ知りたいなら `aggregate_messages` のほうが安い。');
+    lines.push('- このサーバーは過去ログを取り込み済み。`search_messages` で全期間を検索できる。件数だけ知りたいなら `aggregate_messages` のほうが安い。ローカルで0件だったときや Discord の関連度順が欲しいときだけ `source:discord` を使う。');
   } else {
     lines.push('- このサーバーは過去ログ未取り込み。`search_messages` は Discord の検索 API を使うので、単純なキーワードしか通らない。');
   }
