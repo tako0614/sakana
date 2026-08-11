@@ -30,6 +30,29 @@ export function toolLabel(name, args = {}) {
   return name;
 }
 
+/**
+ * 経過が長くなるほど編集の間隔を空ける。
+ *
+ * 待つ人がいちばん気にするのは最初の数秒で、そこを過ぎたら「生きているか」しか
+ * 見ていない。ずっと毎秒編集すると、チャンネル単位の編集レート (5回/5秒あたり)
+ * を1つの回答で食い潰して、他の編集まで詰まる。
+ */
+function editDelay(elapsedMs) {
+  if (elapsedMs < 10_000) return agentConfig.progressIntervalMs;
+  if (elapsedMs < 30_000) return Math.max(3000, agentConfig.progressIntervalMs);
+  return Math.max(5000, agentConfig.progressIntervalMs);
+}
+
+/**
+ * 15秒を過ぎたら5秒刻みに丸める。
+ * 秒が毎回変わると「表示が変わらないなら編集しない」の判定が永久に効かないので、
+ * 表示そのものを粗くして自然に止める。
+ */
+function renderSeconds(elapsedMs) {
+  const seconds = Math.max(1, Math.round(elapsedMs / 1000));
+  return seconds < 15 ? seconds : Math.round(seconds / 5) * 5;
+}
+
 export class ThinkingIndicator {
   constructor(channel) {
     this.channel = channel;
@@ -38,6 +61,9 @@ export class ThinkingIndicator {
     this.timer = null;
     this.status = null;
     this.lastRendered = null;
+    this.lastEditAt = 0;
+    // ツールが切り替わった瞬間だけは間隔を待たずに出す (情報が増える唯一の瞬間)
+    this.statusDirty = false;
     // 前回の編集がまだ終わっていないときは次のティックを飛ばす。
     // Discord のメッセージ編集はチャンネル単位で絞られるので、詰まらせない。
     this.busy = false;
@@ -48,9 +74,8 @@ export class ThinkingIndicator {
   }
 
   render() {
-    const seconds = Math.max(1, Math.round((Date.now() - this.startedAt) / 1000));
     const suffix = this.status ? ` · ${this.status}` : '';
-    return `-# thinking (${seconds}s)${suffix}`;
+    return `-# thinking (${renderSeconds(Date.now() - this.startedAt)}s)${suffix}`;
   }
 
   async start() {
@@ -58,6 +83,7 @@ export class ThinkingIndicator {
       const content = this.render();
       this.message = await this.channel.send({ content, allowedMentions: NO_MENTIONS });
       this.lastRendered = content;
+      this.lastEditAt = Date.now();
     } catch (error) {
       // 送信できない (権限が無いなど) 場合は経過表示なしで続行する。
       console.error('Failed to post thinking indicator:', error);
@@ -71,6 +97,7 @@ export class ThinkingIndicator {
 
   /** いま何をしているか (ツール名) を次のティックから出す。 */
   setStatus(status) {
+    if (status !== this.status) this.statusDirty = true;
     this.status = status;
   }
 
@@ -81,10 +108,16 @@ export class ThinkingIndicator {
     const content = this.render();
     if (content === this.lastRendered) return;
 
+    // 経過が長いほど間隔を空ける。ツールが切り替わったときだけ待たない。
+    const now = Date.now();
+    if (!this.statusDirty && now - this.lastEditAt < editDelay(now - this.startedAt)) return;
+
     this.busy = true;
     try {
       await this.message.edit({ content, allowedMentions: NO_MENTIONS });
       this.lastRendered = content;
+      this.lastEditAt = Date.now();
+      this.statusDirty = false;
       this.editFailures = 0;
     } catch (error) {
       // メッセージ自体が消えているときだけ本当に諦める (10008 = Unknown Message)。
