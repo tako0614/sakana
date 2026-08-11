@@ -32,12 +32,15 @@ export function buildSystemPrompt(ctx, toolset) {
     '- 日付は見る。前と言ってることが違うなら、そこが核心。',
     '- 名前は表示名をそのまま使う (`<@123...>` は通知が飛ぶので使わない)。誰の発言かは取り違えない。',
     '',
-    '## 誰の話か',
+    '## 誰の話か / どの話か',
     '- 話しかけてきた人は user メッセージの冒頭に書いてある。答えはその人に向けて書く。',
     '- 二人称 (お前・君・自分・あなた) は話しかけてきた人にだけ使う。',
     '  他の人のことは表示名で書く。話題の人と話しかけてきた人は別人のことが多い。',
     '- 誰の話か指定がないなら、直前の会話で話題だった人を勝手に主語にしない。',
     '  そのチャンネルで実際に起きたことから拾うか、誰のことか聞き返す。',
+    '- チャンネルでは複数の話題が同時に流れている。答えるのは1つだけ。',
+    '  「いま返信でつながっている話」があるならそれが今の話題で、直近の会話は背景。',
+    '  混ぜて1つの答えにしない。行末の `↩N` がその番号への返信なので、繋がりはそこで見る。',
     '',
     '## 動き方',
     '- 直近の会話は最初から渡してある。それで答えられるなら道具を呼ばずに答える。',
@@ -90,7 +93,7 @@ export function buildSystemPrompt(ctx, toolset) {
  * 最初のユーザーメッセージ。ここで直近の会話も一緒に渡してしまう。
  * ツールを1往復減らせるので、結果的にトークンが減る。
  */
-export function buildUserContent({ ctx, prompt, recent, replyTarget, refs }) {
+export function buildUserContent({ ctx, prompt, recent, replyChain, refs }) {
   const sections = [];
 
   // 可変な文脈はここ。system に入れるとキャッシュの前方一致を壊す。
@@ -105,16 +108,18 @@ export function buildUserContent({ ctx, prompt, recent, replyTarget, refs }) {
       + 'この人に向けて答える。話題の人がこの人だとは限らない。'
   ].join('\n'));
 
-  if (replyTarget) {
+  // 返信の鎖が「いまの話題」。背景より先に、多めの文字数で置く。
+  // 話題が並行しているチャンネルでは、この2つを分けないと答えが混ざる。
+  if (replyChain?.length) {
     sections.push([
-      '## 返信で名指しされたメッセージ',
-      formatMessages([replyTarget], { refs, showChannel: false, bodyChars: 1600 })
+      '## いま返信でつながっている話 (古い順・これが今の話題)',
+      formatMessages(replyChain, { refs, showChannel: false, bodyChars: 1200 })
     ].join('\n'));
   }
 
   if (recent?.length) {
     sections.push([
-      '## このチャンネルの直近の会話 (古い順)',
+      '## このチャンネルの直近の会話 (古い順・背景。別の話題が混ざっている)',
       formatMessages(recent, {
         refs,
         showChannel: false,

@@ -129,6 +129,36 @@ async function fetchRecent(channel, excludeId, limit) {
   }
 }
 
+// 返信でつながっている分だけさかのぼる。
+//
+// 以前は 1ホップ (message.fetchReference()) だけだった。話題が3つ並行している
+// チャンネルではそれで足りない: 直近30件はその混ざったログなので、どの話の続きなのかを
+// モデルが推測することになり、答えが混ざる。
+// 鎖をたどれば「いまの話題」だけを取り出せる。
+const REPLY_CHAIN_LIMIT = 6;
+
+async function fetchReplyChain(message, channelName) {
+  const chain = [];
+  const seen = new Set([message.id]);
+  let parentId = message.reference?.messageId ?? null;
+
+  while (parentId && chain.length < REPLY_CHAIN_LIMIT && !seen.has(parentId)) {
+    seen.add(parentId);
+
+    // 直近30件を先に取ってあるのでキャッシュに載っていることが多い。
+    // 載っていないぶんだけ取りに行く (削除済みなら鎖はそこで切れる)。
+    const parent = message.channel.messages?.cache?.get(parentId)
+      ?? await message.channel.messages.fetch(parentId).catch(() => null);
+
+    if (!parent) break;
+
+    chain.push(fromDiscordMessage(parent, channelName));
+    parentId = parent.reference?.messageId ?? null;
+  }
+
+  return chain.reverse();
+}
+
 export async function handleAgentRequest(message, client) {
   const guild = message.guild;
   const member = message.member ?? await guild.members.fetch(message.author.id).catch(() => null);
@@ -187,22 +217,24 @@ export async function handleAgentRequest(message, client) {
 
     const toolset = await buildToolset(ctx);
 
-    const replyTarget = message.reference?.messageId
-      ? await message.fetchReference()
-        .then((referenced) => fromDiscordMessage(referenced, message.channel.name))
-        .catch(() => null)
-      : null;
+    // 直近を先に取る (鎖のたどり先がキャッシュに載るので API を叩かずに済む)
+    const preloaded = await fetchRecent(message.channel, message.id, agentConfig.preloadMessages);
+    const replyChain = await fetchReplyChain(message, message.channel.name);
 
-    const recent = await fetchRecent(message.channel, message.id, agentConfig.preloadMessages);
+    // 鎖に入ったものは背景から抜く。同じ発言を2回載せてもトークンだけ増える。
+    const inChain = new Set(replyChain.map((entry) => entry.messageId));
+    const recent = preloaded.filter((entry) => !inChain.has(entry.messageId));
+
     // query を省略した意味検索で「いまの会話」を使う
     ctx.recent = recent;
+    ctx.thread = replyChain;
 
     const system = buildSystemPrompt(ctx, toolset);
     const userContent = buildUserContent({
       ctx,
       prompt: stripMention(message.content, client.user.id),
       recent,
-      replyTarget,
+      replyChain,
       refs
     });
 

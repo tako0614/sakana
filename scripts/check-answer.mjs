@@ -112,7 +112,12 @@ console.log(`prompt ok (byte-static / ${first.length} 文字)`);
 // 見出し行の末尾に埋めていたら、直前の会話の話題の人と混同されて
 // 第三者の話を二人称で書かれた。独立した行であることを固定する。
 
-const content = buildUserContent({
+const said = (id, name, content, extra = {}) => ({
+  guildId: 'g1', channelId: 'c1', messageId: id, authorId: id, authorName: name,
+  content, createdAt: 1_700_000_000_000, reactionCount: 0, attachmentCount: 0, ...extra
+});
+
+const userContentOf = (over = {}) => buildUserContent({
   ctx: {
     guild: { name: 'G' },
     channel: { name: 'general', id: 'c1' },
@@ -120,18 +125,49 @@ const content = buildUserContent({
   },
   prompt: '今日の失言おしえて',
   recent: [],
-  replyTarget: null,
-  refs: new RefTable()
+  replyChain: [],
+  refs: new RefTable(),
+  ...over
 });
 
-const caller = content.split('\n').find((line) => line.includes('話しかけてきた'));
-if (!caller) fail('話しかけてきた人の行が無い');
-if (caller.includes('サーバー:') || caller.includes('チャンネル:')) {
-  fail(`話しかけてきた人が見出し行に埋まっている: ${caller}`);
+{
+  const content = userContentOf();
+  const caller = content.split('\n').find((line) => line.includes('話しかけてきた'));
+  if (!caller) fail('話しかけてきた人の行が無い');
+  if (caller.includes('サーバー:') || caller.includes('チャンネル:')) {
+    fail(`話しかけてきた人が見出し行に埋まっている: ${caller}`);
+  }
+  if (!caller.includes('さば') || !caller.includes('999888777666555444')) {
+    fail(`表示名と ID の両方が要る (ID が無いと author に渡せない): ${caller}`);
+  }
+  if (!content.includes('今日の失言おしえて')) fail('依頼が入っていない');
 }
-if (!caller.includes('さば') || !caller.includes('999888777666555444')) {
-  fail(`表示名と ID の両方が要る (ID が無いと author に渡せない): ${caller}`);
-}
-if (!content.includes('今日の失言おしえて')) fail('依頼が入っていない');
 
-console.log('caller ok (独立した行 / 表示名と ID)');
+{
+  // 話題が並行するチャンネルでは、返信の鎖と背景が別の見出しで分かれていること。
+  // 混ぜると「どの話の続きか」をモデルが推測することになって答えが混ざる。
+  const content = userContentOf({
+    replyChain: [said('11', 'たこ', 'デプロイどうする'), said('12', 'bot', 'まず CI 直そう')],
+    recent: [said('21', 'さば', '昼なに食う'), said('22', 'あきら', 'ラーメン')]
+  });
+
+  const thread = content.indexOf('いま返信でつながっている話');
+  const background = content.indexOf('直近の会話');
+  if (thread < 0) fail('返信の鎖の見出しが無い');
+  if (background < 0) fail('背景の見出しが無い');
+  if (thread > background) fail('今の話題は背景より先に置く');
+  if (!/背景/.test(content.slice(background, background + 60))) {
+    fail('背景であることを見出しに書く');
+  }
+
+  // 鎖は古い順
+  if (content.indexOf('デプロイどうする') > content.indexOf('まず CI 直そう')) {
+    fail('返信の鎖は古い順に並べる');
+  }
+  // 鎖が無いときは見出しごと出さない
+  if (userContentOf({ recent: [said('21', 'さば', '昼なに食う')] }).includes('いま返信でつながっている話')) {
+    fail('鎖が空なら見出しを出さない');
+  }
+}
+
+console.log('caller ok (独立した行 / 表示名と ID / 話題と背景を分離)');

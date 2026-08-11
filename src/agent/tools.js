@@ -421,7 +421,10 @@ async function chunkFilters(ctx, args, lifted = []) {
  * 「これ前にも話した？」がキーワードを思い付かずに成立するのが要点。
  */
 function recentConversationText(ctx) {
-  const recent = (ctx.recent ?? []).filter((message) => message.content?.trim()).slice(-12);
+  // 話題が並行しているチャンネルでは直近12件が混ざったログになるので、
+  // 返信でつながっている側があるならそれを使う (それが今の話題そのもの)。
+  const source = (ctx.thread?.length ?? 0) >= 2 ? ctx.thread : (ctx.recent ?? []);
+  const recent = source.filter((message) => message.content?.trim()).slice(-12);
   if (recent.length < 2) return '';
   return recent.map((message) => `${message.authorName}: ${message.content}`).join('\n');
 }
