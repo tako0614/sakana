@@ -59,6 +59,17 @@ db.exec(`
   );
 `);
 
+// 既存の DB には CREATE TABLE IF NOT EXISTS では列が増えないので、無いときだけ足す。
+//
+// counted = 0 は「請求の記録としては残すが、上限の判定では数えない」印。
+// 使うのは2つ:
+//   - 管理者 (と AGENT_EXEMPT_USERS) の実行。判定を素通りするだけでなく、
+//     全体カウンタにも乗せない。乗せると運営が使うほど他の人が締め出される。
+//   - /agentlimit reset。行を消さずに窓を空にする。
+if (!db.pragma('table_info(agent_calls)').some((row) => row.name === 'counted')) {
+  db.exec('ALTER TABLE agent_calls ADD COLUMN counted INTEGER NOT NULL DEFAULT 1');
+}
+
 // 換算トークンの合計。SQL 側で重みを掛ける (行を JS に運ばずに済む)。
 const WEIGHTED_SUM = `
   COALESCE(SUM(
@@ -69,19 +80,27 @@ const WEIGHTED_SUM = `
 `;
 
 const sumUserStmt = db.prepare(
-  `SELECT ${WEIGHTED_SUM} FROM agent_calls WHERE user_id = @user_id AND created_at >= @since`
+  `SELECT ${WEIGHTED_SUM} FROM agent_calls WHERE user_id = @user_id AND created_at >= @since AND counted = 1`
 );
 const sumGlobalStmt = db.prepare(
+  `SELECT ${WEIGHTED_SUM} FROM agent_calls WHERE created_at >= @since AND counted = 1`
+);
+// 実際に払うぶん。counted は上限の判定用の印なので、請求を見るときは無視する
+// (管理者ぶんもリセットしたぶんも支出には乗っている)。
+const sumUserBilledStmt = db.prepare(
+  `SELECT ${WEIGHTED_SUM} FROM agent_calls WHERE user_id = @user_id AND created_at >= @since`
+);
+const sumBilledStmt = db.prepare(
   `SELECT ${WEIGHTED_SUM} FROM agent_calls WHERE created_at >= @since`
 );
 const oldestUserStmt = db.prepare(
-  'SELECT MIN(created_at) AS at FROM agent_calls WHERE user_id = ? AND created_at >= ?'
+  'SELECT MIN(created_at) AS at FROM agent_calls WHERE user_id = ? AND created_at >= ? AND counted = 1'
 );
 const oldestGlobalStmt = db.prepare(
-  'SELECT MIN(created_at) AS at FROM agent_calls WHERE created_at >= ?'
+  'SELECT MIN(created_at) AS at FROM agent_calls WHERE created_at >= ? AND counted = 1'
 );
 const insertStmt = db.prepare(
-  'INSERT INTO agent_calls (guild_id, channel_id, user_id, created_at) VALUES (?, ?, ?, ?)'
+  'INSERT INTO agent_calls (guild_id, channel_id, user_id, created_at, counted) VALUES (?, ?, ?, ?, ?)'
 );
 const finalizeStmt = db.prepare(`
   UPDATE agent_calls
@@ -204,6 +223,25 @@ export function grantDailyUsd(userId, usd, byUserId) {
   return true;
 }
 
+/**
+ * いまの窓の使用量を消す。上限を絞った直後に、既に使っていた人を締め出さないため。
+ *
+ * 行は消さずに counted = 0 を立てるだけ。請求と突き合わせるための記録は残す
+ * (消してしまうと「なぜこの月これだけ請求が来たか」が追えなくなる)。
+ * userId を渡せばその人だけ、省略すれば全員。戻り値は印を付けた件数。
+ */
+export function resetUsage(userId = null) {
+  const since = Date.now() - Math.max(agentConfig.userWindowMs, agentConfig.globalWindowMs);
+
+  const result = userId
+    ? db.prepare('UPDATE agent_calls SET counted = 0 WHERE counted = 1 AND created_at >= ? AND user_id = ?')
+      .run(since, userId)
+    : db.prepare('UPDATE agent_calls SET counted = 0 WHERE counted = 1 AND created_at >= ?')
+      .run(since);
+
+  return result.changes;
+}
+
 /** 付与済みの一覧。/agentlimit show に出す。 */
 export function listGrants() {
   return db.prepare(`SELECT key, value, updated_by FROM agent_settings WHERE key LIKE '${GRANT_PREFIX}%'`)
@@ -274,7 +312,9 @@ export function reserveCall({ guildId, channelId, userId, admin = false }) {
     }
   }
 
-  const { lastInsertRowid } = insertStmt.run(guildId ?? null, channelId ?? null, userId, now);
+  // 素通りした実行は上限の判定に数えない (記録としては残る)
+  const counted = isExempt(userId, admin) ? 0 : 1;
+  const { lastInsertRowid } = insertStmt.run(guildId ?? null, channelId ?? null, userId, now, counted);
   running += 1;
 
   return { ok: true, id: Number(lastInsertRowid) };
@@ -382,6 +422,11 @@ export function getUsage(userId) {
   const userUsd = dailyUsdFor(userId);
   const globalUsd = getTunable('global_daily_usd');
 
+  // 上限の判定に乗らないぶん (管理者・リセット済み) も含めた実支出。
+  // これが無いと、管理者から見た自分の使用量が常に $0.000 に見える。
+  const userBilled = sumUserBilledStmt.get({ user_id: userId, since: now - agentConfig.userWindowMs, ...w }).total;
+  const globalBilled = sumBilledStmt.get({ since: now - agentConfig.globalWindowMs, ...w }).total;
+
   return {
     // 表示はドル、突き合わせ用にトークンも返す (内部の勘定はトークンなので)
     userUsd: tokensToUsd(userTokens),
@@ -391,6 +436,8 @@ export function getUsage(userId) {
     globalUsd: tokensToUsd(globalTokens),
     globalLimitUsd: globalUsd,
     globalTokens,
+    userBilledUsd: tokensToUsd(userBilled),
+    globalBilledUsd: tokensToUsd(globalBilled),
     running
   };
 }

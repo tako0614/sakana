@@ -22,6 +22,7 @@ import {
   grantDailyUsd,
   listGrants,
   listTunables,
+  resetUsage,
   setTunable,
   usdToTokens
 } from './ratelimit.js';
@@ -75,6 +76,16 @@ function usageEmbed(userId) {
       { name: '実行中', value: String(usage.running), inline: true }
     );
 
+  // 上限に乗らないぶん (管理者・リセット済み) があると、上の数字は支出と一致しない。
+  // ずれているときだけ実支出を出す (いつも出すと欄が2倍になって読みにくい)。
+  const drift = usage.globalBilledUsd - usage.globalUsd;
+  if (drift > 0.0005) {
+    embed.addFields({
+      name: `実支出 (${window}・上限には乗らないぶんを含む)`,
+      value: `全体 $${usage.globalBilledUsd.toFixed(3)} / あなた $${usage.userBilledUsd.toFixed(3)}`
+    });
+  }
+
   embed.addFields({
     name: '設定',
     value: listTunables()
@@ -98,7 +109,10 @@ function usageEmbed(userId) {
     });
   }
 
-  embed.setFooter({ text: '管理者は上限の判定を通りません。金額は見積りで、請求と一致する保証はありません。' });
+  embed.setFooter({
+    text: '管理者の実行は上限の判定を通らず、全体の集計にも乗りません (記録は残ります)。'
+      + '金額は見積りで、請求と一致する保証はありません。'
+  });
 
   return embed;
 }
@@ -154,7 +168,14 @@ export const agentCommands = [
         .addUserOption((option) => option
           .setName('user')
           .setDescription('対象')
-          .setRequired(true))),
+          .setRequired(true)))
+      .addSubcommand((sub) => sub
+        .setName('reset')
+        .setDescription('いまの使用量を消して上限を空けます (管理者用)')
+        .addUserOption((option) => option
+          .setName('user')
+          .setDescription('この人だけ。省略すると全員')
+          .setRequired(false))),
 
     async execute(interaction) {
       const sub = interaction.options.getSubcommand();
@@ -168,6 +189,21 @@ export const agentCommands = [
       }
 
       if (!await requireAdmin(interaction)) return;
+
+      if (sub === 'reset') {
+        const target = interaction.options.getUser('user');
+        const cleared = resetUsage(target?.id ?? null);
+
+        await interaction.reply({
+          content: target
+            ? `${target} の使用量を消しました (${cleared} 件)。記録は残っています。`
+            : `全員の使用量を消しました (${cleared} 件)。記録は残っています。`,
+          embeds: [usageEmbed(interaction.user.id)],
+          allowedMentions: { parse: [] },
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
 
       if (sub === 'grant' || sub === 'revoke') {
         const target = interaction.options.getUser('user');

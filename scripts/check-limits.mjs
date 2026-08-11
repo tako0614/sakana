@@ -7,9 +7,11 @@ import { db } from '../src/db.js';
 import {
   dailyUsdFor,
   finalizeCall,
+  getUsage,
   grantDailyUsd,
   remainingFor,
   reserveCall,
+  resetUsage,
   tokensToUsd,
   usdToTokens,
   weighTokens
@@ -76,15 +78,44 @@ try {
     `expected ~${expected} heavy requests before the wall, got ${count}`
   );
 
-  // --- 管理者は素通り ---
-  // 管理者は判定を通らないが、使用量は記録される (請求と乖離させないため)。
-  // なので全体カウンタは既に上限を超えている。それでも通ることを見る。
+  // --- 管理者は素通りし、全体カウンタにも乗らない ---
+  // 乗せてしまうと、運営が使うほど他の人が「サーバー全体の上限」で止まる。
+  // 記録 (agent_calls の行) は残るので、実支出は getUsage の billed 側で見える。
   assert(remainingFor('check-admin', true) === Infinity, 'an admin must have no remaining cap');
+
+  const globalBefore = getUsage('check-admin').globalUsd;
   for (let i = 0; i < 40; i += 1) {
     const r = reserveCall({ guildId: 'g', channelId: 'c', userId: 'check-admin', admin: true });
     assert(r.ok, `an admin must never be refused (refused at ${i})`);
     finalizeCall(r.id, { status: 'ok', rounds: 9, usage: heavy });
   }
+
+  const after = getUsage('check-admin');
+  assert(
+    Math.abs(after.globalUsd - globalBefore) < 1e-9,
+    `admin usage must not move the shared counter (${globalBefore} -> ${after.globalUsd})`
+  );
+  // ただし支出には乗る (40回ぶん)
+  assert(
+    after.globalBilledUsd > after.globalUsd + 40 * usd - 1e-6,
+    `admin usage must still show up as spend (${after.globalBilledUsd})`
+  );
+  assert(after.userBilledUsd > 40 * usd - 1e-6, 'the admin must see their own spend');
+
+  // --- リセット: 行は残したまま窓を空ける ---
+  const beforeReset = getUsage('check-normal');
+  assert(beforeReset.userUsd > 0, 'the normal user should have usage before the reset');
+  resetUsage('check-normal');
+  const afterReset = getUsage('check-normal');
+  assert(afterReset.userUsd === 0, `reset must clear the window (${afterReset.userUsd})`);
+  assert(
+    Math.abs(afterReset.userBilledUsd - beforeReset.userBilledUsd) < 1e-9,
+    'reset must not erase the spend record'
+  );
+  assert(
+    reserveCall({ guildId: 'g', channelId: 'c', userId: 'check-normal' }).ok,
+    'the user must be able to run again after a reset'
+  );
 
   // --- 個別付与 ---
   assert(dailyUsdFor('check-granted') === DEFAULT_DAILY, 'the default daily cap should apply before a grant');
