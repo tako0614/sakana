@@ -29,9 +29,10 @@ export const agentConfig = {
   // 同じ1回として数えられて実際の費用と合わない。
   // これを超えたらツールを外して、その場の材料で答えを書かせる。
   // 単位は換算トークン (下の重み付け後)。
-  // 暴走を止めるためだけの値。重い調査1回が $0.012 なので、その4回ぶんを
-  // 1リクエストで使ったら異常とみなす。普通に使って引っかかる水準ではない。
-  requestUsd: number(process.env.AGENT_REQUEST_USD, 0.05),
+  // 暴走を止めるためだけの値。実測の最悪が11往復 $0.0116 なので、その1.7倍。
+  // 1人あたり/日 ($0.05) より小さくしてある。1リクエストで1日ぶんを
+  // 使い切れてしまうと、暴走1回でその人が締め出される。
+  requestUsd: number(process.env.AGENT_REQUEST_USD, 0.02),
   // ツール出力に載せる1メッセージあたりの本文文字数。
   messageChars: number(process.env.AGENT_MESSAGE_CHARS, 300),
   // 最初から渡す直近の会話はこちらを使う。人がスマホで見ているのは切られていない
@@ -75,9 +76,14 @@ export const agentConfig = {
 
   // 上限はドルで書く。/agentlimit で管理者が実行中に変えられる。0 で無制限。
   // 管理者は判定そのものを通らないので、これは他の人を縛る壁。
-  // 実測: 重い調査1回 $0.012 / 軽い質問1回 $0.001
+  //
+  // 実測 (プロンプトを直した後の57件): 1回 平均 $0.0024 / 最悪 $0.0116。
+  // 1人 $0.05/日 なら平均 約21回・重いの4回。全体の 10% なので、
+  // 10人が同じだけ使ってようやく全体に当たる。
+  // 以前の $0.25 は1人で約104回・全体の半分を取れてしまい、2人で全体が尽きた。
+  // 信頼している人は /agentlimit grant で個別に上げる。
   globalDailyUsd: number(process.env.AGENT_GLOBAL_DAILY_USD, 0.5),
-  userDailyUsd: number(process.env.AGENT_USER_DAILY_USD, 0.25),
+  userDailyUsd: number(process.env.AGENT_USER_DAILY_USD, 0.05),
   userWindowMs: number(process.env.AGENT_USER_WINDOW_MS, 86_400_000),
   globalWindowMs: number(process.env.AGENT_GLOBAL_WINDOW_MS, 86_400_000),
   // 費用の制限ではなくメモリの番人。1リクエストごとに Chrome の隔離タブを開くので、

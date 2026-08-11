@@ -27,6 +27,11 @@ const assert = (ok, message) => { if (!ok) throw new Error(message); };
 
 cleanup();
 
+// 既定の上限は絞ることがあるので数字を直書きしない。設定から読む
+// (直書きしていたせいで $0.25 -> $0.05 に絞ったときにここが落ちた)。
+// cleanup の後で読む。前回の付与が残っていると既定ではない値を拾う。
+const DEFAULT_DAILY = dailyUsdFor('check-normal');
+
 try {
   // --- 変換の往復 ---
   const round = tokensToUsd(usdToTokens(0.5));
@@ -44,11 +49,11 @@ try {
   // remainingFor が全体側で 0 を返してこの判定ができなくなる。
   const old = reserveCall({ guildId: 'g', channelId: 'c', userId: 'check-granted' });
   finalizeCall(old.id, { status: 'ok', rounds: 9, usage: heavy });
-  assert(remainingFor('check-granted') < usdToTokens(0.25), 'a fresh call must consume the window');
+  assert(remainingFor('check-granted') < usdToTokens(DEFAULT_DAILY), 'a fresh call must consume the window');
   db.prepare('UPDATE agent_calls SET created_at = ? WHERE id = ?')
     .run(Date.now() - 25 * 3_600_000, old.id);
   const left = remainingFor('check-granted');
-  assert(Math.abs(left - usdToTokens(0.25)) < 1, `a 25h-old call must age out of the window (left ${left})`);
+  assert(Math.abs(left - usdToTokens(DEFAULT_DAILY)) < 1, `a 25h-old call must age out of the window (left ${left})`);
 
   // --- 一般ユーザーは既定の上限で止まる ---
   let count = 0;
@@ -63,8 +68,13 @@ try {
     count += 1;
     assert(count <= 200, 'the user limit never triggered');
   }
-  // 既定 $0.25 / 1回 $0.01064 なら 24 回で超える
-  assert(count >= 18 && count <= 28, `expected ~23 heavy requests before the wall, got ${count}`);
+  // 何回もつかも直書きしない。既定の上限 ÷ 1回のコストから出す。
+  // (壁の手前で止まるので ±1 は許す)
+  const expected = Math.floor(DEFAULT_DAILY / usd);
+  assert(
+    count >= expected - 1 && count <= expected + 1,
+    `expected ~${expected} heavy requests before the wall, got ${count}`
+  );
 
   // --- 管理者は素通り ---
   // 管理者は判定を通らないが、使用量は記録される (請求と乖離させないため)。
@@ -77,12 +87,12 @@ try {
   }
 
   // --- 個別付与 ---
-  assert(dailyUsdFor('check-granted') === 0.25, 'the default daily cap should apply before a grant');
+  assert(dailyUsdFor('check-granted') === DEFAULT_DAILY, 'the default daily cap should apply before a grant');
   grantDailyUsd('check-granted', 1.5, 'check');
   assert(dailyUsdFor('check-granted') === 1.5, 'a grant must raise that person only');
-  assert(dailyUsdFor('check-normal') === 0.25, 'a grant must not leak to others');
+  assert(dailyUsdFor('check-normal') === DEFAULT_DAILY, 'a grant must not leak to others');
   grantDailyUsd('check-granted', null, 'check');
-  assert(dailyUsdFor('check-granted') === 0.25, 'revoking must fall back to the default');
+  assert(dailyUsdFor('check-granted') === DEFAULT_DAILY, 'revoking must fall back to the default');
 
   console.log(`limits ok (heavy request = $${usd.toFixed(5)}, wall after ${count} of them)`);
 } finally {
