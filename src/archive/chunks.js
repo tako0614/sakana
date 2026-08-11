@@ -31,9 +31,10 @@ function eligibleParams() {
   return { include_bots: embedConfig.includeBots ? 1 : 0 };
 }
 
-const selectChannels = db.prepare(`
-  SELECT DISTINCT channel_id FROM messages WHERE guild_id = ?
-`);
+// channels 表から取る。messages の DISTINCT は 224ms かかる (実測) うえ、
+// 取り込み済みチャンネルの一覧はこちらが正しい持ち主。
+const selectChannels = db.prepare('SELECT channel_id FROM channels WHERE guild_id = ?');
+const selectChannelsFromMessages = db.prepare('SELECT DISTINCT channel_id FROM messages WHERE guild_id = ?');
 
 const selectLastChunk = db.prepare(`
   SELECT chunk_id, from_ms FROM message_chunks
@@ -159,9 +160,26 @@ const selectPage = db.prepare(`
 `);
 
 // イベントループに順番を返す。better-sqlite3 は同期なので、これを挟まないと
-// 134チャンネルを回りきるまで Discord の heartbeat も進捗表示も止まり、
-// /index cancel も効かない (実際にそうなっていた)。
+// Discord への送信が全部タイムアウトする (実際に28秒ブロックして、その間
+// deferReply も thinking もリアクション処理も AbortError になった)。
 const yieldToLoop = () => new Promise((resolve) => setImmediate(resolve));
+
+// 譲る間隔は件数ではなく経過時間で決める。ページ単位 (5000件) で譲る作りにしたら
+// 粗すぎて28秒止まった。1チャンクの重さはチャンネルの喋り方でまるで違うので、
+// 件数で見積もると必ず外れる。
+const SLICE_MS = 40;
+
+/**
+ * 「同期で走り続けてよい時間」を測るタイマー。
+ * done() が true を返したら譲る。
+ */
+function slicer(ms = SLICE_MS) {
+  let until = Date.now() + ms;
+  return {
+    expired: () => Date.now() >= until,
+    reset: () => { until = Date.now() + ms; }
+  };
+}
 
 /**
  * 1チャンネルぶんのまとまりを作る。末尾に追記していくだけ。
@@ -179,6 +197,7 @@ export async function buildChannelChunks(guildId, channelId, { isCancelled = () 
     if (fresh === 0) return 0;
   }
 
+  const slice = slicer();
   let sinceMs = last ? last.from_ms - 1 : -1;
   let sinceRid = 0;
   // ページの境目でまとまりが切れないよう、最後の組は次のページに持ち越す
@@ -209,6 +228,12 @@ export async function buildChannelChunks(guildId, channelId, { isCancelled = () 
     for (const group of groups) {
       saveChunk(guildId, group);
       built += 1;
+
+      // 1ページぶんの保存だけで数百トランザクションになる。ここでも譲る。
+      if (slice.expired()) {
+        await yieldToLoop();
+        slice.reset();
+      }
     }
 
     const tail = rows[rows.length - 1];
@@ -229,7 +254,11 @@ export async function buildChannelChunks(guildId, channelId, { isCancelled = () 
 
 /** ギルド全体。取り込み済みチャンネルを順に回す。 */
 export async function buildGuildChunks(guildId, { onProgress = () => {}, isCancelled = () => false } = {}) {
-  const channels = selectChannels.all(guildId).map((row) => row.channel_id);
+  const known = selectChannels.all(guildId).map((row) => row.channel_id);
+  // channels 表が無い構成でも動くようにする (取り込み前など)
+  const channels = known.length > 0
+    ? known
+    : selectChannelsFromMessages.all(guildId).map((row) => row.channel_id);
   let built = 0;
 
   for (const [index, channelId] of channels.entries()) {
