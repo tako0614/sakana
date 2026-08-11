@@ -257,6 +257,15 @@ export const refreshStale = db.transaction((guildId, limit = 500) => {
   return { stale: rows.length };
 });
 
+/**
+ * このギルドの最後のまとまりの ID。
+ * カーソルが実在しない値まで進んでいないかを確かめるのに使う。
+ */
+export function maxChunkIdFor(guildId) {
+  return db.prepare('SELECT COALESCE(MAX(chunk_id), 0) AS id FROM message_chunks WHERE guild_id = ?')
+    .get(guildId).id;
+}
+
 /** 次に埋め込むまとまり。cursor は chunk_id (AUTOINCREMENT なので単調)。 */
 export function nextChunkBatch({ guildId, modelId, cursor = 0, limit = 32 }) {
   return db.prepare(`

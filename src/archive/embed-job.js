@@ -18,6 +18,7 @@ import {
   chunkMessages,
   chunkText,
   clearGuildChunks,
+  maxChunkIdFor,
   nextChunkBatch,
   refreshStale,
   saveChunkVectors
@@ -166,6 +167,16 @@ export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, on
     // --- ② まとまりを埋め込む ---
     const state = getEmbedState(guild.id) ?? {};
     let cursor = mode === 'sweep' ? 0 : (state.cursor_rowid ?? 0);
+
+    // カーソルの意味が messages.rowid から chunk_id に変わったので、
+    // 発言単位だった頃の値が残っていると chunk_id > 93万 で永久に0件になり、
+    // 「ベクトル0件のまま正常終了」する。実在する最大より大きければ巻き戻す。
+    const maxChunkId = maxChunkIdFor(guild.id);
+    if (cursor > maxChunkId) {
+      console.warn(`Embed cursor ${cursor} is past the last chunk ${maxChunkId}. Restarting from the beginning.`);
+      cursor = 0;
+      setEmbedState(guild.id, { cursor_rowid: 0, embedded: 0, skipped: 0 });
+    }
 
     const stats = chunkCoverage(guild.id, modelId);
     job.channelsTotal = Math.max(0, stats.total - stats.done);
