@@ -158,6 +158,29 @@ function paginationRow(token, page, pages) {
   );
 }
 
+/**
+ * 何のジョブが動いているのかを出す。
+ * 「既に別のジョブが実行中」だけだと、起動時のキャッチアップが握っている場合に
+ * 何を待てばいいのか分からない (実際にそれで詰まった)。
+ */
+function runningJobMessage(guildId) {
+  const job = getRunningJob(guildId);
+  if (!job) return '既に別のジョブが実行中です。`/index status` で確認できます。';
+
+  const elapsed = Math.round((Date.now() - job.startedAt) / 1000);
+  const progress = job.channelsTotal > 0 ? ` ${job.channelsDone}/${job.channelsTotal}` : '';
+  const label = job.mode === 'catchup'
+    ? '起動時の取りこぼし確認'
+    : job.mode === 'verify' ? '穴埋め' : job.mode;
+
+  return [
+    `いま「${label}」が実行中です${progress} (${elapsed}秒経過)。`,
+    job.mode === 'catchup'
+      ? '起動直後は取りこぼしの確認が走るので、終わってからもう一度実行してください。'
+      : '`/index status` で進捗、`/index cancel` で中止できます。'
+  ].join('');
+}
+
 function queryErrorText(error) {
   return `⚠️ ${error.message}`;
 }
@@ -395,7 +418,7 @@ async function startVerify(interaction) {
   }
 
   if (getRunningJob(interaction.guildId)) {
-    await interaction.reply({ content: '既に別のジョブが実行中です。`/index status` で確認できます。', flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: runningJobMessage(interaction.guildId), flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -478,7 +501,7 @@ async function startEmbed(interaction) {
   }
 
   if (getRunningJob(interaction.guildId)) {
-    await interaction.reply({ content: '既に別のジョブが実行中です。`/index status` で確認できます。', flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: runningJobMessage(interaction.guildId), flags: MessageFlags.Ephemeral });
     return;
   }
 

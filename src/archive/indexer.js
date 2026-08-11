@@ -508,10 +508,16 @@ export async function catchupAllGuilds(client) {
   if (catchupRunning) return;
   catchupRunning = true;
 
+  // 無言で走ると、単一フライトのロックを握っている間に /index embed を叩いた人が
+  // 「既に別のジョブが実行中」しか見えず、何を待てばいいのか分からない。
+  const startedAt = Date.now();
+  console.log('Catch-up started. Other index jobs are blocked until it finishes.');
+
   try {
     await catchupGuilds(client);
   } finally {
     catchupRunning = false;
+    console.log(`Catch-up finished in ${Math.round((Date.now() - startedAt) / 1000)}s.`);
   }
 }
 
@@ -594,7 +600,8 @@ export function coverageReport(guildId) {
  */
 export function claimJob(guildId, job) {
   if (runningJobs.has(guildId)) {
-    throw new Error('このサーバーでは既に別のジョブが実行中です。');
+    const running = runningJobs.get(guildId);
+    throw new Error(`このサーバーでは既に別のジョブが実行中です (${running?.mode ?? '不明'})。`);
   }
   runningJobs.set(guildId, job);
 }
