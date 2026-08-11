@@ -167,7 +167,7 @@ export async function handleAgentRequest(message, client) {
       setStatus: (status) => indicator?.setStatus(status)
     };
 
-    // 「-# thinking (10s)」を出しておく。この先の準備 (ブラウザの生存確認や
+    // 経過表示を出しておく。この先の準備 (ブラウザの生存確認や
     // 直近メッセージの取得) にも時間がかかるので、一番先に出す。
     indicator = new ThinkingIndicator(message.channel);
     await indicator.start();

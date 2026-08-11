@@ -38,8 +38,8 @@ export const agentConfig = {
   // 回答自体は1000字までなので、ここはほぼ全部が思考の枠。
   maxOutputTokens: number(process.env.AGENT_MAX_OUTPUT_TOKENS, 40_000),
   timeoutMs: number(process.env.AGENT_TIMEOUT_MS, 150_000),
-  // 「-# thinking (10s)」の更新間隔。Discord のメッセージ編集はチャンネルあたり
-  // 5回/5秒あたりで絞られるので、1秒はほぼ上限。詰まるようなら 2000 に上げる。
+  // 経過表示の編集をまとめる待ち時間。秒は <t:...:R> でクライアントが進めるので、
+  // 編集が走るのはツールが切り替わったときだけ。連続で切り替わる分をここで畳む。
   progressIntervalMs: number(process.env.AGENT_PROGRESS_INTERVAL_MS, 1000),
 
   // --- 使用量の制限 ---
