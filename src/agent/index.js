@@ -8,6 +8,7 @@
 
 import { AttachmentBuilder } from 'discord.js';
 import { getChannelScope } from '../archive/permissions.js';
+import { closeBrowserSandbox } from './browser.js';
 import { agentConfig, agentEnabled } from './config.js';
 import {
   RefTable,
@@ -17,8 +18,8 @@ import {
 } from './format.js';
 import { runAgent } from './llm.js';
 import { buildSystemPrompt, buildUserContent } from './prompt.js';
-import { finalizeCall, releaseCall, reserveCall } from './ratelimit.js';
-import { ThinkingIndicator } from './thinking.js';
+import { finalizeCall, recordToolCalls, releaseCall, reserveCall } from './ratelimit.js';
+import { ThinkingIndicator, toolLabel } from './thinking.js';
 import { buildToolset } from './tools.js';
 
 const NO_MENTIONS = { parse: [], repliedUser: false };
@@ -76,10 +77,17 @@ function stripMention(content, clientId) {
     .trim();
 }
 
+/**
+ * ブラウザを「操作」できる人。
+ *
+ * ManageGuild では出さない。モデレータ権限は普通に何人も持っているのに、
+ * 生 CDP と eval は共有 Chrome に載っているログイン済みセッションに届く
+ * (Cookie の吸い出しも root でのファイル書き込みも射程に入る)。
+ * 名指しの許可リストだけにして、既定では誰も持たない。
+ */
 function canUseFullBrowser(member) {
   if (agentConfig.browserFullForAll) return true;
-  if (agentConfig.browserTrustedUsers.includes(member.id)) return true;
-  return Boolean(member.permissions?.has('ManageGuild'));
+  return agentConfig.browserTrustedUsers.includes(member.id);
 }
 
 function limitMessage(reservation) {
@@ -89,10 +97,11 @@ function limitMessage(reservation) {
 
   const at = `<t:${Math.floor(reservation.retryAt / 1000)}:R>`;
   const hours = Math.round(reservation.windowMs / 3_600_000);
+  const amount = `${Math.round(reservation.used / 1000)}k / ${Math.round(reservation.limit / 1000)}k トークン`;
 
   return reservation.scope === 'user'
-    ? `呼び出しの上限に達しました (1人あたり ${hours} 時間で ${reservation.limit} 回)。${at} に空きます。`
-    : `サーバー全体の上限に達しました (${hours} 時間で ${reservation.limit} 回)。${at} に空きます。`;
+    ? `使用量の上限に達しました (1人あたり ${hours} 時間で ${amount})。${at} に空きます。`
+    : `サーバー全体の使用量の上限に達しました (${hours} 時間で ${amount})。${at} に空きます。`;
 }
 
 async function fetchRecent(channel, excludeId, limit) {
@@ -136,10 +145,14 @@ export async function handleAgentRequest(message, client) {
 
   let finished = false;
   let indicator = null;
+  let ctx = null;
+
+  // 例外や中断でも使ったぶんが残るように、外で持って runAgent に渡す。
+  const usage = { prompt_tokens: 0, completion_tokens: 0, prompt_cache_hit_tokens: 0 };
 
   try {
     const refs = new RefTable();
-    const ctx = {
+    ctx = {
       client,
       guild,
       channel: message.channel,
@@ -148,7 +161,10 @@ export async function handleAgentRequest(message, client) {
       budget: { remaining: agentConfig.maxToolChars },
       screenshots: [],
       channelScope: getChannelScope(guild, member),
-      browserFull: canUseFullBrowser(member)
+      browserFull: canUseFullBrowser(member),
+      // ツールの中から表示を差し替えられるようにする。キーワード検索から
+      // 意味検索へ自動で回すときに数秒止まるので、そこを黙らせない。
+      setStatus: (status) => indicator?.setStatus(status)
     };
 
     // 「-# thinking (10s)」を出しておく。この先の準備 (ブラウザの生存確認や
@@ -165,6 +181,8 @@ export async function handleAgentRequest(message, client) {
       : null;
 
     const recent = await fetchRecent(message.channel, message.id, agentConfig.preloadMessages);
+    // query を省略した意味検索で「いまの会話」を使う
+    ctx.recent = recent;
 
     const system = buildSystemPrompt(ctx, toolset);
     const userContent = buildUserContent({
@@ -178,8 +196,9 @@ export async function handleAgentRequest(message, client) {
       system,
       userContent,
       toolset,
+      usage,
       signal: controller.signal,
-      onToolCall: (name) => indicator.setStatus(name)
+      onToolCall: (name, args) => indicator.setStatus(toolLabel(name, args))
     });
 
     finalizeCall(reservation.id, {
@@ -187,6 +206,7 @@ export async function handleAgentRequest(message, client) {
       rounds: result.rounds,
       usage: result.usage
     });
+    recordToolCalls(reservation.id, result.used);
     finished = true;
 
     // 回答ができたので経過表示は消す。回答は新しいメッセージとして送るので、
@@ -221,8 +241,9 @@ export async function handleAgentRequest(message, client) {
     const aborted = error.name === 'AbortError';
     console.error('Agent request failed:', error);
 
-    // API 側の障害やタイムアウトは呼び出し回数に数えない (制限は寛大に)。
-    if (!finished) releaseCall(reservation.id);
+    // API 側の障害は数えない。ただし途中まで払ったトークンは記録に残す
+    // (9往復してタイムアウトしたぶんを0として捨てると請求と乖離する)。
+    if (!finished) releaseCall(reservation.id, usage);
 
     // エラー文を出す前に経過表示を片付ける
     await indicator?.stop();
@@ -236,6 +257,8 @@ export async function handleAgentRequest(message, client) {
   } finally {
     // 取りこぼしの保険。stop() は何度呼んでも安全。
     await indicator?.stop();
+    // 隔離タブは実行ごとに捨てる。残すと次の人が中身を読める。
+    if (ctx) await closeBrowserSandbox(ctx).catch(() => {});
     clearTimeout(timeout);
   }
 }

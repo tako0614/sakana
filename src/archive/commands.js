@@ -8,10 +8,18 @@ import {
   SlashCommandBuilder
 } from 'discord.js';
 
-import { countMessages, getEmbedState, getGuildState, listChannelStates, purgeGuild } from './db.js';
+import {
+  checkFtsIntegrity,
+  countMessages,
+  getEmbedState,
+  getGuildState,
+  listChannelStates,
+  purgeGuild,
+  rebuildFts
+} from './db.js';
 import { cancelJob, coverageReport, getRunningJob, runCoverageJob, runIndexJob } from './indexer.js';
 import { embedPreflight, runEmbedJob } from './embed-job.js';
-import { coverage as vectorCoverage } from './vectors.js';
+import { chunkCoverage } from './chunks.js';
 import { canManageIndex, canSeeDeleted, getChannelScope } from './permissions.js';
 import { QueryError } from './query.js';
 import {
@@ -181,6 +189,9 @@ const indexCommand = {
         .setDescription('既存のベクトルを捨てて作り直す (モデルを変えたとき)')
         .setRequired(false)))
     .addSubcommand((sub) => sub
+      .setName('repair')
+      .setDescription('全文検索の索引を検査し、壊れていたら作り直します'))
+    .addSubcommand((sub) => sub
       .setName('status')
       .setDescription('インデックスの状態を表示します'))
     .addSubcommand((sub) => sub
@@ -209,6 +220,7 @@ const indexCommand = {
     if (sub === 'reset') return confirmReset(interaction);
     if (sub === 'verify') return startVerify(interaction);
     if (sub === 'embed') return startEmbed(interaction);
+    if (sub === 'repair') return repairFts(interaction);
 
     return startIndex(interaction, sub === 'build' ? 'full' : 'update');
   }
@@ -255,25 +267,35 @@ async function showStatus(interaction) {
   const coverage = coverageReport(guildId);
   embed.addFields({
     name: '被覆',
-    value: coverage.gapCount === 0
+    value: coverage.clean
       ? '穴なし (記録済みの区間が連続しています)'
       : [
-        `⚠️ 穴 ${coverage.gapCount} 件 (合計 ${formatDuration(coverage.gapMs)})`,
+        coverage.gapCount > 0
+          ? `⚠️ 穴 ${coverage.gapCount} 件 (合計 ${formatDuration(coverage.gapMs)})`
+          : '',
         ...coverage.worst.map((entry) => `<#${entry.channelId}> ${entry.gaps}件 / ${formatDuration(entry.ms)}`),
+        // 「半分だけ取り込んだ」は区間が1本に見えるので、隙間の数だけでは絶対に出ない
+        coverage.headMissingCount > 0
+          ? `⚠️ 先頭まで遡れていない ${coverage.headMissingCount} チャンネル`
+          : '',
+        ...coverage.headMissing.map((entry) => `<#${entry.channelId}> 冒頭 ${formatDuration(entry.ms)} 未取得`),
+        coverage.unspanned.length > 0
+          ? `⚠️ 区間の記録が無い ${coverage.unspanned.length} チャンネル (次の起動時に区間を作って追いつきます)`
+          : '',
         '`/index verify` で埋められます (削除済みメッセージは復元できません)'
-      ].join('\n')
+      ].filter(Boolean).join('\n')
   });
 
   // 意味検索の被覆。部分的なまま「無い=言っていない」と読まれないように数字を出す。
   const embedState = getEmbedState(guildId);
   if (embedState?.model_id) {
     try {
-      const vec = vectorCoverage(guildId, embedState.model_id);
+      const vec = chunkCoverage(guildId, embedState.model_id);
       embed.addFields({
-        name: '意味検索',
+        name: '意味検索 (会話単位)',
         value: [
-          `${formatNumber(vec.done)} / ${formatNumber(vec.embeddable)} 件 (${Math.round(vec.ratio * 100)}%)`,
-          vec.stale > 0 ? `旧モデルのベクトル ${formatNumber(vec.stale)} 件 (無視されます)` : '',
+          `${formatNumber(vec.done)} / ${formatNumber(vec.total)} 会話 (${Math.round(vec.ratio * 100)}%)`,
+          `${formatNumber(vec.messages)} 件の発言を含む`,
           embedState.status === 'error' ? `⚠️ ${embedState.last_error ?? 'エラー'}` : ''
         ].filter(Boolean).join('\n'),
         inline: true
@@ -281,6 +303,23 @@ async function showStatus(interaction) {
     } catch {
       // 埋め込み未使用の構成でも status は出せるようにする
     }
+  }
+
+  // 実体の無いチャンネル。権限を判定できないので一般メンバーの検索からは
+  // 黙って落ちている。数を出さないと「昔の発言が無い」の原因が分からない。
+  const orphaned = channels.filter((channel) => (
+    !channel.is_thread && !interaction.guild.channels.cache.has(channel.channel_id)
+  ));
+
+  if (orphaned.length > 0) {
+    const messages = orphaned.reduce((sum, channel) => sum + (channel.message_count ?? 0), 0);
+    embed.addFields({
+      name: `サーバーから消えたチャンネル (${orphaned.length})`,
+      value: [
+        `${formatNumber(messages)} 件のメッセージを保持しています。`,
+        '権限を判定できないので一般メンバーの検索には出ません (管理者と `ARCHIVE_ADMIN_USERS` の人には出ます)。'
+      ].join('')
+    });
   }
 
   if (incomplete.length > 0) {
@@ -315,6 +354,38 @@ function formatDuration(ms) {
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours}時間${minutes % 60}分`;
   return `${Math.floor(hours / 24)}日${hours % 24}時間`;
+}
+
+/**
+ * 全文検索の索引を検査して、壊れていたら作り直す。
+ *
+ * 索引が本体とずれると「件数は合っているのに古い行だけ引けない」状態になり、
+ * 症状が出ないまま検索結果が痩せる。直す手段がリポジトリに無かったので用意する。
+ */
+async function repairFts(interaction) {
+  await interaction.deferReply();
+
+  const first = checkFtsIntegrity();
+  if (first.ok) {
+    await interaction.editReply('全文検索の索引は本体と一致しています (作り直しは不要)。');
+    return;
+  }
+
+  await interaction.editReply(`⚠️ 索引が本体とずれています (${first.error})。作り直します…`);
+
+  try {
+    rebuildFts();
+  } catch (error) {
+    await interaction.editReply(`索引の作り直しに失敗しました: ${String(error.message ?? error).slice(0, 300)}`);
+    return;
+  }
+
+  const second = checkFtsIntegrity();
+  await interaction.editReply(
+    second.ok
+      ? '索引を作り直しました。検索が痩せていた分は元に戻ります。'
+      : `作り直しましたが、まだ食い違っています: ${second.error}`
+  );
 }
 
 async function startVerify(interaction) {
@@ -430,7 +501,7 @@ async function startEmbed(interaction) {
   }
 
   // 見積りは推定値ではなく SQL で数えた実数を出す
-  const target = rebuild ? preflight.embeddable : preflight.remaining;
+  const target = rebuild ? preflight.total : preflight.remaining;
   await interaction.editReply({
     content: [
       `🧠 埋め込み対象 **${formatNumber(target)} 件**`,
@@ -610,7 +681,7 @@ const searchCommand = {
       .setRequired(false))
     .addStringOption((option) => option
       .setName('after')
-      .setDescription('この日より後 (2024-05-01 / 2024-05 / 7d / today)')
+      .setDescription('この日以降 (2024-05-01 / 2024-05 / 2020 / 7d / today)')
       .setRequired(false))
     .addStringOption((option) => option
       .setName('before')
@@ -718,7 +789,7 @@ const searchStatsCommand = {
       ))
     .addUserOption((option) => option.setName('from').setDescription('投稿者で絞り込む').setRequired(false))
     .addChannelOption((option) => option.setName('in').setDescription('チャンネルで絞り込む').setRequired(false))
-    .addStringOption((option) => option.setName('after').setDescription('この日より後').setRequired(false))
+    .addStringOption((option) => option.setName('after').setDescription('この日以降').setRequired(false))
     .addStringOption((option) => option.setName('before').setDescription('この日より前').setRequired(false)),
 
   async execute(interaction) {

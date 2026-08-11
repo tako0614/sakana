@@ -1,7 +1,7 @@
 // 実行中の経過表示。
 //
 //   -# thinking (10s)
-//   -# thinking (12s) · search_messages
+//   -# thinking (12s) · 検索
 //
 // `-#` は Discord の小文字表示 (subtext)。会話の邪魔にならないようにこれで出す。
 // 答えができたらこのメッセージは削除し、回答は新しいメッセージとして送り直す。
@@ -10,6 +10,25 @@
 import { agentConfig } from './config.js';
 
 const NO_MENTIONS = { parse: [], repliedUser: false };
+
+/**
+ * ツール名をそのまま出すと `· search` のような英語が会話に流れる。
+ * ここは人が読む場所なので日本語にする。mode まで見て何をしているか出す。
+ */
+export function toolLabel(name, args = {}) {
+  if (name === 'search') {
+    const mode = String(args.mode ?? '').trim().toLowerCase();
+    if (mode === 'count') return '集計';
+    if (mode === 'meaning') return '意味検索';
+    return '検索';
+  }
+
+  if (name === 'read') return args.direction === 'replies' ? '返信をたどる' : '読み込み';
+  if (name === 'channels') return 'チャンネル一覧';
+  if (name === 'browser') return 'ブラウザ';
+
+  return name;
+}
 
 export class ThinkingIndicator {
   constructor(channel) {

@@ -9,12 +9,14 @@ import { agentConfig } from './config.js';
 import {
   activatePage,
   closePage,
-  createIsolatedPage,
-  createPage,
+  createBrowserContext,
+  createPageInContext,
+  disposeBrowserContext,
   getSession,
   listPages
 } from './cdp.js';
 import { truncate } from './format.js';
+import { inspectUrl } from './urlguard.js';
 
 // 閲覧するだけの action。誰でも使える。
 const READ_ACTIONS = new Set([
@@ -30,94 +32,152 @@ const FULL_ACTIONS = new Set([
 
 const MAX_SCREENSHOTS = 2;
 
-// 信頼されていない人向けの隔離タブ。オーナーが開いている業務タブを読ませないため、
-// この bot が自分で作ったタブだけを触らせる。
-let sandboxTargetId = null;
-let sandboxContextId = null;
+// action:"cdp" から呼べるメソッド。禁止リストは必ず漏れるので許可リストにする。
+// 特に Browser.setDownloadBehavior (root でのファイル書き込み) と
+// Network.getAllCookies / Storage.*Cookies* (ログイン済みプロファイルの吸い出し) と
+// Target.* (この関門を通らないタブの作成) は絶対に通さない。
+const CDP_ALLOWED_METHODS = new Set([
+  'Page.getNavigationHistory', 'Page.getLayoutMetrics', 'Page.getFrameTree',
+  'Page.getResourceTree', 'Page.captureScreenshot', 'Page.printToPDF', 'Page.reload',
+  'DOM.getDocument', 'DOM.querySelector', 'DOM.querySelectorAll', 'DOM.getOuterHTML',
+  'DOM.getAttributes', 'DOM.getBoxModel', 'DOM.describeNode',
+  'CSS.getComputedStyleForNode',
+  'Accessibility.getFullAXTree',
+  'Network.getResponseBody',
+  'Input.dispatchKeyEvent', 'Input.dispatchMouseEvent', 'Input.insertText',
+  'Emulation.setDeviceMetricsOverride'
+]);
 
-export const browserToolDefinition = {
-  type: 'function',
-  function: {
-    name: 'browser',
-    description: [
-      '外付け Chrome を操作する。貼られた URL の中身を実際に開いて確かめるときに使う。',
-      'action: open(url を開いて本文を返す) / text(本文) / links(リンク一覧) / html /',
-      'screenshot(返信に画像を添付) / click / type / key / scroll / wait / eval /',
-      'back / forward / reload / tabs / tab / new_tab / close_tab / console / network /',
-      'cdp(生の CDP メソッド)。'
-    ].join(' '),
-    parameters: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', description: '実行する操作' },
-        url: { type: 'string', description: 'open / new_tab で開く URL' },
-        selector: { type: 'string', description: 'click / type / scroll / wait の対象 CSS セレクタ' },
-        text: { type: 'string', description: 'type で入力する文字列' },
-        key: { type: 'string', description: 'key で押すキー (Enter / Escape / Tab など)' },
-        expression: { type: 'string', description: 'eval で評価する JavaScript' },
-        method: { type: 'string', description: 'cdp で呼ぶメソッド名 (例: Page.printToPDF)' },
-        params: { type: 'object', description: 'cdp のパラメータ' },
-        dy: { type: 'number', description: 'scroll の縦移動量 (px)' },
-        ms: { type: 'number', description: 'wait の待ち時間 (ms)' },
-        index: { type: 'number', description: 'tab / close_tab の対象タブ番号' },
-        submit: { type: 'boolean', description: 'type のあとに Enter を押すか' }
-      },
-      required: ['action']
+/**
+ * 権限に合わせて定義を出し分ける。
+ *
+ * 操作系を許していない人にまで eval / cdp を宣伝すると、モデルがそれを選んで
+ * 拒否文を受け取り、1往復まるごと無駄になる。enum も実装の集合から作るので、
+ * action を足したときに宣伝と実装がずれない。
+ */
+export function browserToolDefinition(browserFull) {
+  const actions = browserFull ? [...READ_ACTIONS, ...FULL_ACTIONS] : [...READ_ACTIONS];
+
+  return {
+    type: 'function',
+    function: {
+      name: 'browser',
+      description: [
+        '外付け Chrome を操作する。貼られた URL の中身を実際に開いて確かめるときに使う。',
+        'open で URL を開いて本文を返し、screenshot は返信に画像を添付する。',
+        browserFull ? 'cdp は生の CDP メソッド (読み取り系のみ許可)。' : ''
+      ].join(' '),
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: actions, description: '実行する操作' },
+          url: { type: 'string', description: 'open / new_tab で開く URL' },
+          selector: { type: 'string', description: 'click / type / scroll / wait の対象 CSS セレクタ' },
+          text: { type: 'string', description: 'type で入力する文字列' },
+          key: { type: 'string', description: 'key で押すキー (Enter / Escape / Tab など)' },
+          expression: { type: 'string', description: 'eval で評価する JavaScript' },
+          method: { type: 'string', description: 'cdp で呼ぶメソッド名' },
+          params: { type: 'object', description: 'cdp のパラメータ' },
+          dy: { type: 'number', description: 'scroll の縦移動量 (px)' },
+          ms: { type: 'number', description: 'wait の待ち時間 (ms)' },
+          index: { type: 'number', description: 'tab / close_tab の対象タブ番号' },
+          submit: { type: 'boolean', description: 'type のあとに Enter を押すか' }
+        },
+        required: ['action']
+      }
     }
-  }
-};
+  };
+}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function normalizeUrl(input) {
-  const trimmed = String(input ?? '').trim();
-  if (!trimmed) throw new Error('url を指定してください。');
-
-  const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(trimmed);
-  const parsed = new URL(hasScheme ? trimmed : `https://${trimmed}`);
-
-  const allowed = agentConfig.browserAllowLocal
-    ? new Set(['http:', 'https:', 'file:', 'about:', 'data:', 'chrome:'])
-    : new Set(['http:', 'https:', 'about:']);
-
-  if (!allowed.has(parsed.protocol)) {
-    throw new Error(`このスキームは許可されていません: ${parsed.protocol}`);
-  }
-
-  if (!agentConfig.browserAllowLocal && /^(localhost|127\.|0\.0\.0\.0|\[::1\]|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/i.test(parsed.hostname)) {
-    throw new Error('ローカル/内部ネットワークへのアクセスは許可されていません。');
-  }
-
-  return parsed.href;
+function checkUrl(input) {
+  return inspectUrl(input, { allowLocal: agentConfig.browserAllowLocal });
 }
 
 /**
- * 隔離タブを用意する。信頼されていない人はこのタブしか触れない。
+ * リダイレクトとページ内 fetch を塞ぐ。
  *
- * 重要: 共有プロファイルに普通のタブを作ると Cookie を引き継ぐので、
- * オーナーがログイン済みのサイト (管理画面や決済ダッシュボード) を
- * 誰でも開いて読めてしまう。必ず独立コンテキストで作る。
+ * URL を1回検査するだけでは足りない。302 で内部に飛ばされても、ページ内の
+ * fetch('http://192.168.0.1/') を DOM に描かれても、本文としてそのまま返ってしまう。
+ * Fetch ドメインで1リクエストずつ止めて同じ判定をかけるのが、両方を覆える唯一の層。
+ *
+ * 注意: Fetch.enable を張ったら全リクエストに必ず返事をしないとページが止まる。
+ * 判定に失敗したときは continue ではなく fail に寄せる (確認できないものは通さない)。
  */
-async function getSandboxSession() {
-  const pages = await listPages();
+async function installRequestGuard(session) {
+  if (session.guarded) return;
+  session.guarded = true;
 
-  if (sandboxTargetId && !pages.some((page) => page.id === sandboxTargetId)) {
-    sandboxTargetId = null;
-    sandboxContextId = null;
-  }
+  session.on('Fetch.requestPaused', async (params) => {
+    const requestId = params?.requestId;
+    if (!requestId) return;
 
-  if (!sandboxTargetId) {
-    const created = await createIsolatedPage('about:blank');
-    sandboxTargetId = created?.targetId ?? null;
-    sandboxContextId = created?.browserContextId ?? null;
-    if (!sandboxTargetId) throw new Error('ブラウザのタブを開けませんでした。');
-  }
+    let allow = false;
+    try {
+      const url = String(params?.request?.url ?? '');
+      // ネットワークに出ないものは検査対象にしない
+      allow = /^(about:|data:|blob:)/i.test(url) ? true : (await checkUrl(url)).ok;
+    } catch {
+      allow = false;
+    }
 
-  return getSession(sandboxTargetId);
+    await session
+      .send(allow ? 'Fetch.continueRequest' : 'Fetch.failRequest',
+        allow ? { requestId } : { requestId, errorReason: 'Aborted' })
+      .catch(() => {});
+  });
+
+  await session.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] }).catch(() => {
+    // 張れなかったら Fetch なしで続ける。入口の検査と着地の再検査は残る。
+    session.guarded = false;
+  });
 }
 
+/**
+ * この実行専用の隔離タブを用意する。
+ *
+ * 共有プロファイルに普通のタブを作ると Cookie を引き継ぐので、オーナーが
+ * ログイン済みのサイト (管理画面や決済ダッシュボード) を誰でも開いて読めてしまう。
+ * さらにタブを実行ごとに作って捨てることで、他の人が開いたページ・履歴・
+ * そのコンテキストに溜まった Cookie を後から覗かれないようにする。
+ */
+async function getSandboxSession(ctx) {
+  ctx.browser ??= { contextId: null, sandboxTargetId: null, opened: [] };
+
+  if (!ctx.browser.sandboxTargetId) {
+    ctx.browser.contextId = await createBrowserContext();
+    ctx.browser.sandboxTargetId = await createPageInContext('about:blank', ctx.browser.contextId);
+    if (!ctx.browser.sandboxTargetId) throw new Error('ブラウザのタブを開けませんでした。');
+    ctx.browser.opened.push(ctx.browser.sandboxTargetId);
+  }
+
+  const session = await getSession(ctx.browser.sandboxTargetId);
+  await installRequestGuard(session);
+  return session;
+}
+
+/**
+ * 既定は必ず隔離タブ。tab で明示的に既存タブへ移ったときだけそちらを使う
+ * (既存タブを覗くのは信頼済みの人だけの機能なので、そこは意図した動作)。
+ */
 function resolveSession(ctx) {
-  return ctx.browserFull ? getSession() : getSandboxSession();
+  return ctx.browser?.attachedTargetId
+    ? getSession(ctx.browser.attachedTargetId)
+    : getSandboxSession(ctx);
+}
+
+/** 実行の終わりに隔離タブとコンテキストを捨てる。残すと Cookie が溜まっていく。 */
+export async function closeBrowserSandbox(ctx) {
+  const state = ctx?.browser;
+  if (!state) return;
+
+  for (const targetId of state.opened ?? []) {
+    await closePage(targetId).catch(() => {});
+  }
+  await disposeBrowserContext(state.contextId);
+
+  ctx.browser = null;
 }
 
 async function waitForLoad(session, timeoutMs = agentConfig.browserTimeoutMs) {
@@ -142,6 +202,11 @@ const READABLE_SNIPPET = `(() => {
 async function readPage(session, limit) {
   const page = await session.evaluate(READABLE_SNIPPET);
   if (!page) return 'ページを読み取れませんでした。';
+
+  // 着地先を必ず見る。Fetch を張れなかったときの保険で、リダイレクトで
+  // 内部に飛ばされていたらここで本文を渡さない。
+  const landed = await checkUrl(page.url);
+  if (!landed.ok) return `開いた先が許可されていないので本文は返しません。${landed.reason}`;
 
   return [
     `title: ${truncate(page.title, 200)}`,
@@ -185,7 +250,10 @@ export async function runBrowserAction(ctx, args = {}) {
 
   switch (action) {
     case 'open': {
-      const url = normalizeUrl(args.url);
+      const checked = await checkUrl(args.url);
+      if (!checked.ok) return checked.reason;
+
+      const url = checked.url;
       await session.send('Page.navigate', { url });
       await waitForLoad(session);
       await sleep(300); // 描画が追いつくまで少し待つ
@@ -339,8 +407,24 @@ export async function runBrowserAction(ctx, args = {}) {
     }
 
     case 'cdp': {
-      if (!args.method) return 'method を指定してください。';
-      const result = await session.send(String(args.method), args.params ?? undefined);
+      const method = String(args.method ?? '').trim();
+      if (!method) return 'method を指定してください。';
+
+      if (!CDP_ALLOWED_METHODS.has(method)) {
+        return [
+          `${method} は cdp から呼べません。`,
+          'Cookie の取得・ダウンロード設定・タブやコンテキストの作成・ファイル読み出しは禁止しています。',
+          'ページを読むなら text / html、JS を動かすなら eval を使ってください。'
+        ].join(' ');
+      }
+
+      // params.url を持つメソッドは、この関門を迂回する経路になるので必ず検査する
+      if (args.params?.url) {
+        const checked = await checkUrl(args.params.url);
+        if (!checked.ok) return checked.reason;
+      }
+
+      const result = await session.send(method, args.params ?? undefined);
       return truncate(JSON.stringify(result ?? null), textLimit);
     }
 
@@ -359,15 +443,29 @@ export async function runBrowserAction(ctx, args = {}) {
 
       await activatePage(page.id);
       await getSession(page.id);
+
+      // 以降この実行では既存タブ側を操作する (隔離タブに戻すには new_tab)
+      ctx.browser ??= { contextId: null, sandboxTargetId: null, opened: [] };
+      ctx.browser.attachedTargetId = page.id;
+
       return `タブ ${args.index} に切り替えました: ${truncate(page.title, 80)}`;
     }
 
     case 'new_tab': {
-      const url = args.url ? normalizeUrl(args.url) : 'about:blank';
-      const created = await createPage(url);
-      if (!created?.id) return 'タブを開けませんでした。';
+      const checked = args.url ? await checkUrl(args.url) : { ok: true, url: 'about:blank' };
+      if (!checked.ok) return checked.reason;
 
-      const next = await getSession(created.id);
+      // 隔離コンテキストの中に足す。既定プロファイルに作るとログイン状態を引き継ぐ。
+      await getSandboxSession(ctx);
+      const targetId = await createPageInContext(checked.url, ctx.browser.contextId);
+      if (!targetId) return 'タブを開けませんでした。';
+
+      ctx.browser.opened.push(targetId);
+      ctx.browser.attachedTargetId = null;
+      ctx.browser.sandboxTargetId = targetId;
+
+      const next = await getSession(targetId);
+      await installRequestGuard(next);
       await waitForLoad(next);
       return readPage(next, Math.min(textLimit, 2000));
     }

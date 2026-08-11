@@ -1,6 +1,7 @@
 import { ChannelType } from 'discord.js';
 import {
   channelGaps,
+  channelMessageRange,
   channelTailGap,
   countChannelMessages,
   getChannelState,
@@ -139,12 +140,33 @@ async function collectThreads(channel, botMember) {
   for (const type of ['public', 'private']) {
     let before;
 
+    // private は fetchAll を付けないと discord.js が before をリクエストに載せず
+    // (ThreadManager が type==='public' || fetchAll のときだけ before を送る)、
+    // さらに「bot が参加済み」のスレッドしか返さない経路を使う。
+    // つまり同じ1ページ目を200回引き直して、101件目以降は永久に取り込まれない。
+    // fetchAll には ManageThreads が要るので、拒否されたら従来の経路に落とす。
+    let fetchAll = type === 'private';
+    let exhausted = false;
+
     for (let page = 0; page < 200; page += 1) {
-      const fetched = await channel.threads
-        .fetchArchived({ type, limit: PAGE_SIZE, before })
+      let fetched = await channel.threads
+        .fetchArchived({ type, fetchAll, limit: PAGE_SIZE, before })
         .catch(() => null);
 
-      if (!fetched || fetched.threads.size === 0) break;
+      if (!fetched && fetchAll) {
+        fetchAll = false;
+        fetched = await channel.threads
+          .fetchArchived({ type, limit: PAGE_SIZE, before })
+          .catch(() => null);
+
+        if (fetched) {
+          console.warn(
+            `ManageThreads が無いため #${channel.name ?? channel.id} の非公開スレッドは参加済みのぶんだけ取り込みます。`
+          );
+        }
+      }
+
+      if (!fetched || fetched.threads.size === 0) { exhausted = true; break; }
 
       threads.push(...fetched.threads.values());
 
@@ -154,9 +176,19 @@ async function collectThreads(channel, botMember) {
         if (stamp < oldest) oldest = stamp;
       }
 
-      if (!fetched.hasMore || !Number.isFinite(oldest)) break;
+      if (!fetched.hasMore || !Number.isFinite(oldest)) { exhausted = true; break; }
+
+      // before が効かない経路では次ページを引いても同じ結果なので、ここで打ち切る
+      if (type === 'private' && !fetchAll) { exhausted = true; break; }
+
       before = oldest;
       await sleep(FETCH_DELAY_MS);
+    }
+
+    if (!exhausted) {
+      console.warn(
+        `#${channel.name ?? channel.id} の${type === 'private' ? '非公開' : '公開'}アーカイブ済みスレッドが200ページ上限に達しました。取りきれていません。`
+      );
     }
   }
 
@@ -308,13 +340,25 @@ export function markCatchupDone(channelId) {
  * 追いつきが済むまで区間を伸ばさないので、停止中の穴が消えずに残っている。
  */
 async function catchupChannel(channel, { job }) {
-  const state = getChannelState(channel.id);
   const spans = listSpans(channel.id);
-  // 区間が無い = まだ一度も取り込んでいない。/index build の仕事なので触らない。
-  const anchor = spans.length > 0 ? spans[spans.length - 1].to_id : null;
+  let anchor = spans.length > 0 ? spans[spans.length - 1].to_id : null;
+
   if (!anchor) {
-    if (state?.newest_id) markCatchupDone(channel.id);
-    return 0;
+    // 区間が無いのに取り込み済みのメッセージがある = channel_spans を入れる前に
+    // 取ったチャンネル (と live indexing だけで作られたチャンネル)。
+    //
+    // ここで「追いつき済み」の印だけ付けて帰ると、復帰後の最初の1通が
+    // recordSpan(停止前の newest_id, 今の id) を書いてダウン期間を「取った」ことに
+    // してしまい、穴が永久に隠れる。手持ちの範囲を初期区間として1本作ってから追いつく。
+    //
+    // 限界: この1本は「oldest〜newest は連続して持っている」という仮定を置く。
+    // 内側に穴があっても DB からは判別できない。それでも、末尾の穴 (= 停止中の欠損) は
+    // これで必ず埋まるので、印だけ付けて帰る現状より確実に良い。
+    const range = channelMessageRange(channel.id);
+    if (!range.oldestId || !range.newestId) return 0; // 本当に空。/index build の仕事
+
+    recordSpan(channel.id, range.oldestId, range.newestId);
+    anchor = range.newestId;
   }
 
   let cursor = anchor;
@@ -428,7 +472,17 @@ export async function runCoverageJob(guild, { mode = 'catchup', onProgress = () 
           const countGaps = () => channelGaps(channel.id).length + (channelTailGap(channel.id) ? 1 : 0);
           const before = countGaps();
           await catchupChannel(channel, { job });
-          if (mode === 'verify') await fillGaps(channel, { job });
+
+          if (mode === 'verify') {
+            await fillGaps(channel, { job });
+
+            // 先頭まで遡れていないチャンネルは、区間の隙間としては見えないので
+            // ここで続きを取る。indexChannel の後方走査が oldest_id から再開する。
+            if (getChannelState(channel.id)?.complete !== 1) {
+              await indexChannel(channel, { mode: 'full', job });
+            }
+          }
+
           job.gapsClosed += Math.max(0, before - countGaps());
         } catch (error) {
           console.error(`Failed to catch up channel ${row.channel_id}:`, error);
@@ -480,13 +534,34 @@ async function catchupGuilds(client) {
  * チャンネルごとの被覆状況。/index status 用。
  * 区間の隙間だけでなく、未検証の末尾 (停止中に流れた分) も数える。
  */
+// チャンネル作成から最初の発言までは普通に空くので、これ未満は穴と見なさない。
+const HEAD_TOLERANCE_MS = 86_400_000;
+
 export function coverageReport(guildId) {
   const channels = listChannelStates(guildId);
   let gapCount = 0;
   let gapMs = 0;
   const worst = [];
+  const unspanned = [];
+  const headMissing = [];
 
   for (const row of channels) {
+    const spans = listSpans(row.channel_id);
+
+    // 区間が1本も無いのにメッセージがある = 区間管理を入れる前に取ったチャンネル。
+    // 区間が無い間は隙間も末尾も計算できないので、被覆の計算から漏れている。
+    if (spans.length === 0 && row.message_count > 0) unspanned.push(row.channel_id);
+
+    // 先頭に届いていないぶん。区間の隙間では絶対に見えない
+    // (半分だけ取り込んだチャンネルは「連続した1本の区間」に見えるため)。
+    if (row.complete !== 1 && spans.length > 0) {
+      const createdAt = snowflakeToMs(row.channel_id);
+      const missing = createdAt ? spans[0].from_ms - createdAt : 0;
+      if (missing > HEAD_TOLERANCE_MS) {
+        headMissing.push({ channelId: row.channel_id, ms: missing });
+      }
+    }
+
     const gaps = [...channelGaps(row.channel_id)];
     const tail = channelTailGap(row.channel_id);
     if (tail) gaps.push(tail);
@@ -499,7 +574,17 @@ export function coverageReport(guildId) {
   }
 
   worst.sort((a, b) => b.ms - a.ms);
-  return { gapCount, gapMs, worst: worst.slice(0, 5) };
+  headMissing.sort((a, b) => b.ms - a.ms);
+
+  return {
+    gapCount,
+    gapMs,
+    worst: worst.slice(0, 5),
+    unspanned,
+    headMissing: headMissing.slice(0, 5),
+    headMissingCount: headMissing.length,
+    clean: gapCount === 0 && unspanned.length === 0 && headMissing.length === 0
+  };
 }
 
 /**

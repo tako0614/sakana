@@ -1,80 +1,65 @@
-// 意味検索ツール。
+// 意味検索 (mode:meaning)。
 //
-// search_messages は文字列一致なので、「レビュー無しでマージするのは絶対に
+// mode:keyword は文字列一致なので、「レビュー無しでマージするのは絶対に
 // やめるべき」と「急ぎだから自分のPRはレビュー飛ばして通した」を結び付けられない
 // (共通する部分文字列がほぼ無い)。言い換えを跨ぐにはこれが必要。
 //
+// 単位は1発言ではなく「会話のまとまり」。理由は chunks.js に書いてある。
+//
 // 実測で分かった重要な性質: 無関係な日本語の文どうしでもコサインは 0.77〜0.82 出る。
+// まとまりにしても下がらない (0.7988 → 0.8045 で、むしろ僅かに上がった)。
 // つまり絶対閾値では絞れず、意味があるのは順位だけ。生のスコアだけをモデルに
 // 見せると「0.79 も高いから似ている」と誤読するので、順位と併記し、
 // 相対値であることを明記する。
 
-import { coverage, fetchByRowids, scanTopK } from '../archive/vectors.js';
+import { chunkCoverage, chunkMessages } from '../archive/chunks.js';
+import { fetchChunks, scanChunksTopK } from '../archive/vectors.js';
 import { resolveModel } from '../archive/embed-job.js';
 import { embedConfig } from '../embed/config.js';
 import { embedTexts, isDisabled } from '../embed/worker.js';
-import { formatMessages, fromArchiveRow, truncate } from './format.js';
+import { agentConfig } from './config.js';
+import { shortTime, truncate } from './format.js';
 
-export const semanticToolDefinition = {
-  type: 'function',
-  function: {
-    name: 'semantic_search',
-    description: [
-      '言い方が違っても意味が近い発言を探す。search_messages は文字列一致なので',
-      '「レビュー無しでマージするのはやめるべき」と「急ぎだからレビュー飛ばして通した」を',
-      '結び付けられない。同じ人の主張の食い違い (ダブスタ) を調べるときは author を指定して使う。',
-      '返るのは「話題が近い発言」で、矛盾かどうかの判断はしない。',
-      '類似度は相対値で、無関係な文でも 0.78 前後になる。絶対値で判断せず順位で見ること。',
-      '断定する前に read_channel で前後を読むこと。'
-    ].join(''),
-    parameters: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: '探したい主張や話題。文で書くほうが効く。検索結果の参照番号を渡すとその発言に似た発言を探す' },
-        author: { type: 'string', description: '投稿者 (表示名か ID)。食い違いを調べるならほぼ必須' },
-        channel: { type: 'string', description: 'チャンネル (#名前か ID)' },
-        after: { type: 'string', description: 'この日より後' },
-        before: { type: 'string', description: 'この日より前' },
-        filter: { type: 'string', description: '候補を先に絞る検索式 (search_messages の query と同じ書き方)' },
-        limit: { type: 'number', description: '件数 (既定 10、最大 25)' }
-      },
-      required: ['query']
-    }
-  }
-};
-
-/** ベクトルが1件も無い / サーキットブレーク中はツールを出さない。 */
+/** ベクトルが1件も無い / サーキットブレーク中はモードを出さない。 */
 export async function semanticAvailable(guildId) {
   if (!embedConfig.enabled || isDisabled()) return false;
 
   try {
     const { modelId } = await resolveModel();
-    return coverage(guildId, modelId).done > 0;
+    return chunkCoverage(guildId, modelId).done > 0;
   } catch {
     return false;
   }
 }
 
-function collectFilters(args) {
-  const extra = [];
-  if (args.author) extra.push({ key: 'from', value: String(args.author) });
-  if (args.channel) extra.push({ key: 'in', value: String(args.channel) });
-  if (args.after) extra.push({ key: 'after', value: String(args.after) });
-  if (args.before) extra.push({ key: 'before', value: String(args.before) });
-  return extra;
+/** 参加者を「たこ/さば/りん」の形にする。3人を超えたら数で出す。 */
+function participantLabel(rows) {
+  const names = [...new Set(rows.map((row) => row.author_name || 'unknown'))];
+  return names.length <= 3 ? names.join('/') : `${names.slice(0, 3).join('/')}他${names.length - 3}人`;
 }
 
-export async function runSemanticSearch(ctx, args) {
-  const raw = String(args.query ?? '').trim();
-  if (!raw) return 'query を指定してください。';
-
-  // 参照番号を渡されたらその発言文を query にする (「これに似た発言」が無料で付く)
-  const referenced = ctx.refs.resolve(raw);
-  const queryText = referenced?.content ? referenced.content : raw;
-  const excludeId = referenced?.messageId ?? null;
+/**
+ * 意味検索の本体。
+ *
+ * filters は呼び出し側 (tools.js) が解決して渡す。表示名の ID 解決も日付の
+ * 解釈もツール側の仕事で、ここは「絞った上で近い順に出す」だけにしてある
+ * (tools.js から import すると members.js のコメントどおり循環する)。
+ *
+ * escalated: キーワード検索が0件だったので自動で続けて走らせた場合。
+ * 頼まれていない検索なので、見出しと絞り込みの案内を変える。
+ */
+export async function runSemanticSearch(ctx, {
+  queryText,
+  filters = {},
+  excludeId = null,
+  limit = 10,
+  escalated = false
+}) {
+  const text = String(queryText ?? '').trim();
+  if (!text) return 'query を指定してください。';
 
   const { modelId, dim } = await resolveModel();
-  const stats = coverage(ctx.guild.id, modelId);
+  const stats = chunkCoverage(ctx.guild.id, modelId);
 
   if (stats.done === 0) {
     return '意味検索用のベクトルがまだありません。管理者が `/index embed` を実行すると使えるようになります。';
@@ -82,90 +67,105 @@ export async function runSemanticSearch(ctx, args) {
 
   let embedded;
   try {
-    embedded = await embedTexts([queryText], { kind: 'query', encode: 'float32' });
+    embedded = await embedTexts([text], { kind: 'query', encode: 'float32' });
   } catch (error) {
-    return `意味検索は今使えません (${truncate(error.message, 120)})。search_messages で言い換えを何通りか試してください。`;
+    return `意味検索は今使えません (${truncate(error.message, 120)})。言い換えを何通りか試してください。`;
   }
 
   const bytes = Buffer.from(embedded.vectors[0], 'base64');
   const queryVec = new Float32Array(bytes.buffer, bytes.byteOffset, dim);
 
-  const limit = Math.max(1, Math.min(25, Math.floor(Number(args.limit) || 10)));
-
-  const options = {
+  const result = scanChunksTopK({
     guildId: ctx.guild.id,
-    query: String(args.filter ?? ''),
-    extra: collectFilters(args),
-    channelScope: ctx.channelScope, // 権限スコープは走査まで継承させる
-    allowDeleted: false,
-    sort: 'new'
-  };
-
-  const result = scanTopK({ options, modelId, queryVec, limit });
+    modelId,
+    queryVec,
+    filters,
+    channelScope: ctx.channelScope,
+    limit
+  });
 
   if (result.tooMany) {
-    return [
-      `候補が ${result.total.toLocaleString()} 件で上限 ${embedConfig.maxCandidates.toLocaleString()} 件を超えました。`,
-      'author / channel / after のどれかで絞ってください',
-      '(この道具は「誰かの発言の中から」探すのが一番効きます)。'
-    ].join('');
+    // 自動で走らせたときに「絞ってください」と指示するのは不可解に読まれる
+    // (モデルはこの検索を頼んでいない)。1行に畳む。
+    return escalated
+      ? `(意味検索も試したが候補が ${result.total.toLocaleString()} 件で多すぎた。author か channel で絞れば mode:meaning で引ける)`
+      : [
+        `候補が ${result.total.toLocaleString()} 件で上限 ${embedConfig.maxCandidates.toLocaleString()} 件を超えました。`,
+        'author / channel / after のどれかで絞ってください',
+        '(この道具は「誰かの発言の中から」探すのが一番効きます)。'
+      ].join('');
   }
 
-  const candidates = result.hits.filter((hit) => !(excludeId && String(hit.rid) === String(excludeId)));
-  if (candidates.length === 0) return '意味の近い発言は見つかりませんでした。';
+  const chunks = fetchChunks(result.hits.map((hit) => hit.cid));
 
-  // 相対カットオフ。実測で無関係な日本語の文どうしでも 0.77〜0.82 出るので、
-  // 絶対閾値では絞れない。代わりに「1位からどれだけ落ちたか」で切る。
-  // これが無いと limit の枠を埋めるために無関係な発言が並び、モデルが
+  // 起点にした発言そのものが入っているまとまりは外す。
+  // 残すと必ず1位を占め、下の相対カットオフの基準を押し上げて、
+  // 本当に近いまとまりまで切り落とす。
+  const scoreById = new Map(result.hits.map((hit) => [hit.cid, hit.score]));
+  const loaded = chunks
+    .map((chunk) => ({ chunk, rows: chunkMessages(chunk), score: scoreById.get(chunk.chunk_id) ?? 0 }))
+    .filter(({ rows }) => !(excludeId && rows.some((row) => row.message_id === excludeId)));
+
+  if (loaded.length === 0) {
+    return escalated ? '(意味検索も走らせたが0件)' : '意味の近い会話は見つかりませんでした。';
+  }
+
+  // 相対カットオフ。閾値では絞れないので「1位からどれだけ落ちたか」で切る。
+  // これが無いと limit の枠を埋めるために無関係な会話が並び、モデルが
   // 「これも関連している」と誤読する。
-  const top = candidates[0].score;
-  const picked = candidates
-    .filter((hit) => hit.score >= top - embedConfig.relativeCutoff)
+  const top = loaded[0].score;
+  const picked = loaded
+    .filter((entry) => entry.score >= top - embedConfig.relativeCutoff)
     .slice(0, limit);
 
-  const dropped = candidates.length - picked.length;
+  const dropped = loaded.length - picked.length;
+  const ranks = new Map(picked.map((entry, index) => [entry.chunk.chunk_id, index + 1]));
 
-  const rows = fetchByRowids(picked.map((hit) => hit.rid));
-  const scoreByRowid = new Map(picked.map((hit) => [hit.rid, hit.score]));
-  const rankByRowid = new Map(picked.map((hit, index) => [hit.rid, index + 1]));
+  // 時系列に並べ直す。立場の変遷では時系列そのものが答えになる。
+  const ordered = [...picked].sort((a, b) => a.chunk.from_ms - b.chunk.from_ms);
 
-  // 表示は時系列に並べ直す。ダブスタでは時系列そのものが答えになる。
-  // 同一本文の重複は落とす (スコアの近さで落とすと別内容まで消える)。
-  const seen = new Set();
-  const messages = rows
-    .map((row) => ({
-      ...fromArchiveRow(row, ctx.guild.channels.cache.get(row.channel_id)?.name ?? row.channel_id),
-      rowid: row.rid
-    }))
-    .filter((message) => {
-      const key = message.content.trim();
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .sort((a, b) => a.createdAt - b.createdAt);
+  const lines = ordered.map(({ chunk, rows, score }) => {
+    // 参照番号はまとまりの先頭の発言に付ける。URL がやり取りの入口を指す。
+    const ref = ctx.refs.add({
+      guildId: chunk.guild_id,
+      channelId: chunk.channel_id,
+      channelName: channelLabel(ctx, chunk.channel_id),
+      messageId: chunk.from_id,
+      authorId: rows[0]?.author_id ?? '0',
+      authorName: rows[0]?.author_name ?? 'unknown',
+      content: rows.map((row) => row.content).join(' / '),
+      createdAt: chunk.from_ms
+    });
 
-  const scores = picked.map((hit) => hit.score);
-  const body = formatMessages(messages, {
-    refs: ctx.refs,
-    showChannel: true,
-    bodyChars: 300,
-    tailOf: (message) => {
-      const rank = rankByRowid.get(message.rowid);
-      const score = scoreByRowid.get(message.rowid);
-      return rank ? `近さ#${rank}(${score.toFixed(2)})` : null;
-    }
+    const head = [
+      shortTime(chunk.from_ms),
+      `#${channelLabel(ctx, chunk.channel_id)}`,
+      `${chunk.msg_count}件`,
+      participantLabel(rows)
+    ].join(' ');
+
+    const body = truncate(
+      rows.map((row) => `${row.author_name}: ${row.content}`).join(' / '),
+      agentConfig.messageChars * 2
+    );
+
+    return `${ref}) [${head}] ${body} 近さ#${ranks.get(chunk.chunk_id)}(${score.toFixed(2)})`;
   });
 
   return [
-    `意味が近い発言 ${messages.length} 件`
-      + (args.author ? ` / ${args.author} の中から` : '')
-      + ` (類似度 ${Math.max(...scores).toFixed(2)}〜${Math.min(...scores).toFixed(2)}、候補 ${result.total.toLocaleString()} 件)`,
-    `埋め込み済み: このサーバーの ${Math.round(stats.ratio * 100)}%`
+    `意味が近い会話 ${ordered.length} 件 (類似度 ${top.toFixed(2)}〜${picked[picked.length - 1].score.toFixed(2)}、候補 ${result.total.toLocaleString()} 件)`,
+    `埋め込み済み: このサーバーの会話の ${Math.round(stats.ratio * 100)}%`
       + (stats.ratio < 0.99 ? '。ここに無い=言っていない、ではない。' : ''),
     dropped > 0 ? `(1位から離れすぎた ${dropped} 件は関連が薄いので除外した)` : '',
     '類似度は相対値。無関係な文でも 0.78 前後になるので、順位で見ること。',
-    '--- 時系列順 ---',
-    body
+    // 自動で走らせたぶんは「一致した結果」と読まれると困る。毎回言う。
+    escalated ? '以下は文字列一致ではない。断定する前に read で前後を読むこと。' : '',
+    '--- 時系列順 (番号はその会話の先頭の発言) ---',
+    ...lines,
+    '会話まるごと読むなら read の at にその番号を渡す。'
   ].filter(Boolean).join('\n');
+}
+
+function channelLabel(ctx, channelId) {
+  return ctx.guild.channels.cache.get(channelId)?.name ?? channelId;
 }

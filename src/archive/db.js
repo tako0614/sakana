@@ -105,11 +105,15 @@ db.exec(`
     tokenize='trigram'
   );
 
-  CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+  -- 3本とも DROP してから作る。IF NOT EXISTS のままにすると、後で本体を直しても
+  -- 既存の DB は古いトリガを持ち続け、症状の出ない食い違いになる。
+  DROP TRIGGER IF EXISTS messages_fts_ai;
+  CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN
     INSERT INTO messages_fts(rowid, content, extra) VALUES (new.rowid, new.content, new.extra);
   END;
 
-  CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+  DROP TRIGGER IF EXISTS messages_fts_ad;
+  CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, content, extra) VALUES ('delete', old.rowid, old.content, old.extra);
   END;
 
@@ -188,6 +192,52 @@ db.exec(`
     DELETE FROM message_vectors WHERE rowid = old.rowid;
   END;
 
+  -- 会話のまとまり。ベクトル化の単位をこちらに移す。
+  --
+  -- 1発言ずつ埋めても主張が入らない (Discord では意味がやり取りに散る) うえ、
+  -- 10字未満を捨てる規則で実測「発言の半分」が意味検索から消えていた。
+  -- 本文は持たない — 境界だけ持って、必要なときに idx_msg_channel_time の
+  -- 範囲スキャンで組み立てる (二重保存で数十MB払う価値がない)。
+  CREATE TABLE IF NOT EXISTS message_chunks (
+    chunk_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id   TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    from_ms    INTEGER NOT NULL,
+    to_ms      INTEGER NOT NULL,
+    from_id    TEXT NOT NULL,
+    to_id      TEXT NOT NULL,
+    msg_count  INTEGER NOT NULL,
+    text_len   INTEGER NOT NULL,
+    built_at   INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_chunk_channel ON message_chunks(channel_id, from_ms);
+  CREATE INDEX IF NOT EXISTS idx_chunk_guild ON message_chunks(guild_id, from_ms);
+
+  -- まとまりは複数人なので「その人の発言だけ」では絞れない。
+  -- 「その人が参加しているまとまり」で絞る (相手の反論込みで読めるのでむしろ good)。
+  CREATE TABLE IF NOT EXISTS chunk_authors (
+    chunk_id  INTEGER NOT NULL,
+    author_id TEXT NOT NULL,
+    PRIMARY KEY (chunk_id, author_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_chunk_author ON chunk_authors(author_id);
+
+  CREATE TABLE IF NOT EXISTS chunk_vectors (
+    chunk_id   INTEGER PRIMARY KEY,
+    model_id   INTEGER NOT NULL,
+    scale      REAL NOT NULL DEFAULT 1,
+    vec        BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  -- まとまりを作り直したらベクトルと参加者も捨てる。残すと別の会話に
+  -- 前の会話のベクトルが付く (chunk_id は AUTOINCREMENT なので再利用はされないが、
+  -- 作り直しで消える行のぶんが孤児として残り続ける)。
+  CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON message_chunks BEGIN
+    DELETE FROM chunk_vectors WHERE chunk_id = old.chunk_id;
+    DELETE FROM chunk_authors WHERE chunk_id = old.chunk_id;
+  END;
+
   CREATE TABLE IF NOT EXISTS embed_state (
     guild_id     TEXT PRIMARY KEY,
     model_id     INTEGER,
@@ -237,6 +287,68 @@ export function snowflakeToMs(id) {
   } catch {
     return null;
   }
+}
+
+/**
+ * 全文検索の索引が本体と食い違っていないか確かめる。
+ *
+ * このリポジトリのコード経路では desync しない (messages への書き込みは1本だけで、
+ * content/extra は NOT NULL なのでトリガの WHEN 節が NULL で外れることもない)。
+ * ただし VACUUM や .dump からの復元は rowid を振り直すので、そのときは
+ * 件数だけ正しくて古い行が引けない状態になる。完全に無症状なので検査手段が要る。
+ *
+ * integrity-check はデータを書き換えない (食い違っていれば例外を投げるだけ)。
+ */
+export function checkFtsIntegrity() {
+  try {
+    db.prepare("INSERT INTO messages_fts(messages_fts) VALUES('integrity-check')").run();
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: String(error.message ?? error).slice(0, 300) };
+  }
+}
+
+/** 索引を本体から作り直す。件数が多いと数分かかる。 */
+export function rebuildFts() {
+  db.prepare("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')").run();
+}
+
+const selectMessageRowid = db.prepare('SELECT rowid AS rid FROM messages WHERE message_id = ?');
+
+/** スノーフレークから rowid を引く。ベクトル表は rowid で紐づいている。 */
+export function messageRowid(messageId) {
+  return selectMessageRowid.get(String(messageId))?.rid ?? null;
+}
+
+const selectChannelRange = db.prepare(`
+  SELECT
+    (SELECT message_id FROM messages WHERE channel_id = @id ORDER BY created_at ASC LIMIT 1) AS oldest_id,
+    (SELECT message_id FROM messages WHERE channel_id = @id ORDER BY created_at DESC LIMIT 1) AS newest_id
+`);
+
+/**
+ * 取り込み済みメッセージの端。
+ * created_at で並べる (message_id の文字列比較は桁数を跨ぐと逆転する)。
+ */
+export function channelMessageRange(channelId) {
+  const row = selectChannelRange.get({ id: channelId });
+  return { oldestId: row?.oldest_id ?? null, newestId: row?.newest_id ?? null };
+}
+
+/**
+ * ms から snowflake を作る。snowflakeToMs の逆。
+ *
+ * Discord の検索 API は日付を受けず min_id / max_id しか受けないので、
+ * 期間の境目をこの形に直さないと「期間で絞ったつもりの絞れていない結果」になる。
+ * 下位 22bit は 0 なので、その ms のいちばん先頭を指す ID になる。
+ * Discord 以前 (2015年より前) は表せないので 0 に丸める。
+ */
+export function msToSnowflake(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value)) return null;
+
+  const shifted = BigInt(Math.floor(value)) - DISCORD_EPOCH_MS;
+  return shifted <= 0n ? '0' : String(shifted << 22n);
 }
 
 const selectOverlappingSpans = db.prepare(`

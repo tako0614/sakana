@@ -4,20 +4,27 @@
 // 走らない (7.8GiB のコンテナで両方走らせたくない)。/index cancel と
 // /index status も無改造で効く。
 //
-// cursor_rowid はバッチごとに永続化するので、落ちても1バッチ分しか戻らない。
+// 2段構え: ①会話のまとまりを作る ②まとまりのベクトルを作る。
+// 単位が発言ではなくまとまりなのは chunks.js に書いた理由から。
+//
+// cursor_rowid はバッチごとに永続化するので、落ちても1バッチ分しか戻らない
+// (まとまりに移ったあとは chunk_id を入れている。AUTOINCREMENT なので単調)。
 
 import { embedConfig } from '../embed/config.js';
 import { embedTexts, prewarm } from '../embed/worker.js';
+import {
+  buildGuildChunks,
+  chunkCoverage,
+  chunkMessages,
+  chunkText,
+  clearGuildChunks,
+  nextChunkBatch,
+  refreshStale,
+  saveChunkVectors
+} from './chunks.js';
 import { getEmbedState, listEmbedGuilds, setEmbedState } from './db.js';
 import { claimJob, getRunningJob, releaseJob } from './indexer.js';
-import {
-  clearGuildVectors,
-  coverage,
-  ensureModelId,
-  normalizeForEmbedding,
-  nextBatch,
-  saveVectors
-} from './vectors.js';
+import { ensureModelId } from './vectors.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -54,11 +61,12 @@ export function resetModelCache() {
 
 /**
  * 開始前の見積り。実際の件数を SQL で数えて出す (0.5 のような推定値を信じさせない)。
+ * まとまりはまだ作っていないことがあるので、その場合は発言数から概算する。
  */
 export async function embedPreflight(guildId) {
   const { modelId, dim } = await resolveModel();
-  const stats = coverage(guildId, modelId);
-  const remaining = Math.max(0, stats.embeddable - stats.done);
+  const stats = chunkCoverage(guildId, modelId);
+  const remaining = Math.max(0, stats.total - stats.done);
 
   // int8 + 行のオーバーヘッドで概ね dim + 76 バイト
   const bytes = remaining * (dim + 76);
@@ -69,9 +77,9 @@ export async function embedPreflight(guildId) {
     modelId,
     dim,
     estimatedBytes: bytes,
-    // 実測 438 msg/s から、バッチ間の待ちを入れた実効値で見る
+    // まとまりは1件が長いので発言1件より遅い。実測前の見込みで 60 件/秒。
     estimatedMs: remaining > 0
-      ? Math.round((remaining / embedConfig.batchSize) * (embedConfig.batchSize / 438 * 1000 + embedConfig.sleepMs))
+      ? Math.round((remaining / embedConfig.batchSize) * (embedConfig.batchSize / 60 * 1000 + embedConfig.sleepMs))
       : 0
   };
 }
@@ -81,23 +89,22 @@ export async function embedPreflight(guildId) {
  * 埋め込めない1件は印を残して飛ばす。印を残さないと次回も同じ行で止まり、
  * バックフィルが永久に先へ進まない。
  */
-async function embedOneByOne(rows, modelId, job) {
-  for (const row of rows) {
+async function embedOneByOne(prepared, modelId, job) {
+  for (const row of prepared) {
     try {
       const single = await embedTexts([row.text], { kind: 'passage', encode: 'int8' });
-      saveVectors([{
-        rowid: row.rid,
+      saveChunkVectors([{
+        chunkId: row.chunkId,
         modelId,
         scale: single.scales[0],
-        vec: Buffer.from(single.vectors[0], 'base64'),
-        textLen: row.text.length
+        vec: Buffer.from(single.vectors[0], 'base64')
       }]);
       job.embedded += 1;
     } catch (error) {
-      saveVectors([{ rowid: row.rid, modelId, scale: 0, vec: Buffer.alloc(0), textLen: 0 }]);
+      saveChunkVectors([{ chunkId: row.chunkId, modelId, scale: 0, vec: Buffer.alloc(0) }]);
       job.skipped += 1;
       job.failed += 1;
-      console.error(`Skipping message rowid=${row.rid}: ${String(error.message ?? error).slice(0, 160)}`);
+      console.error(`Skipping chunk ${row.chunkId}: ${String(error.message ?? error).slice(0, 160)}`);
     }
   }
 }
@@ -125,15 +132,9 @@ export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, on
     const { modelId } = await resolveModel();
 
     if (rebuild) {
-      clearGuildVectors(guild.id);
+      clearGuildChunks(guild.id);
       setEmbedState(guild.id, { cursor_rowid: 0, embedded: 0, skipped: 0 });
     }
-
-    const state = getEmbedState(guild.id) ?? {};
-    let cursor = mode === 'sweep' ? 0 : (state.cursor_rowid ?? 0);
-
-    const stats = coverage(guild.id, modelId);
-    job.channelsTotal = Math.max(0, stats.embeddable - stats.done);
 
     setEmbedState(guild.id, {
       model_id: modelId,
@@ -144,69 +145,82 @@ export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, on
       enabled: 1
     });
 
-    const since = mode === 'sweep' ? Date.now() - embedConfig.sweepWindowMs : 0;
+    // --- ① 会話のまとまりを作る ---
+    job.currentChannel = '会話のまとまりを作成中';
+    onProgress(job);
+
+    if (mode === 'sweep') {
+      // 編集された発言を含むまとまりを作り直す
+      const { stale } = refreshStale(guild.id);
+      if (stale > 0) console.log(`Refreshed ${stale} stale chunk(s) in ${guild.name}.`);
+    } else {
+      buildGuildChunks(guild.id, {
+        onProgress: ({ channelsDone, channelsTotal }) => {
+          job.channelsDone = channelsDone;
+          job.channelsTotal = channelsTotal;
+          onProgress(job);
+        }
+      });
+    }
+
+    // --- ② まとまりを埋め込む ---
+    const state = getEmbedState(guild.id) ?? {};
+    let cursor = mode === 'sweep' ? 0 : (state.cursor_rowid ?? 0);
+
+    const stats = chunkCoverage(guild.id, modelId);
+    job.channelsTotal = Math.max(0, stats.total - stats.done);
+    job.channelsDone = 0;
+    job.currentChannel = null;
 
     for (;;) {
       if (job.cancelled) break;
 
-      const rows = nextBatch({
+      const chunks = nextChunkBatch({
         guildId: guild.id,
         modelId,
         cursor,
-        limit: embedConfig.batchSize,
-        mode,
-        since
+        limit: embedConfig.batchSize
       });
 
-      if (rows.length === 0) break;
+      if (chunks.length === 0) break;
 
-      const prepared = rows.map((row) => ({ rid: row.rid, text: normalizeForEmbedding(row.content) }));
-      const keep = prepared.filter((row) => row.text.length >= embedConfig.minChars);
-      const drop = prepared.filter((row) => row.text.length < embedConfig.minChars);
+      const prepared = chunks
+        .map((chunk) => ({ chunkId: chunk.chunk_id, text: chunkText(chunkMessages(chunk)) }))
+        .filter((row) => row.text.length > 0);
 
-      // 対象外にも印を残す。残さないとスイープが同じ行を毎回引き直す。
-      if (drop.length > 0) {
-        saveVectors(drop.map((row) => ({
-          rowid: row.rid, modelId, scale: 0, vec: Buffer.alloc(0), textLen: 0
-        })));
-        job.skipped += drop.length;
-      }
-
-      if (keep.length > 0) {
+      if (prepared.length > 0) {
         const started = Date.now();
         let result = null;
 
         try {
-          result = await embedTexts(keep.map((row) => row.text), { kind: 'passage', encode: 'int8' });
+          result = await embedTexts(prepared.map((row) => row.text), { kind: 'passage', encode: 'int8' });
         } catch (error) {
           // バッチ内の1件が悪いだけで全体を止めない。1件ずつ試して犯人を隔離する。
-          // (実際に絵文字が途中で切れた1件で 84% 地点から進まなくなった)
           console.error('Embed batch failed, retrying one by one:', String(error.message ?? error).slice(0, 200));
           job.batchFailures += 1;
-          await embedOneByOne(keep, modelId, job);
+          await embedOneByOne(prepared, modelId, job);
         }
 
         if (result) {
           const elapsed = Math.max(1, Date.now() - started);
-          job.rate = Math.round(keep.length / (elapsed / 1000));
+          job.rate = Math.round(prepared.length / (elapsed / 1000));
 
-          saveVectors(keep.map((row, index) => ({
-            rowid: row.rid,
+          saveChunkVectors(prepared.map((row, index) => ({
+            chunkId: row.chunkId,
             modelId,
             scale: result.scales[index],
-            vec: Buffer.from(result.vectors[index], 'base64'),
-            textLen: row.text.length
+            vec: Buffer.from(result.vectors[index], 'base64')
           })));
 
-          job.embedded += keep.length;
+          job.embedded += prepared.length;
         }
       }
 
       job.messagesIndexed = job.embedded + job.skipped;
       job.channelsDone = job.messagesIndexed;
 
+      cursor = chunks[chunks.length - 1].chunk_id;
       if (mode !== 'sweep') {
-        cursor = rows[rows.length - 1].rid;
         setEmbedState(guild.id, { cursor_rowid: cursor, embedded: job.embedded, skipped: job.skipped });
       }
 
@@ -237,7 +251,7 @@ export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, on
   }
 }
 
-/** 夜間スイープ。有効にしたギルドだけ、新規分と穴を拾う。 */
+/** 夜間スイープ。有効にしたギルドだけ、新規分と編集で崩れた分を拾う。 */
 export async function sweepEnabledGuilds(client) {
   if (!embedConfig.enabled) return;
 
@@ -250,7 +264,7 @@ export async function sweepEnabledGuilds(client) {
       const forward = await runEmbedJob(guild, { mode: 'forward' });
       const swept = await runEmbedJob(guild, { mode: 'sweep' });
       const total = forward.embedded + swept.embedded;
-      if (total > 0) console.log(`Embedded ${total} new message(s) in ${guild.name}.`);
+      if (total > 0) console.log(`Embedded ${total} new chunk(s) in ${guild.name}.`);
     } catch (error) {
       console.error(`Embed sweep failed for ${row.guild_id}:`, error);
     }

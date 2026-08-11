@@ -8,6 +8,7 @@ import {
 } from 'discord.js';
 import cron from 'node-cron';
 import { commandMap } from './commands.js';
+import { enforceGuildAllowlist, isAllowedGuild } from './guilds.js';
 import { handleEmotionRequest, isEmotionRequest } from './emotion.js';
 import { addTextXP, addVoiceXP, getTopXP } from './db.js';
 import { handleArchiveComponent } from './archive/commands.js';
@@ -84,6 +85,13 @@ client.on(Events.ShardReady, () => {
   });
 });
 
+// 招待された瞬間に退出する。許可外のサーバーには何も残さない。
+client.on(Events.GuildCreate, (guild) => {
+  enforceGuildAllowlist(guild.client).catch((error) => {
+    console.error('Failed to enforce the guild allowlist:', error);
+  });
+});
+
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
   console.log(
@@ -91,6 +99,11 @@ client.once(Events.ClientReady, (readyClient) => {
       ? 'AI agent is enabled. Mention the bot to use it.'
       : 'DEEPSEEK_API_KEY is not set. The AI agent is disabled.'
   );
+
+  // 許可していないサーバーに入っていたら出る
+  enforceGuildAllowlist(readyClient).catch((error) => {
+    console.error('Failed to enforce the guild allowlist:', error);
+  });
 
   // 古い呼び出し履歴を毎日掃除する (制限の窓より十分長く残す)
   cron.schedule('0 30 4 * * *', () => pruneCalls());
@@ -191,7 +204,8 @@ client.on(Events.MessageCreate, async (message) => {
 });
 
 async function handleMessageCreate(message) {
-  if (!message.guildId) {
+  // 許可外のサーバーでは記録も応答もしない (退出が効くまでの間も含めて)
+  if (!message.guildId || !isAllowedGuild(message.guildId)) {
     return;
   }
 
@@ -242,6 +256,7 @@ async function handleMessageCreate(message) {
 
 client.on(Events.MessageUpdate, async (_oldMessage, newMessage) => {
   try {
+    if (!isAllowedGuild(newMessage.guildId)) return;
     const message = newMessage.partial ? await newMessage.fetch() : newMessage;
     indexLiveEdit(message);
   } catch (error) {
@@ -251,6 +266,7 @@ client.on(Events.MessageUpdate, async (_oldMessage, newMessage) => {
 
 client.on(Events.MessageDelete, (message) => {
   try {
+    if (!isAllowedGuild(message.guildId)) return;
     markLiveDelete(message);
   } catch (error) {
     console.error('Unhandled error in message delete handler:', error);
@@ -260,6 +276,7 @@ client.on(Events.MessageDelete, (message) => {
 client.on(Events.MessageBulkDelete, (messages) => {
   try {
     for (const message of messages.values()) {
+      if (!isAllowedGuild(message.guildId)) continue;
       markLiveDelete(message);
     }
   } catch (error) {
@@ -269,6 +286,7 @@ client.on(Events.MessageBulkDelete, (messages) => {
 
 async function handleReactionChange(reaction) {
   try {
+    if (!isAllowedGuild(reaction.message?.guildId)) return;
     const message = reaction.message.partial ? await reaction.message.fetch() : reaction.message;
     syncLiveReactions(message);
   } catch (error) {
@@ -296,6 +314,7 @@ function handleVoiceStateUpdate(oldState, newState) {
   const memberId = newState.member?.id;
   const guildId = newState.guild?.id || oldState.guild?.id;
   if (!memberId || !guildId || newState.member?.user.bot) return;
+  if (!isAllowedGuild(guildId)) return;
 
   const joined = !oldState.channelId && newState.channelId;
   const left = oldState.channelId && !newState.channelId;
@@ -334,6 +353,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 async function handleInteractionCreate(interaction) {
+  if (!isAllowedGuild(interaction.guildId)) {
+    if (interaction.isRepliable()) {
+      await interaction.reply({
+        content: 'この bot は許可されたサーバーでのみ動きます。',
+        ephemeral: true
+      }).catch(() => {});
+    }
+    return;
+  }
+
   if (interaction.isButton()) {
     await handleArchiveComponent(interaction);
     return;

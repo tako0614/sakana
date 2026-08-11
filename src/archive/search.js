@@ -20,11 +20,14 @@ const MIN_FTS_LENGTH = 3;
 
 const REGEX_SCAN_BUDGET = Number(process.env.ARCHIVE_REGEX_BUDGET ?? 300_000);
 
+// rowid のタイブレークを付ける理由: created_at だけだと同一ミリ秒の行の順序が
+// 不定になり、ページ送りのたびに並びが変わって重複と欠落が出る。
+// idx_msg_guild_time は末尾に rowid を含むので、これを足しても索引で並べられる。
 export const SORT_MODES = {
-  new: 'm.created_at DESC',
-  old: 'm.created_at ASC',
-  reactions: 'm.reaction_count DESC, m.created_at DESC',
-  long: 'm.char_count DESC, m.created_at DESC',
+  new: 'm.created_at DESC, m.rowid DESC',
+  old: 'm.created_at ASC, m.rowid ASC',
+  reactions: 'm.reaction_count DESC, m.created_at DESC, m.rowid DESC',
+  long: 'm.char_count DESC, m.created_at DESC, m.rowid DESC',
   random: 'RANDOM()'
 };
 
@@ -117,9 +120,14 @@ class Compiler {
       }
 
       case 'after': {
-        // after:2024-05-01 はその日を含まない / after:7d は「直近7日」
-        const { start, end, relative } = parseDateRange(value);
-        return `m.created_at >= ${this.push(relative ? start : end)}`;
+        // after:2024-05-01 はその日を含む / after:2020 は 2020-01-01 以降 / after:7d は「直近7日」
+        //
+        // 以前は絶対日付のとき end を下限にしていた。すると after:2020 が
+        // 「2021-01-01 以降」になり、after:2020 before:2021 が必ず0件になる
+        // (after:today も常に0件)。古い発言を探そうとした側からは
+        // 「昔のメッセージが無い」ように見えるので、含む側にそろえた。
+        const { start } = parseDateRange(value);
+        return `m.created_at >= ${this.push(start)}`;
       }
 
       case 'during':

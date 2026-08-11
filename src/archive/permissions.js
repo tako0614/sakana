@@ -50,6 +50,10 @@ export function canRead(channel, member) {
 export function getChannelScope(guild, member) {
   const allowed = new Set();
   const allowedParents = new Set();
+  // 消えたチャンネルは誰の権限でも判定できないので既定では落とす。
+  // ただし管理者には見せられるようにする (長く運用したサーバーだと、
+  // 整理で消したチャンネルに古い発言がまとまって入っていることがある)。
+  const includeDeleted = canManageIndex(member);
 
   for (const channel of guild.channels.cache.values()) {
     if (!MESSAGE_CHANNEL_TYPES.has(channel.type) && !THREAD_CONTAINER_TYPES.has(channel.type)) {
@@ -77,6 +81,14 @@ export function getChannelScope(guild, member) {
 
     // アーカイブ済みスレッドはキャッシュに無いことが多い。親チャンネルの権限で判定する。
     if (row.is_thread && !row.is_private && row.parent_id && allowedParents.has(row.parent_id)) {
+      allowed.add(row.channel_id);
+      continue;
+    }
+
+    // スレッド以外でキャッシュに無い = サーバーから消えたチャンネル。
+    // (通常のチャンネルは GUILD_CREATE で全部キャッシュに載るので、
+    //  載っていないなら実体が無い。スレッドはアーカイブで載らないので除く)
+    if (includeDeleted && !row.is_thread) {
       allowed.add(row.channel_id);
       continue;
     }

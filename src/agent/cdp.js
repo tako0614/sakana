@@ -106,14 +106,24 @@ async function getBrowserSession() {
  * 引き継いでしまう (誰でも Stripe や管理画面を開いて読めてしまう)。
  * 信頼していない相手にブラウザを触らせるときは必ずこちらを使う。
  */
-export async function createIsolatedPage(url = 'about:blank') {
+export async function createBrowserContext() {
   const browser = await getBrowserSession();
-
   const { browserContextId } = await browser.send('Target.createBrowserContext', {
     disposeOnDetach: false
   });
+  return browserContextId;
+}
 
+/** 指定したコンテキストにタブを足す。同じ実行の中で複数タブを開くときに使う。 */
+export async function createPageInContext(url = 'about:blank', browserContextId) {
+  const browser = await getBrowserSession();
   const { targetId } = await browser.send('Target.createTarget', { url, browserContextId });
+  return targetId;
+}
+
+export async function createIsolatedPage(url = 'about:blank') {
+  const browserContextId = await createBrowserContext();
+  const targetId = await createPageInContext(url, browserContextId);
   return { targetId, browserContextId };
 }
 
@@ -153,6 +163,10 @@ class CdpSession {
     this.consoleLog = [];
     this.requests = [];
 
+    // Fetch.requestPaused のように、呼び出し側が返事をしないとページが止まる
+    // イベントがあるので、method ごとの購読口を持つ。
+    this.listeners = new Map();
+
     socket.addEventListener('message', (event) => this.handleMessage(event.data));
     socket.addEventListener('close', () => this.rejectAll(new Error('CDP connection closed')));
     socket.addEventListener('error', () => this.rejectAll(new Error('CDP connection error')));
@@ -181,7 +195,22 @@ class CdpSession {
     this.handleEvent(parsed);
   }
 
+  /** method を購読する。同じ method に複数登録できる。 */
+  on(method, handler) {
+    if (!this.listeners.has(method)) this.listeners.set(method, new Set());
+    this.listeners.get(method).add(handler);
+    return () => this.listeners.get(method)?.delete(handler);
+  }
+
   handleEvent({ method, params }) {
+    const subscribed = this.listeners.get(method);
+    if (subscribed) {
+      for (const handler of subscribed) {
+        // 購読側の失敗でイベントループを壊さない (Fetch は非同期に返事をする)
+        Promise.resolve().then(() => handler(params)).catch(() => {});
+      }
+    }
+
     const push = (ring, value) => {
       ring.push(value);
       if (ring.length > RING_SIZE) ring.shift();
@@ -304,9 +333,18 @@ function waitForOpen(socket, timeoutMs = 10_000) {
 /**
  * 操作対象のタブに繋ぐ。指定が無ければ前回のタブ、それも無ければ先頭のタブ。
  * タブが1つも無ければ about:blank を開く。
+ *
+ * targetId を明示したときは代替に落ちない。隔離タブが消えた瞬間に
+ * pages[0] (= オーナーのログイン済みタブ) を掴ませてしまうため。
  */
 export async function getSession(targetId) {
   let pages = await listPages();
+
+  if (targetId && !pages.some((page) => page.id === targetId)) {
+    sessions.get(targetId)?.close();
+    sessions.delete(targetId);
+    throw new Error('操作していたタブが閉じられました。もう一度開き直してください。');
+  }
 
   let wanted = targetId ?? activeTargetId;
   if (wanted && !pages.some((page) => page.id === wanted)) {

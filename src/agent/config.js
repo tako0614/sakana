@@ -26,23 +26,36 @@ export const agentConfig = {
 
   // --- トークン節約のための上限 ---
   // ツールを呼ぶたびに会話全体を再送するので、往復回数が費用に直結する。
-  maxRounds: number(process.env.AGENT_MAX_ROUNDS, 10),
+  maxRounds: number(process.env.AGENT_MAX_ROUNDS, 12),
   // 1回の実行でツール出力に使える合計文字数。超えたらツールが打ち切る。
-  maxToolChars: number(process.env.AGENT_MAX_TOOL_CHARS, 24_000),
+  maxToolChars: number(process.env.AGENT_MAX_TOOL_CHARS, 32_000),
   // ツール出力に載せる1メッセージあたりの本文文字数。
   messageChars: number(process.env.AGENT_MESSAGE_CHARS, 300),
   // 呼ばれた時点で直近メッセージを最初から渡しておく (ツール往復を1回減らす)。0 で無効。
   preloadMessages: number(process.env.AGENT_PRELOAD_MESSAGES, 30),
-  maxOutputTokens: number(process.env.AGENT_MAX_OUTPUT_TOKENS, 4000),
+  // max_tokens には思考ぶんも含まれる。4000 だと reasoning_effort:high の思考で
+  // 使い切って本文が空のまま返り、「うまく答えをまとめられませんでした」になる。
+  // 回答自体は1000字までなので、ここはほぼ全部が思考の枠。
+  maxOutputTokens: number(process.env.AGENT_MAX_OUTPUT_TOKENS, 40_000),
   timeoutMs: number(process.env.AGENT_TIMEOUT_MS, 150_000),
   // 「-# thinking (10s)」の更新間隔。Discord のメッセージ編集はチャンネルあたり
   // 5回/5秒あたりで絞られるので、1秒はほぼ上限。詰まるようなら 2000 に上げる。
   progressIntervalMs: number(process.env.AGENT_PROGRESS_INTERVAL_MS, 1000),
 
-  // --- 呼び出し制限 ---
-  userLimit: number(process.env.AGENT_USER_LIMIT, 30),
+  // --- 使用量の制限 ---
+  // 数えるのは呼び出し回数ではなくトークン。1回の実行で 1.5万〜10万トークン使うので、
+  // 回数で縛ると軽い質問と重い調査が同じ1回として扱われて実際の費用と合わない。
+  //
+  // 入力・キャッシュヒット入力・出力は単価が違うので、
+  // 「キャッシュミス入力1トークン = 1」に正規化した重みを掛けて合算する。
+  // 既定の重みは DeepSeek の価格比。価格表が変わったら env で上書きする。
+  tokenWeightInput: number(process.env.AGENT_TOKEN_WEIGHT_INPUT, 1),
+  tokenWeightCached: number(process.env.AGENT_TOKEN_WEIGHT_CACHED, 0.1),
+  tokenWeightOutput: number(process.env.AGENT_TOKEN_WEIGHT_OUTPUT, 1.5),
+  // 換算トークンでの上限。/agentlimit で管理者が実行中に変えられる。
+  userTokenLimit: number(process.env.AGENT_USER_TOKEN_LIMIT, 500_000),
   userWindowMs: number(process.env.AGENT_USER_WINDOW_MS, 3_600_000),
-  globalLimit: number(process.env.AGENT_GLOBAL_LIMIT, 500),
+  globalTokenLimit: number(process.env.AGENT_GLOBAL_TOKEN_LIMIT, 10_000_000),
   globalWindowMs: number(process.env.AGENT_GLOBAL_WINDOW_MS, 86_400_000),
   maxConcurrent: number(process.env.AGENT_MAX_CONCURRENT, 3),
   // 制限を無視できる人 (運営用)。

@@ -1,9 +1,11 @@
 import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
 import { getTopXP, getUserRank } from './db.js';
 import { archiveCommands } from './archive/commands.js';
+import { agentCommands } from './agent/commands.js';
 
 export const commands = [
   ...archiveCommands,
+  ...agentCommands,
   {
     data: new SlashCommandBuilder()
       .setName('top')
