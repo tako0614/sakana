@@ -65,38 +65,41 @@ export function messageLink(entry) {
 }
 
 /**
- * モデルが書いた [3] は本文にそのまま残し、URL は末尾に1行だけまとめる。
+ * モデルが書いた [3] を本文から取り除き、URL だけを末尾にまとめる。
  *
- * 以前はここで [3] を生の URL に差し替えていた。「生の URL なら Discord が元の発言を
- * プレビューしてくれる」という前提だったが、実際に出るのはチャンネル名だけで、
+ * 番号はモデルに「どの発言を根拠にしたか」を書かせるための仕組みで、読む人には要らない。
+ * 本文に残すと地の文に括弧の数字が散るので消す。URL は加工せずそのまま並べる
+ * (Discord のプレビューもそのまま出る)。
+ *
+ * 以前ここで [3] を生の URL に差し替えて本文に埋めていた。「生の URL なら Discord が
+ * 元の発言をプレビューしてくれる」という前提だったが、実際に出るのはチャンネル名だけで、
  * 代わりに 88 文字の URL が1文ごとに挟まって本文が読めなくなっていた。
- * [3] は3文字なので地の文を壊さない。
  *
- * 末尾は subtext (`-#`) にして本文と分ける。URL は `<>` で囲んでプレビューを止める
- * (役に立たないプレビューが3つ並ぶだけなので)。
- * 載せるのはモデルが実際に書いた番号だけ。refs にはモデルに見せた全メッセージが
+ * 載せるのはモデルが実際に書いた番号ぶんだけ。refs にはモデルに見せた全メッセージが
  * 入っているので、全部並べると数百行になる。
- * 引けなかった番号は本文に残し、末尾には出さない (リンク切れを作らない)。
+ * 引けなかった番号は本文から消すだけで、末尾には出さない (リンク切れを作らない)。
  */
 export function expandCitations(text, refs) {
-  const body = String(text ?? '');
-  const cited = [];
+  const urls = [];
   const seen = new Set();
 
-  for (const match of body.matchAll(/\[(\d{1,4})\]/g)) {
-    const ref = Number(match[1]);
-    if (seen.has(ref)) continue;
-
+  // 直前の空白ごと食う。番号を抜いた跡に空白が残ると句点の前が空く。
+  // 全角スペースも食う (日本語で書かせているので混ざる)。
+  const body = String(text ?? '').replace(/[ \t　]*\[(\d{1,4})\]/g, (match, digits) => {
+    const ref = Number(digits);
     const url = messageLink(refs.get(ref));
-    if (!url) continue;
 
-    seen.add(ref);
-    cited.push(`[${ref}] <${url}>`);
-  }
+    if (url && !seen.has(ref)) {
+      seen.add(ref);
+      urls.push(url);
+    }
 
-  if (cited.length === 0) return body;
+    return '';
+  });
 
-  return `${body.trimEnd()}\n\n-# ${cited.join(' ')}`;
+  if (urls.length === 0) return body.trim();
+
+  return `${body.trim()}\n\n-# ${urls.join(' ')}`;
 }
 
 function collapse(text) {
