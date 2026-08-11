@@ -152,10 +152,11 @@ export async function handleAgentRequest(message, client) {
   }
 
   // ここから先は必ず try の中で組み立てる。
-  // 確保した枠を返さずに抜けると、同時実行の空きと呼び出し回数が永久に戻らない。
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), agentConfig.timeoutMs);
-
+  // 確保した枠を返さずに抜けると、同時実行の空きが永久に戻らない。
+  //
+  // リクエスト全体のタイムアウトは持たない。止めるのはトークンの予算だけで、
+  // 時間で畳むと「払ったのに謝り文だけ返す」ことになる (実際にそうなっていた)。
+  // 応答が来ないソケットは llm.js が1回ごとに畳む。
   let finished = false;
   let indicator = null;
   let ctx = null;
@@ -215,7 +216,6 @@ export async function handleAgentRequest(message, client) {
       // 管理者は残りが Infinity なので、暴走ガードだけが効く。
       budget: Math.min(usdToTokens(agentConfig.requestUsd), remainingFor(message.author.id, admin)),
       weigh: weighTokens,
-      signal: controller.signal,
       onToolCall: (name, args) => indicator.setStatus(toolLabel(name, args))
     });
 
@@ -256,7 +256,6 @@ export async function handleAgentRequest(message, client) {
       rememberOwnReply(sent?.id);
     }
   } catch (error) {
-    const aborted = error.name === 'AbortError';
     console.error('Agent request failed:', error);
 
     // API 側の障害は数えない。ただし途中まで払ったトークンは記録に残す
@@ -267,9 +266,7 @@ export async function handleAgentRequest(message, client) {
     await indicator?.stop();
 
     await message.reply({
-      content: aborted
-        ? '時間内に答えを作れませんでした。もう少し範囲を絞って聞いてください。'
-        : 'エージェントの実行に失敗しました。しばらくしてからもう一度試してください。',
+      content: 'エージェントの実行に失敗しました。しばらくしてからもう一度試してください。',
       allowedMentions: NO_MENTIONS
     }).catch(() => {});
   } finally {
@@ -277,6 +274,5 @@ export async function handleAgentRequest(message, client) {
     await indicator?.stop();
     // 隔離タブは実行ごとに捨てる。残すと次の人が中身を読める。
     if (ctx) await closeBrowserSandbox(ctx).catch(() => {});
-    clearTimeout(timeout);
   }
 }

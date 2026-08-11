@@ -49,16 +49,36 @@ function buildBody({ messages, tools, dropThinking, effort }) {
   return body;
 }
 
-async function requestOnce({ messages, tools, dropThinking, effort, signal }) {
-  const response = await fetch(`${agentConfig.baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${agentConfig.apiKey}`
-    },
-    body: JSON.stringify(buildBody({ messages, tools, dropThinking, effort })),
-    signal
-  });
+async function requestOnce({ messages, tools, dropThinking, effort }) {
+  // タイムアウトは1回の呼び出しにだけ掛ける。リクエスト全体に時間の上限は無い
+  // (止めるのはトークンだけ)。ここは応答が来ないソケットを畳むための保険。
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), agentConfig.httpTimeoutMs);
+  timer.unref?.();
+
+  let response;
+  try {
+    response = await fetch(`${agentConfig.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${agentConfig.apiKey}`
+      },
+      body: JSON.stringify(buildBody({ messages, tools, dropThinking, effort })),
+      signal: controller.signal
+    });
+  } catch (error) {
+    // 自分で畳んだぶんは失敗扱いにしない。引き直せば通ることが多い。
+    if (error.name === 'AbortError') {
+      throw new DeepSeekError(
+        `DeepSeek への1回の呼び出しが ${Math.round(agentConfig.httpTimeoutMs / 1000)} 秒で応答しませんでした。`,
+        { retryable: true }
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 
   if (response.ok) {
     return response.json();
@@ -73,15 +93,13 @@ async function requestOnce({ messages, tools, dropThinking, effort, signal }) {
   );
 }
 
-async function callModel({ messages, tools, signal, effort }) {
+async function callModel({ messages, tools, effort }) {
   let dropThinking = false;
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      return await requestOnce({ messages, tools, dropThinking, effort, signal });
+      return await requestOnce({ messages, tools, dropThinking, effort });
     } catch (error) {
-      if (error.name === 'AbortError') throw error;
-
       // thinking / reasoning_effort を受けつけないモデルに当たったら、
       // その2つを外して素の ChatCompletions として1回だけ試す。
       if (
@@ -128,7 +146,7 @@ const HARD_ROUND_CAP = 100;
  * budget を使い切ったらツールを外すので、その場の材料で答えを書いて終わる。
  */
 export async function runAgent({
-  system, userContent, toolset, onToolCall, signal, usage,
+  system, userContent, toolset, onToolCall, usage,
   budget = Infinity,
   weigh = () => 0
 }) {
@@ -166,7 +184,7 @@ export async function runAgent({
       console.warn(`Tool budget exhausted after ${rounds} round(s) (${Math.round(spent)} / ${Math.round(budget)}).`);
     }
 
-    let data = await callModel({ messages, tools, signal });
+    let data = await callModel({ messages, tools });
     accumulate(data);
 
     // max_tokens には思考ぶんが含まれるので、思考で使い切ると本文が空で返る。
@@ -175,7 +193,7 @@ export async function runAgent({
       console.warn(
         `DeepSeek returned an empty answer (finish_reason=${data.choices?.[0]?.finish_reason}). Retrying with low effort.`
       );
-      data = await callModel({ messages, tools, signal, effort: 'low' });
+      data = await callModel({ messages, tools, effort: 'low' });
       accumulate(data);
     }
 
@@ -198,7 +216,7 @@ export async function runAgent({
       if (text.trim()) return { text, rounds: rounds + 1, usage: totals, used };
 
       // 2回引いても空。ツールを外して「今ある情報で書け」と言い直す。
-      const forced = await finalAnswer({ messages, signal });
+      const forced = await finalAnswer({ messages });
       accumulate(forced.data);
       return { text: forced.text, rounds: rounds + 2, usage: totals, used };
     }
@@ -227,7 +245,7 @@ export async function runAgent({
   // ここに来るのは HARD_ROUND_CAP に当たったとき (壊れている)。
   // 空文字を返すと謝り文だけが出るので、必ず1回書かせる。
   console.warn(`Hit the hard round cap (${HARD_ROUND_CAP}). Forcing an answer.`);
-  const forced = await finalAnswer({ messages, signal });
+  const forced = await finalAnswer({ messages });
   accumulate(forced.data);
 
   return { text: forced.text, rounds: rounds + 1, usage: totals, used };
@@ -239,7 +257,7 @@ export async function runAgent({
  * 空の本文をそのまま返すと「うまく答えをまとめられませんでした」になる。
  * 材料は既に会話に載っているので、書かせないまま諦めるのがいちばん惜しい。
  */
-async function finalAnswer({ messages, signal }) {
+async function finalAnswer({ messages }) {
   const closing = [
     ...messages,
     {
@@ -250,10 +268,9 @@ async function finalAnswer({ messages, signal }) {
   ];
 
   try {
-    const data = await callModel({ messages: closing, tools: null, signal, effort: 'low' });
+    const data = await callModel({ messages: closing, tools: null, effort: 'low' });
     return { text: data.choices?.[0]?.message?.content ?? '', data };
   } catch (error) {
-    if (error.name === 'AbortError') throw error;
     console.error('Final answer attempt failed:', error);
     return { text: '', data: null };
   }
