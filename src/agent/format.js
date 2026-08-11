@@ -65,22 +65,38 @@ export function messageLink(entry) {
 }
 
 /**
- * モデルが書いた [3] を、そのメッセージの URL そのものに変える。
- * `[3](url)` のような番号リンクにはしない。生の URL なら Discord 側が元の発言を
- * プレビュー表示してくれるので、本文を引き写させずに済む。
- * 存在しない番号はそのまま残す (リンク切れを作らない)。
+ * モデルが書いた [3] は本文にそのまま残し、URL は末尾に1行だけまとめる。
+ *
+ * 以前はここで [3] を生の URL に差し替えていた。「生の URL なら Discord が元の発言を
+ * プレビューしてくれる」という前提だったが、実際に出るのはチャンネル名だけで、
+ * 代わりに 88 文字の URL が1文ごとに挟まって本文が読めなくなっていた。
+ * [3] は3文字なので地の文を壊さない。
+ *
+ * 末尾は subtext (`-#`) にして本文と分ける。URL は `<>` で囲んでプレビューを止める
+ * (役に立たないプレビューが3つ並ぶだけなので)。
+ * 載せるのはモデルが実際に書いた番号だけ。refs にはモデルに見せた全メッセージが
+ * 入っているので、全部並べると数百行になる。
+ * 引けなかった番号は本文に残し、末尾には出さない (リンク切れを作らない)。
  */
 export function expandCitations(text, refs) {
-  // 直前の空白ごと食って必ず1つ空ける。前の文字と URL がくっつくと読みにくい。
-  // 全角スペースも食う (日本語で書かせているので混ざる)。
-  return String(text ?? '').replace(/[ \t　]*\[(\d{1,4})\]/g, (match, digits, offset, whole) => {
-    const url = messageLink(refs.get(Number(digits)));
-    if (!url) return match;
+  const body = String(text ?? '');
+  const cited = [];
+  const seen = new Set();
 
-    // 行頭に来たときは空白を足さない。行が空白で始まると見た目が崩れる。
-    const atLineStart = offset === 0 || whole[offset - 1] === '\n';
-    return atLineStart ? url : ` ${url}`;
-  });
+  for (const match of body.matchAll(/\[(\d{1,4})\]/g)) {
+    const ref = Number(match[1]);
+    if (seen.has(ref)) continue;
+
+    const url = messageLink(refs.get(ref));
+    if (!url) continue;
+
+    seen.add(ref);
+    cited.push(`[${ref}] <${url}>`);
+  }
+
+  if (cited.length === 0) return body;
+
+  return `${body.trimEnd()}\n\n-# ${cited.join(' ')}`;
 }
 
 function collapse(text) {
