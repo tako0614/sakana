@@ -123,6 +123,12 @@ def handle_embed(embedder, request):
     cleaned = []
     for text in texts:
         value = "" if text is None else str(text)
+
+        # 孤立サロゲートを落とす。呼び出し側が UTF-16 単位で切ると絵文字の途中で
+        # 切れて不正な文字列が来ることがあり、tokenizer がバッチ丸ごと拒否する。
+        # 1件の変な発言でバックフィル全体を止めないよう、ここで無害化しておく。
+        value = value.encode("utf-8", "ignore").decode("utf-8", "ignore")
+
         # 空文字を通すとゼロベクトルになり、何にでも 0 で当たる嘘の結果になる
         if not value.strip():
             raise ValueError("empty text is not allowed")

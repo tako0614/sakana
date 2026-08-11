@@ -76,6 +76,32 @@ export async function embedPreflight(guildId) {
   };
 }
 
+/**
+ * バッチが失敗したときに1件ずつ埋め直す。
+ * 埋め込めない1件は印を残して飛ばす。印を残さないと次回も同じ行で止まり、
+ * バックフィルが永久に先へ進まない。
+ */
+async function embedOneByOne(rows, modelId, job) {
+  for (const row of rows) {
+    try {
+      const single = await embedTexts([row.text], { kind: 'passage', encode: 'int8' });
+      saveVectors([{
+        rowid: row.rid,
+        modelId,
+        scale: single.scales[0],
+        vec: Buffer.from(single.vectors[0], 'base64'),
+        textLen: row.text.length
+      }]);
+      job.embedded += 1;
+    } catch (error) {
+      saveVectors([{ rowid: row.rid, modelId, scale: 0, vec: Buffer.alloc(0), textLen: 0 }]);
+      job.skipped += 1;
+      job.failed += 1;
+      console.error(`Skipping message rowid=${row.rid}: ${String(error.message ?? error).slice(0, 160)}`);
+    }
+  }
+}
+
 export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, onProgress = () => {} } = {}) {
   const job = {
     guildId: guild.id,
@@ -88,7 +114,9 @@ export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, on
     channelsDone: 0,
     channelsTotal: 0,
     currentChannel: null,
-    rate: 0
+    rate: 0,
+    batchFailures: 0,
+    failed: 0
   };
 
   claimJob(guild.id, job);
@@ -146,19 +174,32 @@ export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, on
 
       if (keep.length > 0) {
         const started = Date.now();
-        const result = await embedTexts(keep.map((row) => row.text), { kind: 'passage', encode: 'int8' });
-        const elapsed = Math.max(1, Date.now() - started);
-        job.rate = Math.round(keep.length / (elapsed / 1000));
+        let result = null;
 
-        saveVectors(keep.map((row, index) => ({
-          rowid: row.rid,
-          modelId,
-          scale: result.scales[index],
-          vec: Buffer.from(result.vectors[index], 'base64'),
-          textLen: row.text.length
-        })));
+        try {
+          result = await embedTexts(keep.map((row) => row.text), { kind: 'passage', encode: 'int8' });
+        } catch (error) {
+          // バッチ内の1件が悪いだけで全体を止めない。1件ずつ試して犯人を隔離する。
+          // (実際に絵文字が途中で切れた1件で 84% 地点から進まなくなった)
+          console.error('Embed batch failed, retrying one by one:', String(error.message ?? error).slice(0, 200));
+          job.batchFailures += 1;
+          await embedOneByOne(keep, modelId, job);
+        }
 
-        job.embedded += keep.length;
+        if (result) {
+          const elapsed = Math.max(1, Date.now() - started);
+          job.rate = Math.round(keep.length / (elapsed / 1000));
+
+          saveVectors(keep.map((row, index) => ({
+            rowid: row.rid,
+            modelId,
+            scale: result.scales[index],
+            vec: Buffer.from(result.vectors[index], 'base64'),
+            textLen: row.text.length
+          })));
+
+          job.embedded += keep.length;
+        }
       }
 
       job.messagesIndexed = job.embedded + job.skipped;

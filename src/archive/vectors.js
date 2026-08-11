@@ -127,7 +127,13 @@ export function normalizeForEmbedding(content) {
     .replace(/\s+/g, ' ')
     .trim();
 
-  return text.slice(0, embedConfig.maxChars);
+  // コードポイント単位で切る。String#slice は UTF-16 単位なので、絵文字
+  // (サロゲートペア) の途中で切れて孤立サロゲートが残る。そうなると UTF-8 として
+  // 不正な文字列になり、Rust 実装の tokenizer が丸ごと受け付けない。
+  // 実際に「AI is dead 💀」の繰り返しでこれを踏んで、バックフィルが 84% で止まった。
+  const chars = Array.from(text);
+  if (chars.length <= embedConfig.maxChars) return text;
+  return chars.slice(0, embedConfig.maxChars).join('');
 }
 
 /**
