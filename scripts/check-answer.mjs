@@ -117,11 +117,14 @@ const said = (id, name, content, extra = {}) => ({
   content, createdAt: 1_700_000_000_000, reactionCount: 0, attachmentCount: 0, ...extra
 });
 
+const SELF_ID = '111000111000111000';
+
 const userContentOf = (over = {}) => buildUserContent({
   ctx: {
     guild: { name: 'G' },
     channel: { name: 'general', id: 'c1' },
-    member: { displayName: 'さば', id: '999888777666555444' }
+    member: { displayName: 'さば', id: '999888777666555444' },
+    client: { user: { id: SELF_ID } }
   },
   prompt: '今日の失言おしえて',
   recent: [],
@@ -170,4 +173,31 @@ const userContentOf = (over = {}) => buildUserContent({
   }
 }
 
-console.log('caller ok (独立した行 / 表示名と ID / 話題と背景を分離)');
+{
+  // 自分の発言を第三者の発言として読ませない。`bot` の印だけでは
+  // 「何かの bot」でしかなく、自分の回答を根拠に引用していた。
+  const content = userContentOf({
+    recent: [
+      said('21', 'さば', 'たこの失言おしえて'),
+      said(SELF_ID, 'sakana', '6月と今日で言ってることが違う', { isBot: true }),
+      said('23', 'のあ', 'まじか', { isBot: false })
+    ]
+  });
+
+  const mine = content.split('\n').find((line) => line.includes('6月と今日で'));
+  if (!mine?.includes('←あなた自身の発言')) fail(`自分の発言に印が付いていない: ${mine}`);
+
+  // 他人の行には付けない
+  if (content.split('\n').find((l) => l.includes('たこの失言')).includes('あなた自身')) {
+    fail('他人の発言に「あなた自身」が付いている');
+  }
+
+  // 表示名ではなく ID で判定する (ニックネームはサーバーごとに変わる)
+  const impostor = userContentOf({
+    recent: [said('24', 'sakana', 'なりすまし', { isBot: true })]
+  });
+  if (impostor.includes('あなた自身')) fail('表示名の一致で自分だと判定してはいけない');
+  if (!impostor.includes('bot')) fail('他の bot には bot の印が要る');
+}
+
+console.log('caller ok (独立した行 / 表示名と ID / 話題と背景 / 自分の発言に印)');

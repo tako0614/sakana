@@ -201,7 +201,10 @@ export function fromRawMessage(raw, guildId, channelName) {
  * メッセージ列を1行1件で書き出す。
  *   3) [08/10 14:32 たこ #general] 本文… ⭐2 ↩1
  */
-export function formatMessages(messages, { refs, showChannel = false, bodyChars = 300, tailOf = null } = {}) {
+export function formatMessages(
+  messages,
+  { refs, showChannel = false, bodyChars = 300, tailOf = null, selfId = null } = {}
+) {
   const now = Date.now();
   const lines = [];
 
@@ -209,7 +212,13 @@ export function formatMessages(messages, { refs, showChannel = false, bodyChars 
     const ref = refs ? refs.add(message) : null;
     const head = [shortTime(message.createdAt, now), message.authorName];
     if (showChannel && message.channelName) head.push(`#${message.channelName}`);
-    if (message.isBot) head.push('bot');
+
+    // 自分の発言だと分かるようにする。`bot` の印だけでは「何かの bot」でしかなく、
+    // モデルは自分の過去の回答を第三者の発言として読んでいた
+    // (自分の回答を根拠として引用したり、自分の結論に反論したりする)。
+    // 表示名はサーバーごとのニックネームで変わるので、ID で判定する。
+    if (selfId && message.authorId === selfId) head.push('←あなた自身の発言');
+    else if (message.isBot) head.push('bot');
 
     const tail = [];
     // 呼び出し側が行末に足したいもの (意味検索の近さ順位など)

@@ -424,7 +424,13 @@ function recentConversationText(ctx) {
   // 話題が並行しているチャンネルでは直近12件が混ざったログになるので、
   // 返信でつながっている側があるならそれを使う (それが今の話題そのもの)。
   const source = (ctx.thread?.length ?? 0) >= 2 ? ctx.thread : (ctx.recent ?? []);
-  const recent = source.filter((message) => message.content?.trim()).slice(-12);
+  const selfId = ctx.client?.user?.id;
+
+  // 自分の過去の回答は外す。探したいのは人が書いた発言なので、
+  // 自分の要約文を混ぜると自分の言い回しに近いものを引きに行くことになる。
+  const recent = source
+    .filter((message) => message.content?.trim() && message.authorId !== selfId)
+    .slice(-12);
   if (recent.length < 2) return '';
   return recent.map((message) => `${message.authorName}: ${message.content}`).join('\n');
 }
@@ -634,6 +640,7 @@ async function searchViaArchive(ctx, args, limit, note = null) {
 
   lines.push(formatMessages(messages, {
     refs: ctx.refs,
+    selfId: ctx.client?.user?.id,
     showChannel: true,
     bodyChars: agentConfig.messageChars
   }));
@@ -886,6 +893,7 @@ async function searchViaDiscord(ctx, args, limit, archiveAvailable) {
         + (hidden ? ' ・ 読めないチャンネルのヒットは除外済' : ''),
       formatMessages(messages, {
         refs: ctx.refs,
+        selfId: ctx.client?.user?.id,
         showChannel: true,
         bodyChars: agentConfig.messageChars
       })
@@ -983,6 +991,7 @@ async function readManyChannels(ctx, wanted, args, { anchor = { kind: 'none' }, 
         ? '(発言なし)'
         : formatMessages(messages, {
           refs: ctx.refs,
+          selfId: ctx.client?.user?.id,
           showChannel: false,
           bodyChars: agentConfig.messageChars
         })
@@ -1203,6 +1212,7 @@ async function runRead(ctx, args) {
     `#${channel.name} ${messages.length} 件${period}${notes.length ? ` ・ ${notes.join(' ・ ')}` : ''}`,
     formatMessages(messages, {
       refs: ctx.refs,
+      selfId: ctx.client?.user?.id,
       showChannel: !sameChannel,
       bodyChars: agentConfig.messageChars
     }),
@@ -1283,6 +1293,7 @@ async function readReplies(ctx, anchor, args) {
     `返信の連鎖 ${messages.length} 件 (起点への返信を含む${replies === 0 ? '。返信は付いていない' : ''})`,
     formatMessages(messages, {
       refs: ctx.refs,
+      selfId: ctx.client?.user?.id,
       showChannel: true,
       bodyChars: agentConfig.messageChars
     }),

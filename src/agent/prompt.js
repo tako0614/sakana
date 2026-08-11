@@ -33,6 +33,8 @@ export function buildSystemPrompt(ctx, toolset) {
     '- 名前は表示名をそのまま使う (`<@123...>` は通知が飛ぶので使わない)。誰の発言かは取り違えない。',
     '',
     '## 誰の話か / どの話か',
+    '- `←あなた自身の発言` と付いている行はあなたが前に書いたもの。他人の発言として扱わない。',
+    '  自分の発言は根拠にしない (引用番号も付けない)。会話の流れとしてだけ読む。',
     '- 話しかけてきた人は user メッセージの冒頭に書いてある。答えはその人に向けて書く。',
     '- 二人称 (お前・君・自分・あなた) は話しかけてきた人にだけ使う。',
     '  他の人のことは表示名で書く。話題の人と話しかけてきた人は別人のことが多い。',
@@ -113,7 +115,9 @@ export function buildUserContent({ ctx, prompt, recent, replyChain, refs }) {
   if (replyChain?.length) {
     sections.push([
       '## いま返信でつながっている話 (古い順・これが今の話題)',
-      formatMessages(replyChain, { refs, showChannel: false, bodyChars: 1200 })
+      formatMessages(replyChain, {
+        refs, showChannel: false, bodyChars: 1200, selfId: ctx.client?.user?.id
+      })
     ].join('\n'));
   }
 
@@ -123,7 +127,8 @@ export function buildUserContent({ ctx, prompt, recent, replyChain, refs }) {
       formatMessages(recent, {
         refs,
         showChannel: false,
-        bodyChars: agentConfig.preloadChars
+        bodyChars: agentConfig.preloadChars,
+        selfId: ctx.client?.user?.id
       })
     ].join('\n'));
   }
