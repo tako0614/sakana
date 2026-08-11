@@ -29,9 +29,9 @@ export const agentConfig = {
   // 同じ1回として数えられて実際の費用と合わない。
   // これを超えたらツールを外して、その場の材料で答えを書かせる。
   // 単位は換算トークン (下の重み付け後)。
-  // 暴走を止めるためだけの値。普通に使って引っかかってはいけないので、
-  // 重い調査 (実測で最大10万トークン) の10倍を置く。
-  requestTokenLimit: number(process.env.AGENT_REQUEST_TOKEN_LIMIT, 1_000_000),
+  // 暴走を止めるためだけの値。重い調査1回が $0.012 なので、その4回ぶんを
+  // 1リクエストで使ったら異常とみなす。普通に使って引っかかる水準ではない。
+  requestUsd: number(process.env.AGENT_REQUEST_USD, 0.05),
   // ツール出力に載せる1メッセージあたりの本文文字数。
   messageChars: number(process.env.AGENT_MESSAGE_CHARS, 300),
   // 最初から渡す直近の会話はこちらを使う。人がスマホで見ているのは切られていない
@@ -50,21 +50,32 @@ export const agentConfig = {
   progressIntervalMs: number(process.env.AGENT_PROGRESS_INTERVAL_MS, 1000),
 
   // --- 使用量の制限 ---
-  // 数えるのは呼び出し回数ではなくトークン。1回の実行で 1.5万〜10万トークン使うので、
-  // 回数で縛ると軽い質問と重い調査が同じ1回として扱われて実際の費用と合わない。
+  // 勘定はトークン、意思決定はドル。
   //
-  // 入力・キャッシュヒット入力・出力は単価が違うので、
-  // 「キャッシュミス入力1トークン = 1」に正規化した重みを掛けて合算する。
-  // 既定の重みは DeepSeek の価格比。価格表が変わったら env で上書きする。
+  // 数えるのは呼び出し回数ではなくトークン (1回の実行で 8千〜14万トークン使うので、
+  // 回数で縛ると軽い質問と重い調査が同じ1回として扱われて費用と合わない)。
+  // ただし「換算トークン500万」では高いか安いか判断できないので、
+  // 設定する数字はドルで書き、内部でトークンに直す。
+  //
+  // 重みは「キャッシュミス入力1トークン = 1」に正規化した実単価の比。
+  // deepseek-v4-flash は 1Mトークンあたり 入力 $0.14 / キャッシュ $0.028 / 出力 $0.28
+  // なので 0.028/0.14 = 0.2、0.28/0.14 = 2.0。
+  // (キャッシュヒットの単価は資料で $0.028 と $0.0028 が食い違っていた。上限は壁なので
+  //  高い方を採る。実際が安ければ厳しめに働くだけで、逆より安全。)
   tokenWeightInput: number(process.env.AGENT_TOKEN_WEIGHT_INPUT, 1),
-  tokenWeightCached: number(process.env.AGENT_TOKEN_WEIGHT_CACHED, 0.1),
-  tokenWeightOutput: number(process.env.AGENT_TOKEN_WEIGHT_OUTPUT, 1.5),
-  // 換算トークンでの上限。/agentlimit で管理者が実行中に変えられる。
-  // これも「荒らしを止める壁」であって使用量の目標ではないので、寛大に置く
-  // (重い調査を1人で時50回やっても当たらない)。管理者は判定そのものを通らない。
-  userTokenLimit: number(process.env.AGENT_USER_TOKEN_LIMIT, 5_000_000),
-  userWindowMs: number(process.env.AGENT_USER_WINDOW_MS, 3_600_000),
-  globalTokenLimit: number(process.env.AGENT_GLOBAL_TOKEN_LIMIT, 50_000_000),
+  tokenWeightCached: number(process.env.AGENT_TOKEN_WEIGHT_CACHED, 0.2),
+  tokenWeightOutput: number(process.env.AGENT_TOKEN_WEIGHT_OUTPUT, 2.0),
+
+  // ドル ↔ 換算トークンの変換に使う単価。換算トークン1個は
+  // 「キャッシュミス入力1トークン」なので、その値段がそのまま換算レートになる。
+  priceInPerMTok: number(process.env.AGENT_PRICE_IN_PER_MTOK, 0.14),
+
+  // 上限はドルで書く。/agentlimit で管理者が実行中に変えられる。0 で無制限。
+  // 管理者は判定そのものを通らないので、これは他の人を縛る壁。
+  // 実測: 重い調査1回 $0.012 / 軽い質問1回 $0.001
+  globalDailyUsd: number(process.env.AGENT_GLOBAL_DAILY_USD, 0.5),
+  userDailyUsd: number(process.env.AGENT_USER_DAILY_USD, 0.25),
+  userWindowMs: number(process.env.AGENT_USER_WINDOW_MS, 86_400_000),
   globalWindowMs: number(process.env.AGENT_GLOBAL_WINDOW_MS, 86_400_000),
   // 費用の制限ではなくメモリの番人。1リクエストごとに Chrome の隔離タブを開くので、
   // 同時に何十本も走ると 12GiB を食い潰す。トークンでは同時実行数は縛れない。

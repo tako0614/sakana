@@ -2,6 +2,9 @@
 //
 // 上限を env だけで持つと、変えるたびに再起動が必要で、
 // 「今いくら使っているのか」も分からない。実行中に見て触れるようにする。
+//
+// 表示はドル。内部の勘定は換算トークンなので、突き合わせたいときのために
+// トークンも括弧で添える。単価も必ず出す (入れ間違いに気付けるように)。
 
 import {
   EmbedBuilder,
@@ -12,57 +15,103 @@ import {
 
 import { canManageIndex } from '../archive/permissions.js';
 import { agentConfig } from './config.js';
-import { TUNABLES, getUsage, listTunables, setTunable } from './ratelimit.js';
+import {
+  TUNABLES,
+  getTunable,
+  getUsage,
+  grantDailyUsd,
+  listGrants,
+  listTunables,
+  setTunable,
+  usdToTokens
+} from './ratelimit.js';
 
 const KEY_LABELS = {
-  user_token_limit: '1人あたりの上限 (換算トークン / 窓)',
-  global_token_limit: '全体の上限 (換算トークン / 窓)',
-  max_concurrent: '同時実行数',
-  weight_input: '重み: 入力 (キャッシュミス)',
-  weight_cached: '重み: 入力 (キャッシュヒット)',
-  weight_output: '重み: 出力'
+  user_daily_usd: '1人あたり/日 ($)',
+  global_daily_usd: '全体/日 ($)',
+  request_usd: '1リクエストの上限 ($)',
+  price_in: '単価: 入力 ($/1Mトークン)',
+  weight_cached: '重み: キャッシュヒット入力',
+  weight_output: '重み: 出力',
+  max_concurrent: '同時実行数'
 };
 
-function formatAmount(value) {
+function compactTokens(value) {
+  if (!Number.isFinite(value)) return '無制限';
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
   if (value >= 1000) return `${Math.round(value / 1000)}k`;
-  return String(Math.round(value * 100) / 100);
+  return String(Math.round(value));
 }
 
 function usageEmbed(userId) {
   const usage = getUsage(userId);
-  const userHours = Math.round(agentConfig.userWindowMs / 3_600_000);
-  const globalHours = Math.round(agentConfig.globalWindowMs / 3_600_000);
+  const hours = Math.round(agentConfig.userWindowMs / 3_600_000);
+  const window = hours === 24 ? '直近24時間' : `直近 ${hours} 時間`;
+
+  const line = (used, limit) => (
+    limit > 0 ? `$${used.toFixed(3)} / $${limit.toFixed(2)}` : `$${used.toFixed(3)} / 無制限`
+  );
+
+  const priceIn = getTunable('price_in');
 
   const embed = new EmbedBuilder()
     .setColor('#2b2d31')
     .setTitle('🧮 エージェントの使用量')
     .setDescription([
-      '数えているのは呼び出し回数ではなく「換算トークン」。',
-      '入力・キャッシュヒット・出力で単価が違うので、重みを掛けて合算している。'
+      '勘定はトークン、上限はドル。',
+      `換算トークン1個 = キャッシュミス入力1トークン = $${(priceIn / 1_000_000).toExponential(2)}。`
     ].join(''))
     .addFields(
       {
-        name: `あなた (直近 ${userHours} 時間)`,
-        value: `${formatAmount(usage.user)} / ${formatAmount(usage.userLimit)}`,
+        name: `あなた (${window})`,
+        value: `${line(usage.userUsd, usage.userLimitUsd)}\n(${compactTokens(usage.userTokens)} / ${compactTokens(usage.userLimitTokens)} 換算トークン)`,
         inline: true
       },
       {
-        name: `全体 (直近 ${globalHours} 時間)`,
-        value: `${formatAmount(usage.global)} / ${formatAmount(usage.globalLimit)}`,
+        name: `全体 (${window})`,
+        value: `${line(usage.globalUsd, usage.globalLimitUsd)}\n(${compactTokens(usage.globalTokens)} 換算トークン)`,
         inline: true
       },
       { name: '実行中', value: String(usage.running), inline: true }
     );
 
   embed.addFields({
-    name: '上限と重み',
+    name: '設定',
     value: listTunables()
       .map((row) => `${KEY_LABELS[row.key] ?? row.key}: \`${row.value}\`${row.overridden ? ` (既定 ${row.defaultValue})` : ''}`)
       .join('\n')
   });
 
+  // 1リクエストの上限はトークンにも直して出す (llm 側はこの数字で止める)
+  const requestUsd = getTunable('request_usd');
+  embed.addFields({
+    name: '1リクエストの暴走ガード',
+    value: `$${requestUsd} (${compactTokens(usdToTokens(requestUsd))} 換算トークン)`,
+    inline: true
+  });
+
+  const grants = listGrants();
+  if (grants.length > 0) {
+    embed.addFields({
+      name: `個別に付与 (${grants.length})`,
+      value: grants.map((row) => `<@${row.userId}> $${row.usd.toFixed(2)}`).join('\n').slice(0, 1000)
+    });
+  }
+
+  embed.setFooter({ text: '管理者は上限の判定を通りません。金額は見積りで、請求と一致する保証はありません。' });
+
   return embed;
+}
+
+async function requireAdmin(interaction) {
+  const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
+  if (canManageIndex(member)) return true;
+
+  await interaction.reply({
+    content: '上限を変えられるのは「サーバー管理」権限を持つ人か、`ARCHIVE_ADMIN_USERS` に登録された人だけです。',
+    flags: MessageFlags.Ephemeral
+  });
+  return false;
 }
 
 export const agentCommands = [
@@ -78,7 +127,7 @@ export const agentCommands = [
         .setDescription('いまの使用量と上限を表示します'))
       .addSubcommand((sub) => sub
         .setName('set')
-        .setDescription('上限や重みを変えます (管理者用)')
+        .setDescription('上限や単価を変えます (管理者用)')
         .addStringOption((option) => option
           .setName('key')
           .setDescription('変える項目')
@@ -87,7 +136,25 @@ export const agentCommands = [
         .addNumberOption((option) => option
           .setName('value')
           .setDescription('新しい値。省略すると .env の既定に戻します')
-          .setRequired(false))),
+          .setRequired(false)))
+      .addSubcommand((sub) => sub
+        .setName('grant')
+        .setDescription('特定の人の1日上限を上げます (管理者用)')
+        .addUserOption((option) => option
+          .setName('user')
+          .setDescription('対象')
+          .setRequired(true))
+        .addNumberOption((option) => option
+          .setName('usd')
+          .setDescription('1日あたりの上限 (ドル)。0 でその人だけ無制限')
+          .setRequired(true)))
+      .addSubcommand((sub) => sub
+        .setName('revoke')
+        .setDescription('個別の付与を取り消して既定に戻します (管理者用)')
+        .addUserOption((option) => option
+          .setName('user')
+          .setDescription('対象')
+          .setRequired(true))),
 
     async execute(interaction) {
       const sub = interaction.options.getSubcommand();
@@ -100,10 +167,23 @@ export const agentCommands = [
         return;
       }
 
-      const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
-      if (!canManageIndex(member)) {
+      if (!await requireAdmin(interaction)) return;
+
+      if (sub === 'grant' || sub === 'revoke') {
+        const target = interaction.options.getUser('user');
+        const usd = sub === 'grant' ? interaction.options.getNumber('usd') : null;
+
+        if (!grantDailyUsd(target.id, usd, interaction.user.id)) {
+          await interaction.reply({ content: `その値は使えません: ${usd}`, flags: MessageFlags.Ephemeral });
+          return;
+        }
+
         await interaction.reply({
-          content: '上限を変えられるのは「サーバー管理」権限を持つ人か、`ARCHIVE_ADMIN_USERS` に登録された人だけです。',
+          content: sub === 'grant'
+            ? `${target} の1日上限を $${usd} にしました${usd === 0 ? ' (無制限)' : ''}。`
+            : `${target} の付与を取り消して既定に戻しました。`,
+          embeds: [usageEmbed(interaction.user.id)],
+          allowedMentions: { parse: [] },
           flags: MessageFlags.Ephemeral
         });
         return;
@@ -113,8 +193,7 @@ export const agentCommands = [
       const value = interaction.options.getNumber('value');
 
       // value 省略で既定に戻す。戻す手段が無いと怖くて触れない。
-      const ok = setTunable(key, value ?? null, interaction.user.id);
-      if (!ok) {
+      if (!setTunable(key, value ?? null, interaction.user.id)) {
         await interaction.reply({ content: `その値は使えません: ${value}`, flags: MessageFlags.Ephemeral });
         return;
       }

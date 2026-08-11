@@ -1,13 +1,19 @@
 // エージェントの使用量制限と記録。
 //
-// 数えるのは呼び出し回数ではなく「換算トークン」。軽い一言と全期間の調査を
-// 同じ1回として数えると、実際の費用とまるで合わない。
-// 入力 / キャッシュヒット入力 / 出力は単価が違うので、重みを掛けて合算する。
+// 勘定はトークン、意思決定はドル。
+//   - 保存するのは生のトークン数 (prompt / completion / cached)。値上げされても
+//     過去の記録の意味が変わらないようにするため
+//   - 集計は「換算トークン」(キャッシュミス入力1トークン = 1 に正規化した重み付き合計)
+//   - 上限はドルで設定して、判定の直前にトークンへ直す。換算トークン1個の値段が
+//     そのまま換算レートになる (= キャッシュミス入力1トークンの単価)
 //
-// 制限は「1人あたり」と「全体」の2段構え。プロセスを再起動しても効くように
-// カウントはメモリではなく SQLite に置く。
+// 回数で数えないのは、軽い一言と全期間の調査が同じ「1回」になって費用と合わないから。
+//
+// 制限は「1人あたり」と「全体」の2段構えで、窓はどちらも直近24時間の移動窓。
+// 暦の日で区切ると深夜0時のリセット待ちが生まれるし、1時間窓は1日に24回
+// リセットされるので請求の長さを測っていない。
+// プロセスを再起動しても効くようにカウントはメモリではなく SQLite に置く。
 // 予約 (reserveCall) → 実行 → 確定 (finalizeCall) の順に使う。
-// better-sqlite3 は同期実行なので、予約は他の呼び出しと競合しない。
 //
 // トークンは実行が終わるまで分からないので、上限は厳密には後追い。
 // 超過は「同時実行数 × 1回ぶん」で有界なので、それで足りるとみなす。
@@ -101,15 +107,21 @@ const deleteSettingStmt = db.prepare('DELETE FROM agent_settings WHERE key = ?')
 // 実行中の件数。同時実行数を抑えて、レート制限と課金の暴発を防ぐ。
 let running = 0;
 
-/** 実行中に変えられる設定。既定は env。 */
+/** 実行中に変えられる設定。既定は env。金額は USD。 */
 export const TUNABLES = {
-  user_token_limit: () => agentConfig.userTokenLimit,
-  global_token_limit: () => agentConfig.globalTokenLimit,
-  max_concurrent: () => agentConfig.maxConcurrent,
-  weight_input: () => agentConfig.tokenWeightInput,
+  user_daily_usd: () => agentConfig.userDailyUsd,
+  global_daily_usd: () => agentConfig.globalDailyUsd,
+  request_usd: () => agentConfig.requestUsd,
+  price_in: () => agentConfig.priceInPerMTok,
   weight_cached: () => agentConfig.tokenWeightCached,
-  weight_output: () => agentConfig.tokenWeightOutput
+  weight_output: () => agentConfig.tokenWeightOutput,
+  max_concurrent: () => agentConfig.maxConcurrent
 };
+
+// 個人ごとの上限は同じ表に key='limit:<userId>' で入れる (新しい表は作らない)。
+// 保存する値はドル。単価を変えたら付与額の意味も追従してほしいので、
+// トークンに直してから保存はしない。
+const GRANT_PREFIX = 'limit:';
 
 export function getTunable(key) {
   const fallback = TUNABLES[key];
@@ -149,10 +161,54 @@ export function listTunables() {
 
 function weights() {
   return {
-    w_in: getTunable('weight_input'),
+    // 入力 (キャッシュミス) は正規化の基準なので常に 1
+    w_in: 1,
     w_cached: getTunable('weight_cached'),
     w_out: getTunable('weight_output')
   };
+}
+
+/**
+ * ドル ↔ 換算トークン。
+ * 換算トークン1個は「キャッシュミス入力1トークン」なので、その単価が換算レート。
+ */
+export function usdToTokens(usd) {
+  const rate = getTunable('price_in') / 1_000_000;
+  if (!Number.isFinite(rate) || rate <= 0) return Infinity;
+  return usd / rate;
+}
+
+export function tokensToUsd(tokens) {
+  return tokens * (getTunable('price_in') / 1_000_000);
+}
+
+/** その人の1日上限 (ドル)。付与があればそれ、無ければ既定。 */
+export function dailyUsdFor(userId) {
+  const row = getSettingStmt.get(`${GRANT_PREFIX}${userId}`);
+  return Number.isFinite(row?.value) ? row.value : getTunable('user_daily_usd');
+}
+
+/** 個人への付与。usd が null なら取り消して既定に戻す。 */
+export function grantDailyUsd(userId, usd, byUserId) {
+  const key = `${GRANT_PREFIX}${userId}`;
+
+  if (usd === null || usd === undefined) {
+    deleteSettingStmt.run(key);
+    return true;
+  }
+
+  const parsed = Number(usd);
+  if (!Number.isFinite(parsed) || parsed < 0) return false;
+
+  setSettingStmt.run({ key, value: parsed, at: Date.now(), by: byUserId ?? null });
+  return true;
+}
+
+/** 付与済みの一覧。/agentlimit show に出す。 */
+export function listGrants() {
+  return db.prepare(`SELECT key, value, updated_by FROM agent_settings WHERE key LIKE '${GRANT_PREFIX}%'`)
+    .all()
+    .map((row) => ({ userId: row.key.slice(GRANT_PREFIX.length), usd: row.value, by: row.updated_by }));
 }
 
 /** usage 1件を換算トークンにする。表示にも使う。 */
@@ -182,7 +238,9 @@ export function reserveCall({ guildId, channelId, userId, admin = false }) {
       return { ok: false, scope: 'busy' };
     }
 
-    const userLimit = getTunable('user_token_limit');
+    // 上限はドルで持っているので、判定の直前にトークンへ直す
+    const userUsd = dailyUsdFor(userId);
+    const userLimit = userUsd > 0 ? usdToTokens(userUsd) : 0;
     const userSince = now - agentConfig.userWindowMs;
     const userUsed = sumUserStmt.get({ user_id: userId, since: userSince, ...weights() }).total;
 
@@ -191,14 +249,15 @@ export function reserveCall({ guildId, channelId, userId, admin = false }) {
       return {
         ok: false,
         scope: 'user',
-        used: userUsed,
-        limit: userLimit,
+        usedUsd: tokensToUsd(userUsed),
+        limitUsd: userUsd,
         windowMs: agentConfig.userWindowMs,
         retryAt: oldest + agentConfig.userWindowMs
       };
     }
 
-    const globalLimit = getTunable('global_token_limit');
+    const globalUsd = getTunable('global_daily_usd');
+    const globalLimit = globalUsd > 0 ? usdToTokens(globalUsd) : 0;
     const globalSince = now - agentConfig.globalWindowMs;
     const globalUsed = sumGlobalStmt.get({ since: globalSince, ...weights() }).total;
 
@@ -207,8 +266,8 @@ export function reserveCall({ guildId, channelId, userId, admin = false }) {
       return {
         ok: false,
         scope: 'global',
-        used: globalUsed,
-        limit: globalLimit,
+        usedUsd: tokensToUsd(globalUsed),
+        limitUsd: globalUsd,
         windowMs: agentConfig.globalWindowMs,
         retryAt: oldest + agentConfig.globalWindowMs
       };
@@ -301,14 +360,14 @@ export function remainingFor(userId, admin = false) {
   const now = Date.now();
   const w = weights();
 
-  const userLimit = getTunable('user_token_limit');
-  const globalLimit = getTunable('global_token_limit');
+  const userUsd = dailyUsdFor(userId);
+  const globalUsd = getTunable('global_daily_usd');
 
-  const userLeft = userLimit > 0
-    ? userLimit - sumUserStmt.get({ user_id: userId, since: now - agentConfig.userWindowMs, ...w }).total
+  const userLeft = userUsd > 0
+    ? usdToTokens(userUsd) - sumUserStmt.get({ user_id: userId, since: now - agentConfig.userWindowMs, ...w }).total
     : Infinity;
-  const globalLeft = globalLimit > 0
-    ? globalLimit - sumGlobalStmt.get({ since: now - agentConfig.globalWindowMs, ...w }).total
+  const globalLeft = globalUsd > 0
+    ? usdToTokens(globalUsd) - sumGlobalStmt.get({ since: now - agentConfig.globalWindowMs, ...w }).total
     : Infinity;
 
   return Math.max(0, Math.min(userLeft, globalLeft));
@@ -318,11 +377,20 @@ export function getUsage(userId) {
   const now = Date.now();
   const w = weights();
 
+  const userTokens = sumUserStmt.get({ user_id: userId, since: now - agentConfig.userWindowMs, ...w }).total;
+  const globalTokens = sumGlobalStmt.get({ since: now - agentConfig.globalWindowMs, ...w }).total;
+  const userUsd = dailyUsdFor(userId);
+  const globalUsd = getTunable('global_daily_usd');
+
   return {
-    user: sumUserStmt.get({ user_id: userId, since: now - agentConfig.userWindowMs, ...w }).total,
-    userLimit: getTunable('user_token_limit'),
-    global: sumGlobalStmt.get({ since: now - agentConfig.globalWindowMs, ...w }).total,
-    globalLimit: getTunable('global_token_limit'),
+    // 表示はドル、突き合わせ用にトークンも返す (内部の勘定はトークンなので)
+    userUsd: tokensToUsd(userTokens),
+    userLimitUsd: userUsd,
+    userTokens,
+    userLimitTokens: userUsd > 0 ? usdToTokens(userUsd) : Infinity,
+    globalUsd: tokensToUsd(globalTokens),
+    globalLimitUsd: globalUsd,
+    globalTokens,
     running
   };
 }

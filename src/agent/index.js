@@ -18,7 +18,15 @@ import {
 } from './format.js';
 import { runAgent } from './llm.js';
 import { buildSystemPrompt, buildUserContent } from './prompt.js';
-import { finalizeCall, recordToolCalls, releaseCall, remainingFor, reserveCall, weighTokens } from './ratelimit.js';
+import {
+  finalizeCall,
+  recordToolCalls,
+  releaseCall,
+  remainingFor,
+  reserveCall,
+  usdToTokens,
+  weighTokens
+} from './ratelimit.js';
 import { ThinkingIndicator, toolLabel } from './thinking.js';
 import { buildToolset } from './tools.js';
 
@@ -97,11 +105,12 @@ function limitMessage(reservation) {
 
   const at = `<t:${Math.floor(reservation.retryAt / 1000)}:R>`;
   const hours = Math.round(reservation.windowMs / 3_600_000);
-  const amount = `${Math.round(reservation.used / 1000)}k / ${Math.round(reservation.limit / 1000)}k トークン`;
+  const window = hours === 24 ? '1日' : `${hours}時間`;
+  const amount = `$${reservation.usedUsd.toFixed(3)} / $${reservation.limitUsd.toFixed(2)}`;
 
   return reservation.scope === 'user'
-    ? `使用量の上限に達しました (1人あたり ${hours} 時間で ${amount})。${at} に空きます。`
-    : `サーバー全体の使用量の上限に達しました (${hours} 時間で ${amount})。${at} に空きます。`;
+    ? `使用量の上限に達しました (1人あたり${window} ${amount})。${at} に空きます。`
+    : `サーバー全体の使用量の上限に達しました (${window} ${amount})。${at} に空きます。`;
 }
 
 async function fetchRecent(channel, excludeId, limit) {
@@ -201,9 +210,10 @@ export async function handleAgentRequest(message, client) {
       userContent,
       toolset,
       usage,
-      // 止めるのはトークンだけ。1回ぶんの上限と、その人の残りのうち小さい方。
-      // 管理者は残りが Infinity なので、暴走ガードの1回ぶんだけが効く。
-      budget: Math.min(agentConfig.requestTokenLimit, remainingFor(message.author.id, admin)),
+      // 止めるのはトークンだけ。上限はドルで持っているのでここで換算する。
+      // 1回ぶんの暴走ガードと、その人の残りのうち小さい方。
+      // 管理者は残りが Infinity なので、暴走ガードだけが効く。
+      budget: Math.min(usdToTokens(agentConfig.requestUsd), remainingFor(message.author.id, admin)),
       weigh: weighTokens,
       signal: controller.signal,
       onToolCall: (name, args) => indicator.setStatus(toolLabel(name, args))
