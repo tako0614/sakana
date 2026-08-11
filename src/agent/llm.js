@@ -3,8 +3,9 @@
 // トークンの効き方:
 //   ツールを1回呼ぶたびに会話全体を再送するので、往復回数がそのまま費用になる。
 //   だから maxRounds で往復を、maxToolChars でツール出力の総量を縛る。
-//   system → tools → messages の順序と中身を実行ごとに変えないでおくと、
-//   DeepSeek 側のコンテキストキャッシュに乗って入力ぶんが安くなる。
+//   キャッシュは前方一致なので、system は1文字も可変にしない (時刻を入れていた頃は
+//   その後ろ 5.5KB がリクエストごとに新規扱いになっていた)。可変な文脈は
+//   user メッセージ側に置く。system → tools → messages の順序も変えない。
 
 import { agentConfig } from './config.js';
 

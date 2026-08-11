@@ -31,6 +31,10 @@ export const agentConfig = {
   maxToolChars: number(process.env.AGENT_MAX_TOOL_CHARS, 32_000),
   // ツール出力に載せる1メッセージあたりの本文文字数。
   messageChars: number(process.env.AGENT_MESSAGE_CHARS, 300),
+  // 最初から渡す直近の会話はこちらを使う。人がスマホで見ているのは切られていない
+  // 本文なので、ここで切ると「読んだはずの発言」が欠けたまま答えることになる。
+  // user メッセージ側なのでキャッシュの前方一致は壊さない。
+  preloadChars: number(process.env.AGENT_PRELOAD_CHARS, 800),
   // 呼ばれた時点で直近メッセージを最初から渡しておく (ツール往復を1回減らす)。0 で無効。
   preloadMessages: number(process.env.AGENT_PRELOAD_MESSAGES, 30),
   // max_tokens には思考ぶんも含まれる。4000 だと reasoning_effort:high の思考で

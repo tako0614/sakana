@@ -7,13 +7,19 @@
 import { agentConfig } from './config.js';
 import { formatMessages, shortTime } from './format.js';
 
+/**
+ * ここは1文字も可変にしない。
+ *
+ * DeepSeek のコンテキストキャッシュは前方一致なので、時刻やチャンネル名を混ぜると
+ * その後ろ全部 (プロンプト 1.4KB + ツール定義 4.1KB) がリクエストごとに新規扱いになる。
+ * 可変な情報は buildUserContent の側に置く。
+ * 変わるのは可用性で出し入れする末尾のツール行だけ (ギルド単位でほぼ固定)。
+ */
 export function buildSystemPrompt(ctx, toolset) {
   // チャンネル一覧はここに載せない。数の多いサーバーだと毎ターン払うことになるので、
   // 必要になったときだけ channels で取りに行かせる。
   const lines = [
     'あなたは Discord サーバーの中にいるアシスタントです。会話を読み、取得した発言だけを根拠に答えます。',
-    `サーバー: ${ctx.guild.name} / チャンネル: #${ctx.channel.name ?? ctx.channel.id}`
-      + ` / 現在 ${shortTime(Date.now())} (UTC+9) / 呼んだ人: ${ctx.member?.displayName ?? 'unknown'}`,
     '',
     '## 根拠',
     '- 取得したメッセージだけを根拠にする。記憶で補わない。引用の捏造は禁止。',
@@ -74,13 +80,19 @@ export function buildSystemPrompt(ctx, toolset) {
  * 最初のユーザーメッセージ。ここで直近の会話も一緒に渡してしまう。
  * ツールを1往復減らせるので、結果的にトークンが減る。
  */
-export function buildUserContent({ prompt, recent, replyTarget, refs }) {
+export function buildUserContent({ ctx, prompt, recent, replyTarget, refs }) {
   const sections = [];
+
+  // 可変な文脈はここ。system に入れるとキャッシュの前方一致を壊す。
+  sections.push([
+    `サーバー: ${ctx.guild.name} / チャンネル: #${ctx.channel.name ?? ctx.channel.id}`,
+    `現在 ${shortTime(Date.now())} (UTC+9) / 呼んだ人: ${ctx.member?.displayName ?? 'unknown'}`
+  ].join(' / '));
 
   if (replyTarget) {
     sections.push([
       '## 返信で名指しされたメッセージ',
-      formatMessages([replyTarget], { refs, showChannel: false, bodyChars: 1200 })
+      formatMessages([replyTarget], { refs, showChannel: false, bodyChars: 1600 })
     ].join('\n'));
   }
 
@@ -90,7 +102,7 @@ export function buildUserContent({ prompt, recent, replyTarget, refs }) {
       formatMessages(recent, {
         refs,
         showChannel: false,
-        bodyChars: agentConfig.messageChars
+        bodyChars: agentConfig.preloadChars
       })
     ].join('\n'));
   }

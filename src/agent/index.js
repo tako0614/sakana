@@ -186,6 +186,7 @@ export async function handleAgentRequest(message, client) {
 
     const system = buildSystemPrompt(ctx, toolset);
     const userContent = buildUserContent({
+      ctx,
       prompt: stripMention(message.content, client.user.id),
       recent,
       replyTarget,
