@@ -146,6 +146,23 @@ const countAfter = db.prepare(`
   WHERE m.channel_id = @channel_id AND m.created_at > @since AND ${ELIGIBLE_SQL}
 `);
 
+
+// (created_at, rowid) の行値で進める。created_at だけだと同一ミリ秒の発言で
+// 取りこぼしか重複が出るし、rowid だけだと backfill の挿入順が時系列と逆なので使えない。
+const selectPage = db.prepare(`
+  SELECT m.*, m.rowid AS rid FROM messages m
+  WHERE m.channel_id = @channel_id
+    AND (m.created_at, m.rowid) > (@since_ms, @since_rid)
+    AND ${ELIGIBLE_SQL}
+  ORDER BY m.created_at, m.rowid
+  LIMIT @limit
+`);
+
+// イベントループに順番を返す。better-sqlite3 は同期なので、これを挟まないと
+// 134チャンネルを回りきるまで Discord の heartbeat も進捗表示も止まり、
+// /index cancel も効かない (実際にそうなっていた)。
+const yieldToLoop = () => new Promise((resolve) => setImmediate(resolve));
+
 /**
  * 1チャンネルぶんのまとまりを作る。末尾に追記していくだけ。
  *
@@ -154,7 +171,7 @@ const countAfter = db.prepare(`
  * ただし新しい発言が1件も無いなら触らない — 作り直すとベクトルも捨てることに
  * なり、静かなチャンネルでも毎晩1件ずつ埋め直す羽目になる。
  */
-export function buildChannelChunks(guildId, channelId) {
+export async function buildChannelChunks(guildId, channelId, { isCancelled = () => false } = {}) {
   const last = selectLastChunk.get(channelId);
 
   if (last) {
@@ -162,18 +179,48 @@ export function buildChannelChunks(guildId, channelId) {
     if (fresh === 0) return 0;
   }
 
-  const since = last ? last.from_ms - 1 : -1;
+  let sinceMs = last ? last.from_ms - 1 : -1;
+  let sinceRid = 0;
+  // ページの境目でまとまりが切れないよう、最後の組は次のページに持ち越す
+  let carry = [];
+  let built = 0;
+
   if (last) deleteChunk.run(last.chunk_id);
 
-  const rows = db.prepare(`
-    SELECT m.* FROM messages m
-    WHERE m.channel_id = @channel_id AND m.created_at > @since AND ${ELIGIBLE_SQL}
-    ORDER BY m.created_at
-  `).all({ ...eligibleParams(), channel_id: channelId, since });
+  for (;;) {
+    if (isCancelled()) break;
 
-  let built = 0;
-  for (const group of splitIntoChunks(rows)) {
-    saveChunk(guildId, group);
+    const rows = selectPage.all({
+      ...eligibleParams(),
+      channel_id: channelId,
+      since_ms: sinceMs,
+      since_rid: sinceRid,
+      limit: embedConfig.chunkPage
+    });
+
+    if (rows.length === 0) break;
+
+    const groups = splitIntoChunks([...carry, ...rows]);
+    const done = rows.length < embedConfig.chunkPage;
+
+    // 最後まで読んだときだけ最後の組も確定させる
+    carry = done ? [] : (groups.pop() ?? []);
+
+    for (const group of groups) {
+      saveChunk(guildId, group);
+      built += 1;
+    }
+
+    const tail = rows[rows.length - 1];
+    sinceMs = tail.created_at;
+    sinceRid = tail.rid;
+
+    if (done) break;
+    await yieldToLoop();
+  }
+
+  if (carry.length > 0) {
+    saveChunk(guildId, carry);
     built += 1;
   }
 
@@ -181,13 +228,16 @@ export function buildChannelChunks(guildId, channelId) {
 }
 
 /** ギルド全体。取り込み済みチャンネルを順に回す。 */
-export function buildGuildChunks(guildId, { onProgress = () => {} } = {}) {
+export async function buildGuildChunks(guildId, { onProgress = () => {}, isCancelled = () => false } = {}) {
   const channels = selectChannels.all(guildId).map((row) => row.channel_id);
   let built = 0;
 
   for (const [index, channelId] of channels.entries()) {
-    built += buildChannelChunks(guildId, channelId);
+    if (isCancelled()) break;
+
+    built += await buildChannelChunks(guildId, channelId, { isCancelled });
     onProgress({ channelsDone: index + 1, channelsTotal: channels.length, built });
+    await yieldToLoop();
   }
 
   return { built, channels: channels.length };

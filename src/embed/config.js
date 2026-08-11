@@ -56,6 +56,9 @@ export const embedConfig = {
   // 長い議論が1ベクトルに溶けないよう上限も置く
   chunkMaxMessages: number(process.env.SEMANTIC_CHUNK_MAX_MESSAGES, 20),
   chunkMaxChars: number(process.env.SEMANTIC_CHUNK_MAX_CHARS, 1200),
+  // 1チャンネルを丸ごとメモリに載せないためのページ幅 (18.8万件のチャンネルがある)。
+  // 小さくすればページ境界の持ち越しを試験できる。
+  chunkPage: number(process.env.SEMANTIC_CHUNK_PAGE, 5000),
 
   // バックフィル
   batchSize: number(process.env.SEMANTIC_BATCH_SIZE, 32),

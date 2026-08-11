@@ -155,13 +155,20 @@ export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, on
       const { stale } = refreshStale(guild.id);
       if (stale > 0) console.log(`Refreshed ${stale} stale chunk(s) in ${guild.name}.`);
     } else {
-      buildGuildChunks(guild.id, {
-        onProgress: ({ channelsDone, channelsTotal }) => {
+      await buildGuildChunks(guild.id, {
+        isCancelled: () => job.cancelled,
+        onProgress: ({ channelsDone, channelsTotal, built }) => {
           job.channelsDone = channelsDone;
           job.channelsTotal = channelsTotal;
+          job.currentChannel = `会話のまとまりを作成中 (${built} 件)`;
           onProgress(job);
         }
       });
+    }
+
+    if (job.cancelled) {
+      setEmbedState(guild.id, { status: 'cancelled', finished_at: Date.now() });
+      return job;
     }
 
     // --- ② まとまりを埋め込む ---
