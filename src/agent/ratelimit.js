@@ -165,17 +165,19 @@ export function weighTokens(usage = {}) {
   return Math.max(0, prompt - cached) * w_in + cached * w_cached + completion * w_out;
 }
 
-function isExempt(userId) {
-  return agentConfig.exemptUsers.includes(userId);
+function isExempt(userId, admin = false) {
+  // 管理者は完全に素通り。上限は荒らしを止める壁で、運営を縛るものではない。
+  return admin || agentConfig.exemptUsers.includes(userId);
 }
 
 /**
  * 枠を1つ確保する。空いていなければ理由と復帰時刻を返す。
+ * admin: true なら回数・トークン・同時実行のどれも見ない。
  */
-export function reserveCall({ guildId, channelId, userId }) {
+export function reserveCall({ guildId, channelId, userId, admin = false }) {
   const now = Date.now();
 
-  if (!isExempt(userId)) {
+  if (!isExempt(userId, admin)) {
     if (running >= getTunable('max_concurrent')) {
       return { ok: false, scope: 'busy' };
     }
@@ -287,6 +289,29 @@ export function recordToolCalls(callId, used = []) {
   } catch (error) {
     console.error('Failed to record tool calls:', error);
   }
+}
+
+/**
+ * この人が今の窓で使える残り。1リクエストの予算をここから決める。
+ * 上限が 0 (無制限) のときは Infinity。
+ */
+export function remainingFor(userId, admin = false) {
+  if (isExempt(userId, admin)) return Infinity;
+
+  const now = Date.now();
+  const w = weights();
+
+  const userLimit = getTunable('user_token_limit');
+  const globalLimit = getTunable('global_token_limit');
+
+  const userLeft = userLimit > 0
+    ? userLimit - sumUserStmt.get({ user_id: userId, since: now - agentConfig.userWindowMs, ...w }).total
+    : Infinity;
+  const globalLeft = globalLimit > 0
+    ? globalLimit - sumGlobalStmt.get({ since: now - agentConfig.globalWindowMs, ...w }).total
+    : Infinity;
+
+  return Math.max(0, Math.min(userLeft, globalLeft));
 }
 
 export function getUsage(userId) {

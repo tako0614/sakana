@@ -2,7 +2,8 @@
 //
 // トークンの効き方:
 //   ツールを1回呼ぶたびに会話全体を再送するので、往復回数がそのまま費用になる。
-//   だから maxRounds で往復を、maxToolChars でツール出力の総量を縛る。
+//   縛るのはトークンだけ。予算を使い切ったらツールを外して締めさせる
+//   (往復や文字数で縛ると、軽い往復と重い往復が同じ「1回」になって費用と合わない)。
 //   キャッシュは前方一致なので、system は1文字も可変にしない (時刻を入れていた頃は
 //   その後ろ 5.5KB がリクエストごとに新規扱いになっていた)。可変な文脈は
 //   user メッセージ側に置く。system → tools → messages の順序も変えない。
@@ -115,10 +116,22 @@ function parseArguments(raw) {
   }
 }
 
+// 暴走したループを止めるためだけの最後の壁。つまみではないので env に出さない。
+// 予算で止まるのが普通の経路で、ここに当たるのは何かが壊れているとき。
+const HARD_ROUND_CAP = 100;
+
 /**
  * ツールループ本体。最終的なテキストと、使ったトークンを返す。
+ *
+ * 止めるのは往復回数ではなくトークン。往復や文字数で縛ると、軽い往復と
+ * 重い往復が同じ「1回」として数えられて実際の費用と合わない。
+ * budget を使い切ったらツールを外すので、その場の材料で答えを書いて終わる。
  */
-export async function runAgent({ system, userContent, toolset, onToolCall, signal, usage }) {
+export async function runAgent({
+  system, userContent, toolset, onToolCall, signal, usage,
+  budget = Infinity,
+  weigh = () => 0
+}) {
   const messages = [
     { role: 'system', content: system },
     { role: 'user', content: userContent }
@@ -143,11 +156,15 @@ export async function runAgent({ system, userContent, toolset, onToolCall, signa
     return (message.tool_calls ?? []).length === 0 && !String(message.content ?? '').trim();
   };
 
-  for (; rounds < agentConfig.maxRounds; rounds += 1) {
-    // 最後の1往復はツールを外して必ず文章で締めさせる。
-    // ただし maxRounds=1 のときにツールを一度も出さないのは行き過ぎなので除く。
-    const isLastRound = agentConfig.maxRounds > 1 && rounds === agentConfig.maxRounds - 1;
-    const tools = isLastRound ? null : toolset.definitions;
+  for (; rounds < HARD_ROUND_CAP; rounds += 1) {
+    // 予算を使い切ったらツールを外す。そうすると次の応答は必ず文章になるので、
+    // 「打ち切りました」ではなく、その場の材料で答えた文が返る。
+    const spent = weigh(totals);
+    const tools = spent >= budget ? null : toolset.definitions;
+
+    if (tools === null && rounds > 0) {
+      console.warn(`Tool budget exhausted after ${rounds} round(s) (${Math.round(spent)} / ${Math.round(budget)}).`);
+    }
 
     let data = await callModel({ messages, tools, signal });
     accumulate(data);
@@ -207,7 +224,9 @@ export async function runAgent({ system, userContent, toolset, onToolCall, signa
     }
   }
 
-  // 往復を使い切った。ここで空文字を返すと謝り文だけが出るので、必ず1回書かせる。
+  // ここに来るのは HARD_ROUND_CAP に当たったとき (壊れている)。
+  // 空文字を返すと謝り文だけが出るので、必ず1回書かせる。
+  console.warn(`Hit the hard round cap (${HARD_ROUND_CAP}). Forcing an answer.`);
   const forced = await finalAnswer({ messages, signal });
   accumulate(forced.data);
 

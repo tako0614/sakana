@@ -7,7 +7,7 @@
 // 呼ばれた時点で直近の会話を渡してしまうので、多くの場合ツールを1回も呼ばずに答える。
 
 import { AttachmentBuilder } from 'discord.js';
-import { getChannelScope } from '../archive/permissions.js';
+import { canManageIndex, getChannelScope } from '../archive/permissions.js';
 import { closeBrowserSandbox } from './browser.js';
 import { agentConfig, agentEnabled } from './config.js';
 import {
@@ -18,7 +18,7 @@ import {
 } from './format.js';
 import { runAgent } from './llm.js';
 import { buildSystemPrompt, buildUserContent } from './prompt.js';
-import { finalizeCall, recordToolCalls, releaseCall, reserveCall } from './ratelimit.js';
+import { finalizeCall, recordToolCalls, releaseCall, remainingFor, reserveCall, weighTokens } from './ratelimit.js';
 import { ThinkingIndicator, toolLabel } from './thinking.js';
 import { buildToolset } from './tools.js';
 
@@ -126,10 +126,14 @@ export async function handleAgentRequest(message, client) {
 
   if (!member) return;
 
+  // 管理者は上限を通らない。上限は荒らしを止める壁で、運営を縛るものではない。
+  const admin = canManageIndex(member);
+
   const reservation = reserveCall({
     guildId: guild.id,
     channelId: message.channelId,
-    userId: message.author.id
+    userId: message.author.id,
+    admin
   });
 
   if (!reservation.ok) {
@@ -158,7 +162,6 @@ export async function handleAgentRequest(message, client) {
       channel: message.channel,
       member,
       refs,
-      budget: { remaining: agentConfig.maxToolChars },
       screenshots: [],
       channelScope: getChannelScope(guild, member),
       browserFull: canUseFullBrowser(member),
@@ -198,6 +201,10 @@ export async function handleAgentRequest(message, client) {
       userContent,
       toolset,
       usage,
+      // 止めるのはトークンだけ。1回ぶんの上限と、その人の残りのうち小さい方。
+      // 管理者は残りが Infinity なので、暴走ガードの1回ぶんだけが効く。
+      budget: Math.min(agentConfig.requestTokenLimit, remainingFor(message.author.id, admin)),
+      weigh: weighTokens,
       signal: controller.signal,
       onToolCall: (name, args) => indicator.setStatus(toolLabel(name, args))
     });

@@ -24,11 +24,14 @@ export const agentConfig = {
   reasoningEffort: process.env.AGENT_REASONING_EFFORT ?? 'high',
   thinking: flag(process.env.AGENT_THINKING, true),
 
-  // --- トークン節約のための上限 ---
-  // ツールを呼ぶたびに会話全体を再送するので、往復回数が費用に直結する。
-  maxRounds: number(process.env.AGENT_MAX_ROUNDS, 12),
-  // 1回の実行でツール出力に使える合計文字数。超えたらツールが打ち切る。
-  maxToolChars: number(process.env.AGENT_MAX_TOOL_CHARS, 32_000),
+  // --- 1回の実行に使える量 ---
+  // 縛るのはトークンだけ。往復回数や文字数で縛ると、軽い往復と重い往復が
+  // 同じ1回として数えられて実際の費用と合わない。
+  // これを超えたらツールを外して、その場の材料で答えを書かせる。
+  // 単位は換算トークン (下の重み付け後)。
+  // 暴走を止めるためだけの値。普通に使って引っかかってはいけないので、
+  // 重い調査 (実測で最大10万トークン) の10倍を置く。
+  requestTokenLimit: number(process.env.AGENT_REQUEST_TOKEN_LIMIT, 1_000_000),
   // ツール出力に載せる1メッセージあたりの本文文字数。
   messageChars: number(process.env.AGENT_MESSAGE_CHARS, 300),
   // 最初から渡す直近の会話はこちらを使う。人がスマホで見ているのは切られていない
@@ -57,10 +60,14 @@ export const agentConfig = {
   tokenWeightCached: number(process.env.AGENT_TOKEN_WEIGHT_CACHED, 0.1),
   tokenWeightOutput: number(process.env.AGENT_TOKEN_WEIGHT_OUTPUT, 1.5),
   // 換算トークンでの上限。/agentlimit で管理者が実行中に変えられる。
-  userTokenLimit: number(process.env.AGENT_USER_TOKEN_LIMIT, 500_000),
+  // これも「荒らしを止める壁」であって使用量の目標ではないので、寛大に置く
+  // (重い調査を1人で時50回やっても当たらない)。管理者は判定そのものを通らない。
+  userTokenLimit: number(process.env.AGENT_USER_TOKEN_LIMIT, 5_000_000),
   userWindowMs: number(process.env.AGENT_USER_WINDOW_MS, 3_600_000),
-  globalTokenLimit: number(process.env.AGENT_GLOBAL_TOKEN_LIMIT, 10_000_000),
+  globalTokenLimit: number(process.env.AGENT_GLOBAL_TOKEN_LIMIT, 50_000_000),
   globalWindowMs: number(process.env.AGENT_GLOBAL_WINDOW_MS, 86_400_000),
+  // 費用の制限ではなくメモリの番人。1リクエストごとに Chrome の隔離タブを開くので、
+  // 同時に何十本も走ると 12GiB を食い潰す。トークンでは同時実行数は縛れない。
   maxConcurrent: number(process.env.AGENT_MAX_CONCURRENT, 3),
   // 制限を無視できる人 (運営用)。
   exemptUsers: list(process.env.AGENT_EXEMPT_USERS),

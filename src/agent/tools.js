@@ -484,9 +484,6 @@ async function escalateToMeaning(ctx, args, limit, flags) {
   if (!flags.semanticAvailable) return null;
   // 1実行1回だけ。モデルが自分で意味検索を使ったなら重ねない
   if (ctx.escalated || ctx.usedMeaning) return null;
-  // 出力の上限に当たっているなら足しても切られる
-  if (ctx.budget.remaining < 2000) return null;
-
   const raw = String(args.query ?? '').trim();
   if (!raw) return null;
   if (!looksLikeSentence(splitMeaningQuery(raw).text)) return null;
@@ -1421,8 +1418,7 @@ export async function buildToolset(ctx) {
       if (!handler) return `そのツールはありません: ${name}`;
 
       try {
-        const result = await handler(args ?? {});
-        return applyBudget(ctx, String(result ?? ''));
+        return String((await handler(args ?? {})) ?? '');
       } catch (error) {
         if (error instanceof QueryError) return `クエリが不正です: ${error.message}`;
         console.error(`Agent tool ${name} failed:`, error);
@@ -1432,20 +1428,3 @@ export async function buildToolset(ctx) {
   };
 }
 
-/**
- * ツール出力の総量に上限を設ける。長い会話で膨らみ続けるのを止めるため。
- */
-function applyBudget(ctx, text) {
-  if (ctx.budget.remaining <= 0) {
-    return '(ツール出力の上限に達しました。ここまでの情報で答えてください)';
-  }
-
-  if (text.length <= ctx.budget.remaining) {
-    ctx.budget.remaining -= text.length;
-    return text;
-  }
-
-  const clipped = text.slice(0, ctx.budget.remaining);
-  ctx.budget.remaining = 0;
-  return `${clipped}\n(以降は上限のため省略。ここまでの情報で答えてください)`;
-}
