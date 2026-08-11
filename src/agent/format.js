@@ -65,13 +65,21 @@ export function messageLink(entry) {
 }
 
 /**
- * モデルが書いた [3] を実際のメッセージリンクに変える。
+ * モデルが書いた [3] を、そのメッセージの URL そのものに変える。
+ * `[3](url)` のような番号リンクにはしない。生の URL なら Discord 側が元の発言を
+ * プレビュー表示してくれるので、本文を引き写させずに済む。
  * 存在しない番号はそのまま残す (リンク切れを作らない)。
  */
 export function expandCitations(text, refs) {
-  return String(text ?? '').replace(/\[(\d{1,4})\]/g, (match, digits) => {
+  // 直前の空白ごと食って必ず1つ空ける。前の文字と URL がくっつくと読みにくい。
+  // 全角スペースも食う (日本語で書かせているので混ざる)。
+  return String(text ?? '').replace(/[ \t　]*\[(\d{1,4})\]/g, (match, digits, offset, whole) => {
     const url = messageLink(refs.get(Number(digits)));
-    return url ? `[${digits}](${url})` : match;
+    if (!url) return match;
+
+    // 行頭に来たときは空白を足さない。行が空白で始まると見た目が崩れる。
+    const atLineStart = offset === 0 || whole[offset - 1] === '\n';
+    return atLineStart ? url : ` ${url}`;
   });
 }
 

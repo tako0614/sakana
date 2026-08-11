@@ -731,7 +731,9 @@ export async function buildToolset(ctx) {
   }
 
   // ベクトルがあるときだけ出す。無いギルドでツール定義ぶんのトークンを払わない。
-  if (archiveAvailable && await semanticAvailable(ctx.guild.id)) {
+  const semanticReady = archiveAvailable && await semanticAvailable(ctx.guild.id);
+
+  if (semanticReady) {
     definitions.push(semanticToolDefinition);
     handlers.semantic_search = (args) => runSemanticSearch(ctx, args);
     // モデルのロードに数秒かかるので、await せず先に温めておく。
@@ -748,6 +750,7 @@ export async function buildToolset(ctx) {
     definitions,
     archiveAvailable,
     browserAvailable,
+    semanticAvailable: semanticReady,
 
     async call(name, args) {
       const handler = handlers[name];
