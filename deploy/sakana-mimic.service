@@ -1,0 +1,28 @@
+[Unit]
+Description=Sakana mimic (自作 5.87M モデルの推論)
+# bot とは独立させる。推論が固まっても bot は生きていてほしいので Requires にはしない。
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/sakana
+# 127.0.0.1 だけで待ち受ける (server.py の既定)。LAN に出す必要は無い。
+ExecStart=/root/sakana/.venv-llm/bin/python -u src/mimic/server.py \
+  --ckpt /root/sakana/mimic/ckpt.pt \
+  --corpus /root/sakana/mimic \
+  --threads 4
+
+Restart=on-failure
+RestartSec=5
+
+# bot と同じ機械に載るので、推論が暴れてもあちらを落とさないように絞る。
+# 5.87M の重み (25MB) + torch のランタイムで 300〜500MB 見込み。
+MemoryMax=1500M
+CPUWeight=50
+Nice=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
