@@ -61,6 +61,25 @@ AIは正式な請願だけでなく、公開チャンネルの直近7日を週�
 
 導入は環境変数にかかわらず必ず記録のみで、判決と監査記録だけ作りDiscord制裁は実行しません。実執行は`/governance`で権限・有効憲法・失敗処理を診断し、警告を確認したうえでサーバー名を再入力する二段階確認でだけ有効化できます。手続・票決・司法のpolicyは憲法の一部なので、導入前は`governance/policy.json`、成立後は改憲投票でだけ変更できます。週次起案数や一般/特別有権者のAI回数枠など運用値だけを同じ本人限定パネルで変更できます。AI回数枠の`0`はその区分の利用停止ですが、違憲審査申立てには憲法policyで保護された別枠があります。既存のメンションagentは統治AIと別物で、特別有権者になってもブラウザ操作権限は増えません。
 
+#### ライブE2E
+
+公開チャンネル、特別有権者、AI、投票、裁判、承認、上訴、法令集、官報を実サーバーでまとめて確認する場合は、通常botを止めてから`scripts/governance-live-e2e.mjs`を使います。先に`plan`で対象を確認できます。
+
+```bash
+node scripts/governance-live-e2e.mjs plan
+LIVE_GOVERNANCE_E2E=1 node scripts/governance-live-e2e.mjs seed \
+  --guild GUILD_ID --actor OWNER_ID --confirm-shadow
+```
+
+このスクリプトは`shadow`執行でしか動かず、既存outboxがあれば停止します。特別有権者ロールはownerに対して追加・削除を実測し、終了時に元の状態へ戻します。投票・承認はowner本人の記名操作だけを使い、他memberの票や承認を捏造しません。kick、ban、timeoutは記録経路だけを通し、Discordへ実執行しません。テスト用法律は制限primitiveの登録直後に廃止されます。
+
+`seed`が出力するrun IDを指定すると、公開履歴を削除せず、残した討議・投票・答弁・承認待ちfixtureだけを終了状態へ移せます。
+
+```bash
+LIVE_GOVERNANCE_E2E=1 node scripts/governance-live-e2e.mjs cleanup \
+  --guild GUILD_ID --run RUN_ID --confirm-shadow
+```
+
 ## AI エージェント (メンションで呼ぶ)
 
 bot を直接メンションすると、サーバーの会話を読んで答えます。用途は Discord の中で起きることに絞っています。

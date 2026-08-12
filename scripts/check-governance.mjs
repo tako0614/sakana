@@ -1093,6 +1093,19 @@ assert.throws(
   '@Evex公式から閲覧権限を越えて統治記録を読めない'
 );
 
+const liveE2eSource = readFileSync(new URL('./governance-live-e2e.mjs', import.meta.url), 'utf8');
+assert.match(liveE2eSource, /LIVE_GOVERNANCE_E2E/, 'live E2Eは明示的な環境変数を要求する');
+assert.match(liveE2eSource, /--confirm-shadow/, 'live E2Eはshadow確認フラグを要求する');
+assert.match(liveE2eSource, /governance\.enforcement_mode, 'shadow'/, 'live執行ではE2Eを拒否する');
+assert.match(liveE2eSource, /pendingActions\(100\)\.length, 0/, '既存outboxを巻き込まない');
+assert.match(liveE2eSource, /currentTrusted !== initialTrusted/, '特別有権者ロールを原状復帰する');
+assert.match(liveE2eSource, /setTrustedMember/, 'owner専用の正規経路で特別有権者を操作する');
+assert.match(liveE2eSource, /unauthorizedChangeReverted: true/, '正規経路外の特別有権者変更を差し戻す');
+assert.match(liveE2eSource, /allSummary\.trustedTotal, 1/, 'trusted拒否を有効投票数で実測する');
+assert.match(liveE2eSource, /type: 'warning'/, 'warning刑もlive fixtureで検証する');
+assert.match(liveE2eSource, /type: 'restriction'/, '新しい制限定義とrestriction刑もlive fixtureで検証する');
+assert.doesNotMatch(liveE2eSource, /guild\.members\.(kick|ban)/, 'live E2EからDiscord処分を直接呼ばない');
+
 governanceDb.governanceDatabase.close();
 for (const path of [mainPath, archivePath]) {
   rmSync(path, { force: true });
