@@ -790,22 +790,32 @@ export function proposalVoteSummary(proposalId) {
   const snapshot = db.prepare(`
     SELECT
       SUM(CASE WHEN eligible_general = 1 THEN 1 ELSE 0 END) AS electorate,
-      SUM(CASE WHEN trusted = 1 THEN 1 ELSE 0 END) AS trusted_total
+      SUM(CASE WHEN trusted = 1 THEN 1 ELSE 0 END) AS trusted_electorate
     FROM governance_proposal_voters WHERE proposal_id = ?
   `).get(proposalId);
-  const trustedNo = db.prepare(`
-    SELECT COUNT(*) AS count
+  const trustedCounts = db.prepare(`
+    SELECT
+      SUM(CASE WHEN v.choice = 'yes' THEN 1 ELSE 0 END) AS yes,
+      SUM(CASE WHEN v.choice = 'no' THEN 1 ELSE 0 END) AS no,
+      SUM(CASE WHEN v.choice = 'abstain' THEN 1 ELSE 0 END) AS abstain
     FROM governance_votes v
     JOIN governance_proposal_voters e ON e.proposal_id = v.proposal_id AND e.user_id = v.user_id
-    WHERE v.proposal_id = ? AND v.choice = 'no' AND e.trusted = 1
-  `).get(proposalId).count;
+    WHERE v.proposal_id = ? AND e.trusted = 1 AND e.eligible_general = 1
+  `).get(proposalId);
+  const trustedYes = trustedCounts?.yes ?? 0;
+  const trustedNo = trustedCounts?.no ?? 0;
+  const trustedAbstain = trustedCounts?.abstain ?? 0;
   return {
     yes: counts.yes ?? 0,
     no: counts.no ?? 0,
     abstain: counts.abstain ?? 0,
     electorate: snapshot?.electorate ?? 0,
-    trustedTotal: snapshot?.trusted_total ?? 0,
-    trustedNo
+    // trusted拒否権の分母は有権者数ではなく、有効票（yes + no）。棄権は含めない。
+    trustedTotal: trustedYes + trustedNo,
+    trustedElectorate: snapshot?.trusted_electorate ?? 0,
+    trustedYes,
+    trustedNo,
+    trustedAbstain
   };
 }
 
@@ -935,7 +945,8 @@ export function createCase(input) {
   `).run(
     input.guildId, input.kind ?? 'criminal', input.reporterId, input.accusedId ?? null,
     input.lawId ?? null, input.offenseCode ?? null, input.challengedType ?? null,
-    input.challengedId ?? null, input.summary, input.status ?? 'filed', input.defenseUntil ?? null,
+    input.challengedId === null || input.challengedId === undefined ? null : String(input.challengedId),
+    input.summary, input.status ?? 'filed', input.defenseUntil ?? null,
     input.allegedAt ?? null,
     now, now
   );

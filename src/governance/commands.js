@@ -194,7 +194,7 @@ const governanceCommand = {
       }
       await interaction.deferReply({ flags: EPHEMERAL });
       const surfaces = await createGovernanceSurfaces(interaction.guild);
-      const documents = loadBootstrapDocuments();
+      const documents = loadBootstrapDocuments({ serverName: interaction.guild.name });
       const result = bootstrapGovernanceGuild({
         guildId: interaction.guildId,
         enactedBy: interaction.user.id,
@@ -403,7 +403,7 @@ const lawCommand = {
     const electorate = proposalElectorate(id);
     const content = [
       `L-${id} ${proposal.title}`,
-      `賛成 ${summary.yes} / 反対 ${summary.no} / 棄権 ${summary.abstain} / trusted反対 ${summary.trustedNo}/${summary.trustedTotal}`,
+      `賛成 ${summary.yes} / 反対 ${summary.no} / 棄権 ${summary.abstain} / trusted反対 ${summary.trustedNo}/${summary.trustedTotal}有効票 (棄権 ${summary.trustedAbstain} / 有権者 ${summary.trustedElectorate})`,
       '',
       ...rows.map((row) => `${row.user_id}\t${row.choice}\ttrusted=${Boolean(row.trusted)}\t${new Date(row.updated_at).toISOString()}`),
       '',

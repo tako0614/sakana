@@ -53,8 +53,31 @@ export const governanceConfig = {
   trustedDailyCalls: number(process.env.GOVERNANCE_TRUSTED_DAILY_CALLS, 200)
 };
 
-export function loadBootstrapDocuments() {
-  const constitution = readFileSync(new URL('../../governance/constitution.md', import.meta.url), 'utf8').trim();
+export function communityDisplayName(value) {
+  const normalized = String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 100);
+  return normalized || 'Community';
+}
+
+function constitutionServerName(value) {
+  return communityDisplayName(value).replace(/([\\`*_{}\[\]()<>#+\-.!|])/g, '\\$1');
+}
+
+export function governanceCategoryName(serverName) {
+  const suffix = ' Governance';
+  return `${communityDisplayName(serverName).slice(0, 100 - suffix.length)}${suffix}`;
+}
+
+export function renderBootstrapConstitution(template, serverName) {
+  return String(template).replaceAll('{{SERVER_NAME}}', constitutionServerName(serverName));
+}
+
+export function loadBootstrapDocuments({ serverName = 'Community' } = {}) {
+  const template = readFileSync(new URL('../../governance/constitution.md', import.meta.url), 'utf8').trim();
+  const constitution = renderBootstrapConstitution(template, serverName);
   const policy = JSON.parse(readFileSync(new URL('../../governance/policy.json', import.meta.url), 'utf8'));
   return { constitution, policy };
 }

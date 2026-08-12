@@ -29,7 +29,7 @@
 ## AI自治コミュニティ
 
 `/governance bootstrap [trusted_role:<role>]` をDiscord ownerまたは
-`GOVERNANCE_OPERATOR_USERS`が1回実行すると、初期憲法を正本として次を作ります。
+`GOVERNANCE_OPERATOR_USERS`が1回実行すると、そのサーバー名を冠した初期憲法を正本として次を作ります。
 trusted user機能は任意で、あとからroleを設定・無効化できます。
 
 - `議会` Forum: AI起草法案を草案24h → policy所定panelの事前違憲審査 → 討議24h → 記名投票24hで処理
@@ -41,7 +41,7 @@ AIは正式な請願だけでなく、公開チャンネルの直近7日を週�
 
 制裁は任意コードではなく、安全なprimitiveの宣言的profileです。法律内でAIが新しい組み合わせを定義でき、発言数、リンク・添付・メンション、reaction、thread作成、voice、agent利用、請願、投票を制限できます。timeoutは既定で最大7日、1日超はtrusted 1人、kick/banは当事者以外のtrusted 2人の承認が必要です。trustedが未設定または承認人数不足なら重い刑を勝手に縮退せず、執行不能として公開終了します。banと3日以上のtimeoutだけ48h以内に1回上訴でき、実際に上訴している間だけ他チャンネルでの発言を止めます。
 
-投票scopeは法案・改憲案ごとに`all`または`trusted`を選べ、既定の`all`はbot以外の全サーバーメンバーです。既定では有権者25%以上かつ最低2票の定足数が必要です。通常法は過半数、改憲は2/3で、`all`投票ではsnapshot時のtrusted全員の2/3が明示的に反対すると否決されます。trusted-only投票へ同じ拒否権は二重適用しません。trusted roleの名前は自由で、判定は設定したrole IDだけです。membershipはDiscord ownerだけが`/governance trusted-add` / `trusted-remove`で変更でき、role UIや別botからの直接変更は差し戻します。
+投票scopeは法案・改憲案ごとに`all`または`trusted`を選べ、既定の`all`はbot以外の全サーバーメンバーです。既定では有権者25%以上かつ最低2票の定足数が必要です。通常法は過半数、改憲は2/3で、`all`投票ではtrustedが実際に投じた有効票（賛成と反対、棄権を除く）のうち2/3以上が反対すると否決されます。分母はtrusted有権者総数ではありません。trusted-only投票へ同じ拒否権は二重適用しません。trusted roleの名前は自由で、判定は設定したrole IDだけです。membershipはDiscord ownerだけが`/governance trusted-add` / `trusted-remove`で変更でき、role UIや別botからの直接変更は差し戻します。
 
 bootstrapは環境変数にかかわらず必ず`shadow`で、判決と監査記録だけ作りDiscord制裁は実行しません。必要権限の検査後に`/governance enforcement mode:live`で有効化します。手続・票決・司法のpolicyは憲法の一部なので、bootstrap前は`governance/policy.json`、成立後は改憲投票でだけ変更できます。週次起案数や一般/trustedのagent回数枠など運用値だけを`/governance config`で変更できます。agent回数枠の`0`はその区分の利用停止ですが、違憲審査申立てには憲法policyで保護された別枠があります。既存のメンションagentは統治AIと別物で、trusted roleを持ってもブラウザ操作権限は増えません。
 

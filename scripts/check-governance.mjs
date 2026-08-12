@@ -8,11 +8,22 @@ process.env.DATABASE_PATH = mainPath;
 process.env.ARCHIVE_DB_PATH = archivePath;
 process.env.GOVERNANCE_API_KEY = 'check';
 
-const { loadBootstrapDocuments } = await import('../src/governance/config.js');
+const { governanceCategoryName, loadBootstrapDocuments, renderBootstrapConstitution } = await import('../src/governance/config.js');
 const policyModule = await import('../src/governance/policy.js');
 const governanceDb = await import('../src/governance/db.js');
 
-const { constitution, policy } = loadBootstrapDocuments();
+const { constitution, policy } = loadBootstrapDocuments({ serverName: 'Test Community' });
+assert.match(constitution, /^# Test Community憲法$/m);
+assert.doesNotMatch(constitution, /Sakana|\{\{SERVER_NAME\}\}/);
+assert.doesNotMatch(constitution, /Discord|database|browser|tool|primitive/i,
+  '憲法本文には変更不能な実装詳細を書かない');
+assert.match(
+  renderBootstrapConstitution('# {{SERVER_NAME}}憲法', 'unsafe # server'),
+  /^# unsafe \\# server憲法$/,
+  'サーバー名をMarkdown見出しへ安全に埋め込む'
+);
+assert.equal(governanceCategoryName('Test Community'), 'Test Community Governance');
+assert.equal(Array.from(governanceCategoryName('x'.repeat(100))).length, 100);
 policyModule.validateConstitutionPolicy(policy);
 
 const eligible = policyModule.evaluateEligibility({
@@ -110,7 +121,19 @@ governanceDb.castProposalVote(proposal.id, 't2', 'no');
 governanceDb.castProposalVote(proposal.id, 't3', 'yes');
 assert.throws(() => governanceDb.castProposalVote(proposal.id, 'outsider', 'yes'));
 const vote = governanceDb.proposalVoteSummary(proposal.id);
+assert.equal(vote.trustedTotal, 3, 'trusted拒否権の分母は投票済み有効票');
 assert.equal(policyModule.closeVote({ kind: 'law', ...vote }, policy).vetoed, true);
+governanceDb.castProposalVote(proposal.id, 't3', 'abstain');
+const voteWithTrustedAbstention = governanceDb.proposalVoteSummary(proposal.id);
+assert.equal(voteWithTrustedAbstention.trustedElectorate, 3);
+assert.equal(voteWithTrustedAbstention.trustedAbstain, 1);
+assert.equal(voteWithTrustedAbstention.trustedTotal, 2, 'trusted棄権は有効投票数に含めない');
+assert.equal(policyModule.closeVote({ kind: 'law', ...voteWithTrustedAbstention }, policy).vetoed, true,
+  'trusted有効票2票がともに反対なら、有権者3人でも拒否成立');
+assert.equal(policyModule.closeVote({
+  kind: 'law', yes: 4, no: 1, abstain: 0, electorate: 5,
+  trustedNo: 1, trustedTotal: 2
+}, policy).vetoed, false, 'trusted有効票の反対が2/3未満なら拒否不成立');
 assert.equal(policyModule.closeVote({
   kind: 'amendment', yes: 2, no: 1, abstain: 0, electorate: 3, trustedNo: 0, trustedTotal: 0
 }, policy).passed, true, '改憲の2/3ちょうどは成立する');
@@ -226,6 +249,168 @@ const administrativeAct = governanceDb.createAdministrativeAct({
   detail: { operation: 'operational_setting', key: 'weekly_draft_limit', before: 3, after: 2 }
 });
 assert.equal(governanceDb.getAdministrativeAct(administrativeAct.id).detail.before, 3);
+assert.equal(governanceDb.listAdministrativeActs('g2').length, 1);
+assert.equal(governanceDb.updateAdministrativeAct(administrativeAct.id, {
+  status: 'reversed', reversed_at: Date.now()
+}).status, 'reversed');
+
+const evidenceId = governanceDb.addCaseEvidence({
+  caseId: caseWithTime.id,
+  submittedBy: 'r',
+  messageId: 'evidence-message',
+  channelId: 'public',
+  authorId: 'a',
+  content: '証拠本文',
+  occurredAt: 123456789
+});
+assert.equal(governanceDb.listCaseEvidence(caseWithTime.id)[0].occurred_at, 123456789);
+assert.ok(governanceDb.markEvidenceDisclosed(evidenceId, 123456999).disclosed_at);
+governanceDb.addCaseSubmission(caseWithTime.id, 'a', 'defense', '反論本文');
+assert.equal(governanceDb.listCaseSubmissions(caseWithTime.id)[0].kind, 'defense');
+governanceDb.recordCaseDecision({
+  caseId: caseWithTime.id,
+  panelId: 'panel-1',
+  phase: 'trial',
+  seat: 1,
+  model: 'judge-1',
+  verdict: 'responsible',
+  lawId: law.id,
+  offenseCode: 'O1',
+  sanction: { type: 'restriction', definitionCode: 'SLOW_MODE', durationSeconds: 600 },
+  evidenceIds: [evidenceId],
+  reasons: ['構成要件を認定'],
+  inputHash: 'input-hash',
+  output: { verdict: 'responsible' }
+});
+assert.equal(governanceDb.listCaseDecisions(caseWithTime.id, 'trial')[0].evidenceIds[0], evidenceId);
+governanceDb.setCaseApproval(caseWithTime.id, 't1', 'approve', '承認');
+governanceDb.setCaseApproval(caseWithTime.id, 't1', 'reject', '再検討');
+assert.equal(governanceDb.listCaseApprovals(caseWithTime.id)[0].decision, 'reject', '承認票は1人1票で更新される');
+
+const restrictionProfile = {
+  rules: [
+    { primitive: 'messages_per_window', maximum: 1, windowSeconds: 600 },
+    { primitive: 'block_links', enabled: true },
+    { primitive: 'block_reactions', enabled: true },
+    { primitive: 'block_thread_creation', enabled: true },
+    { primitive: 'block_voice', enabled: true },
+    { primitive: 'agent_calls_per_window', maximum: 1, windowSeconds: 600 },
+    { primitive: 'block_petitions', enabled: true },
+    { primitive: 'block_voting', enabled: true }
+  ]
+};
+const sanction = governanceDb.createSanction({
+  caseId: caseWithTime.id,
+  guildId: 'g2',
+  userId: 'a',
+  type: 'restriction',
+  durationSeconds: 600,
+  status: 'executed',
+  requiredApprovals: 0,
+  appealable: false,
+  restrictionStartedAt: Date.now(),
+  definitionCode: 'SLOW_MODE',
+  profile: restrictionProfile
+});
+assert.equal(governanceDb.getCaseSanction(caseWithTime.id).definition_code, 'SLOW_MODE');
+assert.equal(governanceDb.listSanctions('g2', ['executed']).length, 1);
+const restrictionStart = Date.now();
+governanceDb.activateRestriction({
+  sanctionId: sanction.id,
+  guildId: 'g2',
+  userId: 'a',
+  definitionId: 1,
+  profile: restrictionProfile,
+  startedAt: restrictionStart,
+  endsAt: restrictionStart + 600_000
+});
+const [activeRestriction] = governanceDb.activeRestrictions('g2', 'a', restrictionStart);
+assert.ok(activeRestriction);
+assert.equal(governanceDb.recordRestrictionUsage(activeRestriction.id, 'message', 'event-1'), true);
+assert.equal(governanceDb.recordRestrictionUsage(activeRestriction.id, 'message', 'event-1'), false, '同一eventを二重計上しない');
+assert.equal(governanceDb.restrictionUsageCount(activeRestriction.id, 'message', 0), 1);
+
+const restrictionModule = await import('../src/governance/restrictions.js');
+assert.equal(restrictionModule.governanceActionAllowed('g2', 'a', 'petition', restrictionStart), false);
+assert.equal(restrictionModule.governanceActionAllowed('g2', 'a', 'vote', restrictionStart), false);
+assert.equal(restrictionModule.reserveRestrictedAgentCall('g2', 'a', 'agent-1', restrictionStart).ok, true);
+assert.equal(restrictionModule.reserveRestrictedAgentCall('g2', 'a', 'agent-2', restrictionStart).ok, false);
+let messageDeleted = false;
+const blockedMessage = {
+  id: 'blocked-message', guildId: 'g2', channelId: 'public',
+  author: { id: 'a', bot: false, send: async () => {} },
+  channel: { isThread: () => false },
+  content: 'https://example.com', attachments: { size: 0 },
+  mentions: { users: { size: 0 }, roles: { size: 0 }, channels: { size: 0 }, everyone: false },
+  delete: async () => { messageDeleted = true; }
+};
+assert.equal(await restrictionModule.enforceMessageRestrictions(blockedMessage), true);
+assert.equal(messageDeleted, true);
+governanceDb.updateCase(caseWithTime.id, { private_thread_id: 'private-court' });
+assert.equal(await restrictionModule.enforceMessageRestrictions({
+  ...blockedMessage,
+  id: 'court-message',
+  channelId: 'private-court',
+  channel: { isThread: () => true },
+  delete: async () => { throw new Error('裁判チャットは削除してはならない'); }
+}), false, '裁判チャットでは防御権を制裁より優先する');
+let reactionRemoved = false;
+assert.equal(await restrictionModule.enforceReactionRestrictions({
+  message: { guildId: 'g2', id: 'reaction-message' },
+  users: { remove: async () => { reactionRemoved = true; } }
+}, { id: 'a', bot: false }), true);
+assert.equal(reactionRemoved, true);
+assert.equal(await restrictionModule.enforceVoiceRestrictions(null, {
+  guild: { id: 'g2' }, member: { id: 'a' }, channelId: 'voice', disconnect: async () => {}
+}), true);
+assert.equal(await restrictionModule.enforceThreadRestrictions({
+  id: 'thread', guildId: 'g2', ownerId: 'a', parentId: 'public', delete: async () => {}
+}), true);
+
+const appeal = governanceDb.createAppeal(caseWithTime.id, 'a', '判決に誤りがある');
+assert.equal(governanceDb.getAppeal(caseWithTime.id).id, appeal.id);
+assert.throws(() => governanceDb.createAppeal(caseWithTime.id, 'a', '二重上訴'), /UNIQUE/, '上訴は1回だけ');
+assert.equal(governanceDb.updateAppeal(caseWithTime.id, { status: 'decided', decided_at: Date.now() }).status, 'decided');
+
+const constitutionalCase = governanceDb.createCase({
+  guildId: 'g2', kind: 'constitutional', reporterId: 'r', challengedType: 'administrative_act',
+  challengedId: administrativeAct.id, summary: '行政行為の違憲審査', status: 'deliberation'
+});
+assert.equal(governanceDb.findOpenConstitutionalCase('g2', 'administrative_act', administrativeAct.id).id, constitutionalCase.id);
+governanceDb.recordReview({
+  guildId: 'g2', targetType: 'administrative_act', targetId: administrativeAct.id,
+  panelId: 'constitutional-panel', phase: 'post', seat: 1, model: 'judge-1', verdict: 'unconstitutional',
+  reasons: ['第五条違反'], citations: ['第五条（憲法の最高性）'], inputHash: 'constitutional-input',
+  output: { verdict: 'unconstitutional' }
+});
+
+const queued = governanceDb.enqueueAction({
+  guildId: 'g2', actionType: 'restriction.apply', targetId: sanction.id,
+  payload: { sanctionId: sanction.id }, idempotencyKey: 'restriction:g2:1'
+});
+assert.equal(governanceDb.enqueueAction({
+  guildId: 'g2', actionType: 'restriction.apply', targetId: sanction.id,
+  payload: { sanctionId: sanction.id }, idempotencyKey: 'restriction:g2:1'
+}).id, queued.id, 'outboxはidempotency keyで重複しない');
+governanceDb.markActionRunning(queued.id);
+governanceDb.failAction(queued.id, '一時失敗');
+assert.equal(governanceDb.listActionFailures('g2').length, 1);
+assert.equal(governanceDb.retryFailedActions('g2'), 1);
+governanceDb.markActionRunning(queued.id);
+governanceDb.completeAction(queued.id);
+assert.equal(governanceDb.pendingActions().some((action) => action.id === queued.id), false);
+
+const constitutionBeforeAmendment = governanceDb.getActiveConstitution('g2');
+const amended = governanceDb.enactConstitution({
+  guildId: 'g2',
+  content: constitution.replace('Test Community憲法', 'Test Community改正憲法'),
+  policy,
+  proposalId: scopedProposal.id,
+  enactedBy: 'vote'
+});
+assert.equal(amended.version, 2);
+assert.equal(governanceDb.getConstitution(amended.id).status, 'active');
+assert.equal(governanceDb.getConstitution(constitutionBeforeAmendment.id).status, 'superseded');
 
 let modelOutput;
 let capturedRequest;

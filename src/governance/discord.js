@@ -5,6 +5,7 @@ import {
   ChannelType,
   PermissionFlagsBits
 } from 'discord.js';
+import { governanceCategoryName } from './config.js';
 
 const TAGS = ['草案', '違憲審査', '討議', '投票', '成立', '否決', '廃案'];
 
@@ -84,7 +85,7 @@ export async function createGovernanceSurfaces(guild) {
     reason: 'Sakana governance appeal restriction'
   });
   const category = await guild.channels.create({
-    name: 'Sakana Governance',
+    name: governanceCategoryName(guild.name),
     type: ChannelType.GuildCategory,
     reason: 'Sakana governance bootstrap'
   });
@@ -92,7 +93,7 @@ export async function createGovernanceSurfaces(guild) {
     name: '議会',
     type: ChannelType.GuildForum,
     parent: category.id,
-    topic: '請願・法案・改憲案。正式案件はSakana botが1案件1投稿で作成します。',
+    topic: '請願・法案・改憲案。正式案件は1案件1投稿で作成します。',
     availableTags: TAGS.map((name) => ({ name, moderated: true })),
     defaultAutoArchiveDuration: 10_080,
     permissionOverwrites: [everyoneForumOverwrite(guild, { discuss: true }), botOverwrite(guild)],

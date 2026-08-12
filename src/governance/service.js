@@ -476,7 +476,7 @@ async function closeProposalVote(guild, proposal) {
   const result = closeVote({ kind: proposal.kind, scope: proposal.vote_scope, ...summary }, policy);
   if (!result.passed) {
     proposal = updateProposal(proposal.id, { status: 'rejected', stage_ends_at: Date.now() });
-    await postProposalUpdate(guild, proposal, `否決されました。賛成 ${summary.yes} / 反対 ${summary.no} / 棄権 ${summary.abstain} / 定足数 ${summary.yes + summary.no + summary.abstain}/${result.quorumNeeded} / trusted反対 ${summary.trustedNo}/${summary.trustedTotal}`, { state: '否決' });
+    await postProposalUpdate(guild, proposal, `否決されました。賛成 ${summary.yes} / 反対 ${summary.no} / 棄権 ${summary.abstain} / 定足数 ${summary.yes + summary.no + summary.abstain}/${result.quorumNeeded} / trusted反対 ${summary.trustedNo}/${summary.trustedTotal}有効票 (棄権 ${summary.trustedAbstain} / 有権者 ${summary.trustedElectorate})`, { state: '否決' });
     return proposal;
   }
   if (proposal.kind === 'amendment') {
