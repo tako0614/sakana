@@ -11,7 +11,7 @@ import {
   SlashCommandBuilder
 } from 'discord.js';
 
-import { mimicConfig, status } from './client.js';
+import { ENDPOINTS, endpointFor, status } from './client.js';
 import { impersonate } from './impersonate.js';
 import { clearPersona, forgetPersona, personaCounts, personaFor, setPersona } from './persona.js';
 import { DEFAULT_ENGINE, ENGINES, engineCounts, engineFor, setEngine } from './prefs.js';
@@ -21,7 +21,13 @@ import { hasOptedOut, learnedSpeakers, optIn, optOut } from './speakers.js';
 async function overview(userId) {
   const current = engineFor(userId);
   const counts = new Map(engineCounts().map((row) => [row.engine, row.users]));
-  const health = await status();
+
+  // 自作モデルは世代ごとに別プロセス。立っていないものを選ばせないよう、
+  // それぞれの状態を見る
+  const selfHosted = Object.keys(ENDPOINTS).filter((key) => ENGINES[key]);
+  const health = new Map(await Promise.all(
+    selfHosted.map(async (key) => [key, await status(key)])
+  ));
 
   const embed = new EmbedBuilder()
     .setColor('#2b2d31')
@@ -42,19 +48,18 @@ async function overview(userId) {
     });
   }
 
-  // evex は別プロセスなので、立っていないなら選んでも答えられない。先に出す。
-  if (health.up) {
+  // 別プロセスなので、立っていないなら選んでも答えられない。世代ごとに出す。
+  for (const key of selfHosted) {
+    const info = health.get(key) ?? { up: false };
     embed.addFields({
-      name: 'Evex の状態',
-      value: [
-        `起動中 (epoch ${health.epoch ?? '?'} / val ${health.val_loss?.toFixed?.(4) ?? '?'})`,
-        'メンションすると会話の続きを1発言だけ返します。道具も検索も使いません。'
-      ].join('\n')
-    });
-  } else {
-    embed.addFields({
-      name: 'Evex の状態',
-      value: '推論プロセスが起動していません。選んでも答えられないので、先に立ててください。'
+      name: `${ENGINES[key].label} の状態`,
+      value: info.up
+        ? [
+          `起動中 (epoch ${info.epoch ?? '?'} / val ${info.val_loss?.toFixed?.(4) ?? '?'})`,
+          'メンションすると会話の続きを1発言だけ返します。道具も検索も使いません。',
+          '`/as` で誰として喋るかを選べます。'
+        ].join('\n')
+        : `推論プロセスが起動していません (${endpointFor(key).url})。選んでも答えられません。`
     });
   }
 
@@ -164,10 +169,15 @@ export const mimicCommands = [
       await interaction.deferReply();
 
       try {
+        // その人が選んでいる世代で生成する。deepseek のままだと自作モデルが
+        // 使われないので、既定は evex に落とす
+        const chosen = engineFor(interaction.user.id);
+        const engine = ENDPOINTS[chosen] ? chosen : 'evex';
         const { text, how } = await impersonate(targetId, {
           topic,
           channelId: interaction.channelId,
-          askerId: interaction.user.id
+          askerId: interaction.user.id,
+          engine
         });
 
         if (!text) {
@@ -185,7 +195,7 @@ export const mimicCommands = [
           : '直近の発言から真似';
 
         await interaction.editReply({
-          content: `${text}\n-# ${mimicConfig.label} が ${name ?? 'この人'} として書いたもの (${source})`,
+          content: `${text}\n-# ${endpointFor(engine).label} が ${name ?? 'この人'} として書いたもの (${source})`,
           allowedMentions: { parse: [], repliedUser: false }
         });
       } catch (error) {
@@ -238,7 +248,7 @@ export const mimicCommands = [
         const changed = clearPersona(interaction.user.id);
         await interaction.reply({
           content: changed
-            ? `${mimicConfig.label} 自身に戻しました。`
+            ? 'bot 自身に戻しました。'
             : 'もともと bot 自身のままです。',
           flags: MessageFlags.Ephemeral
         });
@@ -257,10 +267,10 @@ export const mimicCommands = [
           content: [
             current
               ? `いまのあなた: **${nameOf(current)} として**`
-              : `いまのあなた: **${mimicConfig.label} 自身**`,
+              : 'いまのあなた: **bot 自身**',
             others.length ? `他の人がよく選んでいるのは ${others.join(' / ')}` : null,
             '`/as who:<候補>` で変えられます。`/as off:true` で戻ります。',
-            `効くのは \`/model\` で **${ENGINES.evex.label}** を選んでいるときだけです。`
+            '効くのは `/model` で自作モデルを選んでいるときだけです。'
           ].filter(Boolean).join('\n'),
           flags: MessageFlags.Ephemeral
         });
@@ -291,9 +301,9 @@ export const mimicCommands = [
       await interaction.reply({
         content: [
           `あなたの分を **${nameOf(targetId)} として** にしました。他の人には影響しません。`,
-          engine === 'evex'
+          ENDPOINTS[engine]
             ? 'メンションすると、その口調で1発言返します。'
-            : `いまのあなたは **${ENGINES[engine].label}** なので効きません。\`/model engine:${ENGINES.evex.label}\` に変えてください。`
+            : `いまのあなたは **${ENGINES[engine].label}** なので効きません。\`/model\` で自作モデルに変えてください。`
         ].join('\n'),
         flags: MessageFlags.Ephemeral
       });

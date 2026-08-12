@@ -291,13 +291,15 @@ export async function handleAgentRequest(message, client) {
   // ドル換算の上限に混ぜると請求と乖離するから。
   const governanceTopic = Boolean(getGovernanceGuild(guild.id))
     && isGovernanceAgentTopic(message.content);
-  if (engineFor(message.author.id) === 'evex' && !governanceTopic) {
+  const chosen = engineFor(message.author.id);
+  // 自作モデル側はどれも「会話の続きを1発言書く」だけ。道具も検索も使えない
+  if ((chosen === 'evex' || chosen === 'evex-ft') && !governanceTopic) {
     const recent = await message.channel.messages
       .fetch({ limit: 20 })
       .then((found) => [...found.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp))
       .catch(() => [message]);
 
-    await handleMimicRequest(message, client, { recent });
+    await handleMimicRequest(message, client, { recent, engine: chosen });
     return;
   }
 

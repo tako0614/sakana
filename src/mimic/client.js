@@ -20,6 +20,34 @@ export const mimicConfig = {
   format: process.env.MIMIC_FORMAT ?? 'auto'
 };
 
+/**
+ * 世代ごとの接続先。**別プロセス・別ポートで並走させる**ので、まとめて持つ。
+ *
+ * 世代を差し替えるのではなく並べるのは、性質が違うものだから:
+ *   evex-1     94万件だけで学習。純度は高いが荒い (5.87M)
+ *   evex-ft-1  Qwen3-0.6B を追加学習。読めるが Qwen の知識が混ざる
+ * どちらが面白いかは読み比べないと分からないので、/model で選べる形にする。
+ *
+ * format を env で固定できるようにしてあるのは、evex-ft-1 を llama.cpp で配信すると
+ * server.py の /health が無く、申告から判定できないから。取り違えるとモデルが
+ * 一度も見ていない入力を受け取り、例外を出さずに静かに崩れる。
+ */
+export const ENDPOINTS = {
+  evex: mimicConfig,
+  'evex-ft': {
+    url: process.env.MIMIC_FT_URL ?? 'http://127.0.0.1:8766',
+    timeoutMs: number(process.env.MIMIC_FT_TIMEOUT_MS, 120_000),
+    maxNewTokens: number(process.env.MIMIC_FT_MAX_NEW_TOKENS, 120),
+    label: process.env.MIMIC_FT_LABEL ?? 'evex-ft-1-preview',
+    format: process.env.MIMIC_FT_FORMAT ?? 'plain'
+  }
+};
+
+/** そのエンジンの接続先。知らないものは既定 (evex) に落とす。 */
+export function endpointFor(engine) {
+  return ENDPOINTS[engine] ?? mimicConfig;
+}
+
 // speakers.json は使わない。話者は会話ごとの相対トークンになったので、
 // Discord の user_id と結びつける表がそもそも要らない。
 
@@ -34,18 +62,19 @@ class MimicError extends Error {
  * 生成する。prompt は学習時と同じ直列化形式で渡す。
  * 落ちているときは down を立てて返す (呼び出し側で文面を変えたいので)。
  */
-export async function generate({ prompt, maxNewTokens, temperature = 0.9, topK = 40 }) {
+export async function generate({ prompt, maxNewTokens, temperature = 0.9, topK = 40, engine = null }) {
+  const config = endpointFor(engine);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), mimicConfig.timeoutMs);
+  const timer = setTimeout(() => controller.abort(), config.timeoutMs);
   timer.unref?.();
 
   try {
-    const response = await fetch(`${mimicConfig.url}/generate`, {
+    const response = await fetch(`${config.url}/generate`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         prompt,
-        max_new_tokens: maxNewTokens ?? mimicConfig.maxNewTokens,
+        max_new_tokens: maxNewTokens ?? config.maxNewTokens,
         temperature,
         top_k: topK
       }),
@@ -71,29 +100,33 @@ export async function generate({ prompt, maxNewTokens, temperature = 0.9, topK =
 }
 
 // サーバーが申告した役の形式。世代が違うトークンを渡さないために使う。
-let scheme = null;
+// エンジンごとに別プロセスなので、エンジンごとに覚える。
+const schemes = new Map();
 
 /** 役の形式。まだ聞いていなければ /health で取りに行く。 */
-export async function roleScheme() {
-  if (scheme) return scheme;
+export async function roleScheme(engine = null) {
+  const key = engine ?? 'evex';
+  if (schemes.has(key)) return schemes.get(key);
 
-  const info = await status();
+  const info = await status(engine);
   if (!info.up || !info.roles?.length) return null;
 
   // speakers は実在の人物に紐づくトークン。持っているのは evex-1 だけ。
   // 申告に無いものを渡さないために、bot 側はここだけを見る
-  scheme = { roles: info.roles, overflow: info.overflow, speakers: info.speakers ?? [] };
-  return scheme;
+  const found = { roles: info.roles, overflow: info.overflow, speakers: info.speakers ?? [] };
+  schemes.set(key, found);
+  return found;
 }
 
 /** 生きているか。/model の表示で使う。 */
-export async function status() {
+export async function status(engine = null) {
+  const config = endpointFor(engine);
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3000);
     timer.unref?.();
 
-    const response = await fetch(`${mimicConfig.url}/health`, { signal: controller.signal });
+    const response = await fetch(`${config.url}/health`, { signal: controller.signal });
     clearTimeout(timer);
 
     if (!response.ok) return { up: false };

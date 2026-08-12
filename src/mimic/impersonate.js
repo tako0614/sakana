@@ -12,7 +12,7 @@
 // 最初は相対の役 (A/B/C) にしていて、そのときは原理的に不可能だった —
 // 実測で役 A の中身は 1,062 人ぶんで、最多の人でも 10.4% (全体シェア 9.4% とほぼ同じ)。
 
-import { generate, mimicConfig, roleScheme } from './client.js';
+import { endpointFor, generate, roleScheme } from './client.js';
 import {
   assignPlainRoles, buildPlainPrompt, labelFor, plainFirstTurn, plainText
 } from './plain.js';
@@ -30,20 +30,21 @@ const MAX_TRIES = 3;
  * 一度も見ていない入力を受け取り、例外を出さずに静かに崩れる (evex-1 に <|a|> を
  * 渡して実際に壊した)。既定は推論サーバーの申告から判定し、env で上書きできる。
  */
-export async function mimicFormat() {
-  if (mimicConfig.format === 'plain' || mimicConfig.format === 'tokens') return mimicConfig.format;
+export async function mimicFormat(engine = 'evex') {
+  const { format } = endpointFor(engine);
+  if (format === 'plain' || format === 'tokens') return format;
 
-  const scheme = await roleScheme();
+  const scheme = await roleScheme(engine);
   // 申告が取れないときは素の形式とみなす。llama.cpp で配信する evex-ft-1 は
   // server.py の /health を持たない
   return scheme?.roles?.length ? 'tokens' : 'plain';
 }
 
 /** その人の話者トークンが使えるか (上位48人 かつ 独自トークンの世代)。 */
-export async function canUseToken(userId) {
-  if (await mimicFormat() !== 'tokens') return false;
+export async function canUseToken(userId, engine = 'evex') {
+  if (await mimicFormat(engine) !== 'tokens') return false;
 
-  const scheme = await roleScheme();
+  const scheme = await roleScheme(engine);
   // 相対の役だけの世代 (evex-2) は個人に紐づかないので不可
   if (!scheme?.speakers?.length) return false;
 
@@ -52,8 +53,8 @@ export async function canUseToken(userId) {
 }
 
 /** 独自トークン形式のプロンプト。 */
-async function tokenPrompt(userId, { topic }) {
-  const scheme = await roleScheme();
+async function tokenPrompt(userId, { topic, engine }) {
+  const scheme = await roleScheme(engine);
   const token = tokenFor(userId);
   const other = scheme?.overflow ?? '<|other|>';
 
@@ -117,15 +118,15 @@ function plainPrompt(userId, { topic, channelId, askerId }) {
  * 'examples' (実発言を例に真似) で、どちらで作ったかを表示に出す —
  * 深さが違うので、見た人が期待を合わせられる方がいい。
  */
-export async function impersonate(userId, { topic = null, channelId = null, askerId = null } = {}) {
+export async function impersonate(userId, { topic = null, channelId = null, askerId = null, engine = 'evex' } = {}) {
   if (hasOptedOut(userId)) {
     return { text: null, how: 'opted-out' };
   }
 
-  const format = await mimicFormat();
+  const format = await mimicFormat(engine);
   const built = format === 'plain'
     ? plainPrompt(userId, { topic, channelId, askerId })
-    : await tokenPrompt(userId, { topic });
+    : await tokenPrompt(userId, { topic, engine });
 
   if (built.how === 'empty') return { text: null, how: 'empty' };
 
@@ -133,7 +134,7 @@ export async function impersonate(userId, { topic = null, channelId = null, aske
 
   let text = '';
   for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
-    const result = await generate({ prompt: built.prompt });
+    const result = await generate({ prompt: built.prompt, engine });
     text = cut(String(result.text ?? '').slice(built.prompt.length));
     if (text.length >= MIN_CHARS) break;
   }

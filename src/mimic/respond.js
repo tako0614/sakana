@@ -20,7 +20,7 @@
 // ドル換算の上限 (agent_calls) に混ぜると請求と乖離する。
 
 import { chunkForDiscord } from '../agent/format.js';
-import { generate, mimicConfig, roleScheme } from './client.js';
+import { endpointFor, generate, roleScheme } from './client.js';
 import { mimicFormat } from './impersonate.js';
 import { personaFor } from './persona.js';
 import {
@@ -56,8 +56,8 @@ const MAX_TRIES = 3;
  * 独自トークン形式 (evex-1 / evex-2)。会話に出てくる人に役を振って、
  * bot は次の空いている役 — または /as で選ばれた人の話者トークン — で喋る。
  */
-async function tokenRequest(messages, { wanted }) {
-  const known = await roleScheme();
+async function tokenRequest(messages, { wanted, engine }) {
+  const known = await roleScheme(engine);
   const roles = assignRoles(messages.map((entry) => entry.author?.id), known);
   const turns = messages.map((entry) => ({
     token: roles.get(entry.author?.id),
@@ -103,7 +103,7 @@ function plainRequest(messages, { wanted, channelId }) {
   };
 }
 
-export async function handleMimicRequest(message, client, { recent = [] } = {}) {
+export async function handleMimicRequest(message, client, { recent = [], engine = 'evex' } = {}) {
   if (running >= MAX_CONCURRENT) {
     await message.reply({
       content: 'いま別の生成を回しています。少し待ってからもう一度呼んでください。',
@@ -133,13 +133,13 @@ export async function handleMimicRequest(message, client, { recent = [] } = {}) 
 
     // 載っている世代で形式が違う。取り違えるとモデルが一度も見ていない入力を
     // 受け取り、例外を出さずに静かに崩れる (evex-1 に <|a|> を渡して実際に壊した)
-    const built = await mimicFormat() === 'plain'
+    const built = await mimicFormat(engine) === 'plain'
       ? plainRequest(messages, { wanted, channelId: message.channelId })
-      : await tokenRequest(messages, { wanted });
+      : await tokenRequest(messages, { wanted, engine });
 
     let body = '';
     for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
-      const result = await generate({ prompt: built.prompt });
+      const result = await generate({ prompt: built.prompt, engine });
       // プロンプトぶんを落として、生成された続きだけを見る
       body = built.cut(String(result.text ?? '').slice(built.prompt.length));
       if (body.length >= MIN_CHARS) break;
@@ -159,7 +159,7 @@ export async function handleMimicRequest(message, client, { recent = [] } = {}) 
     const asName = built.as
       ? (labelledSpeakers().concat(learnedSpeakers()).find((row) => row.userId === persona)?.name ?? null)
       : null;
-    const note = `\n-# ${mimicConfig.label}${asName ? ` / ${asName} として` : ''}`;
+    const note = `\n-# ${endpointFor(engine).label}${asName ? ` / ${asName} として` : ''}`;
 
     for (const [index, chunk] of chunkForDiscord(body + note).entries()) {
       const payload = { content: chunk, allowedMentions: NO_MENTIONS };
