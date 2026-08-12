@@ -474,6 +474,12 @@ for epoch in range(1, args.epochs + 1):
     model.save_pretrained(epoch_dir, safe_serialization=True)
     tok.save_pretrained(epoch_dir)
     (out / "history.json").write_text(json.dumps(history, ensure_ascii=False, indent=2) + "\n")
+    # **その epoch ぶんだけ**を重みの隣に置く。history.json は走り全体の記録なので、
+    # 途中の epoch を選んで載せたときに末尾を読むと違う数字を申告してしまう
+    # (preview で epoch 2 の重みに epoch 4 の val 2.7536 が付いた)
+    (epoch_dir / "meta.json").write_text(
+        json.dumps(history[-1], ensure_ascii=False, indent=2) + "\n"
+    )
 
     if args.keep:
         import shutil

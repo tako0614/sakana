@@ -66,9 +66,13 @@ params = sum(p.numel() for p in model.parameters())
 if args.int8:
     model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
 
-# 学習時の記録があれば出す (どの epoch を載せているかを /model に表示するため)
+# 学習時の記録があれば出す (どの epoch を載せているかを /model に表示するため)。
+#
+# meta.json を先に見る。あちらは**その重みぶんだけ**の記録で、history.json は走り
+# 全体の配列。途中の epoch を選んで載せたときに history の末尾を読むと、載せていない
+# epoch の数字を申告してしまう (preview で epoch 2 の重みに epoch 4 の 2.7536 が付いた)。
 meta = {}
-for name in ("history.json", "meta.json"):
+for name in ("meta.json", "history.json"):
     path = model_dir / name
     if path.exists():
         try:
