@@ -127,7 +127,15 @@ def evaluate(ids, iters=40):
     return total / iters
 
 
-SAMPLE_PROMPTS = ["<|conv|><|s0|>", "<|conv|><|s3|>", "<|conv|>"]
+# 話者トークンだけを渡すと文脈が無く、モデルは <url> や <file> のような
+# 頻出トークンに流れる。実際の使い方 (直前の発言がある状態) に近い形で出す。
+# epoch 1〜2 のサンプルが記号の羅列になっていて信号にならなかったので直した。
+SAMPLE_PROMPTS = [
+    "<|conv|><|s3|>Cloudflare Containers ってどうなん<|s0|>",
+    "<|conv|><|s0|>rebase 疲れた<|s3|>",
+    "<|conv|><|other|>これバグってる？<|other|>",
+    "<|conv|>",
+]
 
 
 def samples(tag):
