@@ -6,8 +6,8 @@
 // 「記号だけ」「短すぎる」がどれだけ出るかを本番の設定で測れる。
 // 記号の禁止を入れる前は 38% が使えなかった。入れてからの実測をここで確認する。
 
-import { generate, mimicConfig, status } from '../../src/mimic/client.js';
-import { ROLE_TOKENS, buildPrompt, firstTurn, messageText } from '../../src/mimic/serialize.js';
+import { generate, mimicConfig, roleScheme, status } from '../../src/mimic/client.js';
+import { assignRoles, buildPrompt, firstTurn, messageText, nextRole } from '../../src/mimic/serialize.js';
 
 const times = Number(process.argv[2] ?? 12);
 
@@ -22,17 +22,21 @@ if (!health.up) {
   console.error(`推論サーバーが起動していません (${mimicConfig.url})`);
   process.exit(1);
 }
-console.log(`${mimicConfig.url} / epoch ${health.epoch} / val ${health.val_loss?.toFixed(4)}\n`);
+const scheme = await roleScheme();
+console.log(`${mimicConfig.url} / epoch ${health.epoch} / val ${health.val_loss?.toFixed(4)}`);
+console.log(`役: ${scheme?.roles?.join(' ') ?? '(申告なし)'}\n`);
 
 let usable = 0;
 let total = 0;
 
 for (const [messages] of CASES) {
-  // 交互に喋っている2人として渡す。bot は3人目として答える
+  // 役はサーバーの申告に従う。ここを固定値にしていたので evex-1 に <|a|> を
+  // 渡して出力を崩壊させた (probe だけ直し忘れて、直った後も壊れて見えた)。
+  const roles = assignRoles(messages.map((_, i) => `u${i % 2}`), scheme);
   const turns = messages.map((content, i) => ({
-    token: ROLE_TOKENS[i % 2], reply: false, content: messageText(content)
+    token: roles.get(`u${i % 2}`), reply: false, content: messageText(content)
   }));
-  const prompt = buildPrompt(turns, ROLE_TOKENS[2]);
+  const prompt = buildPrompt(turns, nextRole(roles, scheme));
 
   console.log(`--- ${messages.join(' / ')}`);
   for (let i = 0; i < times; i += 1) {
