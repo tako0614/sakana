@@ -23,16 +23,19 @@ VOCAB_SIZE = int(os.environ.get("LLM_VOCAB", 4096))
 # しか残らなかった (= 日本語がほぼ文字単位)。0.995 なら 1,492 文字で足りて、
 # 捨てる 4,216 文字は全体の 0.5% なのでバイト送りで足りる。
 COVERAGE = float(os.environ.get("LLM_COVERAGE", 0.995))
-SPEAKER_SLOTS = 48
 
 # 1トークンに収めたい記号。BPE に学習させると `<|s3|>` が 3〜4 トークンに割れて、
 # 会話 1 件ぶんの構造だけで数百トークン払うことになる。
 CONTROL = [
-    "<|conv|>", "<|end|>", "<|re|>", "<|other|>",
+    "<|conv|>", "<|end|>", "<|re|>", "<|z|>",
     "<url>", "<mention>", "<channel>", "<time>",
     "<code>", "</code>", "<nl>", "<file>",
 ]
-SYMBOLS = CONTROL + [f"<|s{i}|>" for i in range(SPEAKER_SLOTS)]
+# 話者は会話ごとに出現順で振る相対トークン (src/mimic/serialize.js)。
+# evex-1 は実在の人物に紐づく 48 個を持っていたが、8 個で 99.1% を被覆できるうえ
+# 身元が消える。空いた 40 枠はそのまま BPE のマージに回る。
+ROLES = [f"<|{c}|>" for c in "abcdefgh"]
+SYMBOLS = CONTROL + ROLES
 
 train_txt = CORPUS / "train.txt"
 prefix = str(CORPUS / "tok")

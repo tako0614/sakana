@@ -4,7 +4,10 @@
 // ずれても例外は出ず、モデルが「学習中に一度も見ていない形」を受け取って
 // 静かに崩れた出力を返すだけなので、門を置く。
 
-import { CONTROL_TOKENS, buildPrompt, firstTurn, humanize, messageText, normalize } from '../src/mimic/serialize.js';
+import {
+  CONTROL_TOKENS, ROLE_TOKENS, ROLE_OVERFLOW, assignRoles, buildPrompt,
+  firstTurn, humanize, messageText, nextRole, normalize
+} from '../src/mimic/serialize.js';
 import { DEFAULT_ENGINE, ENGINES, engineFor, setEngine } from '../src/mimic/prefs.js';
 import { db } from '../src/db.js';
 
@@ -61,7 +64,7 @@ function fail(message) {
   const once = messageText(raw);
   if (!once.includes('<nl>Current')) fail(`1回目で改行が消えた: ${once}`);
 
-  const turns = [{ token: '<|s0|>', reply: false, content: once }];
+  const turns = [{ token: '<|a|>', reply: false, content: once }];
   const prompt = buildPrompt(turns);
   if (!prompt.includes('<nl>Current')) {
     fail(`buildPrompt が正規化を二度掛けている: ${prompt}`);
@@ -72,16 +75,16 @@ function fail(message) {
 
 {
   const turns = [
-    { token: '<|s0|>', reply: false, content: '今日ひま？' },
-    { token: '<|s7|>', reply: true, content: 'ひま' }
+    { token: '<|a|>', reply: false, content: '今日ひま？' },
+    { token: '<|b|>', reply: true, content: 'ひま' }
   ];
 
   const prompt = buildPrompt(turns);
-  if (prompt !== '<|conv|><|s0|>今日ひま？<|s7|><|re|>ひま') fail(`直列化が違う: ${prompt}`);
+  if (prompt !== '<|conv|><|a|>今日ひま？<|b|><|re|>ひま') fail(`直列化が違う: ${prompt}`);
 
-  // 末尾に話者トークンを置くと、その人として続きを書かせられる
-  const asked = buildPrompt(turns, '<|other|>');
-  if (!asked.endsWith('<|other|>')) fail(`末尾の話者トークンが無い: ${asked}`);
+  // 末尾に役を置くと、その役として続きを書かせられる
+  const asked = buildPrompt(turns, '<|c|>');
+  if (!asked.endsWith('<|c|>')) fail(`末尾の役トークンが無い: ${asked}`);
 }
 
 // --- 1発言だけ取り出す ---
@@ -89,10 +92,10 @@ function fail(message) {
 // 放っておくとモデルは会話を続けるので、次の話者トークンで切らないと
 // 「他の人の発言まで捏造した長文」が Discord に流れる。
 {
-  const nameOf = (rank) => `s${rank}`;
+  const nameOf = (role) => role;
 
   // Discord に返すのは firstTurn。次の話者トークンで切る
-  const one = firstTurn('そうだねー<|s3|>いや違う<|end|>');
+  const one = firstTurn('そうだねー<|c|>いや違う<|end|>');
   if (one !== 'そうだねー') fail(`1発言だけになっていない: ${one}`);
 
   // <|end|> より後ろは次の会話なので捨てる
@@ -100,8 +103,8 @@ function fail(message) {
   if (after !== 'はい') fail(`<|end|> の後ろを含んでいる: ${after}`);
 
   // 会話ごと見せる方 (sample.py 用) は名前を出して続ける
-  const whole = humanize('そうだねー<|s3|>いや違う<|end|>', nameOf);
-  if (!whole.includes('s3:') || !whole.includes('いや違う')) fail(`humanize が展開しない: ${whole}`);
+  const whole = humanize('そうだねー<|c|>いや違う<|end|>', nameOf);
+  if (!whole.includes('c:') || !whole.includes('いや違う')) fail(`humanize が展開しない: ${whole}`);
 
   // 制御記号が生のまま表示に漏れない
   const shown = firstTurn('a<nl>b<url><file><mention><|re|>');
@@ -122,7 +125,7 @@ function fail(message) {
   emitted.add(normalize('<#123456789012345678>'));       // <channel>
   emitted.add(normalize('<t:1:R>'));                     // <time>
   emitted.add('<nl>');
-  for (const token of ['<|conv|>', '<|end|>', '<|re|>', '<|other|>', '<code>', '</code>']) {
+  for (const token of ['<|conv|>', '<|end|>', '<|re|>', ROLE_OVERFLOW, '<code>', '</code>', ...ROLE_TOKENS]) {
     emitted.add(token);
   }
 
@@ -133,7 +136,30 @@ function fail(message) {
   }
 }
 
-console.log(`serialize ok (制御記号 ${CONTROL_TOKENS.length} 個 / 二重適用でも壊れない)`);
+// --- 役の割り当て ---
+//
+// 会話ごとに振り直すことが身元を消す仕組みそのもの。同じ人でも別の会話では別の役。
+{
+  const roles = assignRoles(['u1', 'u2', 'u1', 'u3']);
+  if (roles.get('u1') !== '<|a|>') fail(`最初に喋った人が <|a|>: ${roles.get('u1')}`);
+  if (roles.get('u2') !== '<|b|>') fail(`2人目が <|b|>: ${roles.get('u2')}`);
+  if (roles.get('u3') !== '<|c|>') fail(`3人目が <|c|>: ${roles.get('u3')}`);
+  if (roles.size !== 3) fail(`同じ人に2つ振ってはいけない: ${roles.size}`);
+
+  // bot は次の空いている役で喋る
+  if (nextRole(roles) !== '<|d|>') fail(`次の役が違う: ${nextRole(roles)}`);
+
+  // 9人目以降はまとめる (実測 0.9%)
+  const many = assignRoles(Array.from({ length: 10 }, (_, i) => `u${i}`));
+  if (many.get('u8') !== ROLE_OVERFLOW) fail(`9人目は ${ROLE_OVERFLOW}: ${many.get('u8')}`);
+  if (many.get('u9') !== ROLE_OVERFLOW) fail(`10人目も ${ROLE_OVERFLOW}: ${many.get('u9')}`);
+
+  // 別の会話では同じ人が別の役になる = 身元が残らない
+  const other = assignRoles(['u2', 'u1']);
+  if (other.get('u1') === roles.get('u1')) fail('会話をまたいで役が固定されてはいけない');
+}
+
+console.log(`serialize ok (制御記号 ${CONTROL_TOKENS.length} 個 / 役 ${ROLE_TOKENS.length} + 溢れ / 二重適用でも壊れない)`);
 
 // --- エンジンの選択 ---
 

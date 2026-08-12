@@ -4,12 +4,13 @@
     .venv-llm/bin/python scripts/llm/chat.py --ckpt scripts/llm/out/ckpt-e10.pt
 
 コマンド:
-    /as <名前|番号>   その人として返させる (話者を指定)
-    /who              話者の一覧
-    /temp <数>        温度 (既定 0.9)
-    /raw              生成の生トークンを見せる/隠す
-    /reset            会話を捨てる
-    /quit             終了
+    /temp <数>   温度 (既定 0.9)
+    /raw         生成の生トークンを見せる/隠す
+    /reset       会話を捨てる
+    /quit        終了
+
+話者は会話ごとに出現順で振る相対トークン。あなたが <|a|>、evex が <|b|>。
+実在の人物には紐づかないので「その人として書かせる」ことはできない。
 
 正規化の本体は src/mimic/serialize.js。ここでは**人が打ち込むもの**に必要な分だけ
 実装している (URL と改行)。`<@123>` のような Discord の記法は CLI では出てこない。
@@ -28,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from model import Config, MicroLM  # noqa: E402
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--corpus", default="corpus")
+parser.add_argument("--corpus", default="corpus")  # リポジトリ root から実行する前提
 parser.add_argument("--ckpt", default="scripts/llm/out/ckpt-e10.pt")
 parser.add_argument("--temperature", type=float, default=0.9)
 parser.add_argument("--top-k", type=int, default=40)
@@ -50,17 +51,52 @@ END_ID = sp.piece_to_id("<|end|>")
 # (禁止前は実測 38%、禁止後 12%)。
 BAN = [sp.piece_to_id(t) for t in ("<file>", "<url>", "<mention>", "<channel>", "<time>")]
 
-import json  # noqa: E402
+# 話者トークンの形式は世代で違うので、tokenizer から判定する。
+#
+#   evex-1: 実在の人物に紐づく <|s0|>..<|s47|> と <|other|>
+#   evex-2: 会話ごとに振り直す <|a|>..<|h|> (身元を持たない)
+#
+# チェックポイントと tokenizer は対の関係なので、片方だけ差し替えると
+# トークン ID が総入れ替えになって出力が崩れる (実際にやって `',ぴの` が出た)。
+def has_piece(piece):
+    return sp.piece_to_id(piece) != sp.unk_id()
 
-# speakers.json は2種類ある。build-corpus.mjs が出すもの (count / userId 付き) と、
-# HF 公開用に ID と表示名を落としたもの (messages / 名前なし)。どちらでも読む。
-speakers = json.loads((corpus / "speakers.json").read_text(encoding="utf8"))
-for i, s in enumerate(speakers):
-    s.setdefault("rank", i)
-    s.setdefault("count", s.get("messages", 0))
-    s.setdefault("name", f"s{s['rank']}")
 
-blob = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+if has_piece("<|a|>"):
+    YOU, EVEX, GEN = "<|a|>", "<|b|>", 2
+elif has_piece("<|other|>"):
+    # evex-1 の bot は自分も相手も <|other|> で喋っていた
+    YOU, EVEX, GEN = "<|other|>", "<|other|>", 1
+else:
+    raise SystemExit(f"{args.corpus}/tok.model が evex-1 でも evex-2 でもない")
+
+ROLE_RE = r"<\|s\d+\|>|<\|other\|>|<\|end\|>|<\|conv\|>" if GEN == 1 \
+    else r"<\|[a-hz]\|>|<\|end\|>|<\|conv\|>"
+
+def resolve_ckpt(given):
+    """指定が無い / 見つからないときは out/ の一番進んだ epoch を使う。
+
+    `npm run chat` を引数なしで叩けるようにするため。掃きの出力
+    (out/lr*/ckpt-e*.pt) は拾わない — 直下だけ見る。
+    """
+    path = Path(given)
+    if path.exists():
+        return path
+
+    out = Path(__file__).resolve().parent / "out"
+    found = sorted(
+        out.glob("ckpt-e*.pt"),
+        key=lambda q: int(re.search(r"e(\d+)", q.name).group(1)),
+    )
+    if not found:
+        raise SystemExit(f"チェックポイントが無い: {given} も {out}/ckpt-e*.pt も見つからない")
+
+    print(f"({given} が無いので {found[-1]} を使う)")
+    return found[-1]
+
+
+ckpt = resolve_ckpt(args.ckpt)
+blob = torch.load(ckpt, map_location="cpu", weights_only=False)
 saved = blob["config"]
 cfg = Config(
     vocab_size=saved["vocab_size"], n_layers=saved["n_layers"], d_model=saved["d_model"],
@@ -79,39 +115,22 @@ def normalize(text):
 
 def first_turn(text):
     """最初の1発言だけ取る。切らないと他人の発言まで作った長文になる。"""
-    cut = re.search(r"<\|s\d+\|>|<\|other\|>|<\|end\|>|<\|conv\|>", text)
+    cut = re.search(ROLE_RE, text)
     body = text[: cut.start()] if cut else text
     for a, b in (("<|re|>", ""), ("<nl>", "\n"), ("<code>", "```\n"), ("</code>", "\n```")):
         body = body.replace(a, b)
     return body.strip()
 
 
-def find_speaker(needle):
-    """名前でも順位でも引く。"""
-    if needle.isdigit() and int(needle) < len(speakers):
-        return speakers[int(needle)]
-    lowered = needle.lower()
-    for s in speakers:
-        if s["name"].lower() == lowered:
-            return s
-    for s in speakers:
-        if lowered in s["name"].lower():
-            return s
-    return None
-
-
-# 会話は [(話者トークン, 本文)] で持つ。自分の発言は <|other|> にする
-# (bot と同じ扱い。特定の人に成り代わらせない)
+# 会話は [(役トークン, 本文)] で持つ
 history = []
-voice = "<|other|>"
-voice_name = "evex"
 temperature = args.temperature
 show_raw = False
 
-print(f"evex ({args.ckpt} / epoch {blob.get('epoch')} / val {blob.get('val_loss'):.4f})")
+print(f"evex ({ckpt} / epoch {blob.get('epoch')} / val {blob.get('val_loss'):.4f})")
 print(f"{blob['config']['n_layers']}層 {blob['config']['d_model']}次元 / "
       f"このサーバーの94万件だけで学習。一般知識はありません")
-print("/as <名前> で話者を指定、/who で一覧、/quit で終了\n")
+print(f"形式 evex-{GEN} / /temp /raw /reset /quit\n")
 
 
 def build_prompt():
@@ -119,7 +138,7 @@ def build_prompt():
     for token, text in history[-args.history:]:
         parts.append(token)
         parts.append(text)
-    parts.append(voice)
+    parts.append(EVEX)
     return "".join(parts)
 
 
@@ -161,12 +180,6 @@ while True:
         print("(会話を捨てた)")
         continue
 
-    if line == "/who":
-        for s in speakers[:16]:
-            print(f"  {s['rank']:>2} {s['name']:<24} {s['count']:>7}件")
-        print(f"  (上位{len(speakers)}人。/as <名前|番号>)")
-        continue
-
     if line == "/raw":
         show_raw = not show_raw
         print(f"(生トークン {'表示' if show_raw else '非表示'})")
@@ -180,30 +193,14 @@ while True:
             print(f"(いまの温度 {temperature})")
         continue
 
-    if line.startswith("/as"):
-        needle = line[3:].strip()
-        if not needle:
-            voice, voice_name = "<|other|>", "evex"
-            print("(話者の指定を外した)")
-            continue
-
-        found = find_speaker(needle)
-        if not found:
-            print(f"(「{needle}」は上位48人に居ない。/who で一覧)")
-            continue
-
-        voice, voice_name = found["token"], found["name"]
-        print(f"(これから {voice_name} として返す。学習データに {found['count']:,}件)")
-        continue
-
     if line.startswith("/"):
-        print("(/as /who /temp /raw /reset /quit)")
+        print("(/temp /raw /reset /quit)")
         continue
 
-    history.append(("<|other|>", normalize(line)))
+    history.append((YOU, normalize(line)))
     body, raw = generate_reply()
-    history.append((voice, normalize(body)))
+    history.append((EVEX, normalize(body)))
 
-    print(f"{voice_name}: {body}")
+    print(f"evex: {body}")
     if show_raw:
         print(f"  raw: {raw!r}")

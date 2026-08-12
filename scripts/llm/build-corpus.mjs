@@ -18,13 +18,15 @@ import { gunzipSync } from 'node:zlib';
 
 process.env.ARCHIVE_DB_PATH = path.join(os.tmpdir(), 'sakana-corpus-scratch.sqlite');
 const { splitIntoChunks } = await import('../../src/archive/chunks.js');
-const { buildPrompt, messageText } = await import('../../src/mimic/serialize.js');
+const { assignRoles, buildPrompt, messageText } = await import('../../src/mimic/serialize.js');
 
 const dir = process.argv[2] ?? 'corpus';
 
-// 話者に固有トークンを与える人数。上位 12 人で 55%、この辺で頭打ちになる。
-// 残りは <|other|> にまとめる (2,647 人ぶんの語彙を持つ意味がない)。
-const SPEAKER_SLOTS = Number(process.env.LLM_SPEAKER_SLOTS ?? 48);
+// 話者は会話ごとに出現順で振る (src/mimic/serialize.js の assignRoles)。
+// evex-1 は上位48人に固有トークンを与えていたが、それは実在の人物に紐づくので
+// speakers.json / 順位 / Discord ID の対応表がぶら下がっていた。相対にすれば
+// 身元は消え、会話の交代だけが残る。
+// 実測: 1会話の異なる話者は 8 人までで 99.1%、37% は 1 人だけ。
 // val は「最後の N 日ぶんの会話」。ランダム分割にしない —
 // 「草」「www」のような完全一致が 23% あるので、時間で切らないと val が嘘になる。
 const VAL_DAYS = Number(process.env.LLM_VAL_DAYS ?? 14);
@@ -32,18 +34,6 @@ const VAL_DAYS = Number(process.env.LLM_VAL_DAYS ?? 14);
 // 正規化と直列化は src/mimic/serialize.js に置いてある。
 // 学習データと推論のプロンプトが同じ形でないと、モデルは「一度も見ていない形」を
 // 受け取ることになる (しかも例外は出ないので静かに崩れるだけ)。
-
-// --- 話者 ---
-
-const authors = JSON.parse(await readFile(path.join(dir, 'authors.json'), 'utf8'));
-const humans = authors.filter((a) => !a.bot).sort((a, b) => b.count - a.count);
-const slots = new Map();
-
-for (const [rank, author] of humans.slice(0, SPEAKER_SLOTS).entries()) {
-  slots.set(author.idx, `<|s${rank}|>`);
-}
-
-const speakerToken = (idx) => slots.get(idx) ?? '<|other|>';
 
 // --- 会話を組む ---
 
@@ -81,8 +71,10 @@ const conversations = [];
 
 for (const rows of byChannel.values()) {
   for (const chunk of splitIntoChunks(rows)) {
+    // この会話に出てくる人だけに a,b,c... を振る。別の会話では別人になる
+    const roles = assignRoles(chunk.map((row) => row.author));
     const turns = chunk.map((row) => ({
-      token: speakerToken(row.author), reply: row.reply, content: row.content
+      token: roles.get(row.author), reply: row.reply, content: row.content
     }));
     conversations.push({
       at: chunk[chunk.length - 1].created_at,
@@ -101,29 +93,12 @@ const val = conversations.filter((c) => c.at >= cutoff);
 
 await writeFile(path.join(dir, 'train.txt'), `${train.map((c) => c.text).join('\n')}\n`);
 await writeFile(path.join(dir, 'val.txt'), `${val.map((c) => c.text).join('\n')}\n`);
-await writeFile(
-  path.join(dir, 'speakers.json'),
-  JSON.stringify(
-    // Discord の user_id を必ず入れる。これが無いと実ユーザーを話者トークンに
-    // 対応づけられず、/model evex で「その人として書く」ができない。
-    humans.slice(0, SPEAKER_SLOTS).map((a, rank) => ({
-      token: `<|s${rank}|>`, rank, userId: a.id, idx: a.idx, name: a.name, count: a.count
-    })),
-    null,
-    2
-  )
-);
-
 // --- 統計 ---
 
 const chars = (list) => list.reduce((sum, c) => sum + c.text.length, 0);
-const covered = humans.slice(0, SPEAKER_SLOTS).reduce((sum, a) => sum + a.count, 0);
-const allHuman = humans.reduce((sum, a) => sum + a.count, 0);
-const pct = (a, b) => `${((a / b) * 100).toFixed(1)}%`;
 
 console.log(`読んだ行            ${read} (bot を除外 ${bots})`);
 console.log(`会話                ${conversations.length}`);
 console.log(`  train             ${train.length} 会話 / ${chars(train).toLocaleString()} 文字`);
 console.log(`  val               ${val.length} 会話 / ${chars(val).toLocaleString()} 文字 (最後の ${VAL_DAYS} 日)`);
-console.log(`話者トークン        ${slots.size} 人で人間の発言の ${pct(covered, allHuman)} を被覆`);
 console.log(`1会話あたり         ${Math.round(chars(conversations) / conversations.length)} 文字`);

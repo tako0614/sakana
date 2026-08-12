@@ -81,9 +81,29 @@ model = MicroLM(cfg)
 params = model.parameter_count()
 print(f"パラメータ {params:,} ({params / 1e6:.2f}M)")
 
+def cuda_usable():
+    """torch.cuda.is_available() だけでは足りない。
+
+    GTX 960 (sm_52) では is_available() が True を返すのに、カーネルを起動すると
+    「no kernel image is available」で落ちる。PyTorch 2.13+cu130 が持っているのは
+    sm_75 以上で、Maxwell 世代は含まれていない。実際に対応表と突き合わせる。
+    """
+    if not torch.cuda.is_available():
+        return False
+
+    have = torch.cuda.get_device_capability(0)
+    supported = {tuple(int(c) for c in a.removeprefix("sm_")) for a in torch.cuda.get_arch_list()}
+    if have in supported:
+        return True
+
+    print(f"cuda を使わない: この GPU は sm_{have[0]}{have[1]} だが "
+          f"PyTorch が持っているのは {sorted(torch.cuda.get_arch_list())}")
+    return False
+
+
 picked = args.device
 if picked == "auto":
-    picked = "cuda" if torch.cuda.is_available() else "cpu"
+    picked = "cuda" if cuda_usable() else "cpu"
 
 device = torch.device(picked)
 model.to(device)

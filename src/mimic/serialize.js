@@ -16,11 +16,43 @@ const RULES = [
   [/@everyone|@here/g, '<mention>']
 ];
 
+// 話者は「会話の中で何番目に喋ったか」で振る。実在の人物には紐づけない。
+//
+// evex-1 は上位48人に固有トークンを与えていたので、speakers.json / 順位 /
+// Discord ID の対応表 / 「その人として書く」機能が全部くっついてきた。
+// 相対にすれば身元は消え、会話の交代だけが残る。
+// 実測: 1会話あたりの異なる話者は 8 人までで 99.1%、37% は 1 人だけ
+// (連投・独り言)。だから「同じ人が続けている」と「別の人が返した」の
+// 区別は残す価値がある。
+export const ROLE_TOKENS = ['<|a|>', '<|b|>', '<|c|>', '<|d|>', '<|e|>', '<|f|>', '<|g|>', '<|h|>'];
+export const ROLE_OVERFLOW = '<|z|>';
+
 export const CONTROL_TOKENS = [
-  '<|conv|>', '<|end|>', '<|re|>', '<|other|>',
+  '<|conv|>', '<|end|>', '<|re|>', ROLE_OVERFLOW,
   '<url>', '<mention>', '<channel>', '<time>',
-  '<code>', '</code>', '<nl>', '<file>'
+  '<code>', '</code>', '<nl>', '<file>',
+  ...ROLE_TOKENS
 ];
+
+/**
+ * 会話の参加者に出現順でトークンを割る。
+ *
+ * 同じ `<|a|>` が別の会話では別人になる。これが身元を消す仕組みそのもの。
+ * 9人目以降は `<|z|>` にまとめる (実測で 0.9%)。
+ */
+export function assignRoles(keys) {
+  const roles = new Map();
+  for (const key of keys) {
+    if (roles.has(key)) continue;
+    roles.set(key, ROLE_TOKENS[roles.size] ?? ROLE_OVERFLOW);
+  }
+  return roles;
+}
+
+/** 会話に居る参加者の次に来る役 (bot が新しい参加者として喋るとき)。 */
+export function nextRole(roles) {
+  return ROLE_TOKENS[roles.size] ?? ROLE_OVERFLOW;
+}
 
 export function normalize(text) {
   let out = String(text ?? '');
@@ -79,7 +111,7 @@ export function buildPrompt(turns, trailingToken = null) {
  */
 export function firstTurn(text) {
   const raw = String(text ?? '');
-  const cut = raw.search(/<\|s\d+\|>|<\|other\|>|<\|end\|>|<\|conv\|>/);
+  const cut = raw.search(/<\|[a-hz]\|>|<\|end\|>|<\|conv\|>/);
   return plain(cut >= 0 ? raw.slice(0, cut) : raw);
 }
 
@@ -99,9 +131,9 @@ function plain(text) {
 }
 
 /**
- * 生成結果を人が読める形に戻す。会話ごと見たいとき (sample.py) 用。
+ * 生成結果を人が読める形に戻す。会話ごと見たいとき用。
  * Discord に返すのは firstTurn の方。
- * 話者トークンは名前に、<nl> は改行に、制御記号は落とす。
+ * 役トークンは nameOf(役) で置き換え、<nl> は改行に、制御記号は落とす。
  */
 export function humanize(text, nameOf) {
   let out = String(text ?? '');
@@ -111,8 +143,7 @@ export function humanize(text, nameOf) {
   if (end >= 0) out = out.slice(0, end);
 
   out = out.replace(/<\|conv\|>/g, '');
-  out = out.replace(/<\|s(\d+)\|>/g, (_, rank) => `\n${nameOf(Number(rank))}: `);
-  out = out.replace(/<\|other\|>/g, '\nだれか: ');
+  out = out.replace(/<\|([a-hz])\|>/g, (_, role) => `\n${nameOf(role)}: `);
 
   return plain(out);
 }

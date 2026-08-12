@@ -7,7 +7,7 @@
 // 記号の禁止を入れる前は 38% が使えなかった。入れてからの実測をここで確認する。
 
 import { generate, mimicConfig, status } from '../../src/mimic/client.js';
-import { buildPrompt, firstTurn, messageText } from '../../src/mimic/serialize.js';
+import { ROLE_TOKENS, buildPrompt, firstTurn, messageText } from '../../src/mimic/serialize.js';
 
 const times = Number(process.argv[2] ?? 12);
 
@@ -28,10 +28,11 @@ let usable = 0;
 let total = 0;
 
 for (const [messages] of CASES) {
-  const turns = messages.map((content) => ({
-    token: '<|other|>', reply: false, content: messageText(content)
+  // 交互に喋っている2人として渡す。bot は3人目として答える
+  const turns = messages.map((content, i) => ({
+    token: ROLE_TOKENS[i % 2], reply: false, content: messageText(content)
   }));
-  const prompt = buildPrompt(turns, '<|other|>');
+  const prompt = buildPrompt(turns, ROLE_TOKENS[2]);
 
   console.log(`--- ${messages.join(' / ')}`);
   for (let i = 0; i < times; i += 1) {

@@ -14,3 +14,6 @@ scripts/llm/out/
 
 # HF に上げる用の書き出し (重みは git に入れない)
 dist/
+
+# evex-1 の tokenizer 一式 (チェックポイントと対なので凍結)
+corpus-v1/

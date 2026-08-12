@@ -4,16 +4,16 @@
 // 指示に従わせようとしても学習中に一度も見ていない形になるので崩れるだけ。
 // できるのは「会話の続きを1発言書く」ことだけなので、それだけをやる。
 //
-// 誰かに成り代わらせない。話者は <|other|> (上位48人に入らない 2,599 人ぶんの
-// 発言 = このサーバーの平均的な声) で固定する。特定の人の名前で書かせると
-// 「その人が実際に言ったこと」を思い出して出しうるので、既定にはしない。
+// 話者は会話ごとに出現順で振る相対トークン (<|a|>, <|b|>, ...)。実在の人物には
+// 紐づかないので、そもそも「誰かに成り代わる」ことができない。
+// bot は会話に加わる新しい参加者として、次の空いている役で喋る。
 //
 // 使用量の記録もしない。API を叩いていないので費用がゼロで、
 // ドル換算の上限 (agent_calls) に混ぜると請求と乖離する。
 
 import { chunkForDiscord } from '../agent/format.js';
-import { generate, speakerFor } from './client.js';
-import { buildPrompt, firstTurn, messageText } from './serialize.js';
+import { generate } from './client.js';
+import { assignRoles, buildPrompt, firstTurn, messageText, nextRole } from './serialize.js';
 
 const NO_MENTIONS = { parse: [], repliedUser: false };
 
@@ -27,8 +27,6 @@ const MAX_CONCURRENT = 1;
 const CONTEXT_MESSAGES = 16;
 
 // 返すのは1発言だけ。会話ごと生成させると「他の人の発言まで捏造した長文」になる。
-const VOICE = '<|other|>';
-
 // 短すぎる返答は引き直す。
 //
 // 正規化トークン (<url> / <file>) はサーバー側で既定禁止にしてあるが、それでも
@@ -36,10 +34,6 @@ const VOICE = '<|other|>';
 // CPU で数秒かかるので回数は絞る。
 const MIN_CHARS = 3;
 const MAX_TRIES = 3;
-
-function speakerToken(userId) {
-  return speakerFor(userId)?.token ?? VOICE;
-}
 
 export async function handleMimicRequest(message, client, { recent = [] } = {}) {
   if (running >= MAX_CONCURRENT) {
@@ -61,16 +55,20 @@ export async function handleMimicRequest(message, client, { recent = [] } = {}) 
 
     // bot の発言は文脈に入れない。学習データが人間ぶんだけなので、
     // bot の長い回答が混ざると学習中に見ていない形になる。
-    const history = recent
+    const messages = recent
       .filter((entry) => !entry.author?.bot && (entry.content ?? '').trim())
-      .slice(-CONTEXT_MESSAGES)
-      .map((entry) => ({
-        token: speakerToken(entry.author?.id),
-        reply: Boolean(entry.reference?.messageId),
-        content: messageText(entry.content)
-      }));
+      .slice(-CONTEXT_MESSAGES);
 
-    const prompt = buildPrompt(history, VOICE);
+    // この会話に出てくる人だけに a,b,c... を振る。誰が誰かは持たない
+    const roles = assignRoles(messages.map((entry) => entry.author?.id));
+    const history = messages.map((entry) => ({
+      token: roles.get(entry.author?.id),
+      reply: Boolean(entry.reference?.messageId),
+      content: messageText(entry.content)
+    }));
+
+    // bot は新しい参加者として喋る
+    const prompt = buildPrompt(history, nextRole(roles));
 
     let body = '';
     for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {

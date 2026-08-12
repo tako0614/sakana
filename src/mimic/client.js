@@ -7,49 +7,16 @@
 // 127.0.0.1 だけで待ち受ける。エージェントの browser ツールは urlguard が
 // ループバックを塞いでいるので、SSRF でここに到達する経路は無い。
 
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
-
 const number = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
 
 export const mimicConfig = {
   url: process.env.MIMIC_URL ?? 'http://127.0.0.1:8765',
   timeoutMs: number(process.env.MIMIC_TIMEOUT_MS, 60_000),
-  corpusDir: process.env.MIMIC_CORPUS_DIR ?? 'corpus',
   maxNewTokens: number(process.env.MIMIC_MAX_NEW_TOKENS, 200)
 };
 
-/**
- * Discord の user_id → 話者トークンの順位。
- *
- * corpus/speakers.json は build-corpus.mjs が書く。上位48人だけ固有トークンを
- * 持っていて、それ以外は <|other|> になる (2,647 人ぶんの語彙は持てない)。
- */
-let speakerMap = null;
-
-function speakers() {
-  if (speakerMap) return speakerMap;
-
-  speakerMap = new Map();
-  try {
-    const file = path.join(mimicConfig.corpusDir, 'speakers.json');
-    for (const entry of JSON.parse(readFileSync(file, 'utf8'))) {
-      if (entry.userId) speakerMap.set(String(entry.userId), entry);
-    }
-  } catch {
-    // 学習前・コーパス未生成でも bot は動く。話者指定が効かないだけ。
-  }
-  return speakerMap;
-}
-
-/** その人に固有の話者トークンがあるか。無ければ <|other|> 扱いになる。 */
-export function speakerFor(userId) {
-  return speakers().get(String(userId)) ?? null;
-}
-
-export function speakerList() {
-  return [...speakers().values()];
-}
+// speakers.json は使わない。話者は会話ごとの相対トークンになったので、
+// Discord の user_id と結びつける表がそもそも要らない。
 
 class MimicError extends Error {
   constructor(message, { down = false } = {}) {
