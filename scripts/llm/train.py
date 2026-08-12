@@ -36,6 +36,9 @@ parser.add_argument("--bench", action="store_true", help="200 step だけ回し�
 # 広げると P コアが E コアを待つので、素朴に 16 を指定すると逆に遅い
 # (実測 attn_dropout=0 で 16 スレッド 2,104 → 12 スレッド 5,476 tok/s)。
 parser.add_argument("--threads", type=int, default=12)
+# GPU が使えるなら使う。auto は「あれば cuda」。
+# CPU 決め打ちにしていたので、GPU のある機械に移しても回せなかった。
+parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
 args = parser.parse_args()
 
 corpus = Path(args.corpus)
@@ -78,8 +81,18 @@ model = MicroLM(cfg)
 params = model.parameter_count()
 print(f"パラメータ {params:,} ({params / 1e6:.2f}M)")
 
-device = torch.device("cpu")
+picked = args.device
+if picked == "auto":
+    picked = "cuda" if torch.cuda.is_available() else "cpu"
+
+device = torch.device(picked)
 model.to(device)
+
+if picked == "cuda":
+    print(f"device cuda: {torch.cuda.get_device_name(0)} "
+          f"/ sm_{''.join(map(str, torch.cuda.get_device_capability(0)))}")
+else:
+    print(f"device cpu / threads {args.threads}")
 
 
 def batches(ids, batch_size, generator):
