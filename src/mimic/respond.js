@@ -29,6 +29,14 @@ const CONTEXT_MESSAGES = 16;
 // 返すのは1発言だけ。会話ごと生成させると「他の人の発言まで捏造した長文」になる。
 const VOICE = '<|other|>';
 
+// 短すぎる返答は引き直す。
+//
+// 正規化トークン (<url> / <file>) はサーバー側で既定禁止にしてあるが、それでも
+// 「これ」のような 2 文字が 12% ほど出る (禁止前は 38% が記号だけだった)。
+// CPU で数秒かかるので回数は絞る。
+const MIN_CHARS = 3;
+const MAX_TRIES = 3;
+
 function speakerToken(userId) {
   return speakerFor(userId)?.token ?? VOICE;
 }
@@ -63,10 +71,14 @@ export async function handleMimicRequest(message, client, { recent = [] } = {}) 
       }));
 
     const prompt = buildPrompt(history, VOICE);
-    const result = await generate({ prompt });
 
-    // プロンプトぶんを落として、生成された続きだけを見る
-    const body = firstTurn(String(result.text ?? '').slice(prompt.length));
+    let body = '';
+    for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
+      const result = await generate({ prompt });
+      // プロンプトぶんを落として、生成された続きだけを見る
+      body = firstTurn(String(result.text ?? '').slice(prompt.length));
+      if (body.length >= MIN_CHARS) break;
+    }
 
     if (!body) {
       await message.reply({

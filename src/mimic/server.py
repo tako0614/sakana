@@ -39,6 +39,11 @@ torch.set_grad_enabled(False)
 sp = spm.SentencePieceProcessor(model_file=str(Path(args.corpus) / "tok.model"))
 END_ID = sp.piece_to_id("<|end|>")
 
+# 正規化が作った記号は「発言」ではないので、既定でサンプリングから外す。
+# これを許すと `<url>` だけ吐いて終わる返答が実測 38% 出た (外すと 12%)。
+NORMALIZED = ("<file>", "<url>", "<mention>", "<channel>", "<time>", "<code>", "</code>")
+DEFAULT_BAN = [sp.piece_to_id(t) for t in NORMALIZED]
+
 blob = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 saved = blob["config"]
 cfg = Config(
@@ -61,7 +66,7 @@ INFO = {
 lock = threading.Lock()
 
 
-def run(prompt, max_new_tokens, temperature, top_k):
+def run(prompt, max_new_tokens, temperature, top_k, ban, min_new_tokens):
     ids = sp.encode(prompt, out_type=int)
     # プロンプトが context を超えていたら後ろを残す (直近の会話が本題)
     ids = ids[-(cfg.context - 1):]
@@ -73,6 +78,8 @@ def run(prompt, max_new_tokens, temperature, top_k):
             temperature=temperature,
             top_k=top_k,
             stop_id=END_ID,
+            ban_ids=ban,
+            min_new_tokens=min_new_tokens,
         )
     return sp.decode(out[0].tolist())
 
@@ -112,11 +119,19 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
+            # ban を明示的に [] で渡せば素の挙動に戻せる (研究用)
+            requested = payload.get("ban")
+            ban = DEFAULT_BAN if requested is None else [
+                sp.piece_to_id(t) for t in requested if sp.piece_to_id(t) > 0
+            ]
+
             text = run(
                 prompt,
                 min(int(payload.get("max_new_tokens", 200)), args.max_new_cap),
                 float(payload.get("temperature", 0.9)),
                 int(payload.get("top_k", 40)),
+                ban,
+                int(payload.get("min_new_tokens", 2)),
             )
         except Exception as error:  # noqa: BLE001 - 落とさずに理由を返す
             self._send(500, {"error": str(error)})

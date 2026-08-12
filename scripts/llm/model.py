@@ -183,12 +183,25 @@ class MicroLM(nn.Module):
         return total
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=0.9, top_k=40, stop_id=None):
+    def generate(self, idx, max_new_tokens, temperature=0.9, top_k=40, stop_id=None,
+                 ban_ids=None, min_new_tokens=0):
+        """ban_ids: 絶対に出させないトークン。min_new_tokens: それまでは stop_id も出させない。
+
+        チャットに使うと `<url>` や `<file>` だけを吐いて終わることが多い
+        (実測 38%)。あれは正規化が作った記号で発言ではないので、
+        呼び出し側から外せるようにしてある。
+        """
         self.eval()
-        for _ in range(max_new_tokens):
+        for step in range(max_new_tokens):
             window = idx[:, -self.cfg.context:]
             logits, _ = self(window)
             logits = logits[:, -1, :] / max(temperature, 1e-5)
+
+            if ban_ids:
+                logits[:, ban_ids] = float("-inf")
+            # 何か言う前に終わらせない
+            if stop_id is not None and step < min_new_tokens:
+                logits[:, stop_id] = float("-inf")
 
             if top_k:
                 kth = torch.topk(logits, min(top_k, logits.size(-1))).values[:, -1:]
