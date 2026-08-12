@@ -34,7 +34,18 @@ export const mimicConfig = {
  * 一度も見ていない入力を受け取り、例外を出さずに静かに崩れる。
  */
 export const ENDPOINTS = {
+  // キーは 'evex' のまま evex-2 を指す。agent_engine 表に 'evex' を選んだ人の行が
+  // 残っているので、キーを消すとその人たちが黙って DeepSeek に戻る
   evex: mimicConfig,
+  // 元の 5.87M (val 4.2404)。evex-2 に差し替えたあとも比べられるように残す。
+  // 同じ server.py / 同じ tok.model で、違うのは ckpt だけ
+  'evex-1': {
+    url: process.env.MIMIC_V1_URL ?? 'http://127.0.0.1:8767',
+    timeoutMs: number(process.env.MIMIC_V1_TIMEOUT_MS, 60_000),
+    maxNewTokens: number(process.env.MIMIC_V1_MAX_NEW_TOKENS, 200),
+    label: process.env.MIMIC_V1_LABEL ?? 'evex-1',
+    format: process.env.MIMIC_V1_FORMAT ?? 'auto'
+  },
   'evex-ft': {
     url: process.env.MIMIC_FT_URL ?? 'http://127.0.0.1:8766',
     timeoutMs: number(process.env.MIMIC_FT_TIMEOUT_MS, 120_000),

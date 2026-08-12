@@ -1,0 +1,28 @@
+[Unit]
+Description=Sakana mimic evex-1 (初代 5.87M の推論)
+# evex-2 (8765) と並走させる。読み比べるために初代を残しておく。
+# 同じ server.py / 同じ tok.model で、違うのは ckpt だけ (LR 3e-4 で学習したもの)。
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/sakana
+ExecStart=/root/sakana/.venv-llm/bin/python -u src/mimic/server.py \
+  --ckpt /root/sakana/mimic/ckpt-evex1.pt \
+  --corpus /root/sakana/mimic \
+  --port 8767 \
+  --threads 3
+
+Restart=on-failure
+RestartSec=5
+
+# 5.87M の重み (23MB) + torch のランタイム。evex-2 と 2 本立つので少なめに。
+MemoryMax=1200M
+CPUWeight=30
+Nice=15
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
