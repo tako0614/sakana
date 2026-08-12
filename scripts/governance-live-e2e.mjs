@@ -193,7 +193,7 @@ async function publishCase(guild, governance, caseRecord, state, text, component
 async function setTrustedAndAudit(guild, member, desired) {
   const before = oldMemberSnapshot(member);
   const changed = await setTrustedMember(guild, guild.ownerId, member, desired);
-  const refreshed = await fetchMemberRoleState(guild, member.id, getGovernanceGuild(guild.id).trusted_role_id, desired);
+  const refreshed = await guild.members.fetch({ user: member.id, force: true });
   if (changed) await onTrustedRoleChange(before, refreshed);
   return fetchMemberRoleState(guild, member.id, getGovernanceGuild(guild.id).trusted_role_id, desired);
 }
