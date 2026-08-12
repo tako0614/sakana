@@ -38,6 +38,7 @@ import {
   listCaseEvidence,
   listCaseDecisions,
   listCaseSubmissions,
+  listCurrentCaseSubmissions,
   listCases,
   listGovernanceGuilds,
   listLaws,
@@ -52,6 +53,7 @@ import {
   recordActivities,
   recordActivity,
   recentGovernanceMessages,
+  replaceCaseSubmission,
   reserveAgentAttempt,
   setCaseApproval,
   setOperationalSetting,
@@ -599,7 +601,8 @@ export async function castAndPublishVote(interaction, proposalId, choice) {
   const result = castProposalVote(proposalId, interaction.user.id, choice);
   const proposal = result.proposal;
   const label = { yes: '賛成', no: '反対', abstain: '棄権' }[choice];
-  await postProposalUpdate(interaction.guild, proposal, `<@${interaction.user.id}> が ${label} に投票しました${result.oldChoice ? ` (変更前: ${result.oldChoice})` : ''}。`);
+  const oldLabel = { yes: '賛成', no: '反対', abstain: '棄権' }[result.oldChoice] ?? result.oldChoice;
+  await postProposalUpdate(interaction.guild, proposal, `<@${interaction.user.id}> が ${label} に投票しました${oldLabel ? ` (変更前: ${oldLabel})` : ''}。`);
   writeAudit({ guildId: interaction.guildId, actorType: 'member', actorId: interaction.user.id, action: 'vote.cast', targetType: 'proposal', targetId: proposalId, detail: { oldChoice: result.oldChoice, choice, public: true } });
   return { proposal, governance, choice };
 }
@@ -771,22 +774,48 @@ export async function fileConstitutionalChallenge(guild, reporter, input) {
   }
 }
 
-export async function recordCourtSubmission(message) {
-  if (!message?.channel?.isThread?.() || message.author?.bot) return false;
-  const caseRecord = getCaseByPublicThread(message.channelId);
+function courtSubmissionText(message) {
+  return [
+    message.content,
+    ...[...(message.attachments?.values?.() ?? message.attachments ?? [])]
+      .map((attachment) => `[添付] ${attachment.name} ${attachment.url}`)
+  ].filter(Boolean).join('\n') || '(本文なし)';
+}
+
+async function courtMessageContext(message) {
+  if (!message?.guildId || message.author?.bot) return { caseRecord: null, blocked: false };
   const governance = getGovernanceGuild(message.guildId);
+  let member = message.member ?? null;
+  if (!member && message.guild?.members?.fetch) {
+    member = await message.guild.members.fetch(message.author.id).catch(() => null);
+  }
   const isAppealRestricted = Boolean(governance?.appeal_role_id
-    && message.member?.roles?.cache?.has(governance.appeal_role_id));
+    && member?.roles?.cache?.has(governance.appeal_role_id));
+  const caseRecord = message.channel?.isThread?.() ? getCaseByPublicThread(message.channelId) : null;
   if (isAppealRestricted
     && (!caseRecord || !(caseRecord.status === 'appeal' && caseRecord.accused_id === message.author.id))) {
-    await message.delete().catch(() => {});
+    const deleted = await message.delete().then(() => true).catch(() => false);
+    writeAudit({
+      guildId: message.guildId,
+      actorType: 'system',
+      action: deleted ? 'appeal.message_blocked' : 'appeal.message_block_failed',
+      targetType: 'member',
+      targetId: message.author.id,
+      detail: { messageId: message.id, channelId: message.channelId }
+    });
     await message.author.send(`${message.guild?.name ?? 'このコミュニティ'}では、上訴中は自分の上訴事件以外へ投稿できません。`).catch(() => {});
-    return false;
+    return { caseRecord, blocked: true };
   }
+  return { caseRecord, blocked: false };
+}
+
+export async function recordCourtSubmission(message) {
+  const { caseRecord, blocked } = await courtMessageContext(message);
+  if (blocked) return 'blocked';
   if (!caseRecord) return false;
   const isParty = [caseRecord.reporter_id, caseRecord.accused_id].filter(Boolean).includes(message.author.id);
   if (!['defense', 'appeal'].includes(caseRecord.status) || !isParty) return false;
-  const phaseCount = listCaseSubmissions(caseRecord.id)
+  const phaseCount = listCurrentCaseSubmissions(caseRecord.id)
     .filter((entry) => entry.kind === caseRecord.status).length;
   if (phaseCount >= CASE_SUBMISSION_LIMIT_PER_PHASE) {
     await message.reply({
@@ -795,11 +824,46 @@ export async function recordCourtSubmission(message) {
     }).catch(() => {});
     return false;
   }
-  const submission = [
-    message.content,
-    ...message.attachments.map((attachment) => `[添付] ${attachment.name} ${attachment.url}`)
-  ].filter(Boolean).join('\n') || '(本文なし)';
-  addCaseSubmission(caseRecord.id, message.author.id, caseRecord.status, submission.slice(0, 8000));
+  const submission = courtSubmissionText(message);
+  addCaseSubmission(caseRecord.id, message.author.id, caseRecord.status, submission.slice(0, 8000), {
+    sourceMessageId: message.id ?? null
+  });
+  return true;
+}
+
+export async function recordCourtSubmissionEdit(message) {
+  const { caseRecord, blocked } = await courtMessageContext(message);
+  if (blocked) return 'blocked';
+  if (!caseRecord || !message.id) return false;
+  const isParty = [caseRecord.reporter_id, caseRecord.accused_id].filter(Boolean).includes(message.author.id);
+  if (!isParty) return false;
+  const existing = listCurrentCaseSubmissions(caseRecord.id)
+    .find((entry) => entry.source_message_id === message.id && entry.author_id === message.author.id);
+  if (!existing) return false;
+  if (!['defense', 'appeal'].includes(caseRecord.status) || existing.kind !== caseRecord.status) {
+    await message.channel.send({
+      content: `<@${message.author.id}> が締切後に正式主張を編集しました。この編集は判決資料へ反映しません。保存済みhash: \`${existing.content_hash}\``,
+      allowedMentions: { parse: [] }
+    }).catch(() => {});
+    return false;
+  }
+  const changed = replaceCaseSubmission(
+    caseRecord.id,
+    message.author.id,
+    caseRecord.status,
+    courtSubmissionText(message).slice(0, 8000),
+    message.id
+  );
+  if (!changed || changed.unchanged) return false;
+  await message.channel.send({
+    content: [
+      `<@${message.author.id}> が正式主張を編集しました。`,
+      `変更前: \`${changed.previous.content_hash}\``,
+      `変更後: \`${changed.current.content_hash}\``,
+      '変更前の内容も監査履歴に残し、判決には変更後の正本だけを使用します。'
+    ].join('\n'),
+    allowedMentions: { parse: [] }
+  }).catch(() => {});
   return true;
 }
 
@@ -844,7 +908,8 @@ async function adjudicateCriminalCase(guild, caseRecord, phase = 'initial') {
     law: currentLaw,
     offense,
     evidence,
-    submissions: listCaseSubmissions(caseRecord.id),
+    // 編集前の主張は監査履歴に残すが、判決入力には各Discord投稿の最新正本だけを使う。
+    submissions: listCurrentCaseSubmissions(caseRecord.id),
     policy,
     phase
   });
@@ -1093,10 +1158,15 @@ export async function approveCase(interaction, caseId, decision) {
   const caseRecord = getCase(caseId);
   if (!caseRecord || caseRecord.guild_id !== interaction.guildId || caseRecord.status !== 'approval') throw new Error('承認待ちの事件ではありません。');
   if ([caseRecord.accused_id, caseRecord.reporter_id].includes(member.id)) throw new Error('被告・通報者は執行承認できません。');
-  setCaseApproval(caseId, member.id, decision);
+  const approvalResult = setCaseApproval(caseId, member.id, decision);
   const sanction = getCaseSanction(caseId);
   const approvals = listCaseApprovals(caseId).filter((entry) => entry.decision === 'approve').length;
-  await postCourtUpdate(interaction.guild, caseRecord, `<@${member.id}> が執行を${decision === 'approve' ? '承認' : '拒否'}しました。承認 ${approvals}/${sanction.required_approvals}`);
+  const oldLabel = { approve: '承認', reject: '拒否' }[approvalResult.oldDecision];
+  await postCourtUpdate(
+    interaction.guild,
+    caseRecord,
+    `<@${member.id}> が執行を${decision === 'approve' ? '承認' : '拒否'}しました${oldLabel ? ` (変更前: ${oldLabel})` : ''}。承認 ${approvals}/${sanction.required_approvals}`
+  );
   if (decision === 'approve' && approvals >= sanction.required_approvals) {
     if (sanction.appealable) await beginAppealWindow(interaction.guild, caseRecord, sanction);
     else queueExecution(caseRecord, sanction);
@@ -1547,5 +1617,5 @@ export async function onGuildRoleDelete(role) {
 export async function onGuildChannelCreate(channel) {
   const governance = getGovernanceGuild(channel.guildId);
   if (!governance || channel.id === governance.court_forum_id) return;
-  await syncAppealRoleOverwrites(channel.guild, governance.appeal_role_id, governance.court_forum_id);
+  await syncAppealRoleOverwrites(channel.guild, governance.appeal_role_id, governance.court_forum_id, { strict: true });
 }

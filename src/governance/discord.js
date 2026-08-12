@@ -21,7 +21,7 @@ const GAZETTE_TOPIC = '成立・改正・判決・執行・運営操作を時系
 export const COURT_TOPIC = '事件ごとの公開審理です。答弁・証拠・判決・執行承認・上訴を1つの事件投稿に記録します。';
 export const GOVERNANCE_GUIDE_NAME = '統治案内';
 export const GOVERNANCE_ADMIN_NAME = '統治管理';
-export const GOVERNANCE_PROCEDURE_TOPIC = '投票・執行承認・上訴・答弁など、参加者の判断が必要な統治手続きを一覧にします。';
+export const GOVERNANCE_PROCEDURE_TOPIC = '全員に公開する統治手続の一覧です。投票・執行承認は対象案件で記名し、選択と変更を公開記録に残します。';
 
 function proposalStateLabel(state) {
   return ({
@@ -486,19 +486,22 @@ export async function ensureGovernanceCourtForum(guild, governance) {
 
 async function retireLegacyCourtChat(channel, guildName) {
   if (!channel || channel.type !== ChannelType.GuildText) return { removed: false, retained: false };
-  let hasCaseThreads = true;
+  let hasCourtRecords = true;
   try {
-    const [active, archived] = await Promise.all([
+    const [active, archived, messages] = await Promise.all([
       channel.threads.fetchActive(),
       // Discord APIのarchive取得limitは2以上。存在確認だけなので最小値を使う。
-      channel.threads.fetchArchived({ type: 'private', fetchAll: true, limit: 2 })
+      channel.threads.fetchArchived({ type: 'private', fetchAll: true, limit: 2 }),
+      // 旧実装や手動運用で本文をtext channelへ直接残した可能性もある。
+      channel.messages.fetch({ limit: 2 })
     ]);
     const belongsToChannel = (thread) => thread.parentId === channel.id;
-    hasCaseThreads = [...active.threads.values(), ...archived.threads.values()].some(belongsToChannel);
+    hasCourtRecords = [...active.threads.values(), ...archived.threads.values()].some(belongsToChannel)
+      || messages.size > 0;
   } catch {
     // 読み戻せない場合は記録を消さず、legacy archiveとして残す。
   }
-  if (!hasCaseThreads) {
+  if (!hasCourtRecords) {
     const removed = await channel.delete(`${guildName} governance: public court migration`)
       .then(() => true).catch(() => false);
     if (removed) return { removed: true, retained: false };
@@ -763,15 +766,38 @@ export async function syncStatuteBook(guild, governance, { verifyExisting = fals
   return changed;
 }
 
-export async function syncAppealRoleOverwrites(guild, roleId, courtForumId) {
+export async function syncAppealRoleOverwrites(guild, roleId, courtForumId, { strict = false } = {}) {
   await guild.channels.fetch();
+  const failures = [];
   for (const channel of guild.channels.cache.values()) {
     if (!channel.permissionOverwrites) continue;
     const permissionState = channel.id === courtForumId ? APPEAL_COURT_ACCESS : APPEAL_DENY;
-    await channel.permissionOverwrites.edit(roleId, permissionState, {
-      reason: `${guild.name} governance: appeal restriction can speak only in court forum`
-    }).catch(() => {});
+    try {
+      await channel.permissionOverwrites.edit(roleId, permissionState, {
+        reason: `${guild.name} governance: appeal restriction can speak only in court forum`
+      });
+    } catch (error) {
+      failures.push({ channelId: channel.id, error: String(error?.message ?? error) });
+    }
   }
+  if (strict && failures.length > 0) {
+    throw new Error(`上訴中ロールの権限を${failures.length}チャンネルで同期できません。`);
+  }
+  return { failures };
+}
+
+export function appealRestrictedChannelAccessible(channel, member, courtForumId) {
+  if (channel.id === courtForumId || channel.parentId === courtForumId) return false;
+  const permissions = channel.permissionsFor?.(member);
+  if (channel.isTextBased?.()) {
+    return Boolean(permissions?.has(PermissionFlagsBits.SendMessages)
+      || permissions?.has(PermissionFlagsBits.SendMessagesInThreads));
+  }
+  if (channel.isVoiceBased?.()) {
+    return Boolean(permissions?.has(PermissionFlagsBits.Connect)
+      || permissions?.has(PermissionFlagsBits.Speak));
+  }
+  return false;
 }
 
 function tagId(channel, name) {
@@ -974,28 +1000,41 @@ export async function applyAppealRestriction(guild, governance, userId) {
   }
   const role = await guild.roles.fetch(governance.appeal_role_id);
   if (!role || role.position >= guild.members.me.roles.highest.position) throw new Error('上訴中ロールをbotが管理できません。');
-  await syncAppealRoleOverwrites(guild, role.id, governance.court_forum_id);
+  await syncAppealRoleOverwrites(guild, role.id, governance.court_forum_id, { strict: true });
   await member.roles.add(role, `${guild.name} governance appeal restriction`);
 
   const fallbackChannelIds = [];
-  const stillWritable = [...guild.channels.cache.values()].filter((channel) => {
-    if (!channel.isTextBased?.()
-      || channel.id === governance.court_forum_id
-      || channel.parentId === governance.court_forum_id) return false;
-    const permissions = channel.permissionsFor(member);
-    return permissions?.has(PermissionFlagsBits.SendMessages)
-      || permissions?.has(PermissionFlagsBits.SendMessagesInThreads);
-  });
-  if (stillWritable.length > 100) {
+  const canSpeakOutsideCourt = (channel) => appealRestrictedChannelAccessible(
+    channel,
+    member,
+    governance.court_forum_id
+  );
+  const stillAccessible = [...guild.channels.cache.values()].filter(canSpeakOutsideCourt);
+  const fallbackTargets = new Map();
+  for (const channel of stillAccessible) {
+    const target = channel.permissionOverwrites
+      ? channel
+      : guild.channels.cache.get(channel.parentId);
+    if (!target?.permissionOverwrites) {
+      await member.roles.remove(role, `${guild.name} governance appeal restriction rollback`).catch(() => {});
+      throw new Error(`上訴中の発言先 ${channel.id} を権限で閉じられません。`);
+    }
+    fallbackTargets.set(target.id, target);
+  }
+  if (fallbackTargets.size > 100) {
     await member.roles.remove(role, `${guild.name} governance appeal restriction rollback`).catch(() => {});
     throw new Error('上訴中のmember overwriteが100チャンネルを超えるため安全に限定できません。権限設計を修正してください。');
   }
   try {
-    for (const channel of stillWritable) {
+    for (const channel of fallbackTargets.values()) {
       await channel.permissionOverwrites.edit(member.id, APPEAL_DENY, {
         reason: `${guild.name} governance appeal restriction fallback`
       });
       fallbackChannelIds.push(channel.id);
+    }
+    const remaining = [...guild.channels.cache.values()].filter(canSpeakOutsideCourt);
+    if (remaining.length > 0) {
+      throw new Error(`上訴中の発言先を${remaining.length}件閉じられません。`);
     }
   } catch (error) {
     for (const channelId of fallbackChannelIds) {

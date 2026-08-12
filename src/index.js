@@ -36,6 +36,7 @@ import {
   onGuildRoleDelete,
   onTrustedRoleChange,
   recordCourtSubmission,
+  recordCourtSubmissionEdit,
   recordGovernanceMessage,
   runGovernanceScheduler
 } from './governance/service.js';
@@ -256,7 +257,9 @@ async function handleMessageCreate(message) {
   // 混ざったり、制限中の依頼がモデルまで届いたりしないようにする。
   if (governanceConfig.enabled && await enforceMessageRestrictions(message)) return;
   if (governanceConfig.enabled) {
-    await recordCourtSubmission(message);
+    const courtResult = await recordCourtSubmission(message);
+    // 上訴制限で削除した投稿をXP・活動記録・通常agentへ流さない。
+    if (courtResult === 'blocked') return;
     recordGovernanceMessage(message);
   }
 
@@ -311,6 +314,8 @@ client.on(Events.MessageUpdate, async (_oldMessage, newMessage) => {
     if (governanceConfig.enabled && !message.author.bot) {
       deleteActivity(message.id);
       if (await enforceMessageRestrictions(message)) return;
+      const courtResult = await recordCourtSubmissionEdit(message);
+      if (courtResult === 'blocked') return;
       recordGovernanceMessage(message);
     }
   } catch (error) {

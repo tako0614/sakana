@@ -212,6 +212,8 @@ db.exec(`
     kind TEXT NOT NULL,
     content TEXT NOT NULL,
     content_hash TEXT NOT NULL,
+    source_message_id TEXT,
+    superseded_at INTEGER,
     created_at INTEGER NOT NULL
   );
 
@@ -563,6 +565,21 @@ if (!db.pragma('table_info(governance_legacy_message_archive)').some((row) => ro
   db.exec('ALTER TABLE governance_legacy_message_archive ADD COLUMN message_created_at INTEGER');
 }
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (9, ?)').run(Date.now());
+
+{
+  const submissionColumns = new Set(db.pragma('table_info(governance_case_submissions)').map((row) => row.name));
+  if (!submissionColumns.has('source_message_id')) {
+    db.exec('ALTER TABLE governance_case_submissions ADD COLUMN source_message_id TEXT');
+  }
+  if (!submissionColumns.has('superseded_at')) {
+    db.exec('ALTER TABLE governance_case_submissions ADD COLUMN superseded_at INTEGER');
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_gov_case_submission_source
+    ON governance_case_submissions(case_id, source_message_id, superseded_at)
+  `);
+}
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (10, ?)').run(Date.now());
 
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
@@ -1378,17 +1395,49 @@ export function markEvidenceDisclosed(id, at = Date.now()) {
   return db.prepare('SELECT * FROM governance_case_evidence WHERE id = ?').get(Number(id)) ?? null;
 }
 
-export function addCaseSubmission(caseId, authorId, kind, content) {
+export function addCaseSubmission(caseId, authorId, kind, content, { sourceMessageId = null } = {}) {
   const result = db.prepare(`
-    INSERT INTO governance_case_submissions (case_id, author_id, kind, content, content_hash, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(caseId, authorId, kind, content, sha256(content), Date.now());
+    INSERT INTO governance_case_submissions
+      (case_id, author_id, kind, content, content_hash, source_message_id, superseded_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+  `).run(caseId, authorId, kind, content, sha256(content), sourceMessageId, Date.now());
   return Number(result.lastInsertRowid);
 }
 
 export function listCaseSubmissions(caseId) {
   return db.prepare('SELECT * FROM governance_case_submissions WHERE case_id = ? ORDER BY id').all(Number(caseId));
 }
+
+export function listCurrentCaseSubmissions(caseId) {
+  return db.prepare(`
+    SELECT * FROM governance_case_submissions
+    WHERE case_id = ? AND superseded_at IS NULL ORDER BY id
+  `).all(Number(caseId));
+}
+
+export const replaceCaseSubmission = db.transaction((caseId, authorId, kind, content, sourceMessageId) => {
+  const current = db.prepare(`
+    SELECT * FROM governance_case_submissions
+    WHERE case_id = ? AND author_id = ? AND source_message_id = ? AND superseded_at IS NULL
+    ORDER BY id DESC LIMIT 1
+  `).get(Number(caseId), String(authorId), String(sourceMessageId));
+  if (!current) return null;
+  const contentHash = sha256(content);
+  if (contentHash === current.content_hash) {
+    return { previous: current, current, unchanged: true };
+  }
+  const now = Date.now();
+  db.prepare('UPDATE governance_case_submissions SET superseded_at = ? WHERE id = ?').run(now, current.id);
+  const result = db.prepare(`
+    INSERT INTO governance_case_submissions
+      (case_id, author_id, kind, content, content_hash, source_message_id, superseded_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+  `).run(Number(caseId), String(authorId), String(kind), String(content), contentHash, String(sourceMessageId), now);
+  return {
+    previous: { ...current, superseded_at: now },
+    current: db.prepare('SELECT * FROM governance_case_submissions WHERE id = ?').get(Number(result.lastInsertRowid))
+  };
+});
 
 export function recordCaseDecision(input) {
   db.prepare(`
@@ -1418,14 +1467,23 @@ export function listCaseDecisions(caseId, phase = null) {
   }));
 }
 
-export function setCaseApproval(caseId, userId, decision, reason = '') {
+export const setCaseApproval = db.transaction((caseId, userId, decision, reason = '') => {
   if (!['approve', 'reject'].includes(decision)) throw new Error('承認値が不正です。');
+  const previous = db.prepare(`
+    SELECT * FROM governance_case_approvals WHERE case_id = ? AND user_id = ?
+  `).get(Number(caseId), String(userId));
   db.prepare(`
     INSERT INTO governance_case_approvals (case_id, user_id, decision, reason, created_at)
     VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(case_id, user_id) DO UPDATE SET decision = excluded.decision, reason = excluded.reason, created_at = excluded.created_at
   `).run(caseId, userId, decision, reason, Date.now());
-}
+  return {
+    oldDecision: previous?.decision ?? null,
+    approval: db.prepare(`
+      SELECT * FROM governance_case_approvals WHERE case_id = ? AND user_id = ?
+    `).get(Number(caseId), String(userId))
+  };
+});
 
 export function listCaseApprovals(caseId) {
   return db.prepare('SELECT * FROM governance_case_approvals WHERE case_id = ? ORDER BY created_at').all(Number(caseId));

@@ -86,16 +86,38 @@ function overwriteBits(values = []) {
   return values.reduce((bits, value) => bits | BigInt(value), 0n);
 }
 
-function permissionOverwritesMatch(channel, expected) {
+export function requiredPermissionOverwritesMatch(channel, expected) {
   const current = channel.permissionOverwrites?.cache;
-  if (!current || current.size !== expected.length) return false;
+  if (!current) return false;
   return expected.every((entry) => {
     const overwrite = current.get(entry.id);
     return overwrite
       && (entry.type === undefined || overwrite.type === entry.type)
-      && overwrite.allow.bitfield === overwriteBits(entry.allow)
-      && overwrite.deny.bitfield === overwriteBits(entry.deny);
+      && (entry.allow ?? []).every((permission) => overwrite.allow.has(permission) && !overwrite.deny.has(permission))
+      && (entry.deny ?? []).every((permission) => overwrite.deny.has(permission) && !overwrite.allow.has(permission));
   });
+}
+
+export async function reconcileRequiredPermissionOverwrites(channel, expected, reason) {
+  const merged = new Map([...channel.permissionOverwrites.cache.values()].map((overwrite) => [overwrite.id, {
+    id: overwrite.id,
+    type: overwrite.type,
+    allow: overwrite.allow.bitfield,
+    deny: overwrite.deny.bitfield
+  }]));
+  for (const entry of expected) {
+    const current = merged.get(entry.id) ?? { id: entry.id, type: entry.type, allow: 0n, deny: 0n };
+    const requiredAllow = overwriteBits(entry.allow ?? []);
+    const requiredDeny = overwriteBits(entry.deny ?? []);
+    merged.set(entry.id, {
+      id: entry.id,
+      type: entry.type ?? current.type,
+      allow: (current.allow | requiredAllow) & ~requiredDeny,
+      deny: (current.deny | requiredDeny) & ~requiredAllow
+    });
+  }
+  // Appeal roleやサーバー独自のoverwriteを残したまま、公開性に必要なbitだけを補正する。
+  await channel.permissionOverwrites.set([...merged.values()], reason);
 }
 
 function componentsMatch(message, expected) {
@@ -124,6 +146,7 @@ export async function renderGovernanceGuide(guild, governance) {
     `- 憲法・法律への質問: <@${guild.client.user.id}> に自然文で聞く`,
     '',
     'AIが整理しただけでは正式案件になりません。表示された受付内容を本人が確認して初めて手続が始まります。',
+    '投票と執行承認は記名です。誰がどの選択をしたか、変更した場合の経過も対象の議会・裁判投稿へ公開されます。',
     '',
     '## 公開記録',
     `- 投票・承認など、いま対応が必要な手続: <#${governance.admin_channel_id}>`,
@@ -248,7 +271,8 @@ export async function renderGovernanceProcedureHub(guild, governance) {
     content: [
       `# ${guild.name} 統治管理`,
       '',
-      'ここはBot設定ではなく、コミュニティが判断する手続の一覧です。内容を読んで、リンク先の案件で投票・承認・答弁・上訴を行ってください。',
+      'ここは全員に公開された統治手続の一覧です。Bot設定ではありません。内容を読んで、リンク先の案件で投票・承認・答弁・上訴を行ってください。',
+      '投票と執行承認は記名で、選択と変更の経過が対象案件へ公開されます。',
       '',
       '## 投票中',
       ...(votingLines.length ? votingLines : ['現在、投票中の法案はありません。']),
@@ -293,8 +317,8 @@ export async function ensureGovernanceUx(guild, governance = getGovernanceGuild(
   let guide = current.guide_channel_id ? await guild.channels.fetch(current.guide_channel_id).catch(() => null) : null;
   if (!guide || guide.type !== ChannelType.GuildText) guide = await createGovernanceGuideChannel(guild, category.id);
   const guideOverwrites = readOnlyTextOverwrites(guild);
-  if (!permissionOverwritesMatch(guide, guideOverwrites)) {
-    await guide.permissionOverwrites.set(guideOverwrites, '統治案内を公開読み取り専用に同期');
+  if (!requiredPermissionOverwritesMatch(guide, guideOverwrites)) {
+    await reconcileRequiredPermissionOverwrites(guide, guideOverwrites, '統治案内を公開読み取り専用に同期');
   }
 
   let admin = current.admin_channel_id ? await guild.channels.fetch(current.admin_channel_id).catch(() => null) : null;
@@ -302,8 +326,8 @@ export async function ensureGovernanceUx(guild, governance = getGovernanceGuild(
   if (admin.name !== GOVERNANCE_ADMIN_NAME) await admin.setName(GOVERNANCE_ADMIN_NAME, '統治手続の名称を同期');
   if (admin.topic !== GOVERNANCE_PROCEDURE_TOPIC) await admin.setTopic(GOVERNANCE_PROCEDURE_TOPIC, '統治手続の説明を同期');
   const adminOverwrites = governanceProcedureOverwrites(guild);
-  if (!permissionOverwritesMatch(admin, adminOverwrites)) {
-    await admin.permissionOverwrites.set(adminOverwrites, '統治管理を公開読み取り専用に同期');
+  if (!requiredPermissionOverwritesMatch(admin, adminOverwrites)) {
+    await reconcileRequiredPermissionOverwrites(admin, adminOverwrites, '統治管理を公開読み取り専用に同期');
   }
 
   const siblings = [...guild.channels.cache.values()].filter((channel) => channel.parentId === category.id);
