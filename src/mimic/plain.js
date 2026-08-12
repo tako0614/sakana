@@ -68,7 +68,11 @@ export function labelledSpeakers() {
 const NAMED_CHANNELS = 16;
 
 function loadChannelRanks() {
-  for (const file of [process.env.MIMIC_CHANNELS, 'corpus/channels.json'].filter(Boolean)) {
+  // labels.json と同じ扱いにする。bot サーバーには corpus/ が無い (書き出しは
+  // 開発機だけ) ので、mimic/ に置いたものを先に見る。無いと全部 #other になり、
+  // モデルは学習データの 97% で見ていた話題の手がかりを失う
+  const files = [process.env.MIMIC_CHANNELS, 'mimic/channels.json', 'corpus/channels.json'];
+  for (const file of files.filter(Boolean)) {
     try {
       const rows = JSON.parse(readFileSync(path.resolve(file), 'utf8'));
       if (!Array.isArray(rows) || !rows.length) continue;
