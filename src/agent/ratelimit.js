@@ -50,6 +50,18 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_call ON agent_tool_calls(call_id);
 
+  -- エージェントが出した「回答」のメッセージ ID。
+  --
+  -- これへのリプライだけを会話の続きとして扱う。メモリだけで持っていた頃は
+  -- 再起動で消えるので「bot が書いたメッセージなら続き」と見なす保険を入れていたが、
+  -- それだと経過表示・ウェルカム・断り文・エラー文へのリプライでも起動していた。
+  CREATE TABLE IF NOT EXISTS agent_replies (
+    message_id TEXT PRIMARY KEY,
+    call_id    INTEGER,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_agent_replies_time ON agent_replies(created_at);
+
   -- 上限を実行中に変えられるようにする。env は既定値で、ここに入っていれば勝つ。
   CREATE TABLE IF NOT EXISTS agent_settings (
     key        TEXT PRIMARY KEY,
@@ -251,6 +263,33 @@ export function resetUsage(userId = null) {
       .run(since);
 
   return result.changes;
+}
+
+/**
+ * エージェントの回答を覚える。これへのリプライだけを会話の続きとして扱う。
+ * メモリではなく DB に置くのは、再起動を挟んでも続けられるようにするため。
+ */
+export function rememberAgentReply(messageId, callId = null) {
+  if (!messageId) return;
+
+  try {
+    db.prepare('INSERT OR IGNORE INTO agent_replies (message_id, call_id, created_at) VALUES (?, ?, ?)')
+      .run(String(messageId), callId, Date.now());
+  } catch (error) {
+    // 覚えられなくても回答自体は返っているので、続きが効かなくなるだけ
+    console.error('Failed to remember an agent reply:', error);
+  }
+}
+
+/** その ID がエージェントの回答かどうか。経過表示やウェルカムは入っていない。 */
+export function isAgentReply(messageId) {
+  if (!messageId) return false;
+
+  try {
+    return Boolean(db.prepare('SELECT 1 FROM agent_replies WHERE message_id = ?').get(String(messageId)));
+  } catch {
+    return false;
+  }
 }
 
 /** 付与済みの一覧。/agentlimit show に出す。 */
@@ -461,6 +500,7 @@ export function pruneCalls(keepMs = 30 * 86_400_000) {
     const cutoff = Date.now() - keepMs;
     db.prepare('DELETE FROM agent_tool_calls WHERE call_id IN (SELECT id FROM agent_calls WHERE created_at < ?)').run(cutoff);
     db.prepare('DELETE FROM agent_calls WHERE created_at < ?').run(cutoff);
+    db.prepare('DELETE FROM agent_replies WHERE created_at < ?').run(cutoff);
   } catch (error) {
     console.error('Failed to prune agent calls:', error);
   }

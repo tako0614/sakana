@@ -20,9 +20,11 @@ import { runAgent } from './llm.js';
 import { buildSystemPrompt, buildUserContent } from './prompt.js';
 import {
   finalizeCall,
+  isAgentReply,
   recordToolCalls,
   releaseCall,
   remainingFor,
+  rememberAgentReply,
   reserveCall,
   usdToTokens,
   weighTokens
@@ -32,25 +34,34 @@ import { buildToolset } from './tools.js';
 
 const NO_MENTIONS = { parse: [], repliedUser: false };
 
-// エージェントが投稿した回答の ID。これへのリプライを会話の続きとして扱う。
-// リプライ元をいちいち fetch すると、返信のたびに API を1回叩くことになるので、
-// 自分が送ったものだけ覚えておいて突き合わせる。
+// エージェントが投稿した回答の ID。これへのリプライだけを会話の続きとして扱う。
+// リプライ元をいちいち fetch すると返信のたびに API を1回叩くので、
+// 自分が送ったものを覚えておいて突き合わせる。メモリは速い経路で、実体は DB
+// (再起動を挟んでも続けられるように)。
 const OWN_REPLY_LIMIT = 500;
 const ownReplies = new Set();
 
-function rememberOwnReply(messageId) {
+function rememberOwnReply(messageId, callId) {
   if (!messageId) return;
+
   ownReplies.add(messageId);
   // 古いものから落とす (Set は挿入順を保つ)
   while (ownReplies.size > OWN_REPLY_LIMIT) {
     ownReplies.delete(ownReplies.values().next().value);
   }
+
+  rememberAgentReply(messageId, callId);
 }
 
 /**
  * 入口は2つ。
  *   1. bot への直接メンション
- *   2. エージェントの回答へのリプライ (会話の続き)
+ *   2. エージェントの「回答」へのリプライ (会話の続き)
+ *
+ * 2 は回答だけ。以前は「bot が書いたメッセージなら続き」と見なす保険を入れていて
+ * (再起動でメモリの一覧が消えるため)、経過表示・ウェルカム・上限の断り文・エラー文への
+ * リプライでも起動していた。回答の ID を DB に持つことで保険が要らなくなった。
+ *
  * @everyone / ロールメンション / リプライの自動メンションでは起動しない。
  */
 export function isAgentRequest(message, client) {
@@ -67,15 +78,10 @@ export function isAgentRequest(message, client) {
 
   if (mentioned) return true;
 
-  // エージェントの回答へのリプライなら、メンション無しでも続きとして扱う。
   const repliedTo = message.reference?.messageId;
   if (!repliedTo) return false;
 
-  if (ownReplies.has(repliedTo)) return true;
-
-  // 再起動を挟むと ownReplies は空になる。リプライの通知が付いていれば
-  // それで bot 宛だと分かるので、そちらも見る (追加の API 呼び出しは無し)。
-  return message.mentions.repliedUser?.id === client.user.id;
+  return ownReplies.has(repliedTo) || isAgentReply(repliedTo);
 }
 
 function stripMention(content, clientId) {
@@ -325,7 +331,7 @@ export async function handleAgentRequest(message, client) {
         : await message.channel.send(payload);
 
       // これへのリプライを会話の続きとして受け付ける
-      rememberOwnReply(sent?.id);
+      rememberOwnReply(sent?.id, reservation.id);
     }
   } catch (error) {
     console.error('Agent request failed:', error);

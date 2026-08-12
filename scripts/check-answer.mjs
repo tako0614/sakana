@@ -412,3 +412,53 @@ const { fromDiscordMessage } = await import('../src/agent/format.js');
 }
 
 console.log('extras ok (画像・埋め込み・スタンプの中身を渡す)');
+
+// --- 発火するのは「メンション」と「回答へのリプライ」だけ ---
+//
+// 以前は「bot が書いたメッセージなら続き」と見なす保険があり、経過表示・
+// ウェルカム・上限の断り文・エラー文へのリプライでも起動していた。
+
+const { isAgentRequest } = await import('../src/agent/index.js');
+const { db } = await import('../src/db.js');
+const { isAgentReply, rememberAgentReply } = await import('../src/agent/ratelimit.js');
+
+const ANSWER_ID = 'check-answer-1';
+const OTHER_ID = 'check-other-1';
+const clearReplies = () => db.prepare('DELETE FROM agent_replies WHERE message_id LIKE ?').run('check-%');
+
+clearReplies();
+try {
+  rememberAgentReply(ANSWER_ID, null);
+  if (!isAgentReply(ANSWER_ID)) fail('回答を覚えられていない');
+  if (isAgentReply(OTHER_ID)) fail('覚えていない ID を回答扱いしてはいけない');
+
+  // 二重に覚えても壊れない (チャンクごとに呼ばれる)
+  rememberAgentReply(ANSWER_ID, null);
+
+  const client = { user: { id: 'bot-1' } };
+  const ask = ({ replyTo = null, mention = false, fromBot = false, repliedUser = null }) => ({
+    guildId: 'g1',
+    author: { id: 'u1', bot: fromBot },
+    reference: replyTo ? { messageId: replyTo } : null,
+    mentions: {
+      has: () => mention,
+      repliedUser: repliedUser ? { id: repliedUser } : null
+    }
+  });
+
+  if (!isAgentRequest(ask({ mention: true }), client)) fail('メンションでは起動する');
+  if (!isAgentRequest(ask({ replyTo: ANSWER_ID }), client)) fail('回答へのリプライでは起動する');
+
+  // bot が書いた「回答以外」へのリプライでは起動しない (経過表示・ウェルカムなど)
+  if (isAgentRequest(ask({ replyTo: OTHER_ID, repliedUser: 'bot-1' }), client)) {
+    fail('回答以外の bot メッセージへのリプライで起動してはいけない');
+  }
+  // 人へのリプライ / ただの発言 / bot 自身の発言では起動しない
+  if (isAgentRequest(ask({ replyTo: 'someone-else' }), client)) fail('他人へのリプライでは起動しない');
+  if (isAgentRequest(ask({}), client)) fail('ただの発言では起動しない');
+  if (isAgentRequest(ask({ mention: true, fromBot: true }), client)) fail('bot の発言では起動しない');
+
+  console.log('trigger ok (メンション / 回答へのリプライだけ)');
+} finally {
+  clearReplies();
+}
