@@ -4,6 +4,7 @@ import {
   Events,
   GatewayIntentBits,
   EmbedBuilder,
+  MessageFlags,
   Partials
 } from 'discord.js';
 import cron from 'node-cron';
@@ -22,6 +23,7 @@ import {
 } from './archive/indexer.js';
 import { handleAgentRequest, isAgentRequest } from './agent/index.js';
 import { agentEnabled } from './agent/config.js';
+import { sweepStaleIndicators } from './agent/indicators.js';
 import { pruneCalls } from './agent/ratelimit.js';
 import { sweepEnabledGuilds } from './archive/embed-job.js';
 import { embedConfig } from './embed/config.js';
@@ -103,6 +105,12 @@ client.once(Events.ClientReady, (readyClient) => {
   // 許可していないサーバーに入っていたら出る
   enforceGuildAllowlist(readyClient).catch((error) => {
     console.error('Failed to enforce the guild allowlist:', error);
+  });
+
+  // 前回落ちたときに消し損ねた「thinking」を片付ける。
+  // 残すとチャンネルに経過表示が出たまま積み上がる。
+  sweepStaleIndicators(readyClient).catch((error) => {
+    console.error('Failed to clean up leftover thinking indicators:', error);
   });
 
   // 古い呼び出し履歴を毎日掃除する (制限の窓より十分長く残す)
@@ -288,7 +296,7 @@ async function handleReactionChange(reaction) {
   try {
     if (!isAllowedGuild(reaction.message?.guildId)) return;
     const message = reaction.message.partial ? await reaction.message.fetch() : reaction.message;
-    syncLiveReactions(message);
+    await syncLiveReactions(message);
   } catch (error) {
     console.error('Unhandled error in reaction handler:', error);
   }
@@ -357,7 +365,7 @@ async function handleInteractionCreate(interaction) {
     if (interaction.isRepliable()) {
       await interaction.reply({
         content: 'この bot は許可されたサーバーでのみ動きます。',
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       }).catch(() => {});
     }
     return;
@@ -376,7 +384,7 @@ async function handleInteractionCreate(interaction) {
   if (!command) {
     await interaction.reply({
       content: 'Unknown command.',
-      ephemeral: true
+      flags: MessageFlags.Ephemeral
     });
     return;
   }
@@ -388,7 +396,7 @@ async function handleInteractionCreate(interaction) {
 
     const response = {
       content: 'コマンド実行中にエラーが発生しました。',
-      ephemeral: true
+      flags: MessageFlags.Ephemeral
     };
 
     try {

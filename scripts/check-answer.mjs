@@ -5,6 +5,7 @@
 //
 // どちらも壊れても例外は出ず、静かに読みにくさと費用になるだけなので門を置く。
 
+import { browserToolDefinition } from '../src/agent/browser.js';
 import { RefTable, expandCitations } from '../src/agent/format.js';
 import { buildSystemPrompt, buildUserContent } from '../src/agent/prompt.js';
 
@@ -124,6 +125,26 @@ const bare = buildSystemPrompt({ browserFull: false }, {
 if (/mode:meaning|mode:count|browser/.test(bare)) fail('使えない道具の説明が載っている');
 
 console.log(`prompt ok (byte-static / ${first.length} 文字)`);
+
+// --- web 検索 ---
+//
+// ブラウザを「貼られた URL を開く道具」としか書いていなかったので、モデルは
+// ログに無いことを記憶で埋めるか「分からない」で終わらせていた。
+// 入口 (search) と、それを使う場面の説明が両方あって初めて発想が生まれる。
+// 片方だけ消えても例外は出ないので門を置く。
+const readOnlyBrowser = browserToolDefinition(false).function;
+
+if (!readOnlyBrowser.parameters.properties.action.enum.includes('search')) {
+  fail('閲覧しか許していない人が web 検索を使えない (search は操作ではない)');
+}
+if (!readOnlyBrowser.parameters.properties.query) {
+  fail('search に渡す query が宣伝されていない');
+}
+if (!/search/.test(first)) {
+  fail('プロンプトに web を引く場面が書かれていない (道具があっても呼ばれない)');
+}
+
+console.log('web search ok (閲覧のみでも search / プロンプトに使う場面)');
 
 // --- 話しかけてきた人 ---
 //
@@ -413,6 +434,194 @@ const { fromDiscordMessage } = await import('../src/agent/format.js');
 
 console.log('extras ok (画像・埋め込み・スタンプの中身を渡す)');
 
+// --- Discord のリンク ---
+//
+// リンクにはスノーフレークが3つ並んでいて、最初に当たるのはサーバー ID。
+// 素の /(\d{16,21})/ で拾っていたので、リンクを貼って「これ何？」と聞くと
+// サーバー ID をメッセージ ID として読みに行っていた。
+
+{
+  const G = '1255359848644608035';
+  const C = '1445478071221223515';
+  const M = '1487488490697658408';
+
+  const refs = new RefTable();
+  refs.add({ messageId: '999888777666555444', channelId: 'c1', guildId: 'g1' });
+
+  const link = refs.resolve(`https://discord.com/channels/${G}/${C}/${M}`);
+  if (link?.messageId !== M) fail(`リンクの3つ目を取る (いまは ${link?.messageId}): サーバー ID を掴んではいけない`);
+  if (link.channelId !== C) fail(`リンクからチャンネルも取れる: ${link.channelId}`);
+
+  // 囲みや前後の文があっても拾う
+  const inline = refs.resolve(`これ見て <https://discord.com/channels/${G}/${C}/${M}> どう思う`);
+  if (inline?.messageId !== M) fail(`文中のリンクを拾えていない: ${inline?.messageId}`);
+
+  // 旧ドメイン
+  if (refs.resolve(`https://discordapp.com/channels/${G}/${C}/${M}`)?.messageId !== M) {
+    fail('discordapp.com のリンクを読めていない');
+  }
+
+  // チャンネルへのリンク (メッセージが無い)
+  const toChannel = refs.resolve(`https://discord.com/channels/${G}/${C}`);
+  if (toChannel?.messageId) fail(`チャンネルへのリンクにメッセージは無い: ${toChannel.messageId}`);
+  if (toChannel?.channelId !== C) fail(`チャンネルへのリンクから ID が取れない: ${toChannel?.channelId}`);
+
+  // DM のリンクで落ちない
+  if (refs.resolve(`https://discord.com/channels/@me/${C}/${M}`)?.messageId !== M) {
+    fail('@me のリンクで壊れている');
+  }
+
+  // 素のスノーフレークと参照番号は今までどおり
+  if (refs.resolve('999888777666555444')?.channelId !== 'c1') fail('表にある ID は表から引く');
+  if (refs.resolve('1')?.messageId !== '999888777666555444') fail('参照番号が引けなくなっている');
+  if (refs.resolve('ただの文字列')) fail('ID の無い文字列で何かを返してはいけない');
+}
+
+console.log('discord link ok (3つ目を取る / channel も取れる / 番号は今までどおり)');
+
+// --- 転送メッセージの取り込み ---
+//
+// 転送は content が空で、中身は message_snapshots 側。見ないまま取り込むと
+// 本文なしの行になって検索に永久に引っかからない。
+
+{
+  const { toRecord } = await import('../src/archive/indexer.js');
+
+  const base = {
+    id: 'f1',
+    guildId: 'g1',
+    channelId: 'c1',
+    author: { id: 'u1', username: 'たこ' },
+    member: { displayName: 'たこ' },
+    createdTimestamp: 1_700_000_000_000,
+    attachments: new Map(),
+    embeds: [],
+    stickers: new Map(),
+    reactions: { cache: new Map() },
+    mentions: { users: new Map() },
+    channel: { id: 'c1' }
+  };
+
+  const forwarded = toRecord({
+    ...base,
+    content: '',
+    messageSnapshots: new Map([['far', { content: '隠す必要ないしね' }]])
+  });
+
+  if (!forwarded.content.includes('隠す必要ないしね')) {
+    fail(`転送の本文を取り込んでいない: ${JSON.stringify(forwarded.content)}`);
+  }
+  // 投稿者は Discord が渡してこない。転送だと分かる印は要る
+  if (!forwarded.content.startsWith('[転送]')) fail(`転送の印が無い: ${forwarded.content}`);
+  if (forwarded.char_count === 0) fail('文字数が 0 のままだと len: で引けない');
+
+  // 本文がある発言には足さない
+  const normal = toRecord({
+    ...base,
+    content: '自分で書いた',
+    messageSnapshots: new Map([['far', { content: '転送のぶん' }]])
+  });
+  if (normal.content !== '自分で書いた') fail(`本文があるなら足さない: ${normal.content}`);
+
+  // 転送でない発言は今までどおり
+  if (toRecord({ ...base, content: 'ふつう' }).content !== 'ふつう') fail('普通の発言を壊している');
+}
+
+console.log('forward ok (転送の本文を取り込む / 印を付ける)');
+
+// --- 依頼そのものの取りこぼし ---
+//
+// 直近の会話は describeExtras を通っているのに、依頼だけ message.content の
+// 素通しだった。改行は潰れ、貼られた画像は存在すら伝わっていなかった。
+
+const { stripMention } = await import('../src/agent/index.js');
+
+{
+  const BOT = '111000111000111000';
+
+  // 改行は残す。箇条書きや貼り付けたログが1行に潰れると、人が見ている形と違うものを読ませる。
+  const listed = stripMention(`<@${BOT}> これ直して\n- A が落ちる\n- B が遅い`, BOT);
+  if (!listed.includes('\n- A が落ちる\n- B が遅い')) fail(`改行が潰れている: ${JSON.stringify(listed)}`);
+  if (listed.startsWith('\n') || listed.endsWith('\n')) fail(`端の空白は落とす: ${JSON.stringify(listed)}`);
+
+  // 行の中の連続空白は畳む (元の挙動)
+  if (stripMention('a    b', BOT) !== 'a b') fail('行内の連続空白は畳む');
+  // 空行が3つ以上続いても2つまで
+  if (stripMention('a\n\n\n\n\nb', BOT) !== 'a\n\nb') fail('空行を詰める');
+  // メンションは消える (ニックネーム形式 <@!id> も)
+  if (stripMention(`<@!${BOT}> やあ`, BOT) !== 'やあ') fail('メンションが残っている');
+}
+
+{
+  // 依頼に貼られたものが依頼セクションに出ること
+  const withImage = userContentOf({ extras: 'screenshot.png' });
+  const askBlock = withImage.slice(withImage.indexOf('## 依頼'));
+  if (!askBlock.includes('screenshot.png')) fail(`依頼の添付が出ていない: ${askBlock}`);
+  if (!askBlock.includes('中身は見えない')) fail('読めないことを書かないと、読めたふりをする');
+
+  // 添付が無いときは1行も足さない (普通の依頼のトークンを増やさない)
+  if (userContentOf().includes('貼られているもの')) fail('添付が無いのに行を足している');
+
+  // 本文なし + 添付 のときに「直近の会話をまとめて」と言わない
+  const imageOnly = userContentOf({ prompt: '', extras: 'cat.png' });
+  if (imageOnly.includes('直近の会話をまとめて')) fail('画像だけの依頼で背景の要約を指示してはいけない');
+  if (!imageOnly.includes('貼られたものについて')) fail('画像だけの依頼の指示が出ていない');
+}
+
+console.log('request ok (改行を保つ / 依頼の添付を伝える)');
+
+// --- 長い回答の分割 ---
+//
+// コードブロックの途中で切ると、続きのメッセージが地の文になって等幅もインデントも消える。
+
+const { chunkForDiscord } = await import('../src/agent/format.js');
+
+{
+  const code = Array.from({ length: 200 }, (_, i) => `const x${i} = ${i};`).join('\n');
+  const chunks = chunkForDiscord(`これ直して\n\n\`\`\`js\n${code}\n\`\`\``);
+
+  if (chunks.length < 2) fail('この長さなら分割されるはず');
+  for (const [i, chunk] of chunks.entries()) {
+    const fences = (chunk.match(/```/g) ?? []).length;
+    if (fences % 2 !== 0) fail(`チャンク ${i + 1} でコードブロックが開いたまま: ${JSON.stringify(chunk.slice(-40))}`);
+    if (chunk.length > 2000) fail(`チャンク ${i + 1} が Discord の上限を超えている: ${chunk.length}`);
+  }
+  // 2通目以降はコードの続きとして開き直す
+  if (!chunks[1].startsWith('```')) fail(`続きが開き直されていない: ${JSON.stringify(chunks[1].slice(0, 20))}`);
+
+  // コードが無いときの挙動は変えない
+  const plain = chunkForDiscord('短い答え。');
+  if (plain.length !== 1 || plain[0] !== '短い答え。') fail(`短い答えは1通のまま: ${JSON.stringify(plain)}`);
+  if (chunkForDiscord('あ'.repeat(10_000)).at(-1).includes('```')) fail('コードでないのにフェンスを足している');
+}
+
+console.log('chunking ok (コードブロックを跨いで壊さない)');
+
+// --- 断り文を次の会話に混ぜない ---
+
+const { isAgentNotice } = await import('../src/agent/index.js');
+
+{
+  const self = '111';
+  const notices = [
+    'いま処理が立て込んでいます。少し待ってからもう一度呼んでください。',
+    '使用量の上限に達しました (1人あたり1日 $0.050 / $0.05)。<t:1700000000:R> に空きます。',
+    'サーバー全体の使用量の上限に達しました (1日 $0.500 / $0.50)。<t:1700000000:R> に空きます。',
+    'エージェントの実行に失敗しました。しばらくしてからもう一度試してください。'
+  ];
+
+  for (const content of notices) {
+    if (!isAgentNotice({ authorId: self, content }, self)) fail(`断り文を見分けられていない: ${content}`);
+  }
+
+  // 他人の発言と、自分の普通の回答は捨てない
+  if (isAgentNotice({ authorId: '222', content: notices[0] }, self)) fail('他人の発言を捨ててはいけない');
+  if (isAgentNotice({ authorId: self, content: 'たこが4月に書いてる' }, self)) fail('自分の回答を捨ててはいけない');
+  if (isAgentNotice({ authorId: self, content: notices[0] }, null)) fail('selfId 不明なら捨てない');
+}
+
+console.log('notice ok (断り文を直近の会話に混ぜない)');
+
 // --- 発火するのは「メンション」と「回答へのリプライ」だけ ---
 //
 // 以前は「bot が書いたメッセージなら続き」と見なす保険があり、経過表示・
@@ -436,8 +645,9 @@ try {
   rememberAgentReply(ANSWER_ID, null);
 
   const client = { user: { id: 'bot-1' } };
-  const ask = ({ replyTo = null, mention = false, fromBot = false, repliedUser = null }) => ({
+  const ask = ({ replyTo = null, mention = false, fromBot = false, repliedUser = null, content = 'なんで？' }) => ({
     guildId: 'g1',
+    content,
     author: { id: 'u1', bot: fromBot },
     reference: replyTo ? { messageId: replyTo } : null,
     mentions: {
@@ -458,7 +668,35 @@ try {
   if (isAgentRequest(ask({}), client)) fail('ただの発言では起動しない');
   if (isAgentRequest(ask({ mention: true, fromBot: true }), client)) fail('bot の発言では起動しない');
 
-  console.log('trigger ok (メンション / 回答へのリプライだけ)');
+  // --- 相槌では起動しない ---
+  //
+  // 回答へのリプライは会話の続きとして拾うが、そこに「ありがとう」まで含めると
+  // 相槌のたびに直近30件を積み直して1回ぶん払うことになる。
+  for (const content of [
+    'ありがとう', 'ありがとう！', 'あざす', 'thanks', '了解', 'おけ', 'なるほど',
+    '草', 'wwww', 'ｗ', 'たしかに', 'おつ', '👍', '😂😂', '<:kusa:123456789012345678>', ''
+  ]) {
+    if (isAgentRequest(ask({ replyTo: ANSWER_ID, content }), client)) {
+      fail(`相槌では起動しない: ${JSON.stringify(content)}`);
+    }
+  }
+
+  // 短い追撃は落とさない。ここを落とすと「続きを聞く」機能そのものが死ぬ。
+  for (const content of [
+    'なんで？', 'なんで', 'もっと詳しく', 'ソースは', 'それ本当？', 'なるほど？',
+    'なるほど、じゃあ次は', 'ありがとう、あと1つ聞きたい'
+  ]) {
+    if (!isAgentRequest(ask({ replyTo: ANSWER_ID, content }), client)) {
+      fail(`追撃では起動する: ${JSON.stringify(content)}`);
+    }
+  }
+
+  // メンションは明示的な呼び出しなので、相槌でも通す
+  if (!isAgentRequest(ask({ mention: true, content: 'ありがとう' }), client)) {
+    fail('メンション付きなら相槌でも起動する');
+  }
+
+  console.log('trigger ok (メンション / 回答へのリプライだけ / 相槌は無視)');
 } finally {
   clearReplies();
 }

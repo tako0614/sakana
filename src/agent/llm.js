@@ -93,7 +93,7 @@ async function requestOnce({ messages, tools, dropThinking, effort }) {
   );
 }
 
-async function callModel({ messages, tools, effort }) {
+async function callModel({ messages, tools, effort, deadlineAt = Infinity }) {
   let dropThinking = false;
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -113,7 +113,9 @@ async function callModel({ messages, tools, effort }) {
         continue;
       }
 
-      if (error instanceof DeepSeekError && error.retryable && attempt < 2) {
+      // 締め切りを過ぎたら引き直さない。ここで粘ると deadline が実質3倍になる
+      // (1回の呼び出しが最大 180 秒 なので、3回で9分)。
+      if (error instanceof DeepSeekError && error.retryable && attempt < 2 && Date.now() < deadlineAt) {
         await sleep(800 * (attempt + 1));
         continue;
       }
@@ -148,6 +150,7 @@ const HARD_ROUND_CAP = 100;
 export async function runAgent({
   system, userContent, toolset, onToolCall, usage,
   budget = Infinity,
+  deadlineAt = Infinity,
   weigh = () => 0
 }) {
   const messages = [
@@ -175,16 +178,23 @@ export async function runAgent({
   };
 
   for (; rounds < HARD_ROUND_CAP; rounds += 1) {
-    // 予算を使い切ったらツールを外す。そうすると次の応答は必ず文章になるので、
-    // 「打ち切りました」ではなく、その場の材料で答えた文が返る。
+    // 予算を使い切ったか締め切りを過ぎたらツールを外す。そうすると次の応答は
+    // 必ず文章になるので、「打ち切りました」ではなく、その場の材料で答えた文が返る。
+    // 時間切れも予算切れと同じ経路に寄せるのが要点 — 例外で畳むと、払ったのに
+    // 謝り文だけが出る (以前そうなっていた)。
     const spent = weigh(totals);
-    const tools = spent >= budget ? null : toolset.definitions;
+    const outOfTime = Date.now() >= deadlineAt;
+    const tools = spent >= budget || outOfTime ? null : toolset.definitions;
 
     if (tools === null && rounds > 0) {
-      console.warn(`Tool budget exhausted after ${rounds} round(s) (${Math.round(spent)} / ${Math.round(budget)}).`);
+      console.warn(
+        outOfTime
+          ? `Deadline reached after ${rounds} round(s). Answering with what we have.`
+          : `Tool budget exhausted after ${rounds} round(s) (${Math.round(spent)} / ${Math.round(budget)}).`
+      );
     }
 
-    let data = await callModel({ messages, tools });
+    let data = await callModel({ messages, tools, deadlineAt });
     accumulate(data);
 
     // max_tokens には思考ぶんが含まれるので、思考で使い切ると本文が空で返る。
@@ -193,7 +203,7 @@ export async function runAgent({
       console.warn(
         `DeepSeek returned an empty answer (finish_reason=${data.choices?.[0]?.finish_reason}). Retrying with low effort.`
       );
-      data = await callModel({ messages, tools, effort: 'low' });
+      data = await callModel({ messages, tools, effort: 'low', deadlineAt });
       accumulate(data);
     }
 

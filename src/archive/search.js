@@ -113,6 +113,9 @@ class Compiler {
       case 'is':
         return this.compileIs(value.toLowerCase());
 
+      case 'tag':
+        return this.compileTag(value);
+
       case 'before': {
         // before:2024-05-01 はその日を含まない / before:7d は「7日より前」
         const { start } = parseDateRange(value);
@@ -295,9 +298,38 @@ class Compiler {
       case 'deleted':
         this.includesDeleted = true;
         return 'm.deleted = 1';
+      // 「誰も答えていない投稿」。人間が投稿者しか喋っていないスレッドを指す。
+      // 発言ではなくスレッドの性質なので相関副問い合わせになるが、
+      // idx_msg_channel_time があるので候補1件あたり範囲スキャン1本で済む。
+      case 'unanswered':
+        return `(
+          m.parent_id IS NOT NULL AND (
+            SELECT COUNT(DISTINCT x.author_id) FROM messages x
+            WHERE x.channel_id = m.channel_id AND x.deleted = 0 AND x.is_bot = 0
+          ) <= 1
+        )`;
       default:
-        throw new QueryError(`is: に指定できない値です: \`${value}\` (bot/human/edited/pinned/reply/thread/deleted)`);
+        throw new QueryError(
+          `is: に指定できない値です: \`${value}\` (bot/human/edited/pinned/reply/thread/unanswered/deleted)`
+        );
     }
+  }
+
+  /**
+   * フォーラムのタグ。channels.applied_tags に ` 名前 名前 ` で入っている。
+   *
+   * 取り込み前の行はタグが空なので、当たらないこと自体が「タグが無い」とは限らない。
+   * それを読み違えないための注記は呼び出し側 (tools.js) が出す。
+   */
+  compileTag(value) {
+    const name = String(value).replace(/^#/, '').toLowerCase().replace(/\s+/g, '_');
+    if (!name) throw new QueryError('tag: にはタグ名を指定してください。');
+
+    return `m.channel_id IN (
+      SELECT channel_id FROM channels
+      WHERE guild_id = ${this.push(this.guildId)}
+        AND applied_tags LIKE ${this.push(`% ${escapeLike(name)} %`)} ESCAPE '\\'
+    )`;
   }
 }
 
@@ -415,6 +447,81 @@ const GROUP_EXPRESSIONS = {
 /**
  * 検索条件をそのまま集計する。「このワードを一番使っているのは誰か」など。
  */
+/**
+ * 投稿 (スレッド) を単位にして探す。
+ *
+ * 発言単位の検索では「どの投稿の話か」が分からない。フォーラムでは1つの投稿が
+ * 1つの話題なので、そこを単位にしないと「○○について聞いてる投稿ある？」に答えられない。
+ *
+ * 当たり方は2通りあって、両方拾う:
+ *   - 本文が当たった (既存の WHERE をそのまま使って channel_id で畳む)
+ *   - タイトルが当たった (本文に1度も出てこない語がタイトルにはあることが多い。
+ *     「ビルドが通らない」という投稿の中で誰も「ビルド」と書かない、が普通に起きる)
+ *
+ * 並びはタイトル一致を上に、次にヒット数。タイトルが当たっている投稿は
+ * 「その話題そのもの」なので、本文に多く出てくる投稿より確実に効く。
+ */
+export function searchThreads(options, { limit = 10, offset = 0, titleTerms = [] } = {}) {
+  const built = buildSearch(options);
+  const params = [...built.params];
+
+  // タイトル一致。語は AND (クエリの意味に合わせる)
+  const titleSql = titleTerms.length > 0
+    ? titleTerms.map((term) => {
+      params.push(`%${escapeLike(term)}%`);
+      return "c.name LIKE ? ESCAPE '\\'";
+    }).join(' AND ')
+    : '0';
+
+  // 外側にも実行者のスコープを掛ける。内側 (m.*) だけだと、
+  // タイトルだけが当たった投稿が権限を越えて出てしまう。
+  const scope = options.channelScope;
+  let scopeSql = '1';
+  if (scope?.mode === 'none') {
+    scopeSql = '0';
+  } else if (scope?.ids?.length > 0) {
+    scopeSql = `c.channel_id ${scope.mode === 'exclude' ? 'NOT IN' : 'IN'} (${scope.ids.map(() => '?').join(', ')})`;
+  }
+
+  const sql = `
+    WITH body AS (
+      SELECT m.channel_id AS channel_id,
+             COUNT(*) AS hits,
+             MIN(m.created_at) AS first_hit,
+             MAX(m.created_at) AS last_hit
+      FROM messages m
+      WHERE ${built.where}
+      GROUP BY m.channel_id
+    )
+    SELECT c.channel_id, c.name, c.parent_id, c.message_count, c.oldest_id, c.newest_id, c.applied_tags,
+           COALESCE(b.hits, 0) AS hits,
+           b.first_hit, b.last_hit,
+           (${titleSql}) AS title_hit
+    FROM channels c
+    LEFT JOIN body b ON b.channel_id = c.channel_id
+    WHERE c.guild_id = ? AND c.is_thread = 1 AND c.is_private = 0
+      AND (${scopeSql})
+      AND (b.hits > 0 OR (${titleSql}))
+    ORDER BY title_hit DESC, hits DESC, CAST(c.newest_id AS INTEGER) DESC
+    LIMIT ? OFFSET ?
+  `;
+
+  // プレースホルダの順番: 内側 WHERE → SELECT のタイトル一致 → guild → スコープ
+  //                       → WHERE のタイトル一致 → limit → offset
+  const titleParams = params.slice(built.params.length);
+  const bound = [
+    ...built.params,
+    ...titleParams,
+    options.guildId,
+    ...(scope?.ids?.length > 0 ? scope.ids : []),
+    ...titleParams,
+    limit,
+    offset
+  ];
+
+  return withRegexGuard(built.usesRegex, () => db.prepare(sql).all(...bound));
+}
+
 export function aggregateSearch(options, groupBy, { limit = 10, orderByKey = false } = {}) {
   const expression = GROUP_EXPRESSIONS[groupBy];
   if (!expression) throw new QueryError(`集計軸が不正です: ${groupBy}`);

@@ -54,6 +54,19 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_reaction_emoji ON message_reactions(emoji);
 
+  -- 誰が押したか。count だけでは「これ誰が👍したの？」に答えられない。
+  --
+  -- 過去ぶんは埋めない。users.fetch() は絵文字1つにつき API 1回なので、
+  -- 既存ログ全体に掛けると取り込み時間もレート制限も跳ね上がる。
+  -- リアクションが動いたときに1メッセージぶんだけ記録する (indexer の syncLiveReactions)。
+  CREATE TABLE IF NOT EXISTS message_reaction_users (
+    message_id TEXT NOT NULL,
+    emoji TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    PRIMARY KEY (message_id, emoji, user_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_reaction_user ON message_reaction_users(user_id);
+
   CREATE TABLE IF NOT EXISTS message_links (
     message_id TEXT NOT NULL,
     url TEXT NOT NULL,
@@ -78,6 +91,8 @@ db.exec(`
     updated_at INTEGER
   );
   CREATE INDEX IF NOT EXISTS idx_channel_guild ON channels(guild_id);
+  -- 投稿の一覧と親からの絞り込みはどちらもこの向きで引く
+  CREATE INDEX IF NOT EXISTS idx_channel_parent ON channels(guild_id, parent_id);
 
   CREATE TABLE IF NOT EXISTS guild_index_state (
     guild_id TEXT PRIMARY KEY,
@@ -92,6 +107,22 @@ db.exec(`
     last_error TEXT
   );
 `);
+
+// CREATE TABLE IF NOT EXISTS では既存の DB に列が増えないので、無いときだけ足す。
+//
+// applied_tags はフォーラムのタグ。ID ではなく名前を ` タグ1 タグ2 ` の形で持つ
+// (前後と区切りに空白を入れて `LIKE '% 名前 %'` で引く。messages.attachment_kinds と同じ作り)。
+// 名前で持つのは、ID から名前に直すには親フォーラムの availableTags が要り、
+// 検索のたびに Discord のキャッシュを引く羽目になるため。タグ名が変わったら
+// 次の取り込みで追随する。
+if (!db.pragma('table_info(channels)').some((row) => row.name === 'applied_tags')) {
+  db.exec("ALTER TABLE channels ADD COLUMN applied_tags TEXT NOT NULL DEFAULT ''");
+}
+
+// チャンネルの説明文。「#dev って何のチャンネル？」に答えるのに要る。
+if (!db.pragma('table_info(channels)').some((row) => row.name === 'topic')) {
+  db.exec("ALTER TABLE channels ADD COLUMN topic TEXT NOT NULL DEFAULT ''");
+}
 
 // 全文検索は trigram トークナイザで作る。
 // unicode61 だと日本語が単語分割されず「会議」のような部分一致が引けないため。
@@ -497,6 +528,8 @@ const deleteMentionsStmt = db.prepare('DELETE FROM message_mentions WHERE messag
 const insertMentionStmt = db.prepare('INSERT OR IGNORE INTO message_mentions (message_id, user_id) VALUES (?, ?)');
 const deleteReactionsStmt = db.prepare('DELETE FROM message_reactions WHERE message_id = ?');
 const insertReactionStmt = db.prepare('INSERT OR REPLACE INTO message_reactions (message_id, emoji, count) VALUES (?, ?, ?)');
+const deleteReactionUsersStmt = db.prepare('DELETE FROM message_reaction_users WHERE message_id = ? AND emoji = ?');
+const insertReactionUserStmt = db.prepare('INSERT OR IGNORE INTO message_reaction_users (message_id, emoji, user_id) VALUES (?, ?, ?)');
 const deleteLinksStmt = db.prepare('DELETE FROM message_links WHERE message_id = ?');
 const insertLinkStmt = db.prepare('INSERT OR IGNORE INTO message_links (message_id, url, domain) VALUES (?, ?, ?)');
 
@@ -539,19 +572,38 @@ export function markMessageDeleted(messageId) {
 
 export function replaceReactions(messageId, reactions) {
   const total = reactions.reduce((sum, reaction) => sum + reaction.count, 0);
+  // users を渡してきた絵文字だけ入れ替える。渡していない絵文字の記録は残す
+  // (取れなかった/上限を超えたぶんを消すと、記録が「無い」に化ける)。
+  const withUsers = reactions.filter((reaction) => Array.isArray(reaction.users));
+
   db.transaction(() => {
     deleteReactionsStmt.run(messageId);
     for (const reaction of reactions) {
       insertReactionStmt.run(messageId, reaction.emoji, reaction.count);
     }
+
+    for (const reaction of withUsers) {
+      deleteReactionUsersStmt.run(messageId, reaction.emoji);
+      for (const userId of reaction.users) {
+        insertReactionUserStmt.run(messageId, reaction.emoji, userId);
+      }
+    }
+
     db.prepare('UPDATE messages SET reaction_count = ? WHERE message_id = ?').run(total, messageId);
   })();
 }
 
+/** そのメッセージに誰が何を押したか。記録が無ければ空。 */
+export function reactionUsers(messageId) {
+  return db
+    .prepare('SELECT emoji, user_id FROM message_reaction_users WHERE message_id = ?')
+    .all(String(messageId));
+}
+
 export function upsertChannel(channel) {
   db.prepare(`
-    INSERT INTO channels (channel_id, guild_id, parent_id, name, type, is_thread, is_private, updated_at)
-    VALUES (@channel_id, @guild_id, @parent_id, @name, @type, @is_thread, @is_private, @updated_at)
+    INSERT INTO channels (channel_id, guild_id, parent_id, name, type, is_thread, is_private, applied_tags, topic, updated_at)
+    VALUES (@channel_id, @guild_id, @parent_id, @name, @type, @is_thread, @is_private, @applied_tags, @topic, @updated_at)
     ON CONFLICT(channel_id) DO UPDATE SET
       guild_id = excluded.guild_id,
       parent_id = excluded.parent_id,
@@ -559,8 +611,10 @@ export function upsertChannel(channel) {
       type = excluded.type,
       is_thread = excluded.is_thread,
       is_private = excluded.is_private,
+      applied_tags = excluded.applied_tags,
+      topic = excluded.topic,
       updated_at = excluded.updated_at
-  `).run({ updated_at: Date.now(), ...channel });
+  `).run({ updated_at: Date.now(), applied_tags: '', topic: '', ...channel });
 }
 
 export function getChannelState(channelId) {

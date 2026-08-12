@@ -11,3 +11,6 @@ npm-debug.log*
 .venv-llm/
 corpus/
 scripts/llm/out/
+
+# HF に上げる用の書き出し (重みは git に入れない)
+dist/

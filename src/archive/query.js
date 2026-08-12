@@ -28,6 +28,7 @@ const FILTER_KEYS = new Set([
   'hour',
   'weekday', 'day',
   'domain',
+  'tag',
   'regex', 're'
 ]);
 

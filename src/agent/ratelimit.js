@@ -316,16 +316,22 @@ function isExempt(userId, admin = false) {
 
 /**
  * 枠を1つ確保する。空いていなければ理由と復帰時刻を返す。
- * admin: true なら回数・トークン・同時実行のどれも見ない。
+ * admin: true ならトークンとドルの上限は見ない (同時実行だけは見る)。
  */
 export function reserveCall({ guildId, channelId, userId, admin = false }) {
   const now = Date.now();
+  const exempt = isExempt(userId, admin);
 
-  if (!isExempt(userId, admin)) {
-    if (running >= getTunable('max_concurrent')) {
-      return { ok: false, scope: 'busy' };
-    }
+  // 同時実行だけは管理者にも効かせる。
+  //
+  // これは費用の壁ではなくメモリの番人で、1実行ごとに Chrome の隔離タブを開く
+  // (config.js のコメント参照)。素通りさせると管理者の並列実行だけで 12GiB を
+  // 食い潰せてしまうし、そのぶん一般ユーザーが busy で締め出される。
+  if (running >= getTunable('max_concurrent')) {
+    return { ok: false, scope: 'busy' };
+  }
 
+  if (!exempt) {
     // 上限はドルで持っているので、判定の直前にトークンへ直す
     const userUsd = dailyUsdFor(userId);
     const userLimit = userUsd > 0 ? usdToTokens(userUsd) : 0;
@@ -363,7 +369,7 @@ export function reserveCall({ guildId, channelId, userId, admin = false }) {
   }
 
   // 素通りした実行は上限の判定に数えない (記録としては残る)
-  const counted = isExempt(userId, admin) ? 0 : 1;
+  const counted = exempt ? 0 : 1;
   const { lastInsertRowid } = insertStmt.run(guildId ?? null, channelId ?? null, userId, now, counted);
   running += 1;
 

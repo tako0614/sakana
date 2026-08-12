@@ -45,10 +45,17 @@ export const agentConfig = {
   // 使い切って本文が空のまま返り、「うまく答えをまとめられませんでした」になる。
   // 回答自体は1000字までなので、ここはほぼ全部が思考の枠。
   maxOutputTokens: number(process.env.AGENT_MAX_OUTPUT_TOKENS, 40_000),
-  // リクエスト単位のタイムアウトは持たない。止めるのはトークンだけ。
-  // これは「ソケットが死んだときの保険」で、1回の HTTP 呼び出しにだけ掛かる。
-  // 超えても失敗にはせず、retryable として callModel が引き直す。
+  // 1回の HTTP 呼び出しに掛かるタイムアウト。「ソケットが死んだときの保険」で、
+  // 超えても失敗にはせず retryable として callModel が引き直す。
   httpTimeoutMs: number(process.env.AGENT_HTTP_TIMEOUT_MS, 180_000),
+  // リクエスト全体の締め切り。
+  //
+  // 費用を止めるのはトークンの予算で、こちらは「枠を占有し続けさせない」ための壁。
+  // 予算だけだとキャッシュヒットが効いた実行が70往復ほど回れてしまい、1回で
+  // 同時実行3枠のうち1つを数時間押さえる (その間チャンネルには thinking が出たまま)。
+  // 超えたら打ち切るのではなくツールを外すだけなので、答えはその場の材料で必ず書かれる。
+  // 実測の重い実行が11往復なので10分は十分な余裕がある。
+  deadlineMs: number(process.env.AGENT_DEADLINE_MS, 600_000),
   // 経過表示の編集をまとめる待ち時間。秒は <t:...:R> でクライアントが進めるので、
   // 編集が走るのはツールが切り替わったときだけ。連続で切り替わる分をここで畳む。
   progressIntervalMs: number(process.env.AGENT_PROGRESS_INTERVAL_MS, 1000),
@@ -101,6 +108,17 @@ export const agentConfig = {
   browserTimeoutMs: number(process.env.AGENT_BROWSER_TIMEOUT_MS, 30_000),
   // ページ本文の取得上限。
   browserTextChars: number(process.env.AGENT_BROWSER_TEXT_CHARS, 4000),
+  // web 検索は「検索エンジンのページを開いて結果を抜く」だけ。API キーは要らない。
+  // 前から順に試して、結果が取れなかったら次へ落とす (lite 版は datacenter IP から
+  // だと anomaly ページを返すことがあるので、素の HTML を出す Bing を控えに置く)。
+  // クエリはこの末尾に URL エンコードして足すので、`?q=` まで含めて書く。
+  searchEngines: list(process.env.AGENT_BROWSER_SEARCH_URLS).length
+    ? list(process.env.AGENT_BROWSER_SEARCH_URLS)
+    : ['https://lite.duckduckgo.com/lite/?q=', 'https://www.bing.com/search?q='],
+  // 1回の検索で渡す件数と抜粋の長さ。ここがそのまま毎回のトークン。
+  // 5件×180字なら約 1.5KB。足りなければ open で本文を読ませる方が安い。
+  searchResults: number(process.env.AGENT_BROWSER_SEARCH_RESULTS, 5),
+  searchSnippetChars: number(process.env.AGENT_BROWSER_SEARCH_SNIPPET_CHARS, 180),
   // click / type / eval / 生 CDP など、ブラウザを操作する系の action を誰に許すか。
   // ログイン済みプロファイルを触れてしまうので、既定では信頼済みの人だけ。
   browserFullForAll: flag(process.env.AGENT_BROWSER_FULL_FOR_ALL, false),

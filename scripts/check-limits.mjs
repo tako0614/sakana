@@ -7,6 +7,7 @@ import { db } from '../src/db.js';
 import {
   dailyUsdFor,
   finalizeCall,
+  getTunable,
   getUsage,
   grantDailyUsd,
   remainingFor,
@@ -101,6 +102,31 @@ try {
     `admin usage must still show up as spend (${after.globalBilledUsd})`
   );
   assert(after.userBilledUsd > 40 * usd - 1e-6, 'the admin must see their own spend');
+
+  // --- 同時実行だけは管理者にも効く ---
+  //
+  // これは費用の壁ではなくメモリの番人 (1実行ごとに Chrome の隔離タブを開く)。
+  // 素通りさせると管理者の並列実行だけでメモリを食い潰し、そのぶん一般ユーザーが
+  // busy で締め出される。ドルの上限は今まで通り素通りすること。
+  {
+    const held = [];
+    for (;;) {
+      const r = reserveCall({ guildId: 'g', channelId: 'c', userId: 'check-admin', admin: true });
+      if (!r.ok) {
+        assert(r.scope === 'busy', `同時実行で止まるはず: ${r.scope}`);
+        break;
+      }
+      held.push(r.id);
+      assert(held.length <= 64, '管理者が同時実行の壁に当たらない');
+    }
+    assert(held.length === getTunable('max_concurrent'), `枠のぶんだけ通す: ${held.length}`);
+
+    // 枠を返せばまた通る (running が戻ること)
+    for (const id of held) finalizeCall(id, { status: 'ok', rounds: 1, usage: {} });
+    const again = reserveCall({ guildId: 'g', channelId: 'c', userId: 'check-admin', admin: true });
+    assert(again.ok, '枠を返したら通るはず');
+    finalizeCall(again.id, { status: 'ok', rounds: 1, usage: {} });
+  }
 
   // --- リセット: 行は残したまま窓を空ける ---
   const beforeReset = getUsage('check-normal');

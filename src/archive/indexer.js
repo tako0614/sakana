@@ -62,8 +62,29 @@ function attachmentKind(attachment) {
  * discord.js の Message を DB 行に変換する。
  * extra には本文以外の検索対象 (添付ファイル名 / 埋め込み文言 / URL) を詰める。
  */
+/**
+ * 転送 (forward) された発言の本文。
+ *
+ * 転送は content が空で、中身は message_snapshots 側に入る。見ないまま取り込むと
+ * 本文なしの行になり、検索に永久に引っかからない。返信の鎖 (agent/index.js) だけが
+ * 対応済みで、取り込み側は素通りしていた。
+ *
+ * 投稿者は Discord が渡してこないので名前は出さない。誰の発言かの取り違えは
+ * 捏造と同じ害になるので、転送だと分かる印だけ付ける。
+ */
+function forwardedContent(message) {
+  const snapshots = [...(message.messageSnapshots?.values() ?? [])];
+  if (snapshots.length === 0) return '';
+
+  const parts = snapshots
+    .map((snapshot) => String(snapshot?.content ?? '').trim())
+    .filter(Boolean);
+
+  return parts.length > 0 ? `[転送] ${parts.join('\n')}` : '';
+}
+
 export function toRecord(message) {
-  const content = message.content ?? '';
+  const content = message.content || forwardedContent(message);
   const attachments = [...message.attachments.values()];
   const kinds = new Set(attachments.map(attachmentKind));
 
@@ -119,6 +140,29 @@ export function toRecord(message) {
   };
 }
 
+/**
+ * フォーラムのタグを ` 名前 名前 ` の形にする。
+ *
+ * appliedTags は ID の配列で、名前は親フォーラムの availableTags 側にある。
+ * ID のまま持つと検索のたびに親を引く羽目になるので、取り込みの時点で名前に直す。
+ * 親が取れない (キャッシュに無い) ときは空にする — ID を混ぜると `tag:` が
+ * 数字にしか当たらなくなり、静かに0件を返す方が悪い。
+ */
+function appliedTags(channel) {
+  const ids = channel.appliedTags;
+  if (!Array.isArray(ids) || ids.length === 0) return '';
+
+  const available = channel.parent?.availableTags;
+  if (!Array.isArray(available) || available.length === 0) return '';
+
+  const names = ids
+    .map((id) => available.find((tag) => tag.id === id)?.name)
+    .filter(Boolean)
+    .map((name) => name.toLowerCase().replace(/\s+/g, '_'));
+
+  return names.length > 0 ? ` ${names.join(' ')} ` : '';
+}
+
 function channelRow(channel) {
   return {
     channel_id: channel.id,
@@ -127,7 +171,10 @@ function channelRow(channel) {
     name: channel.name ?? '',
     type: channel.type,
     is_thread: isThreadType(channel.type) ? 1 : 0,
-    is_private: channel.type === ChannelType.PrivateThread ? 1 : 0
+    is_private: channel.type === ChannelType.PrivateThread ? 1 : 0,
+    applied_tags: appliedTags(channel),
+    // スレッドに topic は無い。フォーラム本体とテキストチャンネルだけが持つ。
+    topic: String(channel.topic ?? '').slice(0, 500)
   };
 }
 
@@ -753,15 +800,40 @@ export function markLiveDelete(message) {
   }
 }
 
-export function syncLiveReactions(message) {
+// 誰が押したかを記録するか。既定は on。
+const RECORD_REACTION_USERS = !['0', 'false', 'no', 'off']
+  .includes(String(process.env.ARCHIVE_REACTION_USERS ?? '').toLowerCase());
+
+// これを超えた絵文字は誰が押したかを取りに行かない。
+// users.fetch() は絵文字1つにつき API 1回で、大量に付いた絵文字の全員は
+// 「誰が押した？」の答えとしても要らない (数の話になる)。
+const REACTION_USER_CAP = 25;
+
+export async function syncLiveReactions(message) {
   if (!message?.guildId) return;
   if (!getGuildState(message.guildId)) return;
 
   try {
-    const reactions = [...(message.reactions?.cache?.values() ?? [])].map((reaction) => ({
-      emoji: reaction.emoji.id ? `<${reaction.emoji.animated ? 'a' : ''}:${reaction.emoji.name}:${reaction.emoji.id}>` : reaction.emoji.name,
-      count: reaction.count ?? 0
-    }));
+    const cached = [...(message.reactions?.cache?.values() ?? [])];
+    const reactions = [];
+
+    for (const reaction of cached) {
+      const emoji = reaction.emoji.id
+        ? `<${reaction.emoji.animated ? 'a' : ''}:${reaction.emoji.name}:${reaction.emoji.id}>`
+        : reaction.emoji.name;
+      const count = reaction.count ?? 0;
+
+      // 押した人はここでしか取れない。過去ぶんの一括取得はしない方針なので、
+      // リアクションが動いたこの瞬間に1メッセージぶんだけ拾う。
+      // 取れなかったら users を付けずに返す (空配列で「誰も押していない」にしない)。
+      let users;
+      if (RECORD_REACTION_USERS && count > 0 && count <= REACTION_USER_CAP) {
+        const fetched = await reaction.users.fetch({ limit: REACTION_USER_CAP }).catch(() => null);
+        if (fetched) users = [...fetched.keys()];
+      }
+
+      reactions.push(users ? { emoji, count, users } : { emoji, count });
+    }
 
     replaceReactions(message.id, reactions);
   } catch (error) {

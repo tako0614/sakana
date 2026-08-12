@@ -1,11 +1,13 @@
-import { SlashCommandBuilder, EmbedBuilder } from 'discord.js';
+import { SlashCommandBuilder, EmbedBuilder, MessageFlags } from 'discord.js';
 import { getTopXP, getUserRank } from './db.js';
 import { archiveCommands } from './archive/commands.js';
 import { agentCommands } from './agent/commands.js';
+import { mimicCommands } from './mimic/command.js';
 
 export const commands = [
   ...archiveCommands,
   ...agentCommands,
+  ...mimicCommands,
   {
     data: new SlashCommandBuilder()
       .setName('top')
@@ -34,7 +36,10 @@ export const commands = [
       const guildId = interaction.guildId;
       
       if (!guildId) {
-        return interaction.reply({ content: 'このコマンドはサーバー内でのみ使用できます。', ephemeral: true });
+        return interaction.reply({
+          content: 'このコマンドはサーバー内でのみ使用できます。',
+          flags: MessageFlags.Ephemeral
+        });
       }
 
       // オプションの取得（デフォルトは両方表示の全期間）

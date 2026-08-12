@@ -28,6 +28,32 @@ export function isThreadType(type) {
     || type === ChannelType.AnnouncementThread;
 }
 
+/** フォーラム / メディア。中身は「投稿」= スレッドで、本体は発言を持たない。 */
+export function isForumType(type) {
+  return type === ChannelType.GuildForum || type === ChannelType.GuildMedia;
+}
+
+/**
+ * bot 自身がそのチャンネルで発言できるか。
+ *
+ * 「見える」だけでは足りない。送れない場所で実行すると経過表示も回答も
+ * 投げ捨てることになり、トークンと同時実行の枠だけを払う (実測でそうなっていた)。
+ * 呼ぶのは枠を取る前。
+ */
+export function canBotSpeak(channel, me) {
+  const permissions = channel?.permissionsFor?.(me);
+  if (!permissions?.has(Flags.ViewChannel)) return false;
+
+  return isThreadType(channel.type)
+    ? permissions.has(Flags.SendMessagesInThreads)
+    : permissions.has(Flags.SendMessages);
+}
+
+/** 添付を付けられるか。付けられなくても本文は出せるので、実行自体は止めない。 */
+export function canBotAttach(channel, me) {
+  return Boolean(channel?.permissionsFor?.(me)?.has(Flags.AttachFiles));
+}
+
 export function canRead(channel, member) {
   const permissions = channel.permissionsFor(member);
   if (!permissions?.has(Flags.ViewChannel) || !permissions.has(Flags.ReadMessageHistory)) {

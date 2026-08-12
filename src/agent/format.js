@@ -10,6 +10,39 @@ import { TZ_OFFSET_HOURS } from '../archive/query.js';
 
 const TZ_OFFSET_MS = TZ_OFFSET_HOURS * 3_600_000;
 
+// Discord のリンク。`https://discord.com/channels/<guild>/<channel>/<message>`
+// で、末尾のメッセージは無いこと (チャンネルへのリンク) もある。DM は guild が `@me`。
+const DISCORD_LINK = /discord(?:app)?\.com\/channels\/(\d{16,21}|@me)\/(\d{16,21})(?:\/(\d{16,21}))?/;
+
+/**
+ * 貼られた文字列から Discord の参照を取り出す。
+ *
+ * ここを素の `/(\d{16,21})/` でやってはいけない。リンクにはスノーフレークが3つ
+ * 並んでいて、最初に当たるのは**サーバー ID**。実際そうなっていて、リンクを貼って
+ * 「これ何？」と聞くと、サーバー ID をメッセージ ID として読みに行っていた。
+ *
+ * リンクなら channel まで分かるので、どのチャンネルを読めばいいかも同時に確定する。
+ *
+ * @returns {{ guildId: string|null, channelId: string|null, messageId: string|null }|null}
+ */
+export function parseDiscordRef(value) {
+  const text = String(value ?? '');
+
+  const link = DISCORD_LINK.exec(text);
+  if (link) {
+    const [, guild, second, third] = link;
+    return third
+      // guild/channel/message
+      ? { guildId: guild === '@me' ? null : guild, channelId: second, messageId: third }
+      // guild/channel (チャンネルへのリンク)
+      : { guildId: guild === '@me' ? null : guild, channelId: second, messageId: null };
+  }
+
+  // リンクでなければ素のスノーフレーク。`<#123>` のようなメンションもここで拾う。
+  const bare = /(\d{16,21})/.exec(text);
+  return bare ? { guildId: null, channelId: null, messageId: bare[1] } : null;
+}
+
 /**
  * 参照番号とメッセージの対応表。1回の実行につき1つ作る。
  * モデルには番号だけを見せ、番号 → 実 ID の変換はこちらで持つ。
@@ -46,12 +79,22 @@ export class RefTable {
       if (entry) return entry;
     }
 
-    const snowflake = /(\d{16,21})/.exec(text);
-    if (snowflake) {
-      return this.byMessageId.get(snowflake[1]) ?? { messageId: snowflake[1] };
+    // リンクなら channel まで取れる。素の正規表現で先頭のスノーフレークを取ると
+    // サーバー ID を掴む (リンクは guild/channel/message の順に並んでいる)。
+    const parsed = parseDiscordRef(text);
+    if (!parsed) return null;
+
+    // チャンネルへのリンクにはメッセージが無い。番号を振った覚えも無いので、
+    // 「どのチャンネルか」だけを返す (read はこれで channel を決められる)。
+    if (!parsed.messageId) {
+      return parsed.channelId ? { messageId: null, channelId: parsed.channelId } : null;
     }
 
-    return null;
+    const known = this.byMessageId.get(parsed.messageId);
+    if (known) return known;
+
+    // 表に無くても、リンクから来たなら channel が分かっている
+    return { messageId: parsed.messageId, channelId: parsed.channelId ?? null };
   }
 
   get(ref) {
@@ -165,7 +208,7 @@ export function fromArchiveRow(row, channelName) {
  * `fromArchiveRow` は `content || extra` で使う。生の Message 側だけ抜けていたので、
  * 同じ規則にそろえる (本文があるときは足さない = 普通の発言のトークンは増えない)。
  */
-function describeExtras(message) {
+export function describeExtras(message) {
   const parts = [];
 
   for (const attachment of message.attachments?.values() ?? []) {
@@ -283,24 +326,48 @@ export function formatMessages(
   return lines.join('\n');
 }
 
-/** Discord の 2000 文字制限に合わせて切る。段落・行の境目を優先する。 */
+/** そのテキストがコードブロックを開いたまま終わっているか。 */
+function fenceLeftOpen(text) {
+  return ((text.match(/```/g) ?? []).length % 2) === 1;
+}
+
+/**
+ * Discord の 2000 文字制限に合わせて切る。段落・行の境目を優先する。
+ *
+ * コードブロックの途中で切ると、続きのメッセージが地の文として描画されて
+ * インデントも等幅も消える。切った側を閉じて、次の先頭で開き直す
+ * (言語指定は引き継がない。素の ``` で開き直す)。
+ */
 export function chunkForDiscord(text, limit = 1900, maxChunks = 3) {
   const chunks = [];
   let rest = String(text ?? '').trim();
+  // 前のチャンクが開いたままだったコードブロックの続き
+  let prefix = '';
 
   while (rest.length > 0 && chunks.length < maxChunks) {
-    if (rest.length <= limit) {
-      chunks.push(rest);
+    if (prefix.length + rest.length <= limit) {
+      chunks.push(prefix + rest);
       rest = ''; // 全部入った。消しておかないと下の「省略しました」が誤って付く
       break;
     }
 
-    const window = rest.slice(0, limit);
+    // 閉じの ``` を足す余地を残す
+    const room = limit - prefix.length - 4;
+    const window = rest.slice(0, room);
     const cut = Math.max(window.lastIndexOf('\n\n'), window.lastIndexOf('\n'));
-    const at = cut > limit * 0.5 ? cut : limit;
+    const at = cut > room * 0.5 ? cut : room;
 
-    chunks.push(rest.slice(0, at).trim());
+    let piece = prefix + rest.slice(0, at).trim();
     rest = rest.slice(at).trim();
+
+    if (fenceLeftOpen(piece)) {
+      piece += '\n```';
+      prefix = '```\n';
+    } else {
+      prefix = '';
+    }
+
+    chunks.push(piece);
   }
 
   // 打ち切ったことを黙っていると、途中で切れた回答を完結したものと読まれてしまう。

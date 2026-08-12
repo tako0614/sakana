@@ -13,6 +13,7 @@
 // 編集で置き換えると、待っている間に他の人が喋った場合に回答が過去の位置に埋まってしまう。
 
 import { agentConfig } from './config.js';
+import { forgetIndicator, rememberIndicator } from './indicators.js';
 
 const NO_MENTIONS = { parse: [], repliedUser: false };
 
@@ -30,7 +31,7 @@ export function toolLabel(name, args = {}) {
 
   if (name === 'read') return args.direction === 'replies' ? '返信をたどる' : '読み込み';
   if (name === 'channels') return 'チャンネル一覧';
-  if (name === 'browser') return 'ブラウザ';
+  if (name === 'browser') return args.action === 'search' ? 'web 検索' : 'ブラウザ';
 
   return name;
 }
@@ -87,6 +88,8 @@ export class ThinkingIndicator {
       this.message = await this.channel.send({ content, allowedMentions: NO_MENTIONS });
       this.lastRendered = content;
       this.lastEditAt = Date.now();
+      // 出した瞬間に控える。ここで落ちても次の起動で消せるようにするため。
+      rememberIndicator(this.message.id, this.channel.id);
     } catch (error) {
       // 送信できない (権限が無いなど) 場合は経過表示なしで続行する。
       console.error('Failed to post thinking indicator:', error);
@@ -132,6 +135,8 @@ export class ThinkingIndicator {
     } catch (error) {
       // メッセージ自体が消えているときだけ本当に諦める (10008 = Unknown Message)。
       if (error?.code === 10008 || error?.status === 404) {
+        // もう無いものを次の起動で消しに行かせない
+        forgetIndicator(this.message.id);
         this.editable = false;
         this.message = null;
         this.stopTimer();
@@ -167,6 +172,7 @@ export class ThinkingIndicator {
     this.message = null;
     if (!message) return;
 
+    forgetIndicator(message.id);
     await message.delete().catch(() => {});
   }
 }

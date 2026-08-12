@@ -4,13 +4,14 @@
 // 全往復ぶんのトークンが増える。使えないツールは最初から出さない
 // (アーカイブ未構築なら検索系を出さない / Chrome が居なければブラウザを出さない)。
 
-import { db as archiveDb, getGuildState, msToSnowflake } from '../archive/db.js';
-import { MESSAGE_CHANNEL_TYPES, canRead } from '../archive/permissions.js';
+import { db as archiveDb, getGuildState, msToSnowflake, snowflakeToMs } from '../archive/db.js';
+import { MESSAGE_CHANNEL_TYPES, canRead, isForumType, isThreadType } from '../archive/permissions.js';
 import { QueryError, collectTerms, parseDateRange, parseQuery } from '../archive/query.js';
-import { aggregateSearch, isChannelAllowed, search, searchSummary } from '../archive/search.js';
+import { aggregateSearch, isChannelAllowed, search, searchSummary, searchThreads } from '../archive/search.js';
 import { topTerms } from '../archive/terms.js';
 import { prewarm } from '../embed/worker.js';
 import { browserToolDefinition, runBrowserAction } from './browser.js';
+import { infoDefinition, runInfo } from './info.js';
 import { resolveAuthorFilter, resolveMemberId } from './members.js';
 import { looksLikeSentence } from './sentence.js';
 import { runSemanticSearch, semanticAvailable } from './semantic.js';
@@ -21,6 +22,7 @@ import {
   fromArchiveRow,
   fromDiscordMessage,
   fromRawMessage,
+  parseDiscordRef,
   shortTime,
   truncate
 } from './format.js';
@@ -65,10 +67,40 @@ function authorLabel(ctx, authorId) {
   return `user:${authorId}`;
 }
 
-async function resolveChannel(ctx, value) {
+/**
+ * 名前からアーカイブ済みスレッド (フォーラムの投稿を含む) の ID を引く。
+ *
+ * 閉じた投稿はギルドのキャッシュに載らないので、名前で指定しても見つからなかった
+ * (検索ヒットの番号を at に渡す経路だけが通っていた)。取り込み済みなら当時の名前を
+ * 覚えているので、そこから ID を出して取りに行く。
+ *
+ * 非公開スレッドは名前で掘り当てられないようにする。getChannelScope が
+ * 「親の権限では判定できない」として弾いている相手を、ここから通してはいけない。
+ */
+function archivedThreadId(ctx, name) {
+  try {
+    const pattern = `%${name.replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
+    const row = archiveDb.prepare(`
+      SELECT channel_id FROM channels
+      WHERE guild_id = ? AND is_thread = 1 AND is_private = 0 AND name LIKE ? ESCAPE '\\'
+      ORDER BY LENGTH(name), message_count DESC
+      LIMIT 1
+    `).get(ctx.guild.id, pattern);
+
+    return row?.channel_id ?? null;
+  } catch {
+    // アーカイブが無い構成でも動くようにする
+    return null;
+  }
+}
+
+export async function resolveChannel(ctx, value) {
   if (!value) return ctx.channel;
 
-  const id = /(\d{16,21})/.exec(String(value))?.[1];
+  // リンクなら channel の位置から取る。先頭のスノーフレークを掴むと
+  // サーバー ID をチャンネル ID として扱うことになる。
+  const parsed = parseDiscordRef(value);
+  const id = parsed?.channelId ?? parsed?.messageId ?? null;
   if (id) {
     const cached = ctx.guild.channels.cache.get(id);
     if (cached) return cached;
@@ -81,9 +113,14 @@ async function resolveChannel(ctx, value) {
   const name = String(value).replace(/^#/, '').toLowerCase();
   const channels = [...ctx.guild.channels.cache.values()];
 
-  return channels.find((channel) => channel.name?.toLowerCase() === name)
-    ?? channels.find((channel) => channel.name?.toLowerCase().includes(name))
-    ?? null;
+  const cached = channels.find((channel) => channel.name?.toLowerCase() === name)
+    ?? channels.find((channel) => channel.name?.toLowerCase().includes(name));
+  if (cached) return cached;
+
+  // キャッシュに無い = 閉じた投稿かもしれない。権限は呼び出し側の
+  // assertReadable が (取ってきた実体に対して) 見るので、ここでは ID を出すだけ。
+  const archived = archivedThreadId(ctx, name);
+  return archived ? await ctx.guild.channels.fetch(archived).catch(() => null) : null;
 }
 
 /** チャンネル指定を配列にそろえる。"a, b" でも ["a","b"] でも受ける。 */
@@ -112,14 +149,38 @@ function compactCount(value) {
  * system prompt には載せない。チャンネル数の多いサーバーだと毎ターン払うことに
  * なるので、必要になったときだけ channels 経由で取りに行かせる。
  * 発言数の多い順に並べる (どこに話が溜まっているかの判断材料になる)。
+ *
+ * 単位は「入れ物」。スレッドとフォーラムの投稿は親に足し込んで、個別には出さない:
+ *   - フォーラム本体は MESSAGE_CHANNEL_TYPES に無いので、以前は一覧から丸ごと
+ *     抜けていた (投稿は取り込まれているのに、その置き場の名前が出ない)
+ *   - 逆にアクティブなスレッドはキャッシュに載るので個別に並び、賑やかな
+ *     チャンネルの投稿だけで上位30件が埋まっていた
+ *   - 閉じた投稿はどちらにも出ない
+ * 「どこに話が溜まっているか」を知るための道具なので、入れ物で数えるのが正しい。
  */
 export function describeChannels(ctx, { limit = 30, filter = null } = {}) {
-  let counts = new Map();
+  // 自分の発言数と、ぶら下がっているスレッドの発言数を分けて持つ
+  const own = new Map();
+  const childMessages = new Map();
+  const childCount = new Map();
+  const topics = new Map();
+
   try {
     const rows = archiveDb
-      .prepare('SELECT channel_id, message_count FROM channels WHERE guild_id = ?')
+      .prepare('SELECT channel_id, parent_id, is_thread, message_count, topic FROM channels WHERE guild_id = ?')
       .all(ctx.guild.id);
-    counts = new Map(rows.map((row) => [row.channel_id, row.message_count]));
+
+    for (const row of rows) {
+      const count = row.message_count ?? 0;
+
+      if (row.is_thread && row.parent_id) {
+        childMessages.set(row.parent_id, (childMessages.get(row.parent_id) ?? 0) + count);
+        childCount.set(row.parent_id, (childCount.get(row.parent_id) ?? 0) + 1);
+      } else {
+        own.set(row.channel_id, count);
+        if (row.topic) topics.set(row.channel_id, row.topic);
+      }
+    }
   } catch {
     // アーカイブが無い構成でも動く
   }
@@ -130,7 +191,10 @@ export function describeChannels(ctx, { limit = 30, filter = null } = {}) {
   let hiddenByFilter = 0;
 
   for (const channel of ctx.guild.channels.cache.values()) {
-    if (!MESSAGE_CHANNEL_TYPES.has(channel.type)) continue;
+    // スレッドは親に足し込んであるので個別には出さない。
+    // フォーラム / メディアは自分では発言を持たないが、投稿の置き場なので出す。
+    const holdsMessages = MESSAGE_CHANNEL_TYPES.has(channel.type) && !isThreadType(channel.type);
+    if (!holdsMessages && !isForumType(channel.type)) continue;
     if (!canRead(channel, ctx.member)) continue;
 
     if (needle && !channel.name?.toLowerCase().includes(needle)) {
@@ -138,7 +202,14 @@ export function describeChannels(ctx, { limit = 30, filter = null } = {}) {
       continue;
     }
 
-    visible.push({ channel, count: counts.get(channel.id) ?? 0 });
+    visible.push({
+      channel,
+      count: (own.get(channel.id) ?? 0) + (childMessages.get(channel.id) ?? 0),
+      threads: childCount.get(channel.id) ?? 0,
+      forum: isForumType(channel.type),
+      // 取り込み前でもキャッシュには載っている
+      topic: topics.get(channel.id) ?? channel.topic ?? ''
+    });
   }
 
   if (visible.length === 0) return null;
@@ -151,17 +222,28 @@ export function describeChannels(ctx, { limit = 30, filter = null } = {}) {
   ));
 
   const shown = visible.slice(0, limit);
-  const names = shown.map((entry) => (
-    hasCounts && entry.count > 0
-      ? `#${entry.channel.name}(${compactCount(entry.count)})`
-      : `#${entry.channel.name}`
-  ));
+
+  // 説明文は絞り込んだときだけ出す。全チャンネルぶん並べると出力が数倍になり、
+  // 「どこに話が溜まっているか」を見たいだけの呼び出しでその費用を払うことになる。
+  const withTopics = shown.length <= 10 && shown.some((entry) => entry.topic);
+
+  const names = shown.map((entry) => {
+    const parts = [];
+    if (hasCounts && entry.count > 0) parts.push(compactCount(entry.count));
+    // 投稿がぶら下がっていることは出す。フォーラムでは発言数より件数が効く。
+    if (entry.threads > 0) parts.push(`${entry.forum ? '投稿' : 'スレ'}${compactCount(entry.threads)}`);
+
+    const head = parts.length > 0 ? `#${entry.channel.name}(${parts.join('・')})` : `#${entry.channel.name}`;
+    return withTopics && entry.topic ? `${head} — ${truncate(entry.topic, 60)}` : head;
+  });
 
   return {
     total: visible.length,
     hiddenByFilter,
+    hasThreads: shown.some((entry) => entry.threads > 0),
     truncated: visible.length > shown.length,
-    text: names.join(' ')
+    // 説明文を出したときは1行1件。並べて書くと読めない
+    text: names.join(withTopics ? '\n' : ' ')
   };
 }
 
@@ -203,6 +285,15 @@ function listChannels(ctx, args) {
   // 見えないチャンネルがあること自体は隠さないが、名前は出さない
   if (result.hiddenByFilter > 0) {
     lines.push(`(filter で ${result.hiddenByFilter} 件を除外)`);
+  }
+
+  // スレッド名が一覧に無いことを言わないと、「そのスレッドは無い」と読まれる。
+  // 名前を知らなくても search は横断で引けるので、そちらへ寄せる。
+  if (result.hasThreads) {
+    lines.push(
+      'スレッドとフォーラムの投稿は親に集計してあり、個別の名前は出していない'
+        + '(search は投稿の中まで横断で引ける。`in:#親の名前` でその配下だけに絞れる)。'
+    );
   }
 
   lines.push('ここに無いチャンネルは呼んだ人に閲覧権限がないので読めない。');
@@ -261,12 +352,17 @@ function clampLimit(value, fallback, max) {
 const ARCHIVE_QUERY_HELP = [
   'query の書き方: 空白で AND / `OR` / `-除外` / `"引用符で句"` / `(括弧)` /',
   '`regex:/pattern/` (本文のみ。空白を含むときは `regex:"/a b/"`) / `reactions:>5` / `reaction:👍` / `len:>200` / `hour:22-4` /',
-  '`weekday:sat,sun` / `domain:github.com` / `mentions:@user` / `is:bot|human|edited|pinned`。'
+  '`weekday:sat,sun` / `domain:github.com` / `mentions:@user` / `tag:解決済み` (フォーラム) /',
+  '`is:bot|human|edited|pinned|unanswered`。'
 ].join(' ');
 
 export function searchToolDefinition({ archiveAvailable, semanticAvailable }) {
   // 使えないモードは出さない。定義は毎ターン送り直すので、出せば毎ターン払う。
-  const modes = ['keyword', ...(semanticAvailable ? ['meaning'] : []), ...(archiveAvailable ? ['count'] : [])];
+  const modes = [
+    'keyword',
+    ...(semanticAvailable ? ['meaning'] : []),
+    ...(archiveAvailable ? ['count', 'posts'] : [])
+  ];
 
   const description = [
     'このサーバーの過去ログを検索する。過去の言動を調べるときはこれ。',
@@ -280,7 +376,9 @@ export function searchToolDefinition({ archiveAvailable, semanticAvailable }) {
       '意味検索も同じ呼び出しの中で自動で走るので、呼び直さなくてよい。'
     ] : []),
     ...(archiveAvailable ? [
-      'mode:count は個別の発言を返さず数だけ返すので安い。by:term はその条件でよく話している話題を出す。'
+      'mode:count は個別の発言を返さず数だけ返すので安い。by:term はその条件でよく話している話題を出す。',
+      'mode:posts はスレッド / フォーラムの投稿を単位にして返す (タイトルも本文も見る)。',
+      '「どの投稿でその話をしているか」を知りたいときはこれ。番号を read の at に渡せば中に入れる。'
     ] : [])
   ].join('');
 
@@ -312,7 +410,7 @@ export function searchToolDefinition({ archiveAvailable, semanticAvailable }) {
  * 同じ6キーの options を3箇所で組んでいて実際に2箇所ずれていたし、定義の
  * 7割は JSON Schema の枠なので、ツールを減らすほど毎ターンの固定費が減る。
  */
-async function runSearch(ctx, args, flags) {
+export async function runSearch(ctx, args, flags) {
   const mode = lower(args.mode) || 'keyword';
   const limit = clampLimit(args.limit, 10, 25);
 
@@ -323,6 +421,13 @@ async function runSearch(ctx, args, flags) {
     return aggregateMessages(ctx, args);
   }
 
+  if (mode === 'posts') {
+    if (!flags.archiveAvailable) {
+      return '投稿の検索はローカルの取り込みが要る。管理者が `/index build` を実行するまでは使えません。';
+    }
+    return searchPosts(ctx, args, limit);
+  }
+
   if (mode === 'meaning') {
     if (!flags.semanticAvailable) {
       return '意味検索は今使えません (ベクトル未作成)。mode を外してキーワードで引いてください。';
@@ -331,7 +436,7 @@ async function runSearch(ctx, args, flags) {
   }
 
   if (mode !== 'keyword') {
-    return `mode が不正です: ${args.mode}。keyword / meaning / count のどれかです。`;
+    return `mode が不正です: ${args.mode}。keyword / meaning / count / posts のどれかです。`;
   }
 
   const { source, needs } = pickSearchSource(args, flags.archiveAvailable);
@@ -902,6 +1007,84 @@ async function searchViaDiscord(ctx, args, limit, archiveAvailable) {
 }
 
 
+// ---------------------------------------------------------------- mode:posts (投稿)
+
+/**
+ * 投稿 (スレッド / フォーラムの投稿) を単位にして探す。
+ *
+ * 発言単位で返すと「どの投稿の話か」が読み手に分からない。フォーラムでは
+ * 1投稿 = 1話題なので、そこを単位にしないと「○○の投稿ある？」に答えられない。
+ */
+async function searchPosts(ctx, args, limit) {
+  const options = await searchOptions(ctx, args);
+
+  if (!options.query && options.extra.length === 0) {
+    return '検索条件を1つ以上指定してください。';
+  }
+
+  // タイトル一致に使う素の語。フィルタ (from: など) は語ではないので外れる。
+  let titleTerms = [];
+  try {
+    const { ast } = parseQuery(options.query);
+    titleTerms = collectTerms(ast).slice(0, 4);
+  } catch {
+    // 解釈できないクエリは素の語として扱う
+    titleTerms = options.query ? [options.query] : [];
+  }
+
+  const offset = Math.max(0, Math.floor(Number(args.offset) || 0));
+  const rows = searchThreads(options, { limit, offset, titleTerms });
+
+  if (rows.length === 0) {
+    return [
+      '条件に合う投稿はありませんでした。',
+      'スレッドの外 (普通のチャンネル) の発言は mode:posts では出ないので、mode を外して引き直すこと。'
+    ].join('');
+  }
+
+  const lines = rows.map((row) => {
+    const ref = ctx.refs.add({
+      guildId: ctx.guild.id,
+      channelId: row.channel_id,
+      channelName: row.name,
+      // 起点は中にある実在の発言。スレッド ID は親側の発言なので around に使えない
+      messageId: row.oldest_id ?? row.newest_id ?? row.channel_id,
+      authorId: '0',
+      authorName: 'unknown',
+      content: row.name,
+      createdAt: snowflakeToMs(row.oldest_id ?? row.newest_id ?? '0')
+    });
+
+    const where = row.parent_id ? `#${channelName(ctx, row.parent_id)}` : '';
+    const last = snowflakeToMs(row.newest_id ?? '0');
+    const tags = String(row.applied_tags ?? '').trim();
+
+    const tail = [
+      `${row.message_count ?? 0}件`,
+      row.hits > 0 ? `一致${row.hits}` : null,
+      row.title_hit ? 'タイトル一致' : null,
+      tags ? `[${tags.split(/\s+/).join(' ')}]` : null,
+      last > 0 ? `最終 ${shortTime(last)}` : null
+    ].filter(Boolean).join(' ');
+
+    return `${ref}) [${row.name}${where ? ` ${where}` : ''}] ${tail}`;
+  });
+
+  const notes = [
+    '中を読むなら at にその番号を渡す。',
+    // タグは取り込み時点のもの。当たらない = 付いていない、ではない
+    /tag:/.test(options.query) || options.extra.some((entry) => entry.key === 'tag')
+      ? '(タグは取り込んだ時点のもの。取り込み前の投稿には付いていないので、0件を「そのタグは無い」と読まないこと)'
+      : null
+  ].filter(Boolean);
+
+  return [
+    `投稿 ${rows.length} 件${offset > 0 ? ` (${offset + 1} 件目から)` : ''} ・ タイトル一致を上に、次にヒット数の多い順`,
+    ...lines,
+    ...notes
+  ].join('\n');
+}
+
 // ---------------------------------------------------------------- read
 
 export function readDefinition(archiveAvailable) {
@@ -915,6 +1098,7 @@ export function readDefinition(archiveAvailable) {
         'チャンネルのメッセージを時系列で読む。呼ばれたチャンネルの直近の流れは既に渡してあるので、',
         '検索で出た発言の前後を追うときや、別のチャンネル・別の時期を読みたいときに使う。',
         'at に search の参照番号を渡せばその発言の周辺を読む (別チャンネルのヒットでも channel の指定は不要)。',
+        'フォーラムを channel に渡すと投稿の一覧を番号付きで返すので、読みたい投稿の番号を at に渡す。',
         '検索結果だけでは文脈が分からないので、断定する前にこれで周辺を読むこと。',
         'channel は "general, dev" のようにカンマ区切りで最大5つ渡せる。見比べたいときは1件ずつ呼ばない。'
       ].join(''),
@@ -958,6 +1142,12 @@ async function readManyChannels(ctx, wanted, args, { anchor = { kind: 'none' }, 
       channel = assertReadable(ctx, await resolveChannel(ctx, name));
     } catch (error) {
       problems.push(`${name}: ${error.message}`);
+      continue;
+    }
+
+    // フォーラムが混ざっていても行き止まりにしない。投稿の一覧を1区画として出す。
+    if (isForumType(channel.type)) {
+      sections.push(await listThreadContainer(ctx, channel, Math.min(perChannel, 20)));
       continue;
     }
 
@@ -1010,6 +1200,33 @@ async function readManyChannels(ctx, wanted, args, { anchor = { kind: 'none' }, 
 }
 
 /**
+ * メッセージ ID から、それがどのチャンネルの発言かを引く。
+ *
+ * 検索結果の番号を経由せずに生の ID (やリンク) を渡されたとき、どこを読めばいいかが
+ * 分からないと「呼ばれたチャンネル」に落ちる。他所の ID でそこを around すると、
+ * 取れないか、まるで無関係な場所を読む。readReplies が同じ引き方をしているので、
+ * 材料は最初からあった。
+ *
+ * 実行者に見えないチャンネルは返さない。ここを通すと、ID を知っているだけで
+ * 権限のないチャンネルの前後が読めてしまう。
+ */
+function locateMessage(ctx, messageId) {
+  if (!messageId) return null;
+
+  try {
+    const row = archiveDb
+      .prepare('SELECT channel_id FROM messages WHERE message_id = ?')
+      .get(String(messageId));
+
+    if (!row?.channel_id) return null;
+    return isChannelAllowed(row.channel_id, ctx.channelScope) ? row.channel_id : null;
+  } catch {
+    // アーカイブが無い構成でも動くようにする
+    return null;
+  }
+}
+
+/**
  * at を起点に解く。参照番号 / メッセージ ID / 日付 のどれでも受ける。
  *
  * 数字の扱いに注意が要る。1〜4桁の数字は参照番号のつもりで書かれているので、
@@ -1025,7 +1242,9 @@ export function resolveAnchor(ctx, at) {
     return {
       kind: 'message',
       messageId: entry.messageId,
-      channelId: entry.channelId ?? null,
+      // どのチャンネルか分からないままだと runRead が「呼ばれたチャンネル」に
+      // 落ちて、他所の ID でそこを探しに行く。アーカイブが知っているなら埋める。
+      channelId: entry.channelId ?? locateMessage(ctx, entry.messageId),
       createdAt: entry.createdAt ?? null
     };
   }
@@ -1122,7 +1341,91 @@ function durationLabel(ms) {
   return hours < 24 ? `${hours}時間` : `${Math.round(hours / 24)}日`;
 }
 
-async function runRead(ctx, args) {
+/**
+ * フォーラム / メディアの投稿一覧。
+ *
+ * フォーラム本体は発言を持たない (discord.js の ForumChannel に `.messages` が無い) ので、
+ * `read channel:#フォーラム` は「メッセージを取得できません」で行き止まりだった。
+ * 中身は全部スレッドなので、ここで一覧を出して番号を振り、そのまま `at` に渡せるようにする。
+ *
+ * 起点にする ID はスレッド ID ではなく `oldest_id` (中にある実在の発言)。
+ * スレッド ID は「そのスレッドが始まった親の発言」なので、投稿の中では
+ * around の起点にならないことがある (フォーラムだけは両者が一致する)。
+ */
+async function listThreadContainer(ctx, container, limit) {
+  let rows = [];
+  try {
+    rows = archiveDb.prepare(`
+      SELECT channel_id, name, message_count, oldest_id, newest_id
+      FROM channels
+      WHERE guild_id = ? AND parent_id = ? AND is_thread = 1 AND is_private = 0
+      ORDER BY CAST(newest_id AS INTEGER) DESC
+      LIMIT ?
+    `).all(ctx.guild.id, container.id, limit);
+  } catch {
+    // アーカイブが無い構成でも動く
+  }
+
+  const label = isForumType(container.type) ? '投稿' : 'スレッド';
+  const visible = rows.filter((row) => isChannelAllowed(row.channel_id, ctx.channelScope));
+
+  // 取り込み前でも行き止まりにしない。生きている投稿だけは API から拾える。
+  if (visible.length === 0) {
+    const active = await container.threads?.fetchActive?.().catch(() => null);
+    const threads = [...(active?.threads?.values() ?? [])].slice(0, limit);
+
+    if (threads.length === 0) return `#${container.name} には読める${label}がありませんでした。`;
+
+    const lines = threads.map((thread) => {
+      const ref = ctx.refs.add({
+        guildId: ctx.guild.id,
+        channelId: thread.id,
+        channelName: thread.name,
+        messageId: thread.id,
+        authorId: thread.ownerId ?? '0',
+        authorName: 'unknown',
+        content: thread.name,
+        createdAt: thread.createdTimestamp ?? Date.now()
+      });
+      return `${ref}) [${thread.name}] ${thread.messageCount ?? '?'}件`;
+    });
+
+    return [
+      `#${container.name} の${label} ${threads.length} 件 (取り込み前なので、いま開いているぶんだけ)`,
+      ...lines,
+      `(中を読むなら at にその番号。閉じた${label}まで見るには管理者の \`/index build\` が要る)`
+    ].join('\n');
+  }
+
+  const lines = visible.map((row) => {
+    const ref = ctx.refs.add({
+      guildId: ctx.guild.id,
+      channelId: row.channel_id,
+      channelName: row.name,
+      // 中にある実在の発言を起点にする (無ければ最後の発言)
+      messageId: row.oldest_id ?? row.newest_id ?? row.channel_id,
+      authorId: '0',
+      authorName: 'unknown',
+      content: row.name,
+      createdAt: snowflakeToMs(row.oldest_id ?? row.newest_id ?? '0')
+    });
+
+    const last = snowflakeToMs(row.newest_id ?? '0');
+    const tail = [`${row.message_count ?? 0}件`, last > 0 ? `最終 ${shortTime(last)}` : null]
+      .filter(Boolean)
+      .join(' ');
+
+    return `${ref}) [${row.name}] ${tail}`;
+  });
+
+  return [
+    `#${container.name} の${label} ${visible.length} 件 (最終発言の新しい順)`,
+    ...lines,
+    `(中を読むなら at にその番号 / この配下だけを検索するなら search の query に \`in:#${container.name}\`)`
+  ].join('\n');
+}
+
+export async function runRead(ctx, args) {
   const wanted = normalizeChannelArg(args.channel);
   const direction = lower(args.direction) || 'around';
   const anchor = resolveAnchor(ctx, args.at);
@@ -1158,6 +1461,11 @@ async function runRead(ctx, args) {
           ?? await ctx.guild.channels.fetch(anchor.channelId).catch(() => null)
         : ctx.channel
   );
+
+  // フォーラム / メディアは中身が全部スレッドなので、投稿の一覧を返す
+  if (isForumType(channel.type)) {
+    return listThreadContainer(ctx, channel, clampLimit(args.limit, 20, 50));
+  }
 
   if (typeof channel.messages?.fetch !== 'function') {
     return 'そのチャンネルからはメッセージを取得できません。';
@@ -1413,6 +1721,7 @@ export async function buildToolset(ctx) {
     { definition: searchToolDefinition(flags), handler: (args) => runSearch(ctx, args, flags) },
     { definition: readDefinition(archiveAvailable), handler: (args) => runRead(ctx, args) },
     { definition: channelsDefinition, handler: (args) => listChannels(ctx, args) },
+    { definition: infoDefinition, handler: (args) => runInfo(ctx, args) },
     ...(browserAvailable
       ? [{ definition: browserToolDefinition(ctx.browserFull), handler: (args) => runBrowserAction(ctx, args) }]
       : [])
