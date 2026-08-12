@@ -42,6 +42,7 @@ import argparse
 import json
 import math
 import os
+import re
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -77,6 +78,9 @@ parser.add_argument("--max-steps", type=int, default=0, help="0 なら最後ま�
 # 窓や batch を大きくして OOM したときだけ立てる
 parser.add_argument("--grad-ckpt", action="store_true")
 parser.add_argument("--val-batches", type=int, default=0, help="0 なら val 全部")
+# 添付だけの発言 (`[画像]` など) を損失から外す。文脈には残るので「画像が貼られて
+# 誰かが反応する」流れは学べるが、自分では書かなくなる
+parser.add_argument("--mask-attachments", action=argparse.BooleanOptionalAction, default=True)
 # 1 epoch あたり 1.2GB (bf16) 出る。全部残すと 8 epoch で 9.6GB を上げることになるので、
 # 新しい方から数個だけ残す。どの epoch が一番口調が濃いかは history.json の
 # サンプルで判断できるので、重みを全部持つ必要はない
@@ -148,6 +152,18 @@ tok = AutoTokenizer.from_pretrained(args.base)
 eos = tok.eos_token_id
 
 
+# 添付だけの発言。build-sft.mjs が `[画像]` `[動画]` … の形で出す。
+ATTACHMENT_ONLY = re.compile(
+    r"^[^:\n]{1,12}: (\[(?:画像|動画|音声|ファイル|添付|圧縮ファイル|埋め込み|スタンプ)\])$",
+    re.MULTILINE,
+)
+
+
+def attachment_spans(text):
+    """添付だけの発言の**本文の**文字範囲。ラベル (`たこ: `) は含めない。"""
+    return [m.span(1) for m in ATTACHMENT_ONLY.finditer(text)]
+
+
 class Packed(Dataset):
     """会話を EOS で継いで seq 長に詰める。
 
@@ -158,29 +174,70 @@ class Packed(Dataset):
 
     def __init__(self, texts, seq):
         ids = []
+        labels = []
+        masked = 0
+
         for text in texts:
-            ids.extend(tok(text, add_special_tokens=False).input_ids)
+            encoded = tok(text, add_special_tokens=False, return_offsets_mapping=True)
+            piece = encoded.input_ids
+            keep = [True] * len(piece)
+
+            if args.mask_attachments:
+                # 添付だけの発言は**文脈には残すが、書き方は教えない**。
+                #
+                # 丸ごと落とすと「いいね」が何に対する反応か分からなくなる (前のコーパスが
+                # それで、画像を貼って反応する流れを学べなかった)。逆に普通に学習させると
+                # モデルが返答として `[画像]` を吐く — bot は画像を投稿できないので無意味で、
+                # evex-1 が `<file>` で返答の 38% を潰したのと同じ形になる。
+                #
+                # なので本文の位置だけ損失から外す。ラベル (`たこ: `) と改行は残す —
+                # 「次に誰が喋るか」は学ばせたい。
+                # **重なるものを外す** (完全に含まれるものだけでは足りない)。
+                # BPE は括弧を隣とくっつけるので、`[画像]` は実際にはこう割れる:
+                #   ' ['  ← 直前の空白と合体。完全包含の条件では範囲の外
+                #   '画像'
+                #   ']\n' ← 改行と合体。同じく外
+                # 中だけ外しても `名前: ` の直後に ` [` が来ることを学び続けるので、
+                # 抑えたい失敗がそのまま残る。
+                for start, end in attachment_spans(text):
+                    for i, (a, b) in enumerate(encoded.offset_mapping):
+                        if b > a and b > start and a < end:
+                            keep[i] = False
+
+            ids.extend(piece)
+            labels.extend(t if k else -100 for t, k in zip(piece, keep))
+            masked += keep.count(False)
+
             ids.append(eos)
+            labels.append(eos)
+
         # 端数は捨てる。1 窓に満たない分だけなので影響は無い
         usable = len(ids) // seq * seq
         self.ids = torch.tensor(ids[:usable], dtype=torch.long)
+        self.labels = torch.tensor(labels[:usable], dtype=torch.long)
         self.seq = seq
         self.n = usable // seq
         self.tokens = len(ids)
+        self.masked = masked
 
     def __len__(self):
         return self.n
 
     # ずらさずに返す。`labels=` を渡すと transformers が内部で 1 つずらすので、
     # ここでもずらすと 2 つ先を予測させることになる (実際にやって val 7.12 が出た。
-    # base モデルの日本語なら 3 前後が出るはずの値で、サンプルも崩れていた)
+    # base モデルの日本語なら 3 前後が出るはずの値で、サンプルも崩れていた)。
+    #
+    # labels は ids と同じ長さで、損失から外す位置だけ -100 にしてある。
+    # 内容が違うだけでずれてはいないので、内部のずらしはそのまま正しく効く。
     def __getitem__(self, i):
-        return self.ids[i * self.seq : (i + 1) * self.seq]
+        lo, hi = i * self.seq, (i + 1) * self.seq
+        return self.ids[lo:hi], self.labels[lo:hi]
 
 
 train_set = Packed(load_split("train"), args.seq)
 val_set = Packed(load_split("val"), args.seq)
-print(f"train {train_set.tokens:,} tokens / {len(train_set):,} 窓", flush=True)
+print(f"train {train_set.tokens:,} tokens / {len(train_set):,} 窓 "
+      f"/ 損失から外した {train_set.masked:,}", flush=True)
 print(f"val   {val_set.tokens:,} tokens / {len(val_set):,} 窓", flush=True)
 
 train_loader = DataLoader(train_set, batch_size=args.batch, shuffle=True, drop_last=True)
@@ -224,10 +281,10 @@ def evaluate():
     model.eval()
     loss_sum = 0.0
     count = 0
-    for x in val_loader:
-        x = x.to(device)
+    for x, y in val_loader:
+        x, y = x.to(device), y.to(device)
         with forward_ctx():
-            loss_sum += model(input_ids=x, labels=x).loss.item()
+            loss_sum += model(input_ids=x, labels=y).loss.item()
         count += 1
         # GPU なら val 全部 (214 窓) で 2 秒なので既定は無制限。
         # CPU で形を確かめるときだけ絞る — 素で 11 分かかって固まって見えた
@@ -298,10 +355,10 @@ for epoch in range(1, args.epochs + 1):
     loss_sum = 0.0
     opt.zero_grad(set_to_none=True)
 
-    for i, x in enumerate(train_loader):
-        x = x.to(device)
+    for i, (x, y) in enumerate(train_loader):
+        x, y = x.to(device), y.to(device)
         with forward_ctx():
-            loss = model(input_ids=x, labels=x).loss
+            loss = model(input_ids=x, labels=y).loss
         scaler.scale(loss / args.accum).backward()
         loss_sum += loss.item()
         seen += 1
