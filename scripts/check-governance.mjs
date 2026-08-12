@@ -351,7 +351,29 @@ assert.ok(governanceDb.markEvidenceDisclosed(evidenceId, 123456999).disclosed_at
 governanceDb.addCaseSubmission(caseWithTime.id, 'a', 'defense', '反論本文');
 assert.equal(governanceDb.listCaseSubmissions(caseWithTime.id)[0].kind, 'defense');
 governanceDb.updateCase(caseWithTime.id, { public_thread_id: 'public-court' });
-const { recordCourtSubmission, recordCourtSubmissionEdit } = await import('../src/governance/service.js');
+const {
+  approveCase,
+  castAndPublishVote,
+  recordCourtSubmission,
+  recordCourtSubmissionEdit
+} = await import('../src/governance/service.js');
+governanceDb.updateProposal(proposal.id, {
+  forum_thread_id: 'public-proposal',
+  stage_ends_at: Date.now() + 60_000
+});
+const publicVoteMessages = [];
+const proposalThread = {
+  isThread: () => true,
+  fetchStarterMessage: async () => null,
+  send: async (payload) => { publicVoteMessages.push(payload.content); }
+};
+await castAndPublishVote({
+  guildId: 'g1',
+  user: { id: 't3' },
+  guild: { channels: { fetch: async (id) => id === 'public-proposal' ? proposalThread : null } }
+}, proposal.id, 'yes');
+assert.match(publicVoteMessages[0], /<@t3> が 賛成 に投票しました \(変更前: 棄権\)/,
+  '記名投票の選択変更を法案投稿へ公開する');
 const courtSubmissionCount = governanceDb.listCaseSubmissions(caseWithTime.id).length;
 assert.equal(await recordCourtSubmission({
   id: 'court-submission-1',
@@ -484,6 +506,38 @@ const sanction = governanceDb.createSanction({
 });
 assert.equal(governanceDb.getCaseSanction(caseWithTime.id).definition_code, 'SLOW_MODE');
 assert.equal(governanceDb.listSanctions('g2', ['executed']).length, 1);
+governanceDb.updateGovernanceGuild('g2', { trusted_role_id: 'trusted-g2' });
+const approvalCase = governanceDb.createCase({
+  guildId: 'g2', reporterId: 'approval-reporter', accusedId: 'approval-accused',
+  lawId: law.id, offenseCode: 'O1', summary: '公開承認test', status: 'approval'
+});
+governanceDb.updateCase(approvalCase.id, { public_thread_id: 'public-approval-case' });
+governanceDb.createSanction({
+  caseId: approvalCase.id, guildId: 'g2', userId: 'approval-accused', type: 'kick',
+  status: 'pending_approval', requiredApprovals: 2, appealable: false
+});
+const publicApprovalMessages = [];
+const approvalThread = {
+  isThread: () => true,
+  fetchStarterMessage: async () => null,
+  send: async (payload) => { publicApprovalMessages.push(payload.content); }
+};
+const approvalInteraction = {
+  guildId: 'g2',
+  user: { id: 'approval-voter' },
+  member: { id: 'approval-voter', roles: { cache: { has: (id) => id === 'trusted-g2' } } },
+  guild: {
+    roles: { cache: new Map([['trusted-g2', { name: '貴族院' }]]) },
+    channels: { fetch: async (id) => id === 'public-approval-case' ? approvalThread : null }
+  }
+};
+await approveCase(approvalInteraction, approvalCase.id, 'approve');
+await approveCase(approvalInteraction, approvalCase.id, 'reject');
+assert.match(publicApprovalMessages[0], /<@approval-voter> が執行を承認しました。承認 1\/2/,
+  '執行承認者と選択を事件投稿へ公開する');
+assert.match(publicApprovalMessages[1], /執行を拒否しました \(変更前: 承認\)。承認 0\/2/,
+  '執行承認の選択変更も事件投稿へ公開する');
+governanceDb.updateCase(approvalCase.id, { status: 'closed' });
 const restrictionStart = Date.now();
 governanceDb.activateRestriction({
   sanctionId: sanction.id,
