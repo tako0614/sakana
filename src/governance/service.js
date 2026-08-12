@@ -71,6 +71,7 @@ import {
   createCourtThreads,
   createProposalPost,
   executeDiscordSanction,
+  ensureGovernanceGazetteTopic,
   ensureGovernanceStatuteForum,
   postCourtUpdate,
   postPrivateCourtUpdate,
@@ -1263,6 +1264,7 @@ export async function runGovernanceScheduler(client) {
         console.error(`Failed to ensure governance mention roles in ${guild.id}:`, error);
       }
       try {
+        await ensureGovernanceGazetteTopic(guild, currentGovernance);
         const statuteForum = await ensureGovernanceStatuteForum(guild, currentGovernance);
         const statuteForumChanged = statuteForum.id !== currentGovernance.statute_forum_id;
         if (statuteForumChanged) {

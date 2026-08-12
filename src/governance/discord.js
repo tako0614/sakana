@@ -15,6 +15,8 @@ import {
 
 const TAGS = ['草案', '違憲審査', '討議', '投票', '成立', '否決', '廃案'];
 const STATUTE_TAGS = ['現行憲法', '旧憲法', '現行法', '停止', '違憲', '廃止'];
+const STATUTE_TOPIC = '現行憲法と法律の公開正本です。1法令1投稿で、旧法令も状態付きで保存します。';
+const GAZETTE_TOPIC = '成立・改正・判決・執行・技術操作を時系列に残す公開履歴です。現行本文は法令集を参照してください。';
 
 const APPEAL_DENY = {
   SendMessages: false,
@@ -74,7 +76,7 @@ async function createStatuteForum(guild, categoryId) {
     name: '法令集',
     type: ChannelType.GuildForum,
     parent: categoryId,
-    topic: '現行憲法と法律の公開正本です。1法令1投稿で、旧法令も状態付きで保存します。',
+    topic: STATUTE_TOPIC,
     availableTags: STATUTE_TAGS.map((name) => ({ name, moderated: true })),
     defaultAutoArchiveDuration: 10_080,
     permissionOverwrites: statuteForumOverwrites(guild),
@@ -209,7 +211,7 @@ export async function createGovernanceSurfaces(guild) {
     name: '官報',
     type: ChannelType.GuildText,
     parent: category.id,
-    topic: '成立・改正・判決・執行・技術操作を時系列に残す公開履歴です。現行本文は法令集を参照してください。',
+    topic: GAZETTE_TOPIC,
     permissionOverwrites: [
       {
         id: guild.id,
@@ -239,9 +241,21 @@ export async function ensureGovernanceStatuteForum(guild, governance) {
   const existing = governance.statute_forum_id
     ? await guild.channels.fetch(governance.statute_forum_id).catch(() => null)
     : null;
-  if (existing?.type === ChannelType.GuildForum) return existing;
+  if (existing?.type === ChannelType.GuildForum) {
+    if (existing.topic !== STATUTE_TOPIC) await existing.setTopic(STATUTE_TOPIC, '法令集の説明を同期');
+    return existing;
+  }
   if (!governance.category_id) throw new Error('統治カテゴリがないため法令集を作成できません。');
   return createStatuteForum(guild, governance.category_id);
+}
+
+export async function ensureGovernanceGazetteTopic(guild, governance) {
+  const gazette = await guild.channels.fetch(governance.gazette_channel_id).catch(() => null);
+  if (!gazette?.isTextBased?.() || typeof gazette.setTopic !== 'function') {
+    throw new Error('官報channelが見つかりません。');
+  }
+  if (gazette.topic !== GAZETTE_TOPIC) await gazette.setTopic(GAZETTE_TOPIC, '官報の説明を同期');
+  return gazette;
 }
 
 export function statutePublicationState(instrumentType, status) {
