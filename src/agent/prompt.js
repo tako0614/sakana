@@ -97,6 +97,7 @@ export function buildSystemPrompt(ctx, toolset) {
   if (toolset.governanceAvailable) {
     lines.push(
       '- 現行憲法・法律・法案・事件・行政行為について聞かれたら、会話ログではなく `governance` の正本を読む。',
+      '- 憲法・法律を読む場所を聞かれたら、`governance` が返す法令集channelをそのまま案内する。',
       '- 新しい法律は @立法、申立て・違憲審査・上訴は @裁判 が正式入口。一般agentから実行したふりをしない。'
     );
   }

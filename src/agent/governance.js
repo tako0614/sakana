@@ -78,6 +78,7 @@ export function runGovernanceInfo(ctx, args) {
     return [
       `状態: ${governance.status} / 執行: ${governance.enforcement_mode}`,
       `憲法: v${constitution?.version ?? '?'} / hash ${constitution?.content_hash?.slice(0, 12) ?? '?'}`,
+      `法令集: <#${governance.statute_forum_id || governance.gazette_channel_id}>`,
       `現行法: ${listLaws(guildId).length}件`,
       `進行中法案: ${listProposals(guildId, { statuses: ['drafting', 'draft', 'constitutional_review', 'debate', 'voting'], limit: 100 }).length}件`,
       `進行中事件: ${listCases(guildId, { statuses: ['filing', 'defense', 'deliberation', 'approval', 'appeal_window', 'appeal'], limit: 100 }).length}件`
@@ -86,16 +87,17 @@ export function runGovernanceInfo(ctx, args) {
   if (action === 'constitution') {
     const constitution = getActiveConstitution(guildId);
     return constitution
-      ? `現行憲法 v${constitution.version}\n\n${constitution.content}\n\nPolicy:\n${JSON.stringify(constitution.policy)}`
+      ? `公開場所: 法令集 <#${governance.statute_forum_id || governance.gazette_channel_id}>\n現行憲法 v${constitution.version}\n\n${constitution.content}\n\nPolicy:\n${JSON.stringify(constitution.policy)}`
       : '現行憲法がありません。';
   }
   if (action === 'laws') {
     const laws = listLaws(guildId);
-    return laws.map((law) => `#${law.id} ${law.code} ${law.title} / effective ${new Date(law.effective_at).toISOString()}`).join('\n') || '現行法はありません。';
+    return `公開場所: 法令集 <#${governance.statute_forum_id || governance.gazette_channel_id}>\n`
+      + (laws.map((law) => `#${law.id} ${law.code} ${law.title} / effective ${new Date(law.effective_at).toISOString()}`).join('\n') || '現行法はありません。');
   }
   if (action === 'law') {
     const law = sameGuild(getLaw(integerId(args.id)), guildId, '法律');
-    return `#${law.id} ${law.code} ${law.title}\n\n${law.text}\n\nProvisions:\n${JSON.stringify(law.provisions)}`;
+    return `公開場所: 法令集 <#${governance.statute_forum_id || governance.gazette_channel_id}>\n#${law.id} ${law.code} ${law.title}\n\n${law.text}\n\nProvisions:\n${JSON.stringify(law.provisions)}`;
   }
   if (action === 'proposals') {
     const proposals = listProposals(guildId, { limit: 50 });

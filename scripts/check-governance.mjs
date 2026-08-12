@@ -666,6 +666,8 @@ const visibleGovernanceContext = {
 };
 assert.match(runGovernanceInfo(visibleGovernanceContext, { action: 'law', id: law.id }), /LAW-TEST/,
   '@Evex公式から現行法の正本を読める');
+assert.match(runGovernanceInfo(visibleGovernanceContext, { action: 'constitution' }), /公開場所: 法令集 <#statutes>/,
+  '@Evex公式から人が読む法令集channelも案内する');
 assert.throws(
   () => runGovernanceInfo({
     ...visibleGovernanceContext,
