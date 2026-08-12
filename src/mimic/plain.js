@@ -154,16 +154,50 @@ export function buildPlainPrompt(turns, { channelId = null, trailingRole = null 
 // 本文に `メモ: あれ` のような行があると誤爆するが、学習データにも同じ曖昧さが
 // あるのでモデルの側も同じ形を見ている。切りすぎる方が、他人の発言を捏造して
 // 流すより害が小さい。
-const NEXT_TURN = /\n[^\n:]{1,12}:[ 　]/;
+const NEXT_TURN = /\n([^\n:]{1,12}):[ 　]/;
 
-/** 生成された続きから最初の1発言だけ取る。 */
-export function plainFirstTurn(text) {
-  const raw = String(text ?? '');
-  const cut = raw.search(NEXT_TURN);
-  const body = cut >= 0 ? raw.slice(0, cut) : raw;
+// **同じ人が続けて喋るぶんは残す。** Discord では普通のことで、学習データでも
+// 話者の塊 368,649 個のうち 27.4% が2連続以上 (2連続 17.8% / 3連続 5.6% /
+// 4連続 2.0% で 98.0%)。1発言で切っていたので、モデルが学習したその形を
+// 毎回捨てて、必ず一言だけ返す不自然な相手になっていた。
+//
+// 4 で止めるのは 98% がそこに収まるから。**他人が喋り出したら必ず切る** —
+// 実在の人の発言を捏造して本人のサーバーに流す方が、短く切るより害が大きい。
+const MAX_OWN_TURNS = Number(process.env.MIMIC_MAX_TURNS ?? 4);
+const MAX_REPLY_CHARS = Number(process.env.MIMIC_MAX_REPLY_CHARS ?? 400);
 
+/**
+ * 生成された続きから、**その人が続けて喋ったぶんだけ**取る。
+ *
+ * label はプロンプトの末尾に置いた話者ラベル。省略すると 1 発言で切る
+ * (誰として書かせたか分からないので、同じ人かどうかを判定できない)。
+ */
+export function plainOwnTurns(text, label = null) {
   // 学習データにチャンネル行が入っているので、続きに出てきたら会話の切れ目
-  return body.split(/\n#(?:ch\d+|other)\b/)[0].trim();
+  let rest = String(text ?? '').split(/\n#(?:ch\d+|other)\b/)[0];
+  const turns = [];
+
+  for (let i = 0; i < Math.max(1, MAX_OWN_TURNS); i += 1) {
+    const found = rest.match(NEXT_TURN);
+    if (!found) {
+      turns.push(rest);
+      break;
+    }
+
+    turns.push(rest.slice(0, found.index));
+    // 他人が喋り出した (or 誰として書かせたか不明) ならここで終わり
+    if (!label || found[1] !== label) break;
+    rest = rest.slice(found.index + found[0].length);
+  }
+
+  const cleaned = turns.map((turn) => turn.trim()).filter(Boolean);
+
+  // 長すぎるときは**発言ごと**落とす。途中で切ると文が壊れる
+  while (cleaned.length > 1 && cleaned.join('\n').length > MAX_REPLY_CHARS) {
+    cleaned.pop();
+  }
+
+  return cleaned.join('\n');
 }
 
 // 返答として使えない発言。学習側 (finetune.py の UNUSABLE_BODY) が損失から外して

@@ -14,9 +14,9 @@
 
 import { continuationOf, endpointFor, generate, roleScheme } from './client.js';
 import {
-  assignPlainRoles, buildPlainPrompt, isUnusableReply, labelFor, plainFirstTurn, plainText
+  assignPlainRoles, buildPlainPrompt, isUnusableReply, labelFor, plainOwnTurns, plainText
 } from './plain.js';
-import { buildPrompt, firstTurn, messageText } from './serialize.js';
+import { buildPrompt, messageText, ownTurns } from './serialize.js';
 import { exampleTurns, hasOptedOut, tokenFor } from './speakers.js';
 
 // 短すぎる返答は引き直す。CPU で数秒かかるので回数は絞る
@@ -61,7 +61,7 @@ async function tokenPrompt(userId, { topic, engine }) {
   if (token && scheme?.speakers?.includes(token)) {
     // 本命。お題があれば誰かが振った形にして、その人に答えさせる
     const turns = topic ? [{ token: other, reply: false, content: messageText(topic) }] : [];
-    return { prompt: buildPrompt(turns, token), how: 'token' };
+    return { prompt: buildPrompt(turns, token), how: 'token', trailing: token };
   }
 
   // 48人の外。実発言を例に出して、同じ調子の続きを書かせる
@@ -73,7 +73,11 @@ async function tokenPrompt(userId, { topic, engine }) {
   }
   if (topic) turns.push({ token: other, reply: false, content: messageText(topic) });
 
-  return { prompt: buildPrompt(turns, other), how: examples.length ? 'examples' : 'empty' };
+  return {
+    prompt: buildPrompt(turns, other),
+    how: examples.length ? 'examples' : 'empty',
+    trailing: other
+  };
 }
 
 /** 素の日本語形式 (evex-ft-1) のプロンプト。 */
@@ -89,7 +93,8 @@ function plainPrompt(userId, { topic, channelId, askerId }) {
     const turns = topic ? [{ role: asker, content: plainText(topic) }] : [];
     return {
       prompt: buildPlainPrompt(turns, { channelId, trailingRole: label }),
-      how: 'label'
+      how: 'label',
+      trailing: label
     };
   }
 
@@ -107,7 +112,8 @@ function plainPrompt(userId, { topic, channelId, askerId }) {
 
   return {
     prompt: buildPlainPrompt(turns, { channelId, trailingRole: me }),
-    how: examples.length ? 'examples' : 'empty'
+    how: examples.length ? 'examples' : 'empty',
+    trailing: me
   };
 }
 
@@ -130,11 +136,16 @@ export async function impersonate(userId, { topic = null, channelId = null, aske
 
   if (built.how === 'empty') return { text: null, how: 'empty' };
 
-  const cut = format === 'plain' ? plainFirstTurn : firstTurn;
+  // 同じ人の連投は残し、他人が喋り出したら切る。末尾に置いたラベルが要る
+  const cut = format === 'plain'
+    ? (text) => plainOwnTurns(text, built.trailing)
+    : (text) => ownTurns(text, built.trailing);
 
   let text = '';
   for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
-    const result = await generate({ prompt: built.prompt, engine });
+    const result = await generate({
+      prompt: built.prompt, engine, stopLabel: built.trailing
+    });
     text = cut(continuationOf(result.text, built.prompt));
     if (isUnusableReply(text)) text = '';
     if (text.length >= MIN_CHARS) break;

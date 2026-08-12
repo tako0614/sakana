@@ -2,7 +2,10 @@
 //
 // このモデルは 94万件から作った 5.87M で、道具も system プロンプトも使えない。
 // 指示に従わせようとしても学習中に一度も見ていない形になるので崩れるだけ。
-// できるのは「会話の続きを1発言書く」ことだけなので、それだけをやる。
+// できるのは「会話の続きを書く」ことだけなので、それだけをやる。
+// 同じ人が続けて喋るぶんは残す (学習データの話者の塊のうち 27.4% が2連続以上)。
+// **他人が喋り出したら必ず切る** — 実在の人の発言を捏造して本人のサーバーに
+// 流す方が、短く切るより害が大きい。
 //
 // bot は会話に加わる新しい参加者として、次の空いている役で喋る。
 //
@@ -20,14 +23,14 @@
 // ドル換算の上限 (agent_calls) に混ぜると請求と乖離する。
 
 import { chunkForDiscord } from '../agent/format.js';
-import { continuationOf, endpointFor, generate, roleScheme } from './client.js';
+import { ENDPOINTS, continuationOf, endpointFor, generate, roleScheme } from './client.js';
 import { mimicFormat } from './impersonate.js';
 import { personaFor } from './persona.js';
 import {
   PLAIN_SCHEME, assignPlainRoles, buildPlainPrompt, isUnusableReply, labelFor,
-  labelledSpeakers, plainFirstTurn, plainText
+  labelledSpeakers, plainOwnTurns, plainText
 } from './plain.js';
-import { assignRoles, buildPrompt, firstTurn, messageText, nextRole } from './serialize.js';
+import { assignRoles, buildPrompt, messageText, nextRole, ownTurns } from './serialize.js';
 import { hasOptedOut, learnedSpeakers, tokenFor } from './speakers.js';
 
 const NO_MENTIONS = { parse: [], repliedUser: false };
@@ -43,12 +46,13 @@ const MAX_CONCURRENT = 1;
 // 切ってあるので、短い方に合わせておけばどちらでも分布の中に入る。
 const CONTEXT_MESSAGES = 16;
 
-// 返すのは1発言だけ。会話ごと生成させると「他の人の発言まで捏造した長文」になる。
-// 短すぎる返答は引き直す。
+// 返すのは**その人が続けて喋ったぶんまで**。他人が喋り出したら切る —
+// 会話ごと生成させると「他の人の発言まで捏造した長文」になる。
+// 切り出しは plainOwnTurns / ownTurns 側 (既定4発言 / 400字)。
 //
-// 正規化トークン (<url> / <file>) はサーバー側で既定禁止にしてあるが、それでも
-// 「これ」のような 2 文字が 12% ほど出る (禁止前は 38% が記号だけだった)。
-// CPU で数秒かかるので回数は絞る。
+// 短すぎる返答は引き直す。正規化トークン (<url> / <file>) はサーバー側で既定禁止に
+// してあるが、それでも「これ」のような 2 文字が 12% ほど出る
+// (禁止前は 38% が記号だけだった)。CPU で数秒かかるので回数は絞る。
 const MIN_CHARS = 3;
 const MAX_TRIES = 3;
 
@@ -68,10 +72,13 @@ async function tokenRequest(messages, { wanted, engine }) {
   // 申告に無いトークンは渡さない
   const token = wanted ? tokenFor(wanted) : null;
   const as = token && scheme?.speakers?.includes(token) ? token : null;
+  const trailing = as ?? nextRole(roles, scheme);
 
   return {
-    prompt: buildPrompt(turns, as ?? nextRole(roles, scheme)),
-    cut: firstTurn,
+    prompt: buildPrompt(turns, trailing),
+    // 末尾に置いたトークンを渡す。同じ人の連投は残し、他人が喋り出したら切る
+    cut: (text) => ownTurns(text, trailing),
+    trailing,
     as
   };
 }
@@ -92,13 +99,13 @@ function plainRequest(messages, { wanted, channelId }) {
   })).filter((turn) => turn.role && turn.content);
 
   const as = wanted ? labelFor(wanted) : null;
+  const trailing = as ?? nextRole(roles, PLAIN_SCHEME);
 
   return {
-    prompt: buildPlainPrompt(turns, {
-      channelId,
-      trailingRole: as ?? nextRole(roles, PLAIN_SCHEME)
-    }),
-    cut: plainFirstTurn,
+    prompt: buildPlainPrompt(turns, { channelId, trailingRole: trailing }),
+    // 末尾に置いたラベルを渡す。同じ人の連投は残し、他人が喋り出したら切る
+    cut: (text) => plainOwnTurns(text, trailing),
+    trailing,
     as
   };
 }
@@ -111,7 +118,9 @@ function plainRequest(messages, { wanted, channelId }) {
  * 置く。同じラベルでも前に何が並んでいるかで出るものが変わるので、
  * `/mimic` が動いていても `/as` が効いているとは限らない。
  *
- * 返すのは { prompt, cut, as }。as が null なら人格は乗っていない
+ * 返すのは { prompt, cut, trailing, as }。trailing は末尾に置いた話者ラベルで、
+ * 推論サーバーの打ち切り (stop_label) と切り出しの両方に使う。
+ * as が null なら人格は乗っていない
  * (その世代がその人を知らない = 渡すと未学習のラベルになるので落としている)。
  */
 export async function buildMimicPrompt(messages, { wanted = null, engine = 'evex', channelId = null } = {}) {
@@ -128,6 +137,20 @@ function stripFooter(text) {
   let out = String(text ?? '');
   while (FOOTER.test(out)) out = out.replace(FOOTER, '');
   return out.trim();
+}
+
+// その返答を書いたモデル。footer の先頭に必ずモデル名が入っている
+// (自作側は `-# evex-2-preview / たこ として`、DeepSeek 側は `-# deepseek-... 引用`)。
+//
+// **長さで分けるのをやめた。** 自作モデルの返答は 120 字以下という前提で切って
+// いたが、同じ人の連投を残すようにして最長 400 字になったので、長さでは
+// DeepSeek 側の回答と区別できない。区別を誤ると学習データに無い長文が文脈に入る。
+const SELF_LABELS = new Set(Object.values(ENDPOINTS).map((endpoint) => endpoint.label));
+const FOOTER_LABEL = /\n-#[ 　]*([^\n/]+?)[ 　]*(?:\/|$)/;
+
+function bySelfHosted(text) {
+  const found = String(text ?? '').match(FOOTER_LABEL);
+  return Boolean(found && SELF_LABELS.has(found[1].trim()));
 }
 
 /**
@@ -168,14 +191,14 @@ export async function handleMimicRequest(
     // LLM bot の長い回答が混ざると学習中に見ていない形になる。
     //
     // **自分の返答だけは入れる。** 外していたので、リプで続けても前に何を言ったかを
-    // 覚えていなかった (毎回はじめて話しかけられた形になる)。短い1発言なので
-    // 学習データと同じ形に収まる。長いものは DeepSeek 側の回答なので落とす。
-    const OWN_MAX_CHARS = 120;
+    // 覚えていなかった (毎回はじめて話しかけられた形になる)。自作モデルが書いた
+    // ものは学習データと同じ形なので収まる。DeepSeek 側の回答は落とす。
     const own = (turn) => selfId && turn.authorId === selfId;
+    const mine = (turn) => bySelfHosted(turn.content);
     const usable = (turns) => turns
+      .filter((turn) => (own(turn) ? mine(turn) : !turn.isBot))
       .map((turn) => (own(turn) ? { ...turn, content: stripFooter(turn.content) } : turn))
-      .filter((turn) => turn.content.trim())
-      .filter((turn) => (own(turn) ? turn.content.length <= OWN_MAX_CHARS : !turn.isBot));
+      .filter((turn) => turn.content.trim());
     const recentTurns = usable(recent.map(toTurn));
 
     // 返信の鎖を足す。これが無いと「何にリプしたか」が分からないまま返answerを書く —
@@ -199,7 +222,9 @@ export async function handleMimicRequest(
 
     let body = '';
     for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
-      const result = await generate({ prompt: built.prompt, engine });
+      const result = await generate({
+        prompt: built.prompt, engine, stopLabel: built.trailing
+      });
       // プロンプトぶんを落として、生成された続きだけを見る
       body = built.cut(continuationOf(result.text, built.prompt));
       // 添付だけの返答は bot が画像を投稿できないので意味が無い。引き直す

@@ -2,12 +2,12 @@
 //
 //   node scripts/llm/probe.mjs [回数]
 //
-// bot が実際に使う経路 (buildPrompt → generate → firstTurn) をそのまま通すので、
+// bot が実際に使う経路 (buildPrompt → generate → ownTurns) をそのまま通すので、
 // 「記号だけ」「短すぎる」がどれだけ出るかを本番の設定で測れる。
 // 記号の禁止を入れる前は 38% が使えなかった。入れてからの実測をここで確認する。
 
 import { generate, mimicConfig, roleScheme, status } from '../../src/mimic/client.js';
-import { assignRoles, buildPrompt, firstTurn, messageText, nextRole } from '../../src/mimic/serialize.js';
+import { assignRoles, buildPrompt, messageText, nextRole, ownTurns } from '../../src/mimic/serialize.js';
 
 const times = Number(process.argv[2] ?? 12);
 
@@ -36,12 +36,13 @@ for (const [messages] of CASES) {
   const turns = messages.map((content, i) => ({
     token: roles.get(`u${i % 2}`), reply: false, content: messageText(content)
   }));
-  const prompt = buildPrompt(turns, nextRole(roles, scheme));
+  const trailing = nextRole(roles, scheme);
+  const prompt = buildPrompt(turns, trailing);
 
   console.log(`--- ${messages.join(' / ')}`);
   for (let i = 0; i < times; i += 1) {
     const result = await generate({ prompt, maxNewTokens: 40 });
-    const body = firstTurn(String(result.text ?? '').slice(prompt.length));
+    const body = ownTurns(String(result.text ?? '').slice(prompt.length), trailing);
 
     total += 1;
     // 3文字未満は bot 側で引き直す対象。ここでは素の1回ぶんを見る

@@ -15,7 +15,7 @@ process.on('exit', () => {
 
 const {
   CONTROL_TOKENS, ROLE_TOKENS, ROLE_OVERFLOW, assignRoles, buildPrompt,
-  firstTurn, humanize, messageText, nextRole, normalize
+  humanize, messageText, nextRole, normalize, ownTurns
 } = await import('../src/mimic/serialize.js');
 const { DEFAULT_ENGINE, ENGINES, engineFor, setEngine } = await import('../src/mimic/prefs.js');
 const { isSelfHosted } = await import('../src/mimic/client.js');
@@ -104,12 +104,19 @@ function fail(message) {
 {
   const nameOf = (role) => role;
 
-  // Discord に返すのは firstTurn。次の話者トークンで切る
-  const one = firstTurn('そうだねー<|c|>いや違う<|end|>');
-  if (one !== 'そうだねー') fail(`1発言だけになっていない: ${one}`);
+  // Discord に返すのは ownTurns。**他人**の話者トークンで切る
+  const one = ownTurns('そうだねー<|c|>いや違う<|end|>', '<|b|>');
+  if (one !== 'そうだねー') fail(`他人の発言まで含んでいる: ${one}`);
 
-  // <|end|> より後ろは次の会話なので捨てる
-  const after = firstTurn('はい<|end|>ぜんぜん別の話');
+  // 同じ人が続けて喋るぶんは残す (学習データの話者の塊のうち 27.4% が2連続以上)
+  const run = ownTurns('そうだねー<|b|>いや違う<|c|>ちがくない？', '<|b|>');
+  if (run !== 'そうだねー\nいや違う') fail(`本人の連投を落としている: ${JSON.stringify(run)}`);
+
+  // 末尾のトークンを渡さないときは 1 発言だけ (誰として書かせたか分からない)
+  if (ownTurns('そうだねー<|b|>いや違う') !== 'そうだねー') fail('トークン無しで切れていない');
+
+  // <|end|> / <|conv|> は会話の切れ目なので、本人でも続けない
+  const after = ownTurns('はい<|end|>ぜんぜん別の話', '<|b|>');
   if (after !== 'はい') fail(`<|end|> の後ろを含んでいる: ${after}`);
 
   // 会話ごと見せる方 (sample.py 用) は名前を出して続ける
@@ -117,7 +124,7 @@ function fail(message) {
   if (!whole.includes('c:') || !whole.includes('いや違う')) fail(`humanize が展開しない: ${whole}`);
 
   // 制御記号が生のまま表示に漏れない
-  const shown = firstTurn('a<nl>b<url><file><mention><|re|>');
+  const shown = ownTurns('a<nl>b<url><file><mention><|re|>', '<|b|>');
   for (const token of ['<nl>', '<url>', '<file>', '<mention>', '<|re|>']) {
     if (shown.includes(token)) fail(`制御記号が表示に漏れている: ${token} in ${shown}`);
   }
@@ -183,13 +190,16 @@ function fail(message) {
   // 申告が無ければ evex-2 の既定
   if (assignRoles(['u1']).get('u1') !== ROLE_TOKENS[0]) fail('申告が無ければ既定の役');
 
-  // firstTurn は両世代のトークンで切る (取り違えると生の記号が Discord に漏れる)
-  if (firstTurn('そうだね<|s1|>ID: xxx') !== 'そうだね') fail('evex-1 のトークンで切れていない');
-  if (firstTurn('そうだね<|other|>はい') !== 'そうだね') fail('<|other|> で切れていない');
-  if (firstTurn('そうだね<|b|>いや') !== 'そうだね') fail('evex-2 のトークンで切れていない');
+  // ownTurns は両世代のトークンで切る (取り違えると生の記号が Discord に漏れる)
+  if (ownTurns('そうだね<|s1|>ID: xxx', '<|s0|>') !== 'そうだね') fail('evex-1 のトークンで切れていない');
+  if (ownTurns('そうだね<|other|>はい', '<|s0|>') !== 'そうだね') fail('<|other|> で切れていない');
+  if (ownTurns('そうだね<|b|>いや', '<|a|>') !== 'そうだね') fail('evex-2 のトークンで切れていない');
 }
 
-console.log(`serialize ok (制御記号 ${CONTROL_TOKENS.length} 個 / 役 ${ROLE_TOKENS.length} + 溢れ / 二重適用でも壊れない)`);
+console.log(
+  `serialize ok (制御記号 ${CONTROL_TOKENS.length} 個 / 役 ${ROLE_TOKENS.length} + 溢れ`
+  + ' / 本人の連投は残し他人で切る / 二重適用でも壊れない)'
+);
 
 // --- エンジンの選択 ---
 
@@ -236,7 +246,7 @@ try {
 // 静かに壊れる。evex-1 に <|a|> を渡して出力を崩壊させたのと同じ形の事故になる。
 {
   const {
-    buildPlainPrompt, channelLabel, labelFor, labelledSpeakers, plainFirstTurn, plainText
+    buildPlainPrompt, channelLabel, labelFor, labelledSpeakers, plainOwnTurns, plainText
   } = await import('../src/mimic/plain.js');
 
   const speakers = labelledSpeakers();
@@ -244,7 +254,7 @@ try {
   // labels.json は実 ID を含むので追跡していない (corpus/ と同じ扱い)。
   // 手元にコーパスが無い機械ではラベルの検査を飛ばして、形だけ確かめる
   if (!speakers.length) {
-    if (plainFirstTurn('うん\nたこ: それは違う') !== 'うん') fail('名前ラベルで切れていない');
+    if (plainOwnTurns('うん\nたこ: それは違う', 'B') !== 'うん') fail('名前ラベルで切れていない');
     if (channelLabel('nonexistent') !== '#other') fail('知らないチャンネルが #other にならない');
     console.log('mimic plain ok (labels.json 無し / 切り出しと既定ラベルだけ確認)');
   } else {
@@ -272,10 +282,26 @@ try {
   if (prompt.includes('undefined')) fail('プロンプトに undefined が混ざっている');
 
   // 生成の切り方。名前ラベルでも切れないと他人の発言まで流れる
-  if (plainFirstTurn('うん\nたこ: それは違う') !== 'うん') fail('名前ラベルで切れていない');
-  if (plainFirstTurn('うん\nB: いや') !== 'うん') fail('英字の役で切れていない');
-  if (plainFirstTurn('うん\n#ch2\nA: 次') !== 'うん') fail('チャンネル行で切れていない');
-  if (plainFirstTurn('1行目\n2行目') !== '1行目\n2行目') fail('ただの改行で切ってはいけない');
+  if (plainOwnTurns('うん\nたこ: それは違う', 'B') !== 'うん') fail('名前ラベルで切れていない');
+  if (plainOwnTurns('うん\nB: いや', 'A') !== 'うん') fail('英字の役で切れていない');
+  if (plainOwnTurns('うん\n#ch2\nA: 次', 'A') !== 'うん') fail('チャンネル行で切れていない');
+  if (plainOwnTurns('1行目\n2行目', 'A') !== '1行目\n2行目') fail('ただの改行で切ってはいけない');
+
+  // 同じ人が続けて喋るぶんは残す。1発言で切っていたので、学習した形を毎回捨てて
+  // 必ず一言だけ返す不自然な相手になっていた (話者の塊の 27.4% が2連続以上)
+  const run = plainOwnTurns('あー\nたこ: それな\nB: ちがう', 'たこ');
+  if (run !== 'あー\nそれな') fail(`本人の連投を落としている: ${JSON.stringify(run)}`);
+
+  // 他人が喋り出したら必ず切る。実在の人の発言を捏造して流す方が害が大きい
+  const other = plainOwnTurns('あー\nB: ちがう\nたこ: やっぱ', 'たこ');
+  if (other !== 'あー') fail(`他人の発言を含んでいる: ${JSON.stringify(other)}`);
+
+  // 上限は 4 発言 (学習データの 98% がそこに収まる)
+  const many = plainOwnTurns('1\nA: 2\nA: 3\nA: 4\nA: 5\nA: 6', 'A');
+  if (many !== '1\n2\n3\n4') fail(`4発言で止まっていない: ${JSON.stringify(many)}`);
+
+  // ラベルを渡さないときは 1 発言だけ (誰として書かせたか分からない)
+  if (plainOwnTurns('あー\nたこ: それな') !== 'あー') fail('ラベル無しで切れていない');
 
   // 正規化は build-sft.mjs と同じ規則でないと形がずれる
   const asRole = (id) => (id === 1 ? 'B' : null);
@@ -287,7 +313,9 @@ try {
   if (plainText('<:neko:12345> かわいい') !== ':neko: かわいい') fail('絵文字が :name: になっていない');
   if (channelLabel('nonexistent') !== '#other') fail('知らないチャンネルが #other にならない');
 
-  console.log(`mimic plain ok (${speakers.length} ラベル / 切り出し / 正規化)`);
+  console.log(
+    `mimic plain ok (${speakers.length} ラベル / 本人の連投4発言まで / 他人で切る / 正規化)`
+  );
   void asRole;
   }
 }

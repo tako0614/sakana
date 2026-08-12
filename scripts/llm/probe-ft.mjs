@@ -141,7 +141,9 @@ await probe('名前無し (実発言を例に渡す)', unnamed);
     }
 
     for (let i = 0; i < times; i += 1) {
-      const result = await generate({ prompt: built.prompt, engine: ENGINE });
+      const result = await generate({
+        prompt: built.prompt, engine: ENGINE, stopLabel: built.trailing
+      });
       let text = built.cut(continuationOf(result.text, built.prompt));
       if (isUnusableReply(text)) text = '(使えない返答)';
       console.log(`  ${built.as}: ${JSON.stringify(text)}`);

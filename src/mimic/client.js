@@ -49,7 +49,8 @@ export const ENDPOINTS = {
   'evex-ft': {
     url: process.env.MIMIC_FT_URL ?? 'http://127.0.0.1:8766',
     timeoutMs: number(process.env.MIMIC_FT_TIMEOUT_MS, 120_000),
-    maxNewTokens: number(process.env.MIMIC_FT_MAX_NEW_TOKENS, 64),
+    // 連投を許すぶん長く取る。実際は stop_label で必要なところで止まる
+    maxNewTokens: number(process.env.MIMIC_FT_MAX_NEW_TOKENS, 160),
     label: process.env.MIMIC_FT_LABEL ?? 'evex-ft-1-preview',
     format: process.env.MIMIC_FT_FORMAT ?? 'plain'
   }
@@ -114,7 +115,10 @@ class MimicError extends Error {
  * 生成する。prompt は学習時と同じ直列化形式で渡す。
  * 落ちているときは down を立てて返す (呼び出し側で文面を変えたいので)。
  */
-export async function generate({ prompt, maxNewTokens, temperature = 0.9, topK = 40, engine = null }) {
+export async function generate({
+  prompt, maxNewTokens, temperature = 0.9, topK = 40, engine = null,
+  stopLabel = null, maxTurns = null
+}) {
   const config = endpointFor(engine);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
@@ -128,7 +132,12 @@ export async function generate({ prompt, maxNewTokens, temperature = 0.9, topK =
         prompt,
         max_new_tokens: maxNewTokens ?? config.maxNewTokens,
         temperature,
-        top_k: topK
+        top_k: topK,
+        // 末尾に置いた話者ラベル。素の日本語形式には終端トークンが無いので、
+        // 渡さないと max_new_tokens を必ず使い切る (server-ft.py が他人の発言を
+        // 見た時点で打ち切る)。トークン形式の server.py は無視する
+        ...(stopLabel ? { stop_label: stopLabel } : {}),
+        ...(maxTurns ? { max_turns: maxTurns } : {})
       }),
       signal: controller.signal
     });

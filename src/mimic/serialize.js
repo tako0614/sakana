@@ -114,20 +114,45 @@ export function buildPrompt(turns, trailingToken = null) {
   return parts.join('');
 }
 
+// 話者トークンと会話の切れ目。世代をまたいで見る — evex-1 は <|s0|>..<|s47|> と
+// <|other|>、evex-2 は <|a|>..<|h|>。デプロイ中の世代を取り違えると生の記号が
+// 表示に漏れる (実際に <|s1|> が Discord に出た)。
+const SPEAKER = /<\|s\d+\|>|<\|other\|>|<\|[a-hz]\|>|<\|end\|>|<\|conv\|>/;
+const CONVERSATION_END = /^<\|(?:end|conv)\|>$/;
+
+// plain.js 側と同じ理由・同じ既定。同じ人が続けて喋るぶんは残す
+const MAX_OWN_TURNS = Number(process.env.MIMIC_MAX_TURNS ?? 4);
+
 /**
- * 生成された続きから最初の1発言だけ取る。
+ * 生成された続きから、**その人が続けて喋ったぶんだけ**取る。
  *
- * モデルは放っておくと `<|s3|>…<|s7|>…` と会話を続けてしまうので、
- * 次の話者トークンか <|end|> で切る。ここを切らないと、他の人の発言を
- * 勝手に作った長文が Discord に流れる。
+ * モデルは放っておくと `<|s3|>…<|s7|>…` と会話を続けてしまう。他人が喋り出したら
+ * 切らないと、実在の人の発言を捏造した長文が Discord に流れる。
+ * ただし同じトークンが続くぶんは本人の連投なので残す (学習データで 27.4%)。
+ *
+ * token はプロンプトの末尾に置いた話者トークン。省略すると 1 発言で切る。
  */
-export function firstTurn(text) {
-  const raw = String(text ?? '');
-  // 世代をまたいで切る。evex-1 は <|s0|>..<|s47|> と <|other|>、
-  // evex-2 は <|a|>..<|h|>。デプロイ中の世代を取り違えると生の記号が表示に漏れる
-  // (実際に <|s1|> が Discord に出た)。
-  const cut = raw.search(/<\|s\d+\|>|<\|other\|>|<\|[a-hz]\|>|<\|end\|>|<\|conv\|>/);
-  return plain(cut >= 0 ? raw.slice(0, cut) : raw);
+export function ownTurns(text, token = null) {
+  let rest = String(text ?? '');
+  const turns = [];
+
+  for (let i = 0; i < Math.max(1, MAX_OWN_TURNS); i += 1) {
+    const found = rest.match(SPEAKER);
+    if (!found) {
+      turns.push(rest);
+      break;
+    }
+
+    turns.push(rest.slice(0, found.index));
+    // <|end|> / <|conv|> は会話そのものの切れ目なので、本人でも続けない
+    if (!token || found[0] !== token || CONVERSATION_END.test(found[0])) break;
+    rest = rest.slice(found.index + found[0].length);
+  }
+
+  return turns
+    .map((turn) => plain(turn).trim())
+    .filter(Boolean)
+    .join('\n');
 }
 
 /** 制御記号を読める形に落とす。表示に生のまま漏らさないための一箇所。 */

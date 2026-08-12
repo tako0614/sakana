@@ -5,7 +5,8 @@
 server.py (自作 5.87M 用) と **HTTP の契約を同じにしてある**ので、bot 側は
 接続先を変えるだけで繋がる。中身が transformers になっただけ:
 
-    POST /generate  {prompt, max_new_tokens, temperature, top_k, min_p, repetition_penalty}
+    POST /generate  {prompt, max_new_tokens, temperature, top_k, min_p,
+                     repetition_penalty, stop_label, max_turns}
     GET  /health    {format, label, params, ...}
 
 evex-1 と**同時に立てる**前提で別ポートにする。世代を置き換えないのは性質が
@@ -19,13 +20,15 @@ evex-1 と**同時に立てる**前提で別ポートにする。世代を置き
 1/4 になるぶん速くなる。llama.cpp の Q8_0 なら 36+ tok/s だが、まず品質を見てから
 ビルドする (載せる価値が無かったときに無駄になる)。
 
-そのため max_new_tokens の既定は小さめ。返答は1発言なので、長く生成させても
-bot 側が最初の1発言で切り捨てる。
+素の日本語形式には終端トークンが無いので、放っておくと max_new_tokens を必ず使い切る。
+`stop_label` (末尾に置いた話者ラベル) を渡すと**他人が喋り出した時点で打ち切る**ので、
+上限を長く取っても実際にかかる時間は必要なぶんだけになる。渡さないと使い切る。
 """
 
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -33,7 +36,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", default="mimic-ft", help="重みのディレクトリ")
@@ -100,12 +105,55 @@ INFO = {
 # 1 プロセスで同時に回すと互いに遅くなるだけなので直列化する
 lock = threading.Lock()
 
+# 次の話者の行。bot 側 (plain.js の NEXT_TURN) と同じ形を見る
+NEXT_TURN = re.compile(r"\n([^\n:]{1,12}):[ 　]")
 
-def run(prompt, max_new_tokens, temperature, top_k, min_p, repetition_penalty):
+
+class StopAtOtherSpeaker(StoppingCriteria):
+    """**他人が喋り出した時点で打ち切る。**
+
+    素の日本語形式には終端トークンが無いので、放っておくと max_new_tokens を必ず
+    使い切る。bot 側は他人の発言を捨てるので、その計算は丸ごと無駄 —
+    64 トークンに絞っていたのはそのためで、代わりに返答が必ず一言で終わっていた。
+
+    ここで打ち切れば「上限は長く、実際は必要なぶんだけ」にできる。
+    同じ話者が続くぶんは通す (学習データの話者の塊のうち 27.4% が2連続以上)。
+
+    毎ステップ decode するが、0.6B の forward 1回 (~100ms) に対して桁違いに安い。
+    """
+
+    def __init__(self, prompt_len, label, max_turns):
+        self.prompt_len = prompt_len
+        self.label = label
+        self.max_turns = max_turns
+
+    def __call__(self, input_ids, scores, **kwargs):
+        text = tok.decode(input_ids[0][self.prompt_len:], skip_special_tokens=True)
+
+        turns = 0
+        for found in NEXT_TURN.finditer(text):
+            if found.group(1) != self.label:
+                return True          # 他人の発言に入った
+            turns += 1
+            if turns >= self.max_turns:
+                return True          # 連投の上限に達した
+
+        return False
+
+
+def run(prompt, max_new_tokens, temperature, top_k, min_p, repetition_penalty,
+        stop_label=None, max_turns=4):
     ids = tok(prompt, return_tensors="pt")
     # 学習の窓は 1024。超えたら後ろを残す (直近の会話が本題)
     if ids.input_ids.shape[1] > 1023:
         ids = {k: v[:, -1023:] for k, v in ids.items()}
+
+    prompt_len = ids["input_ids"].shape[1]
+    stopping = None
+    if stop_label:
+        stopping = StoppingCriteriaList(
+            [StopAtOtherSpeaker(prompt_len, stop_label, max_turns)]
+        )
 
     with lock:
         out = model.generate(
@@ -120,6 +168,7 @@ def run(prompt, max_new_tokens, temperature, top_k, min_p, repetition_penalty):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             pad_token_id=tok.eos_token_id,
+            stopping_criteria=stopping,
         )
 
     # bot 側は prompt を落として続きだけを見るので、全文を返す
@@ -164,11 +213,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             text = run(
                 prompt,
-                min(int(payload.get("max_new_tokens", 64)), args.max_new_cap),
+                min(int(payload.get("max_new_tokens", 160)), args.max_new_cap),
                 float(payload.get("temperature", 0.9)),
                 int(payload.get("top_k", 40)),
                 float(payload.get("min_p", 0.05)),
                 float(payload.get("repetition_penalty", 1.1)),
+                # 末尾に置いた話者ラベル。渡されたら他人が喋り出した時点で打ち切る
+                payload.get("stop_label") or None,
+                max(1, int(payload.get("max_turns", 4))),
             )
         except Exception as error:  # noqa: BLE001 - 落とさずに理由を返す
             self._send(500, {"error": str(error)})
