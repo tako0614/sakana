@@ -6,3 +6,8 @@ __pycache__/
 npm-debug.log*
 *.log
 *.sqlite*
+
+# LLM 実験。コーパスと重みは git に入れない (数十MB〜)
+.venv-llm/
+corpus/
+scripts/llm/out/
