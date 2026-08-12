@@ -27,7 +27,8 @@ import {
 import {
   createGovernanceSurfaces,
   governancePermissionReport,
-  postGazette
+  postGazette,
+  syncStatuteBook
 } from './discord.js';
 import {
   approveCase,
@@ -74,7 +75,7 @@ function statusText(governance, interaction) {
     `憲法: v${constitution?.version ?? '?'} / ${constitution?.content_hash?.slice(0, 12) ?? '?'}`,
     `trusted role: ${governance.trusted_role_id ? `<@&${governance.trusted_role_id}> (名前はサーバー側の表示だけに使用)` : 'なし (任意機能は無効)'}`,
     `会話入口: 立法 ${governance.legislature_role_id ? `<@&${governance.legislature_role_id}>` : '準備中'} / 裁判 ${governance.judiciary_role_id ? `<@&${governance.judiciary_role_id}>` : '準備中'} / 一般 <@${interaction.client.user.id}>`,
-    `議会: <#${governance.parliament_forum_id}> / 裁判所: <#${governance.court_forum_id}> / 官報: <#${governance.gazette_channel_id}>`,
+    `議会: <#${governance.parliament_forum_id}> / 裁判所: <#${governance.court_forum_id}> / 法令集: ${governance.statute_forum_id ? `<#${governance.statute_forum_id}>` : '準備中'} / 官報: <#${governance.gazette_channel_id}>`,
     `bot権限: ${permissions.ok ? 'OK' : `不足 ${permissions.missing.join(', ')}`}`,
     governance.weekly_last_error ? `週次AI再試行中: ${governance.weekly_last_error}` : null,
     workflowErrors.length > 0 ? `workflow再試行/失敗:\n${workflowErrors.slice(0, 5).join('\n')}` : 'workflow: OK',
@@ -162,6 +163,10 @@ const governanceCommand = {
       await postGazette(interaction.guild, result.guild, '初期憲法 v1', `${result.constitution.content}\n\n## Policy\n\n\`\`\`json\n${JSON.stringify(result.constitution.policy, null, 2)}\n\`\`\`\n\ncontent hash: ${result.constitution.content_hash}\npolicy hash: ${result.constitution.policy_hash}`).catch((error) => {
         console.error('Initial constitution gazette publication failed:', error);
         warnings.push('官報への初期憲法掲載に失敗しました。bot本体へのメンションでは正本DBから取得できます。');
+      });
+      await syncStatuteBook(interaction.guild, result.guild, { verifyExisting: true }).catch((error) => {
+        console.error('Initial statute book publication failed:', error);
+        warnings.push('法令集への初期憲法掲載に失敗しました。schedulerが再試行します。');
       });
       await interaction.editReply(`初期化しました。trusted role: ${role ? `${role.name} (${role.id})` : 'なし'}。直近活動 ${backfilled}件を取り込みました。執行modeは ${result.guild.enforcement_mode} です。${warnings.length ? `\n注意: ${warnings.join(' ')}` : ''}`);
       return;

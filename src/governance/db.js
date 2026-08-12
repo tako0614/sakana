@@ -21,6 +21,7 @@ db.exec(`
     parliament_forum_id TEXT NOT NULL,
     court_forum_id TEXT NOT NULL,
     court_chat_channel_id TEXT NOT NULL,
+    statute_forum_id TEXT NOT NULL DEFAULT '',
     gazette_channel_id TEXT NOT NULL,
     active_constitution_id INTEGER,
     last_weekly_scan_at INTEGER,
@@ -131,6 +132,22 @@ db.exec(`
     UNIQUE (guild_id, code, effective_at)
   );
   CREATE INDEX IF NOT EXISTS idx_gov_laws_active ON governance_laws(guild_id, status, effective_at);
+
+  CREATE TABLE IF NOT EXISTS governance_statute_publications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    instrument_type TEXT NOT NULL,
+    instrument_id TEXT NOT NULL,
+    forum_thread_id TEXT NOT NULL,
+    forum_message_id TEXT NOT NULL,
+    publication_status TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (guild_id, instrument_type, instrument_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_statute_publications
+    ON governance_statute_publications(guild_id, instrument_type, instrument_id);
 
   CREATE TABLE IF NOT EXISTS governance_reviews (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -467,6 +484,31 @@ db.exec(`
 `);
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (7, ?)').run(Date.now());
 
+{
+  const existing = new Set(db.pragma('table_info(governance_guilds)').map((row) => row.name));
+  if (!existing.has('statute_forum_id')) {
+    db.exec("ALTER TABLE governance_guilds ADD COLUMN statute_forum_id TEXT NOT NULL DEFAULT ''");
+  }
+}
+db.exec(`
+  CREATE TABLE IF NOT EXISTS governance_statute_publications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    instrument_type TEXT NOT NULL,
+    instrument_id TEXT NOT NULL,
+    forum_thread_id TEXT NOT NULL,
+    forum_message_id TEXT NOT NULL,
+    publication_status TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (guild_id, instrument_type, instrument_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_statute_publications
+    ON governance_statute_publications(guild_id, instrument_type, instrument_id);
+`);
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (8, ?)').run(Date.now());
+
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
 db.prepare("UPDATE governance_outbox SET status = 'error', last_error = 'interrupted before completion' WHERE status = 'running'").run();
@@ -539,9 +581,9 @@ export const bootstrapGovernanceGuild = db.transaction((input) => {
     INSERT INTO governance_guilds (
       guild_id, status, enforcement_mode, trusted_role_id, appeal_role_id,
       legislature_role_id, judiciary_role_id, category_id,
-      parliament_forum_id, court_forum_id, court_chat_channel_id, gazette_channel_id,
+      parliament_forum_id, court_forum_id, court_chat_channel_id, statute_forum_id, gazette_channel_id,
       active_constitution_id, created_at, updated_at
-    ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     input.guildId,
     input.enforcementMode,
@@ -553,6 +595,7 @@ export const bootstrapGovernanceGuild = db.transaction((input) => {
     input.parliamentForumId,
     input.courtForumId,
     input.courtChatChannelId,
+    input.statuteForumId ?? '',
     input.gazetteChannelId,
     constitutionId,
     now,
@@ -578,7 +621,7 @@ export function updateGovernanceGuild(guildId, patch) {
   const allowed = new Set([
     'status', 'enforcement_mode', 'trusted_role_id', 'appeal_role_id',
     'legislature_role_id', 'judiciary_role_id', 'category_id',
-    'parliament_forum_id', 'court_forum_id', 'court_chat_channel_id', 'gazette_channel_id',
+    'parliament_forum_id', 'court_forum_id', 'court_chat_channel_id', 'statute_forum_id', 'gazette_channel_id',
     'active_constitution_id', 'last_weekly_scan_at', 'weekly_retry_after',
     'weekly_failure_count', 'weekly_last_error'
   ]);
@@ -600,6 +643,15 @@ export function getActiveConstitution(guildId) {
     JOIN governance_constitutions c ON c.id = g.active_constitution_id
     WHERE g.guild_id = ?
   `).get(String(guildId)));
+}
+
+export function listConstitutions(guildId, { limit = 50 } = {}) {
+  return db.prepare(`
+    SELECT * FROM governance_constitutions
+    WHERE guild_id = ?
+    ORDER BY version DESC
+    LIMIT ?
+  `).all(String(guildId), Number(limit)).map(hydrateConstitution);
 }
 
 export const enactConstitution = db.transaction((input) => {
@@ -1009,6 +1061,42 @@ export function listLaws(guildId, { activeOnly = true, limit = 50 } = {}) {
     ? "SELECT * FROM governance_laws WHERE guild_id = ? AND status = 'active' ORDER BY effective_at DESC LIMIT ?"
     : 'SELECT * FROM governance_laws WHERE guild_id = ? ORDER BY effective_at DESC LIMIT ?';
   return db.prepare(sql).all(guildId, limit).map(hydrateLaw);
+}
+
+export function getStatutePublication(guildId, instrumentType, instrumentId) {
+  return db.prepare(`
+    SELECT * FROM governance_statute_publications
+    WHERE guild_id = ? AND instrument_type = ? AND instrument_id = ?
+  `).get(String(guildId), String(instrumentType), String(instrumentId)) ?? null;
+}
+
+export function listStatutePublications(guildId) {
+  return db.prepare(`
+    SELECT * FROM governance_statute_publications
+    WHERE guild_id = ?
+    ORDER BY instrument_type, id
+  `).all(String(guildId));
+}
+
+export function upsertStatutePublication(input) {
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO governance_statute_publications
+      (guild_id, instrument_type, instrument_id, forum_thread_id, forum_message_id,
+       publication_status, content_hash, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(guild_id, instrument_type, instrument_id) DO UPDATE SET
+      forum_thread_id = excluded.forum_thread_id,
+      forum_message_id = excluded.forum_message_id,
+      publication_status = excluded.publication_status,
+      content_hash = excluded.content_hash,
+      updated_at = excluded.updated_at
+  `).run(
+    String(input.guildId), String(input.instrumentType), String(input.instrumentId),
+    String(input.forumThreadId), String(input.forumMessageId), String(input.publicationStatus),
+    String(input.contentHash), now, now
+  );
+  return getStatutePublication(input.guildId, input.instrumentType, input.instrumentId);
 }
 
 export function lawAtTime(id, occurredAt) {

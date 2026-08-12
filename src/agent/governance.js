@@ -55,7 +55,10 @@ export function runGovernanceInfo(ctx, args) {
   const governance = getGovernanceGuild(guildId);
   if (!governance) return 'このサーバーでは統治機能が初期化されていません。';
   const action = String(args.action ?? 'status');
-  if (['constitution', 'laws', 'law', 'administration', 'administrative_act'].includes(action)) {
+  if (['constitution', 'laws', 'law'].includes(action)) {
+    requireVisible(ctx, governance.statute_forum_id || governance.gazette_channel_id, '法令集');
+  }
+  if (['administration', 'administrative_act'].includes(action)) {
     requireVisible(ctx, governance.gazette_channel_id, '官報');
   }
   if (['proposals', 'proposal'].includes(action)) {
@@ -66,6 +69,7 @@ export function runGovernanceInfo(ctx, args) {
   }
   if (action === 'status') {
     requireVisible(ctx, governance.gazette_channel_id, '官報');
+    requireVisible(ctx, governance.statute_forum_id || governance.gazette_channel_id, '法令集');
     requireVisible(ctx, governance.parliament_forum_id, '議会');
     requireVisible(ctx, governance.court_forum_id, '裁判所');
   }

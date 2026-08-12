@@ -70,6 +70,7 @@ governanceDb.bootstrapGovernanceGuild({
   parliamentForumId: 'parliament',
   courtForumId: 'court',
   courtChatChannelId: 'court-chat',
+  statuteForumId: 'statutes',
   gazetteChannelId: 'gazette',
   enforcementMode: 'shadow',
   constitution,
@@ -95,7 +96,22 @@ assert.equal(governanceDb.activityCounts('g1', 'u1', 0)[0].count, 2, '同日同�
 const activeConstitution = governanceDb.getActiveConstitution('g1');
 assert.equal(governanceDb.getGovernanceGuild('g1').legislature_role_id, 'legislature-role');
 assert.equal(governanceDb.getGovernanceGuild('g1').judiciary_role_id, 'judiciary-role');
+assert.equal(governanceDb.getGovernanceGuild('g1').statute_forum_id, 'statutes');
 assert.equal('administration_role_id' in governanceDb.getGovernanceGuild('g1'), false, '@行政は公開入口として作らない');
+assert.equal(governanceDb.listConstitutions('g1').length, 1, '法令集backfill用に憲法の全versionを列挙できる');
+let publication = governanceDb.upsertStatutePublication({
+  guildId: 'g1', instrumentType: 'constitution', instrumentId: activeConstitution.id,
+  forumThreadId: 'constitution-thread', forumMessageId: 'constitution-message',
+  publicationStatus: '現行憲法', contentHash: activeConstitution.content_hash
+});
+assert.equal(publication.publication_status, '現行憲法');
+publication = governanceDb.upsertStatutePublication({
+  guildId: 'g1', instrumentType: 'constitution', instrumentId: activeConstitution.id,
+  forumThreadId: 'constitution-thread', forumMessageId: 'constitution-message',
+  publicationStatus: '旧憲法', contentHash: activeConstitution.content_hash
+});
+assert.equal(governanceDb.listStatutePublications('g1').length, 1, '同じ法令の掲載記録はupsertされ重複しない');
+assert.equal(publication.publication_status, '旧憲法');
 
 const { governanceMentionBranch, handleGovernanceIntakeComponent, handleGovernanceMention } = await import('../src/governance/intake.js');
 const mentionMessage = (ids) => ({
@@ -258,6 +274,7 @@ governanceDb.bootstrapGovernanceGuild({
   parliamentForumId: 'parliament-2',
   courtForumId: 'court-2',
   courtChatChannelId: 'court-chat-2',
+  statuteForumId: 'statutes-2',
   gazetteChannelId: 'gazette-2',
   enforcementMode: 'shadow',
   constitution,
@@ -619,6 +636,13 @@ await assert.rejects(
 const { governanceCommands } = await import('../src/governance/commands.js');
 assert.deepEqual(governanceCommands.map((command) => command.data.name), ['governance'],
   '公開統治slash commandは管理用governanceだけ');
+const { statutePublicationState } = await import('../src/governance/discord.js');
+assert.equal(statutePublicationState('constitution', 'active'), '現行憲法');
+assert.equal(statutePublicationState('constitution', 'superseded'), '旧憲法');
+assert.equal(statutePublicationState('law', 'active'), '現行法');
+assert.equal(statutePublicationState('law', 'suspended'), '停止');
+assert.equal(statutePublicationState('law', 'unconstitutional'), '違憲');
+assert.equal(statutePublicationState('law', 'repealed'), '廃止');
 
 const { runGovernanceInfo } = await import('../src/agent/governance.js');
 const visibleGovernanceContext = {
@@ -628,6 +652,7 @@ const visibleGovernanceContext = {
     channels: {
       cache: new Map([
         ['gazette', { permissionsFor: () => ({ has: () => true }) }],
+        ['statutes', { permissionsFor: () => ({ has: () => true }) }],
         ['parliament', { permissionsFor: () => ({ has: () => true }) }],
         ['court', { permissionsFor: () => ({ has: () => true }) }]
       ])

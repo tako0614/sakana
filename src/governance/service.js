@@ -71,6 +71,7 @@ import {
   createCourtThreads,
   createProposalPost,
   executeDiscordSanction,
+  ensureGovernanceStatuteForum,
   postCourtUpdate,
   postPrivateCourtUpdate,
   postGazette,
@@ -78,6 +79,7 @@ import {
   releaseAppealRestriction,
   syncAppealRoleOverwrites,
   ensureGovernanceMentionRoles,
+  syncStatuteBook,
   voteButtons
 } from './discord.js';
 import {
@@ -136,6 +138,7 @@ function governanceSurface(channel, governance) {
     governance.parliament_forum_id,
     governance.court_forum_id,
     governance.court_chat_channel_id,
+    governance.statute_forum_id,
     governance.gazette_channel_id
   ].filter(Boolean));
   return ids.has(channel.id) || ids.has(channel.parentId);
@@ -530,6 +533,9 @@ async function closeProposalVote(guild, proposal) {
     proposal = updateProposal(proposal.id, { status: 'enacted', stage_ends_at: Date.now() });
     await postProposalUpdate(guild, proposal, `改憲が成立しました。憲法 v${next.version} が有効です。`, { state: '成立' });
     await postGazette(guild, governance, `憲法 v${next.version}`, `${next.content}\n\n## Policy\n\n\`\`\`json\n${JSON.stringify(next.policy, null, 2)}\n\`\`\`\n\ncontent hash: ${next.content_hash}\npolicy hash: ${next.policy_hash}`);
+    await syncStatuteBook(guild, getGovernanceGuild(guild.id)).catch((error) => {
+      console.error(`Failed to publish constitution v${next.version} in statute book:`, error);
+    });
     // 改憲で既存法との関係が変わり得るため、各現行法を自動的に事後審査へ送る。
     // 審査自体は通常どおり答弁記録期間とpolicy指定のpanelを経る。
     const systemReporter = { id: guild.client.user.id };
@@ -560,6 +566,9 @@ async function closeProposalVote(guild, proposal) {
   proposal = updateProposal(proposal.id, { status: 'enacted', stage_ends_at: Date.now() });
   await postProposalUpdate(guild, proposal, `可決・成立しました。法律 ${law.code} はこの時点から有効です。`, { state: '成立' });
   await postGazette(guild, governance, `${law.code} ${law.title}`, `${law.text}\n\n## Provisions\n\n\`\`\`json\n${JSON.stringify(law.provisions, null, 2)}\n\`\`\`\n\ncontent hash: ${law.content_hash}`);
+  await syncStatuteBook(guild, getGovernanceGuild(guild.id)).catch((error) => {
+    console.error(`Failed to publish law ${law.id} in statute book:`, error);
+  });
   return proposal;
 }
 
@@ -966,6 +975,11 @@ async function adjudicateConstitutionalCase(guild, caseRecord) {
   await postCourtUpdate(guild, getCase(caseRecord.id), uncertain
     ? '再審査後も合憲必要票に達しなかったため、対象の執行を停止しました。'
     : `違憲 ${unconstitutional}/${constitution.policy.judiciary.panelSeats}で対象を取り消しました。`, { state: '取消' });
+  if (caseRecord.challenged_type === 'law') {
+    await syncStatuteBook(guild, getGovernanceGuild(guild.id)).catch((error) => {
+      console.error(`Failed to update law ${target.id} in statute book:`, error);
+    });
+  }
 }
 
 function buildConstitutionalReviewTarget(type, target) {
@@ -1218,6 +1232,7 @@ async function runWeeklyReview(guild, governance, now) {
 
 let schedulerRunning = false;
 let lastPruneAt = 0;
+const verifiedStatuteGuilds = new Set();
 
 export async function runGovernanceScheduler(client) {
   if (schedulerRunning) return;
@@ -1234,17 +1249,31 @@ export async function runGovernanceScheduler(client) {
       if (governance.status !== 'active') continue;
       const guild = client.guilds.cache.get(governance.guild_id) ?? await client.guilds.fetch(governance.guild_id).catch(() => null);
       if (!guild) continue;
+      let currentGovernance = governance;
       try {
-        const roles = await ensureGovernanceMentionRoles(guild, governance);
+        const roles = await ensureGovernanceMentionRoles(guild, currentGovernance);
         if (roles.legislatureRoleId !== governance.legislature_role_id
           || roles.judiciaryRoleId !== governance.judiciary_role_id) {
-          updateGovernanceGuild(guild.id, {
+          currentGovernance = updateGovernanceGuild(guild.id, {
             legislature_role_id: roles.legislatureRoleId,
             judiciary_role_id: roles.judiciaryRoleId
           });
         }
       } catch (error) {
         console.error(`Failed to ensure governance mention roles in ${guild.id}:`, error);
+      }
+      try {
+        const statuteForum = await ensureGovernanceStatuteForum(guild, currentGovernance);
+        const statuteForumChanged = statuteForum.id !== currentGovernance.statute_forum_id;
+        if (statuteForumChanged) {
+          currentGovernance = updateGovernanceGuild(guild.id, { statute_forum_id: statuteForum.id });
+        }
+        await syncStatuteBook(guild, currentGovernance, {
+          verifyExisting: statuteForumChanged || !verifiedStatuteGuilds.has(guild.id)
+        });
+        verifiedStatuteGuilds.add(guild.id);
+      } catch (error) {
+        console.error(`Failed to sync statute book in ${guild.id}:`, error);
       }
       for (const proposal of listProposals(guild.id, { statuses: ['drafting', 'draft', 'constitutional_review', 'debate', 'voting'], limit: 100 })) {
         try {

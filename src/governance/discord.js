@@ -6,8 +6,15 @@ import {
   PermissionFlagsBits
 } from 'discord.js';
 import { governanceCategoryName } from './config.js';
+import {
+  getStatutePublication,
+  listConstitutions,
+  listLaws,
+  upsertStatutePublication
+} from './db.js';
 
 const TAGS = ['草案', '違憲審査', '討議', '投票', '成立', '否決', '廃案'];
+const STATUTE_TAGS = ['現行憲法', '旧憲法', '現行法', '停止', '違憲', '廃止'];
 
 const APPEAL_DENY = {
   SendMessages: false,
@@ -49,6 +56,30 @@ function everyoneForumOverwrite(guild, { discuss }) {
       ...(!discuss ? [PermissionFlagsBits.SendMessagesInThreads] : [])
     ]
   };
+}
+
+function statuteForumOverwrites(guild) {
+  const everyone = everyoneForumOverwrite(guild, { discuss: false });
+  return [
+    {
+      ...everyone,
+      deny: [...everyone.deny, PermissionFlagsBits.AddReactions]
+    },
+    botOverwrite(guild)
+  ];
+}
+
+async function createStatuteForum(guild, categoryId) {
+  return guild.channels.create({
+    name: '法令集',
+    type: ChannelType.GuildForum,
+    parent: categoryId,
+    topic: '現行憲法と法律の公開正本です。1法令1投稿で、旧法令も状態付きで保存します。',
+    availableTags: STATUTE_TAGS.map((name) => ({ name, moderated: true })),
+    defaultAutoArchiveDuration: 10_080,
+    permissionOverwrites: statuteForumOverwrites(guild),
+    reason: 'Governance public statute book'
+  });
 }
 
 async function createMentionRole(guild, name) {
@@ -173,11 +204,12 @@ export async function createGovernanceSurfaces(guild) {
     ],
     reason: 'Sakana governance private court chat'
   });
+  const statuteForum = await createStatuteForum(guild, category.id);
   const gazette = await guild.channels.create({
     name: '官報',
     type: ChannelType.GuildText,
     parent: category.id,
-    topic: '現行憲法・法律・確定判決・執行・技術操作の公開台帳です。',
+    topic: '成立・改正・判決・執行・技術操作を時系列に残す公開履歴です。現行本文は法令集を参照してください。',
     permissionOverwrites: [
       {
         id: guild.id,
@@ -197,9 +229,163 @@ export async function createGovernanceSurfaces(guild) {
     parliamentForumId: parliament.id,
     courtForumId: court.id,
     courtChatChannelId: courtChat.id,
+    statuteForumId: statuteForum.id,
     gazetteChannelId: gazette.id,
     permissionReport: core
   };
+}
+
+export async function ensureGovernanceStatuteForum(guild, governance) {
+  const existing = governance.statute_forum_id
+    ? await guild.channels.fetch(governance.statute_forum_id).catch(() => null)
+    : null;
+  if (existing?.type === ChannelType.GuildForum) return existing;
+  if (!governance.category_id) throw new Error('統治カテゴリがないため法令集を作成できません。');
+  return createStatuteForum(guild, governance.category_id);
+}
+
+export function statutePublicationState(instrumentType, status) {
+  if (instrumentType === 'constitution') return status === 'active' ? '現行憲法' : '旧憲法';
+  return ({
+    active: '現行法',
+    suspended: '停止',
+    unconstitutional: '違憲',
+    repealed: '廃止'
+  })[status] ?? '廃止';
+}
+
+function statuteDocument(instrumentType, instrument) {
+  if (instrumentType === 'constitution') {
+    const state = statutePublicationState(instrumentType, instrument.status);
+    return {
+      title: `憲法 v${instrument.version}`,
+      state,
+      hash: instrument.content_hash,
+      content: [
+        `# 憲法 v${instrument.version}`,
+        `状態: ${state}`,
+        `公布: <t:${Math.floor(instrument.enacted_at / 1000)}:F>`,
+        `本文hash: \`${instrument.content_hash}\``,
+        `policy hash: \`${instrument.policy_hash}\``,
+        '',
+        instrument.content.length <= 1_350
+          ? instrument.content
+          : `${instrument.content.slice(0, 1_350)}\n\n…全文とpolicyは添付ファイルを参照してください。`
+      ].join('\n').slice(0, 2_000),
+      files: [
+        { attachment: Buffer.from(instrument.content), name: `constitution-v${instrument.version}.md` },
+        { attachment: Buffer.from(`${JSON.stringify(instrument.policy, null, 2)}\n`), name: `constitution-policy-v${instrument.version}.json` }
+      ]
+    };
+  }
+  const state = statutePublicationState(instrumentType, instrument.status);
+  const full = [
+    `# ${instrument.code} ${instrument.title}`,
+    '',
+    instrument.text,
+    '',
+    '## Provisions',
+    '',
+    '```json',
+    JSON.stringify(instrument.provisions, null, 2),
+    '```',
+    '',
+    `content hash: ${instrument.content_hash}`
+  ].join('\n');
+  return {
+    title: `${instrument.code} ${instrument.title}`,
+    state,
+    hash: instrument.content_hash,
+    content: [
+      `# ${instrument.code} ${instrument.title}`,
+      `法律ID: #${instrument.id}`,
+      `状態: ${state}`,
+      `施行: <t:${Math.floor(instrument.effective_at / 1000)}:F>`,
+      `本文hash: \`${instrument.content_hash}\``,
+      '',
+      instrument.text.length <= 1_450
+        ? instrument.text
+        : `${instrument.text.slice(0, 1_450)}\n\n…全文と処分定義は添付ファイルを参照してください。`
+    ].join('\n').slice(0, 2_000),
+    files: [{ attachment: Buffer.from(full), name: `law-${instrument.id}.md` }]
+  };
+}
+
+async function applyStatuteState(thread, forum, state, content) {
+  const stateTag = tagId(forum, state);
+  if (!stateTag) throw new Error(`法令集の状態tagがありません: ${state}`);
+  const wasArchived = Boolean(thread.archived);
+  if (wasArchived) await thread.setArchived(false, '法令状態の同期');
+  const starter = await thread.fetchStarterMessage();
+  if (starter) await starter.edit({ content, allowedMentions: { parse: [] } });
+  await thread.setAppliedTags([stateTag], `法令状態: ${state}`);
+  if (wasArchived) await thread.setArchived(true, '法令状態の同期完了');
+}
+
+async function publishStatute(guild, forum, instrumentType, instrument, document) {
+  const stateTag = tagId(forum, document.state);
+  if (!stateTag) throw new Error(`法令集の状態tagがありません: ${document.state}`);
+  const thread = await forum.threads.create({
+    name: document.title.slice(0, 100),
+    appliedTags: [stateTag],
+    autoArchiveDuration: 10_080,
+    message: {
+      content: document.content,
+      files: document.files,
+      allowedMentions: { parse: [] }
+    },
+    reason: `Publish ${instrumentType} ${instrument.id}`
+  });
+  const starter = await thread.fetchStarterMessage();
+  return upsertStatutePublication({
+    guildId: guild.id,
+    instrumentType,
+    instrumentId: instrument.id,
+    forumThreadId: thread.id,
+    forumMessageId: starter?.id ?? thread.id,
+    publicationStatus: document.state,
+    contentHash: document.hash
+  });
+}
+
+export async function syncStatuteBook(guild, governance, { verifyExisting = false } = {}) {
+  const forum = await guild.channels.fetch(governance.statute_forum_id).catch(() => null);
+  if (forum?.type !== ChannelType.GuildForum) throw new Error('法令集Forumが見つかりません。');
+  const instruments = [
+    ...listConstitutions(guild.id, { limit: 100 }).map((instrument) => ({ instrumentType: 'constitution', instrument })),
+    ...listLaws(guild.id, { activeOnly: false, limit: 500 }).map((instrument) => ({ instrumentType: 'law', instrument }))
+  ];
+  let changed = 0;
+  for (const { instrumentType, instrument } of instruments) {
+    const document = statuteDocument(instrumentType, instrument);
+    const publication = getStatutePublication(guild.id, instrumentType, instrument.id);
+    if (publication
+      && publication.publication_status === document.state
+      && publication.content_hash === document.hash
+      && !verifyExisting) continue;
+    const thread = publication
+      ? await guild.channels.fetch(publication.forum_thread_id).catch(() => null)
+      : null;
+    if (!thread?.isThread?.() || thread.parentId !== forum.id || publication?.content_hash !== document.hash) {
+      await publishStatute(guild, forum, instrumentType, instrument, document);
+      changed += 1;
+      continue;
+    }
+    if (publication.publication_status !== document.state) {
+      await applyStatuteState(thread, forum, document.state, document.content);
+      upsertStatutePublication({
+        guildId: guild.id,
+        instrumentType,
+        instrumentId: instrument.id,
+        forumThreadId: thread.id,
+        forumMessageId: publication.forum_message_id,
+        publicationStatus: document.state,
+        contentHash: document.hash
+      });
+      changed += 1;
+    }
+  }
+  return changed;
 }
 
 export async function syncAppealRoleOverwrites(guild, roleId, courtChatChannelId) {
