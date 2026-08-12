@@ -162,6 +162,20 @@ export function plainFirstTurn(text) {
   return body.split(/\n#(?:ch\d+|other)\b/)[0].trim();
 }
 
+// 添付だけの発言。学習データに 17,889 件あり (画像 15,052 / 動画 303 / 他)、
+// 「誰かが画像を貼って、他の人が反応する」という流れを教えるために入れてある。
+//
+// ただし**返答としては無意味**。bot は画像を投稿できないので、これが出たら引き直す。
+// evex-1 で `<file>` を推論時に禁止したのと同じ対処だが、あちらは 1 トークンで
+// 確率が跳ね上がって返答の 38% を占めた。こちらは複数トークンなので出にくいはずで、
+// 実際にどれだけ出るかは probe で測る。
+const ONLY_ATTACHMENT = /^\[(画像|動画|音声|ファイル|添付|圧縮ファイル|埋め込み|スタンプ)\][\s　]*$/;
+
+/** 返答として使えないもの (添付だけ) か。 */
+export function isAttachmentOnly(text) {
+  return ONLY_ATTACHMENT.test(String(text ?? '').trim());
+}
+
 /** 会話に居る人に役を振る。evex-1 側と同じ assignRoles を通す。 */
 export function assignPlainRoles(userIds) {
   return assignRoles(userIds, PLAIN_SCHEME);

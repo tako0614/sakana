@@ -321,3 +321,20 @@ try {
     wipe();
   }
 }
+
+// --- 添付だけの返答を弾く ---
+//
+// [画像] を学習データに入れたので、モデルが返答としてそれを吐きうる。bot は画像を
+// 投稿できないので無意味。evex-1 で <file> を禁止したのと同じ対処。
+{
+  const { isAttachmentOnly } = await import('../src/mimic/plain.js');
+
+  for (const bad of ['[画像]', '[動画]', ' [添付] ', '[スタンプ]', '[画像]　']) {
+    if (!isAttachmentOnly(bad)) fail(`添付だけを弾いていない: ${JSON.stringify(bad)}`);
+  }
+  for (const ok of ['[画像] かわいい', 'これ [画像]', '画像', '[]', '', 'いいね']) {
+    if (isAttachmentOnly(ok)) fail(`本文があるのに弾いている: ${JSON.stringify(ok)}`);
+  }
+
+  console.log('attachment ok (添付だけは引き直す / 本文があれば通す)');
+}

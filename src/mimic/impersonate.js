@@ -14,7 +14,7 @@
 
 import { endpointFor, generate, roleScheme } from './client.js';
 import {
-  assignPlainRoles, buildPlainPrompt, labelFor, plainFirstTurn, plainText
+  assignPlainRoles, buildPlainPrompt, isAttachmentOnly, labelFor, plainFirstTurn, plainText
 } from './plain.js';
 import { buildPrompt, firstTurn, messageText } from './serialize.js';
 import { exampleTurns, hasOptedOut, tokenFor } from './speakers.js';
@@ -136,6 +136,7 @@ export async function impersonate(userId, { topic = null, channelId = null, aske
   for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
     const result = await generate({ prompt: built.prompt, engine });
     text = cut(String(result.text ?? '').slice(built.prompt.length));
+    if (isAttachmentOnly(text)) text = '';
     if (text.length >= MIN_CHARS) break;
   }
 

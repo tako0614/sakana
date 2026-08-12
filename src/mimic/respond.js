@@ -24,8 +24,8 @@ import { endpointFor, generate, roleScheme } from './client.js';
 import { mimicFormat } from './impersonate.js';
 import { personaFor } from './persona.js';
 import {
-  PLAIN_SCHEME, assignPlainRoles, buildPlainPrompt, labelFor, labelledSpeakers,
-  plainFirstTurn, plainText
+  PLAIN_SCHEME, assignPlainRoles, buildPlainPrompt, isAttachmentOnly, labelFor,
+  labelledSpeakers, plainFirstTurn, plainText
 } from './plain.js';
 import { assignRoles, buildPrompt, firstTurn, messageText, nextRole } from './serialize.js';
 import { hasOptedOut, learnedSpeakers, tokenFor } from './speakers.js';
@@ -185,6 +185,8 @@ export async function handleMimicRequest(
       const result = await generate({ prompt: built.prompt, engine });
       // プロンプトぶんを落として、生成された続きだけを見る
       body = built.cut(String(result.text ?? '').slice(built.prompt.length));
+      // 添付だけの返答は bot が画像を投稿できないので意味が無い。引き直す
+      if (isAttachmentOnly(body)) body = '';
       if (body.length >= MIN_CHARS) break;
     }
 
