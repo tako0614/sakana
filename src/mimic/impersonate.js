@@ -12,7 +12,7 @@
 // 最初は相対の役 (A/B/C) にしていて、そのときは原理的に不可能だった —
 // 実測で役 A の中身は 1,062 人ぶんで、最多の人でも 10.4% (全体シェア 9.4% とほぼ同じ)。
 
-import { endpointFor, generate, roleScheme } from './client.js';
+import { continuationOf, endpointFor, generate, roleScheme } from './client.js';
 import {
   assignPlainRoles, buildPlainPrompt, isAttachmentOnly, labelFor, plainFirstTurn, plainText
 } from './plain.js';
@@ -135,7 +135,7 @@ export async function impersonate(userId, { topic = null, channelId = null, aske
   let text = '';
   for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
     const result = await generate({ prompt: built.prompt, engine });
-    text = cut(String(result.text ?? '').slice(built.prompt.length));
+    text = cut(continuationOf(result.text, built.prompt));
     if (isAttachmentOnly(text)) text = '';
     if (text.length >= MIN_CHARS) break;
   }

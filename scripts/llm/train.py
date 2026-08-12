@@ -45,6 +45,9 @@ parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
 # 1次元パラメータに weight decay を掛けるのは標準的には有害とされる。
 # 埋め込みは 5.87M のうち 105万 (18%) なので効き方が大きい。
 parser.add_argument("--wd-mode", default="all", choices=["all", "matrices"])
+# 正規化が作った記号 (<file> <url> <mention> <channel> <time>) を損失から外す。
+# 文脈には残るので流れは学べるが、自分では書かなくなる
+parser.add_argument("--mask-tokens", action=argparse.BooleanOptionalAction, default=True)
 args = parser.parse_args()
 
 corpus = Path(args.corpus)
@@ -121,14 +124,42 @@ else:
     print(f"device cpu / threads {args.threads}")
 
 
-def batches(ids, batch_size, generator):
+# 正規化が作った記号。**文脈には残すが、書き方は教えない。**
+#
+# これらは「本文がそこにあったが渡せなかった」という印で、発言ではない。
+# 普通に学習させると、モデルはこれを発言として書く — 実測で返答の 38% が
+# 「(画像)」だけになり、推論時にトークンを禁止して 12% に抑えるしかなかった。
+# あれは症状の抑え込みで、しかも高確率のトークンを削って再正規化するので
+# 出てくる第二候補が歪む。
+#
+# 学習時に損失から外せば、確率の質量が最初から実際の語に乗る。
+# 文脈からは消さない — 「誰かが画像を貼って、他の人が反応する」流れは学ばせたい。
+#
+# <nl> と <code> は外さない。改行もコードブロックもモデルが書いて良いもの。
+MASKED_PIECES = ("<file>", "<url>", "<mention>", "<channel>", "<time>")
+masked_ids = [sp.piece_to_id(p) for p in MASKED_PIECES if sp.piece_to_id(p) != sp.unk_id()]
+
+# model.py の cross_entropy は ignore_index=-1 なので、-100 ではなく -1 を置く
+IGNORE = -1
+
+
+def batches(ids, batch_size, generator, mask=None):
     """context+1 の窓を無作為に切る。端は捨てる。"""
     high = len(ids) - cfg.context - 1
+    use = args.mask_tokens if mask is None else mask
+    ban = torch.tensor(masked_ids, dtype=torch.long) if use else None
+
     while True:
         starts = torch.randint(0, high, (batch_size,), generator=generator)
         block = np.stack([ids[s: s + cfg.context + 1] for s in starts.tolist()])
         chunk = torch.from_numpy(block.astype(np.int64))
-        yield chunk[:, :-1].to(device), chunk[:, 1:].to(device)
+        x, y = chunk[:, :-1], chunk[:, 1:]
+
+        if ban is not None:
+            # 入力 (x) はそのまま。目標 (y) だけ外すので、文脈としては見えたまま
+            y = y.masked_fill(torch.isin(y, ban), IGNORE)
+
+        yield x.to(device), y.to(device)
 
 
 gen = torch.Generator().manual_seed(0)
@@ -173,10 +204,16 @@ def lr_at(step):
 
 
 @torch.no_grad()
-def evaluate(ids, iters=40):
+def evaluate(ids, iters=40, mask=None):
+    """val を測る。
+
+    mask=True は学習と同じ尺度 (記号を外した loss)。mask=False は記号も含めた素の
+    loss で、**過去の run と比べられるのはこちら**。記号を外すと平均が変わるので、
+    そこを混ぜると「良くなった/悪くなった」を誤読する。両方出す。
+    """
     model.eval()
     local = torch.Generator().manual_seed(1234)
-    stream = batches(ids, args.batch, local)
+    stream = batches(ids, args.batch, local, mask=mask)
     total = 0.0
     for _ in range(iters):
         x, y = next(stream)
@@ -249,14 +286,17 @@ for step in range(total_steps):
         epoch = (step + 1) // steps_per_epoch
         tr = evaluate(train_ids, iters=20)
         va = evaluate(val_ids, iters=20)
-        history.append({"epoch": epoch, "step": step + 1, "train": tr, "val": va})
+        # 記号を含めた素の loss。過去の run と比べられるのはこちらだけ
+        raw = evaluate(val_ids, iters=20, mask=False) if args.mask_tokens else va
+        history.append({"epoch": epoch, "step": step + 1, "train": tr, "val": va,
+                        "val_raw": raw})
 
-        print(f"--- epoch {epoch}  train {tr:.4f}  val {va:.4f}  "
+        print(f"--- epoch {epoch}  train {tr:.4f}  val {va:.4f}  素の val {raw:.4f}  "
               f"({(time.time() - started) / 60:.0f} 分経過)", flush=True)
 
         torch.save(
             {"model": model.state_dict(), "config": vars(cfg), "epoch": epoch,
-             "train_loss": tr, "val_loss": va},
+             "train_loss": tr, "val_loss": va, "val_raw": raw},
             out / f"ckpt-e{epoch}.pt"
         )
         for line in samples(f"e{epoch}"):

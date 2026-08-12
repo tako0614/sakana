@@ -253,6 +253,9 @@ for (const [chIdx, rows] of byChannel) {
     const roles = assignRoles(unnamed, SCHEME);
     const roleOf = (idx) => (idx === undefined ? null : roles.get(idx) ?? null);
 
+    const counts = new Map();
+    for (const row of chunk) counts.set(row.author, (counts.get(row.author) ?? 0) + 1);
+
     const lines = [];
     for (const row of chunk) {
       let text = plainText(row.content, roleOf);
@@ -274,12 +277,83 @@ for (const [chIdx, rows] of byChannel) {
 
     conversations.push({
       at: chunk[chunk.length - 1].created_at,
+      // priming で使う。会話の開始時刻より前からしか引かないので、
+      // 同じ会話が混ざることがない
+      from: chunk[0].created_at,
+      channel: label,
+      roles,
+      counts,
+      lines,
+      primed: 0,
       text: `${label}\n${lines.join('\n')}`
     });
   }
 }
 
 conversations.sort((a, b) => a.at - b.at);
+
+// --- 文脈で人を教える (persona priming) ---
+//
+// 窓の先頭にその人の「別の会話での発言」を置く。学習側では**その位置の損失を外す**
+// (finetune.py が primed の行数を見て外す) ので、「先頭のブロックは条件、続きが
+// 予測対象」という形になる。
+//
+// 狙いは推論側の穴を埋めること。147人はラベルで口調が出るが、残り 2,405人は
+// 実発言を例として見せる経路しかなく、**モデルは「例を使う」ことを一度も学んでいない**。
+// 学習データでは無名の人は A/B/C の相対の役で、実測で役 A の中身は 1,062人ぶん
+// (最多でも 10.4% = その人の全体シェアと同じ) なので、A は誰でもない。
+//
+// 効き方には構造的な裏付けがある。学習データを位置別に数えると、URL だけの行が
+// 出る確率は会話の 0 行目で 9.80% / 1 行目で 5.44% / 6 行目以降で 2.76%。
+// **本人が直前1〜2行で本文を喋っていた場合は 1.94%** まで落ちる。
+// いまの `/mimic` のプロンプトは生成点がちょうど 0〜1 行目 = 最悪の位置 (8.21%)。
+// 本人の実発言を直前に置くだけで、意味検索の当たり外れとは無関係に改善する。
+//
+// **新しい記法は足さない。** `名前: 本文` の行が増えるだけなので、Qwen が
+// 事前学習で見ていない並びにはならない。`[過去]` のような印を入れると、
+// そこだけ未学習になって崩れる (evex-1 に <|a|> を渡して壊したのと同じ形)。
+const PRIME_RATE = Number(process.env.LLM_PRIME_RATE ?? 0.5);
+const PRIME_TURNS = Number(process.env.LLM_PRIME_TURNS ?? 4);
+const PRIME_MIN_CHARS = 4;      // 「草」「w」は口調の情報が無い (exampleTurns と同じ)
+const PRIME_MAX_CHARS = 200;    // 1 件で例が埋まるのを防ぐ
+const PRIME_BUDGET = Math.round(CHUNK.maxChars * 0.4);
+
+// 乱数は種を固定する。Math.random だと作り直すたびに中身が変わって、
+// 「コーパスを変えたのか学習が揺れたのか」が切り分けられなくなる
+function mulberry32(seed) {
+  return () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const rand = mulberry32(Number(process.env.LLM_PRIME_SEED ?? 12345));
+
+// 人ごとの発言。時刻順にしておいて、会話の開始より前から二分探索で引く
+const byAuthor = new Map();
+for (const rows of byChannel.values()) {
+  for (const row of rows) {
+    const length = row.content.length;
+    if (length < PRIME_MIN_CHARS || length > PRIME_MAX_CHARS) continue;
+    if (!byAuthor.has(row.author)) byAuthor.set(row.author, []);
+    byAuthor.get(row.author).push({ at: row.created_at, content: row.content });
+  }
+}
+for (const list of byAuthor.values()) list.sort((a, b) => a.at - b.at);
+
+/** at より前の要素数。上限を二分探索で出す (常連は5万件あるので線形に舐めない)。 */
+function countBefore(list, at) {
+  let lo = 0;
+  let hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (list[mid].at < at) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
 
 // val は「最後の N 日ぶんの会話」。ランダム分割にしない —
 // 「草」「www」のような完全一致が 23% あるので、時間で切らないと val が嘘になる
@@ -289,9 +363,84 @@ const cutoff = newest - VAL_DAYS * 86_400_000;
 const train = conversations.filter((c) => c.at < cutoff);
 const val = conversations.filter((c) => c.at >= cutoff);
 
+// priming は **train にだけ**入れる。val に入れると「例を見た状態」の尺度になって、
+// preview の val 2.5898 と比べられなくなる。
+let primedConversations = 0;
+let primedLines = 0;
+
+for (const conv of train) {
+  if (rand() >= PRIME_RATE) continue;
+
+  // 無名の人を優先する。名前持ちはラベルで既に効いているので、無名側にこそ効く。
+  // 同じ会話で一番喋っている人を選ぶ (材料が多く、効果も測りやすい)
+  const ranked = [...conv.counts.entries()].sort((a, b) => b[1] - a[1]);
+  const target = ranked.find(([idx]) => conv.roles.has(idx))?.[0] ?? ranked[0]?.[0];
+  if (target === undefined) continue;
+
+  const label = speakerLabelOf(target) ?? conv.roles.get(target);
+  if (!label) continue;
+
+  const own = byAuthor.get(target);
+  if (!own) continue;
+
+  // 会話の開始より前からしか引かない。これで同じ会話が混ざらない
+  // (自明なコピーになるし、val に未来を漏らす経路も塞げる)
+  const before = countBefore(own, conv.from);
+  if (before === 0) continue;
+
+  // この会話に既に出ている本文。priming に同じものを入れると、目標がそのまま
+  // 前に置かれた形になって「写せば当たる」問題を作る。時刻で別メッセージを
+  // 選んでいても、「草」「わかる」のような繰り返しで一致する (実測 818 会話 = 9.4%)
+  // 複数行の発言は継続行にラベルが無い。`indexOf` が -1 を返すので、
+  // 見つからないときは行そのものを入れる (先頭1字を落とした変な値を入れない)
+  const already = new Set(conv.lines.flatMap((line) => {
+    const at = line.indexOf(': ');
+    return at < 0 ? [line] : [line.slice(at + 2), ...line.slice(at + 2).split('\n')];
+  }));
+
+  const picked = [];
+  const seen = new Set();
+  let budget = PRIME_BUDGET;
+
+  // 直近から遡る。生成点に近い側に近い発言が来る形にしたいので、最後に反転する
+  for (let i = before - 1; i >= 0 && picked.length < PRIME_TURNS; i -= 1) {
+    const text = plainText(own[i].content, (idx) => (
+      speakerLabelOf(idx) ?? conv.roles.get(idx) ?? null
+    ));
+    if (!text || text.length < PRIME_MIN_CHARS) continue;
+
+    // **改行を含む本文は使わない。** priming の範囲を「先頭 N 行」で渡すので、
+    // 1 発言が複数行に跨ると行数と発言数がずれて、損失マスクが別の場所を外す
+    // (実測で 1,317 会話がこれで壊れていた)。捨てても材料は足りる
+    if (text.includes('\n')) continue;
+
+    if (seen.has(text)) continue;               // 「草」を4回並べても情報が増えない
+    if (already.has(text)) continue;            // 会話の中に同じ本文がある
+    if (text.length > budget) continue;
+
+    seen.add(text);
+    picked.push(text);
+    budget -= text.length;
+  }
+
+  if (!picked.length) continue;
+
+  picked.reverse();
+  const head = picked.map((text) => `${label}: ${text}`);
+  conv.primed = head.length;
+  conv.text = `${conv.channel}\n${head.join('\n')}\n${conv.lines.join('\n')}`;
+
+  primedConversations += 1;
+  primedLines += head.length;
+}
+
 await mkdir(dst, { recursive: true });
 
-const jsonl = (list) => `${list.map((c) => JSON.stringify({ text: c.text })).join('\n')}\n`;
+// primed は「先頭から何行が条件か」。finetune.py がこの行数ぶんの本文を損失から外す。
+// 文字範囲ではなく行数で渡すのは、priming 行を必ず先頭に固めてあるから一意に決まるため
+const jsonl = (list) => `${list
+  .map((c) => JSON.stringify(c.primed ? { text: c.text, primed: c.primed } : { text: c.text }))
+  .join('\n')}\n`;
 await writeFile(path.join(dst, 'train.jsonl'), jsonl(train));
 await writeFile(path.join(dst, 'val.jsonl'), jsonl(val));
 
@@ -326,7 +475,11 @@ await writeFile(
     named_channels: NAMED_CHANNELS,
     chunk: CHUNK,
     named_speakers: labelByIdx.size,
-    named_min_messages: NAMED_MIN_MESSAGES
+    named_min_messages: NAMED_MIN_MESSAGES,
+    primed_conversations: primedConversations,
+    primed_lines: primedLines,
+    prime_rate: PRIME_RATE,
+    prime_turns: PRIME_TURNS
   }, null, 2)}\n`
 );
 
@@ -336,4 +489,6 @@ console.log(`会話             ${fmt(conversations.length)}  train ${fmt(train.
 console.log(`文字数           train ${fmt(chars(train))} / val ${fmt(chars(val))}`);
 console.log(`1 会話あたり     ${Math.round(chars(train) / train.length)} 字`);
 console.log(`名前ラベル       ${labelByIdx.size} 人 (${NAMED_MIN_MESSAGES} 件以上)`);
+console.log(`priming          ${fmt(primedConversations)} 会話 / ${fmt(primedLines)} 行 `
+  + `(train の ${(primedConversations / train.length * 100).toFixed(0)}%)`);
 console.log(`\n--- 先頭の会話 ---\n${train[0]?.text.slice(0, 400)}`);

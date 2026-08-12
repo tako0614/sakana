@@ -60,6 +60,34 @@ export function endpointFor(engine) {
   return ENDPOINTS[engine] ?? mimicConfig;
 }
 
+/**
+ * 生成結果からプロンプトぶんを落として、続きだけを取る。
+ *
+ * `slice(prompt.length)` で済ませていたが、それは**サーバーがプロンプトを一字一句
+ * そのまま返す**前提だった。推論サーバーはどちらも窓を超えたプロンプトを左から
+ * 捨てる (server.py は context-1、server-ft.py は 1023 トークン)。超えた瞬間に
+ * echo がプロンプトより短くなり、slice が空文字を返す。呼び出し側は 3 回引き直して
+ * 「何も出てきませんでした」で終わる — **原因がどこにも出ない壊れ方**。
+ *
+ * 先頭一致で駄目なら末尾側を錨にして探す。先頭側で探すと、同じラベルが何度も
+ * 出るプロンプト (なりきりで本人の過去発言を並べる形) で誤爆する。
+ */
+export function continuationOf(full, prompt) {
+  const text = String(full ?? '');
+  if (text.startsWith(prompt)) return text.slice(prompt.length);
+
+  // 末尾 64 字を錨にする。窓溢れで頭が削られていても末尾は残っている
+  const anchor = prompt.slice(-64);
+  const at = anchor ? text.lastIndexOf(anchor) : -1;
+  if (at >= 0) return text.slice(at + anchor.length);
+
+  console.warn(
+    `推論サーバーの echo がプロンプトと一致しません (prompt ${prompt.length} 字 / `
+    + `返り ${text.length} 字)。窓を超えて切られた可能性があります。`
+  );
+  return '';
+}
+
 // speakers.json は使わない。話者は会話ごとの相対トークンになったので、
 // Discord の user_id と結びつける表がそもそも要らない。
 

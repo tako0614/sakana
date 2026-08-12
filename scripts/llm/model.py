@@ -184,18 +184,34 @@ class MicroLM(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=0.9, top_k=40, stop_id=None,
-                 ban_ids=None, min_new_tokens=0):
+                 ban_ids=None, min_new_tokens=0, min_p=0.0, repetition_penalty=1.0):
         """ban_ids: 絶対に出させないトークン。min_new_tokens: それまでは stop_id も出させない。
 
         チャットに使うと `<url>` や `<file>` だけを吐いて終わることが多い
         (実測 38%)。あれは正規化が作った記号で発言ではないので、
         呼び出し側から外せるようにしてある。
+
+        min_p と repetition_penalty は **evex-ft (transformers) 側と同じ手を
+        こちらでも使えるようにするため**に足した。世代を読み比べるときに、
+        サンプリングが違うと差がモデル由来かハーネス由来か分からなくなる。
         """
         self.eval()
         for step in range(max_new_tokens):
             window = idx[:, -self.cfg.context:]
             logits, _ = self(window)
-            logits = logits[:, -1, :] / max(temperature, 1e-5)
+            logits = logits[:, -1, :]
+
+            # 繰り返しペナルティは温度より前に掛ける (transformers と同じ順序)。
+            # 既に出したトークンの確率を割る。負の logit は掛ける方が下がるので分ける
+            if repetition_penalty and repetition_penalty != 1.0:
+                for row in range(idx.size(0)):
+                    seen = torch.unique(idx[row])
+                    picked = logits[row, seen]
+                    logits[row, seen] = torch.where(
+                        picked > 0, picked / repetition_penalty, picked * repetition_penalty
+                    )
+
+            logits = logits / max(temperature, 1e-5)
 
             if ban_ids:
                 logits[:, ban_ids] = float("-inf")
@@ -207,7 +223,16 @@ class MicroLM(nn.Module):
                 kth = torch.topk(logits, min(top_k, logits.size(-1))).values[:, -1:]
                 logits = logits.masked_fill(logits < kth, float("-inf"))
 
-            nxt = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+            probs = F.softmax(logits, dim=-1)
+
+            # min_p: 最大確率の min_p 倍を下回る候補を切る。top_k だけより崩れが減る。
+            # 分布が尖っているときは強く絞り、平らなときは緩む
+            if min_p and min_p > 0:
+                floor = probs.max(dim=-1, keepdim=True).values * min_p
+                probs = torch.where(probs < floor, torch.zeros_like(probs), probs)
+                probs = probs / probs.sum(dim=-1, keepdim=True)
+
+            nxt = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, nxt), dim=1)
 
             if stop_id is not None and int(nxt) == stop_id:

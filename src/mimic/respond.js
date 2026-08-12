@@ -20,7 +20,7 @@
 // ドル換算の上限 (agent_calls) に混ぜると請求と乖離する。
 
 import { chunkForDiscord } from '../agent/format.js';
-import { endpointFor, generate, roleScheme } from './client.js';
+import { continuationOf, endpointFor, generate, roleScheme } from './client.js';
 import { mimicFormat } from './impersonate.js';
 import { personaFor } from './persona.js';
 import {
@@ -184,7 +184,7 @@ export async function handleMimicRequest(
     for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
       const result = await generate({ prompt: built.prompt, engine });
       // プロンプトぶんを落として、生成された続きだけを見る
-      body = built.cut(String(result.text ?? '').slice(built.prompt.length));
+      body = built.cut(continuationOf(result.text, built.prompt));
       // 添付だけの返答は bot が画像を投稿できないので意味が無い。引き直す
       if (isAttachmentOnly(body)) body = '';
       if (body.length >= MIN_CHARS) break;

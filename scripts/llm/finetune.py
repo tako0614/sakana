@@ -145,7 +145,9 @@ def load_split(name):
         path = Path(hf_hub_download(args.dataset, f"{name}.jsonl", repo_type="dataset"))
     # U+2028 で割れるのを避けるため、書き出し側と同じく \n だけで切る
     text = path.read_text(encoding="utf8")
-    return [json.loads(line)["text"] for line in text.split("\n") if line]
+    rows = [json.loads(line) for line in text.split("\n") if line]
+    # primed は「先頭から何行が条件か」。無い行は 0
+    return [(row["text"], row.get("primed", 0)) for row in rows]
 
 
 tok = AutoTokenizer.from_pretrained(args.base)
@@ -184,6 +186,45 @@ def attachment_spans(text):
     return [m.span(1) for m in UNUSABLE_BODY.finditer(text)]
 
 
+def primed_spans(text, primed):
+    """priming した発言の**本文の**文字範囲。
+
+    build-sft.mjs が窓の先頭にその人の「別の会話での発言」を置き、`primed` に
+    その行数を入れてくる。ここを損失から外すと「先頭のブロックは条件、続きが
+    予測対象」という形になり、**推論時に渡す例をモデルが使えるようになる**。
+
+    外さないと「その人の過去発言を延々と書く」ことを学ぶ。
+
+    行数で受けられるのは、priming 行が
+      - 必ず 1 行目 (チャンネル行) の直後に固まっている
+      - 1 発言 = 1 行 (改行を含む本文は priming に使わない)
+    という2つを build-sft.mjs 側で保証しているから。最初は複数行の本文を許して
+    いて、1,317 会話で行数と発言数がずれ、**別の場所を外していた**。
+    """
+    if not primed:
+        return []
+
+    spans = []
+    at = text.find("\n")            # チャンネル行の終わり
+    if at < 0:
+        return []
+    at += 1
+
+    for _ in range(primed):
+        end = text.find("\n", at)
+        if end < 0:
+            end = len(text)
+        head = text.find(": ", at)
+        # ラベルと `: ` は残す。「次に誰が喋るか」は学ばせたい
+        if 0 <= head < end:
+            spans.append((head + 2, end))
+        at = end + 1
+        if at > len(text):
+            break
+
+    return spans
+
+
 class Packed(Dataset):
     """会話を EOS で継いで seq 長に詰める。
 
@@ -197,7 +238,7 @@ class Packed(Dataset):
         labels = []
         masked = 0
 
-        for text in texts:
+        for text, primed in texts:
             encoded = tok(text, add_special_tokens=False, return_offsets_mapping=True)
             piece = encoded.input_ids
             keep = [True] * len(piece)
@@ -219,10 +260,20 @@ class Packed(Dataset):
                 #   ']\n' ← 改行と合体。同じく外
                 # 中だけ外しても `名前: ` の直後に ` [` が来ることを学び続けるので、
                 # 抑えたい失敗がそのまま残る。
-                for start, end in attachment_spans(text):
-                    for i, (a, b) in enumerate(encoded.offset_mapping):
-                        if b > a and b > start and a < end:
-                            keep[i] = False
+                #
+                # span ごとに全トークンを走査すると 18,000 会話 × 500 トークン ×
+                # span 数 になって、データ準備だけで分単位かかる (GPU が遊ぶ)。
+                # span を開始位置で並べて、オフセットを1回だけ舐める。
+                spans = sorted(attachment_spans(text) + primed_spans(text, primed))
+                cursor = 0
+                for i, (a, b) in enumerate(encoded.offset_mapping):
+                    if b <= a:
+                        continue
+                    # 終わりが a 以下の span は以降のトークンにも掛からない
+                    while cursor < len(spans) and spans[cursor][1] <= a:
+                        cursor += 1
+                    if cursor < len(spans) and spans[cursor][0] < b:
+                        keep[i] = False
 
             ids.extend(piece)
             labels.extend(t if k else -100 for t, k in zip(piece, keep))
