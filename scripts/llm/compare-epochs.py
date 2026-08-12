@@ -24,6 +24,7 @@ val 最小は epoch 2 だが、epoch 3 の方が口語として自然に読め�
 """
 
 import argparse
+import collections
 import json
 import random
 import re
@@ -53,8 +54,36 @@ epochs = sorted(root.glob("epoch-*"), key=lambda p: int(p.name.split("-")[1]))
 if not epochs:
     raise SystemExit(f"{root}/epoch-* が無い")
 
-labels = json.loads(Path(args.labels).read_text(encoding="utf8"))
-people = [row["label"] for row in labels[: args.people]]
+def top_labels(n):
+    """叩く相手を決める。
+
+    labels.json があればそれを使うが、**無くても train.jsonl から数えられる**。
+    あの表は Discord の実 ID を含むので HF に上げていない。行頭のラベルを数えれば
+    同じ順位が出るので、身元を持ち出さずに済む。
+    """
+    path = Path(args.labels)
+    if path.exists():
+        rows = json.loads(path.read_text(encoding="utf8"))
+        return [row["label"] for row in rows[:n]]
+
+    if not args.train:
+        raise SystemExit("--labels も --train も無いと誰を叩けばいいか分からない")
+
+    found = collections.Counter()
+    for line in Path(args.train).read_text(encoding="utf8").split("\n"):
+        if not line:
+            continue
+        for turn in json.loads(line)["text"].split("\n")[1:]:
+            head = turn.split(": ", 1)
+            # 英字1文字の役は名前を持たない人。個人の口調は入っていないので外す
+            if len(head) == 2 and len(head[0]) > 1:
+                found[head[0]] += 1
+
+    return [label for label, _ in found.most_common(n)]
+
+
+people = top_labels(args.people)
+print(f"叩く相手: {' / '.join(people)}\n")
 
 # 学習データの行。逐語コピーの判定に使う (完全一致だけ見る)
 seen = set()

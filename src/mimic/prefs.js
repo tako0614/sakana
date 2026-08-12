@@ -29,17 +29,17 @@ const countStmt = db.prepare('SELECT engine, COUNT(*) n FROM agent_engine GROUP 
  */
 export const ENGINES = {
   deepseek: {
-    label: 'DeepSeek v4 Flash',
+    label: 'deepseek-v4-flash',
     summary: '検索・read・web・引用つきのエージェント。事実を調べて答える'
   },
   evex: {
-    label: 'evex-2-preview (自作 5.87M)',
+    label: 'evex-2-preview',
     summary: 'このサーバーの94万件だけで一から学習した素のチャットボット。道具も検索も無く、会話の続きを1発言返すだけ。evex-1 から LR を直して val 4.2404 → 4.0613'
   },
   // 一から学習した最初の世代。evex-2 に差し替えたあとも比べられるように残す。
   // 同じコーパス・同じ tokenizer で、違うのは LR だけ (3e-4 → 1e-3)。
   'evex-1': {
-    label: 'evex-1 (自作 5.87M / 初代)',
+    label: 'evex-1',
     summary: 'このサーバーの94万件だけで一から学習した最初の版。val 4.2404。evex-2 と読み比べるために残してある'
   },
   // 別プロセス・別ポートで並走させる。evex を置き換えないのは性質が違うから —

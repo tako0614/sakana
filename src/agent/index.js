@@ -167,9 +167,13 @@ function canUseFullBrowser(member) {
   return agentConfig.browserTrustedUsers.includes(member.id);
 }
 
-/** 末尾に出すモデル名。`deepseek-v4-flash` を `deepseek v4 flash` にする。 */
+/** 末尾に出すモデル名。
+ *
+ * 以前はハイフンを空白にしていたが、自作モデル側が `evex-2-preview` の形なので
+ * そちらと揃える。`/model` の表示・フッター・env の値が全部同じ綴りになる。
+ */
 function modelLabel() {
-  return agentConfig.model.replace(/-/g, ' ');
+  return agentConfig.model;
 }
 
 function limitMessage(reservation) {
