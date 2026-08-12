@@ -16,9 +16,11 @@ import {
   archiveLegacyGovernanceMessage,
   createAdministrativeAct,
   getActiveConstitution,
+  getCaseSanction,
   getGovernanceGuild,
   getOperationalSetting,
   listActionFailures,
+  listCaseApprovals,
   listCases,
   listProposals,
   markLegacyGovernanceMessageDeleted,
@@ -30,12 +32,13 @@ import {
 import {
   GOVERNANCE_ADMIN_NAME,
   GOVERNANCE_GUIDE_NAME,
-  createGovernanceAdminChannel,
+  GOVERNANCE_PROCEDURE_TOPIC,
+  createGovernanceProcedureChannel,
   createGovernanceGuideChannel,
+  governanceProcedureOverwrites,
   governancePermissionReport,
   postGazette,
-  readOnlyTextOverwrites,
-  resolvedAdminChannelOverwrites
+  readOnlyTextOverwrites
 } from './discord.js';
 import { setTrustedMember } from './service.js';
 
@@ -121,6 +124,7 @@ export async function renderGovernanceGuide(guild, governance) {
     'AIが整理しただけでは正式案件になりません。表示された受付内容を本人が確認して初めて手続が始まります。',
     '',
     '## 公開記録',
+    `- 投票・承認など、いま対応が必要な手続: <#${governance.admin_channel_id}>`,
     `- 議会: <#${governance.parliament_forum_id}>`,
     `- 裁判所: <#${governance.court_forum_id}>`,
     `- 現行憲法・法律: <#${governance.statute_forum_id}>`,
@@ -128,32 +132,30 @@ export async function renderGovernanceGuide(guild, governance) {
   ].join('\n').slice(0, 2_000);
 }
 
-function dashboardComponents(governance) {
+function operationsComponents(governance) {
   return [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('gov:admin:refresh').setLabel('更新').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('gov:admin:toggle_state')
-        .setLabel(governance.status === 'active' ? '一時停止' : '再開')
+        .setLabel(governance.status === 'active' ? '受付を一時停止' : '受付を再開')
         .setStyle(governance.status === 'active' ? ButtonStyle.Danger : ButtonStyle.Success),
       new ButtonBuilder().setCustomId('gov:admin:enforcement')
-        .setLabel(governance.enforcement_mode === 'live' ? '記録のみに戻す' : '実執行を診断')
+        .setLabel(governance.enforcement_mode === 'live' ? '実執行を停止' : '実執行を診断')
         .setStyle(governance.enforcement_mode === 'live' ? ButtonStyle.Secondary : ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId('gov:admin:settings').setLabel('AI回数・起案上限').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('gov:admin:settings').setLabel('AI利用上限').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('gov:admin:weekly_toggle')
         .setLabel(getOperationalSetting(governance.guild_id, 'weekly_scan_enabled') === 1 ? '自律起案 ON' : '自律起案 OFF')
         .setStyle(getOperationalSetting(governance.guild_id, 'weekly_scan_enabled') === 1 ? ButtonStyle.Success : ButtonStyle.Secondary)
     ),
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('gov:admin:electorate').setLabel('特別有権者').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('gov:admin:electorate').setLabel('特別有権者を設定').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('gov:admin:recovery').setLabel('診断・復旧').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('gov:admin:legacy').setLabel('旧技術投稿を確認').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setLabel('官報を開く').setStyle(ButtonStyle.Link)
-        .setURL(`https://discord.com/channels/${governance.guild_id}/${governance.gazette_channel_id}`)
+      new ButtonBuilder().setLabel('公開手続を開く').setStyle(ButtonStyle.Link)
+        .setURL(`https://discord.com/channels/${governance.guild_id}/${governance.admin_channel_id}`)
     )
   ];
 }
 
-export async function renderGovernanceDashboard(guild, governance) {
+export async function renderGovernanceOperationsPanel(guild, governance) {
   const constitution = getActiveConstitution(guild.id);
   const permissions = governancePermissionReport(guild);
   const failures = listActionFailures(guild.id);
@@ -166,7 +168,9 @@ export async function renderGovernanceDashboard(guild, governance) {
   const weeklyEnabled = getOperationalSetting(guild.id, 'weekly_scan_enabled') === 1;
   return {
     content: [
-      `# ${guild.name} 統治管理`,
+      `# ${guild.name} Bot技術運用`,
+      '',
+      'この画面は `/governance` を実行した運営者だけに表示されています。投票・承認などの統治手続は公開チャンネルで行います。',
       '',
       `状態: **${stateLabel(governance)}** / 執行: **${enforcementLabel(governance)}**`,
       `憲法: v${constitution?.version ?? '?'} / 法案 ${counts.proposals}件 / 事件 ${counts.cases}件`,
@@ -176,10 +180,87 @@ export async function renderGovernanceDashboard(guild, governance) {
       `自律起案: ${weeklyEnabled ? '有効' : '無効'} / 週最大 ${getOperationalSetting(guild.id, 'weekly_draft_limit')}件`,
       `AI受付: 一般 ${getOperationalSetting(guild.id, 'general_daily_calls')}回/日 / ${electorateName} ${getOperationalSetting(guild.id, 'trusted_daily_calls')}回/日`,
       '',
-      `参加者向け案内: <#${governance.guide_channel_id}>`,
-      '憲法・手続policyはここでは変更できません。改憲案と投票を経てください。'
+      `公開手続: <#${governance.admin_channel_id}> / 参加案内: <#${governance.guide_channel_id}>`,
+      'ここで変更できるのはBotの運用値だけです。憲法・投票・司法policyは改憲手続を経なければ変更できません。'
     ].join('\n').slice(0, 1_900),
-    components: dashboardComponents(governance),
+    components: operationsComponents(governance),
+    allowedMentions: { parse: [] }
+  };
+}
+
+function safeLabel(value, maximum = 60) {
+  return String(value ?? '').replace(/[\[\]()*_`]/g, '').replace(/\s+/g, ' ').trim().slice(0, maximum);
+}
+
+function recordLink(guildId, channelId, label) {
+  const text = safeLabel(label);
+  return channelId ? `[${text}](https://discord.com/channels/${guildId}/${channelId})` : text;
+}
+
+function deadline(value, prefix = '締切') {
+  return value ? ` / ${prefix} <t:${Math.floor(Number(value) / 1000)}:R>` : '';
+}
+
+function procedureComponents(governance) {
+  const link = (label, channelId) => new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link)
+    .setURL(`https://discord.com/channels/${governance.guild_id}/${channelId}`);
+  return [new ActionRowBuilder().addComponents(
+    link('議会', governance.parliament_forum_id),
+    link('裁判所', governance.court_forum_id),
+    link('法令集', governance.statute_forum_id),
+    link('官報', governance.gazette_channel_id),
+    link('使い方', governance.guide_channel_id)
+  )];
+}
+
+export async function renderGovernanceProcedureHub(guild, governance) {
+  const voting = listProposals(guild.id, { statuses: ['voting'], limit: 20 });
+  const approvals = listCases(guild.id, { statuses: ['approval'], limit: 20 });
+  const debates = listProposals(guild.id, { statuses: ['debate'], limit: 20 });
+  const defenses = listCases(guild.id, { statuses: ['defense'], limit: 20 });
+  const appeals = listCases(guild.id, { statuses: ['appeal_window'], limit: 20 });
+  const votingLines = voting.slice(0, 6).map((proposal) =>
+    `- ${recordLink(guild.id, proposal.forum_thread_id, `L-${proposal.id} ${proposal.title}`)} / ${proposal.vote_scope === 'all' ? '全員投票' : '特別有権者投票'}${deadline(proposal.stage_ends_at)}`
+  );
+  const approvalLines = approvals.slice(0, 6).map((caseRecord) => {
+    const sanction = getCaseSanction(caseRecord.id);
+    const approved = listCaseApprovals(caseRecord.id).filter((entry) => entry.decision === 'approve').length;
+    return `- ${recordLink(guild.id, caseRecord.public_thread_id, `C-${caseRecord.id} 執行承認`)} / ${approved}/${sanction?.required_approvals ?? '?'}人承認済み`;
+  });
+  const responseLines = [
+    ...appeals.map((caseRecord) => {
+      const sanction = getCaseSanction(caseRecord.id);
+      return `- ${recordLink(guild.id, caseRecord.public_thread_id, `C-${caseRecord.id} 上訴受付`)}${deadline(sanction?.appeal_deadline)}`;
+    }),
+    ...defenses.map((caseRecord) =>
+      `- ${recordLink(guild.id, caseRecord.public_thread_id, `C-${caseRecord.id} 答弁受付`)}${deadline(caseRecord.defense_until)}`
+    ),
+    ...debates.map((proposal) =>
+      `- ${recordLink(guild.id, proposal.forum_thread_id, `L-${proposal.id} 討議: ${proposal.title}`)}${deadline(proposal.stage_ends_at)}`
+    )
+  ].slice(0, 8);
+  const omitted = Math.max(0, voting.length - votingLines.length)
+    + Math.max(0, approvals.length - approvalLines.length)
+    + Math.max(0, appeals.length + defenses.length + debates.length - responseLines.length);
+  return {
+    content: [
+      `# ${guild.name} 統治管理`,
+      '',
+      'ここはBot設定ではなく、コミュニティが判断する手続の一覧です。内容を読んで、リンク先の案件で投票・承認・答弁・上訴を行ってください。',
+      '',
+      '## 投票中',
+      ...(votingLines.length ? votingLines : ['現在、投票中の法案はありません。']),
+      '',
+      '## 執行承認待ち',
+      ...(approvalLines.length ? approvalLines : ['現在、承認待ちの判決はありません。']),
+      '',
+      '## 討議・答弁・上訴受付',
+      ...(responseLines.length ? responseLines : ['現在、対応受付中の案件はありません。']),
+      omitted ? `\nほか ${omitted}件は議会・裁判所から確認できます。` : null,
+      '',
+      '表示されていても、投票scope・特別有権者資格・当事者資格は操作時にBotが確認します。'
+    ].filter(Boolean).join('\n').slice(0, 1_900),
+    components: procedureComponents(governance),
     allowedMentions: { parse: [] }
   };
 }
@@ -212,10 +293,12 @@ export async function ensureGovernanceUx(guild, governance = getGovernanceGuild(
   }
 
   let admin = current.admin_channel_id ? await guild.channels.fetch(current.admin_channel_id).catch(() => null) : null;
-  if (!admin || admin.type !== ChannelType.GuildText) admin = await createGovernanceAdminChannel(guild, category.id);
-  const adminOverwrites = await resolvedAdminChannelOverwrites(guild);
+  if (!admin || admin.type !== ChannelType.GuildText) admin = await createGovernanceProcedureChannel(guild, category.id);
+  if (admin.name !== GOVERNANCE_ADMIN_NAME) await admin.setName(GOVERNANCE_ADMIN_NAME, '統治手続の名称を同期');
+  if (admin.topic !== GOVERNANCE_PROCEDURE_TOPIC) await admin.setTopic(GOVERNANCE_PROCEDURE_TOPIC, '統治手続の説明を同期');
+  const adminOverwrites = governanceProcedureOverwrites(guild);
   if (!permissionOverwritesMatch(admin, adminOverwrites)) {
-    await admin.permissionOverwrites.set(adminOverwrites, '統治管理の閲覧者を同期');
+    await admin.permissionOverwrites.set(adminOverwrites, '統治管理を公開読み取り専用に同期');
   }
 
   const siblings = [...guild.channels.cache.values()].filter((channel) => channel.parentId === category.id);
@@ -236,7 +319,7 @@ export async function ensureGovernanceUx(guild, governance = getGovernanceGuild(
   if (!guideMessage) guideMessage = await guide.send({ content: guideContent, allowedMentions: { parse: [] } });
   else if (guideMessage.content !== guideContent) await guideMessage.edit({ content: guideContent, allowedMentions: { parse: [] } });
 
-  const dashboard = await renderGovernanceDashboard(guild, current);
+  const dashboard = await renderGovernanceProcedureHub(guild, current);
   let adminMessage = await fetchTrackedMessage(admin, current.admin_dashboard_message_id, `# ${guild.name} 統治管理`);
   if (!adminMessage) adminMessage = await admin.send(dashboard);
   else if (adminMessage.content !== dashboard.content || !componentsMatch(adminMessage, dashboard.components)) {
@@ -254,6 +337,9 @@ export async function ensureGovernanceUx(guild, governance = getGovernanceGuild(
 
 async function refreshDashboard(interaction) {
   const ux = await ensureGovernanceUx(interaction.guild, getGovernanceGuild(interaction.guildId));
+  if (interaction.message?.content?.startsWith(`# ${interaction.guild.name} Bot技術運用`)) {
+    await interaction.message.edit(await renderGovernanceOperationsPanel(interaction.guild, ux.governance)).catch(() => {});
+  }
   return ux;
 }
 

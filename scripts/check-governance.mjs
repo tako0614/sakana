@@ -665,9 +665,9 @@ const { governanceCommands } = await import('../src/governance/commands.js');
 assert.deepEqual(governanceCommands.map((command) => command.data.name), ['governance'],
   '公開統治slash commandは管理用governanceだけ');
 assert.equal(governanceCommands[0].data.toJSON().options?.length ?? 0, 0,
-  '/governanceは未導入なら確認画面、導入済みなら管理画面を開く単一command');
+  '/governanceは未導入なら確認画面、導入済みなら運営者だけの技術運用パネルを開く単一command');
 const {
-  adminChannelOverwrites,
+  governanceProcedureOverwrites,
   readOnlyTextOverwrites,
   statuteForumEveryonePermissionState,
   statutePublicationState
@@ -688,11 +688,16 @@ assert.equal(statutePublicationState('law', 'suspended'), '停止');
 assert.equal(statutePublicationState('law', 'unconstitutional'), '違憲');
 assert.equal(statutePublicationState('law', 'repealed'), '廃止');
 const aclGuild = { id: 'acl-guild', ownerId: 'owner', members: { me: { id: 'bot' } } };
+const { PermissionFlagsBits } = await import('discord.js');
+const procedureAcl = governanceProcedureOverwrites(aclGuild);
 assert.deepEqual(
-  adminChannelOverwrites(aclGuild).map((entry) => entry.id),
-  ['acl-guild', 'owner', 'bot'],
-  '統治管理は特別有権者ではなくownerと設定運営者だけを追加する'
+  procedureAcl.map((entry) => entry.id),
+  ['acl-guild', 'bot'],
+  '統治管理は全員が閲覧できる読み取り専用の手続ハブである'
 );
+assert.ok(procedureAcl[0].allow.includes(PermissionFlagsBits.ViewChannel));
+assert.ok(procedureAcl[0].deny.includes(PermissionFlagsBits.SendMessages));
+assert.ok(!procedureAcl[0].deny.includes(PermissionFlagsBits.ViewChannel), '統治管理を@everyoneから隠さない');
 assert.deepEqual(
   readOnlyTextOverwrites(aclGuild).map((entry) => entry.id),
   ['acl-guild', 'bot'],
@@ -707,8 +712,9 @@ governanceDb.updateGovernanceGuild('g1', {
 const {
   legacyGazetteCandidates,
   legacyStatuteTechnicalCandidates,
-  renderGovernanceDashboard,
-  renderGovernanceGuide
+  renderGovernanceGuide,
+  renderGovernanceOperationsPanel,
+  renderGovernanceProcedureHub
 } = await import('../src/governance/ux.js');
 const uxGuild = {
   id: 'g1',
@@ -725,10 +731,15 @@ const guideText = await renderGovernanceGuide(uxGuild, governanceDb.getGovernanc
 assert.match(guideText, /貴族院/);
 assert.match(guideText, /<@&legislature-role>/);
 assert.doesNotMatch(guideText, /trusted|shadow|policy JSON/i, '参加者案内に内部用語を出さない');
-const dashboard = await renderGovernanceDashboard(uxGuild, governanceDb.getGovernanceGuild('g1'));
-assert.match(dashboard.content, /記録のみ/);
-assert.match(dashboard.content, /貴族院/);
-assert.equal(dashboard.components.length, 2);
+const procedureHub = await renderGovernanceProcedureHub(uxGuild, governanceDb.getGovernanceGuild('g1'));
+assert.match(procedureHub.content, /コミュニティが判断する手続/);
+assert.doesNotMatch(procedureHub.content, /Bot権限|AI受付|自律起案|診断・復旧/, '公開手続に技術運用を混ぜない');
+assert.equal(procedureHub.components.length, 1);
+const operations = await renderGovernanceOperationsPanel(uxGuild, governanceDb.getGovernanceGuild('g1'));
+assert.match(operations.content, /Bot技術運用/);
+assert.match(operations.content, /記録のみ/);
+assert.match(operations.content, /貴族院/);
+assert.equal(operations.components.length, 2);
 const uxSource = readFileSync(new URL('../src/governance/ux.js', import.meta.url), 'utf8');
 assert.doesNotMatch(uxSource, /\.pin\(/, '案内専用チャンネルの同期を不要なピン留め権限で止めない');
 const legacyMessages = [

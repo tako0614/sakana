@@ -29,7 +29,7 @@ import {
   castAndPublishVote
 } from './service.js';
 import { handleGovernanceIntakeComponent } from './intake.js';
-import { ensureGovernanceUx, handleGovernanceUxInteraction } from './ux.js';
+import { ensureGovernanceUx, handleGovernanceUxInteraction, renderGovernanceOperationsPanel } from './ux.js';
 
 const EPHEMERAL = MessageFlags.Ephemeral;
 const SETUP_TTL_MS = 15 * 60_000;
@@ -99,7 +99,7 @@ async function openGovernance(interaction) {
   if (governance) {
     await interaction.deferReply({ flags: EPHEMERAL });
     const ux = await ensureGovernanceUx(interaction.guild, governance);
-    await interaction.editReply(`統治管理: <#${ux.admin.id}>\n参加者向け案内: <#${ux.guide.id}>`);
+    await interaction.editReply(await renderGovernanceOperationsPanel(interaction.guild, ux.governance));
     return;
   }
 
@@ -213,7 +213,7 @@ const governanceCommand = {
 function safeCommandError(error) {
   const message = String(error?.message ?? error);
   if (/Governance model HTTP|Governance AI is busy|fetch failed|JSON|SQLITE|DiscordAPIError/i.test(message)) {
-    return 'AI・Discord・DBの一時エラーです。作成済みの案件は自動再試行されます。統治管理の「診断・復旧」を確認してください。';
+    return 'AI・Discord・DBの一時エラーです。作成済みの案件は自動再試行されます。`/governance` の「診断・復旧」を確認してください。';
   }
   return message.slice(0, 500);
 }

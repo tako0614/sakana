@@ -6,7 +6,7 @@ import {
   OverwriteType,
   PermissionFlagsBits
 } from 'discord.js';
-import { governanceCategoryName, governanceConfig } from './config.js';
+import { governanceCategoryName } from './config.js';
 import {
   getStatutePublication,
   listConstitutions,
@@ -20,6 +20,7 @@ const STATUTE_TOPIC = '現行憲法と法律の公開正本です。1法令1投�
 const GAZETTE_TOPIC = '成立・改正・判決・執行・運営操作を時系列に残す公開履歴です。現行本文は法令集を参照してください。';
 export const GOVERNANCE_GUIDE_NAME = '統治案内';
 export const GOVERNANCE_ADMIN_NAME = '統治管理';
+export const GOVERNANCE_PROCEDURE_TOPIC = '投票・執行承認・上訴・答弁など、参加者の判断が必要な統治手続きを一覧にします。';
 
 function proposalStateLabel(state) {
   return ({
@@ -101,27 +102,8 @@ export function readOnlyTextOverwrites(guild) {
   ];
 }
 
-export function adminChannelOverwrites(guild, configuredOperators = governanceConfig.operators) {
-  const botId = guild.members.me.id;
-  const operatorIds = new Set([guild.ownerId, ...configuredOperators].filter((id) => id && id !== botId));
-  return [
-    { id: guild.id, type: OverwriteType.Role, deny: [PermissionFlagsBits.ViewChannel] },
-    ...[...operatorIds].map((id) => ({
-      id,
-      type: OverwriteType.Member,
-      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessages]
-    })),
-    botOverwrite(guild)
-  ];
-}
-
-export async function resolvedAdminChannelOverwrites(guild) {
-  const validOperators = [];
-  for (const id of governanceConfig.operators) {
-    const member = guild.members.cache.get(id) ?? await guild.members.fetch(id).catch(() => null);
-    if (member) validOperators.push(id);
-  }
-  return adminChannelOverwrites(guild, validOperators);
+export function governanceProcedureOverwrites(guild) {
+  return readOnlyTextOverwrites(guild);
 }
 
 export async function createGovernanceGuideChannel(guild, categoryId) {
@@ -135,14 +117,14 @@ export async function createGovernanceGuideChannel(guild, categoryId) {
   });
 }
 
-export async function createGovernanceAdminChannel(guild, categoryId) {
+export async function createGovernanceProcedureChannel(guild, categoryId) {
   return guild.channels.create({
     name: GOVERNANCE_ADMIN_NAME,
     type: ChannelType.GuildText,
     parent: categoryId,
-    topic: 'ownerと設定済み運営者の統治管理画面です。Discord Administratorは仕様上閲覧できます。',
-    permissionOverwrites: await resolvedAdminChannelOverwrites(guild),
-    reason: `${guild.name} governance operator dashboard`
+    topic: GOVERNANCE_PROCEDURE_TOPIC,
+    permissionOverwrites: governanceProcedureOverwrites(guild),
+    reason: `${guild.name} governance procedure hub`
   });
 }
 
@@ -409,7 +391,7 @@ export async function createGovernanceSurfaces(guild, { resources = {}, onProgre
     ],
     reason: `${guild.name} governance gazette`
   }));
-  const admin = await channel('adminChannelId', ChannelType.GuildText, () => createGovernanceAdminChannel(guild, category.id));
+  const admin = await channel('adminChannelId', ChannelType.GuildText, () => createGovernanceProcedureChannel(guild, category.id));
   await syncAppealRoleOverwrites(guild, appealRole.id, courtChat.id);
   return {
     appealRoleId: appealRole.id,
