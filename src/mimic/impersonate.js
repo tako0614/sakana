@@ -30,7 +30,7 @@ const MAX_TRIES = 3;
  * 一度も見ていない入力を受け取り、例外を出さずに静かに崩れる (evex-1 に <|a|> を
  * 渡して実際に壊した)。既定は推論サーバーの申告から判定し、env で上書きできる。
  */
-async function formatOf() {
+export async function mimicFormat() {
   if (mimicConfig.format === 'plain' || mimicConfig.format === 'tokens') return mimicConfig.format;
 
   const scheme = await roleScheme();
@@ -41,7 +41,7 @@ async function formatOf() {
 
 /** その人の話者トークンが使えるか (上位48人 かつ 独自トークンの世代)。 */
 export async function canUseToken(userId) {
-  if (await formatOf() !== 'tokens') return false;
+  if (await mimicFormat() !== 'tokens') return false;
 
   const scheme = await roleScheme();
   // 相対の役だけの世代 (evex-2) は個人に紐づかないので不可
@@ -122,7 +122,7 @@ export async function impersonate(userId, { topic = null, channelId = null, aske
     return { text: null, how: 'opted-out' };
   }
 
-  const format = await formatOf();
+  const format = await mimicFormat();
   const built = format === 'plain'
     ? plainPrompt(userId, { topic, channelId, askerId })
     : await tokenPrompt(userId, { topic });
