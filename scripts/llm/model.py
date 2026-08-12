@@ -23,6 +23,13 @@ class Config:
     n_heads: int = int(os.environ.get("LLM_HEADS", 4))
     context: int = int(os.environ.get("LLM_CONTEXT", 512))
     dropout: float = float(os.environ.get("LLM_DROPOUT", 0.1))
+    # アテンション内の dropout は既定で切る。
+    #
+    # dropout_p > 0 を渡すと scaled_dot_product_attention は融合カーネルを使えず、
+    # B×H×T×T のアテンション行列を実体化する math 経路に落ちる
+    # (24×4×512×512 で 1 層あたり 100MB。6 層ぶんの往復でメモリ帯域を食い潰す)。
+    # 正則化は残差側の dropout で足りるので、ここは 0 にして融合経路に乗せる。
+    attn_dropout: float = float(os.environ.get("LLM_ATTN_DROPOUT", 0.0))
 
     @property
     def d_ff(self):
@@ -74,7 +81,7 @@ class Attention(nn.Module):
         self.cfg = cfg
         self.qkv = nn.Linear(cfg.d_model, cfg.d_model * 3, bias=False)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
-        self.dropout = cfg.dropout
+        self.dropout = cfg.attn_dropout
 
     def forward(self, x, cos, sin):
         b, t, _ = x.shape

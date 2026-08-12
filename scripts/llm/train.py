@@ -32,6 +32,10 @@ parser.add_argument("--batch", type=int, default=24)
 parser.add_argument("--lr", type=float, default=3e-4)
 parser.add_argument("--warmup", type=float, default=0.02)
 parser.add_argument("--bench", action="store_true", help="200 step だけ回して速度を出す")
+# i5-12600K は P コア 6 + E コア 4 の 16 スレッド。同期並列の行列積を全スレッドに
+# 広げると P コアが E コアを待つので、素朴に 16 を指定すると逆に遅い
+# (実測 attn_dropout=0 で 16 スレッド 2,104 → 12 スレッド 5,476 tok/s)。
+parser.add_argument("--threads", type=int, default=12)
 args = parser.parse_args()
 
 corpus = Path(args.corpus)
@@ -39,7 +43,7 @@ out = Path(args.out)
 out.mkdir(parents=True, exist_ok=True)
 
 torch.manual_seed(0)
-torch.set_num_threads(16)
+torch.set_num_threads(args.threads)
 
 sp = spm.SentencePieceProcessor(model_file=str(corpus / "tok.model"))
 cfg = Config(vocab_size=sp.get_piece_size())
@@ -67,7 +71,8 @@ val_ids = load("val")
 
 print(f"train {len(train_ids):,} トークン / val {len(val_ids):,} トークン")
 print(f"vocab {cfg.vocab_size} / layers {cfg.n_layers} / d_model {cfg.d_model} "
-      f"/ context {cfg.context} / dropout {cfg.dropout}")
+      f"/ context {cfg.context} / dropout {cfg.dropout} (attn {cfg.attn_dropout})")
+print(f"threads {args.threads} / batch {args.batch}")
 
 model = MicroLM(cfg)
 params = model.parameter_count()
