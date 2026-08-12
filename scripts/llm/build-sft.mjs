@@ -176,23 +176,45 @@ let empty = 0;
 // JSON レコードが割れる (実データに 5 件あった)。
 const raw = gunzipSync(await readFile(path.join(src, 'raw.jsonl.gz'))).toString('utf8');
 
+/**
+ * 本文が空の発言を添付・埋め込み・スタンプの中身で埋める。
+ *
+ * evex-1 はこれを渡されていなくて、空の発言を全部 `<file>` の1トークンにしていた。
+ * 結果「発言の先頭で記号が来る」確率が上がり、返答の 38% が「(画像)」だけになった
+ * (推論側でトークンを禁止して 12% に抑えたが、あれは症状の抑え込み)。
+ *
+ * extra は `IMG_2931.png` / `[埋め込み] タイトル — 説明` / `[スタンプ] name` の形。
+ * 素のファイル名は何も教えないが、**その発言が存在すること自体**が会話の流れを
+ * 教える (誰かが画像を貼って、他の人が反応する)。角括弧で囲って「喋った言葉では
+ * ない」と分かる形にそろえる。
+ */
+function fromExtra(extra) {
+  const text = String(extra ?? '').trim();
+  if (!text) return '';
+  return text.startsWith('[') ? text : `[添付] ${text}`;
+}
+
 for (const line of raw.split('\n')) {
   if (!line) continue;
   read += 1;
 
-  const [ch, author, createdAt, isBot, isReply, content] = JSON.parse(line);
+  // 列が 6 個の古い書き出しも読める。extra と reply_author は後から足した
+  const [ch, author, createdAt, isBot, isReply, content, extra, replyAuthor] = JSON.parse(line);
   if (isBot) { bots += 1; continue; }
-  if (!content || !content.trim()) { empty += 1; continue; }
+
+  const body = (content && content.trim()) ? content : fromExtra(extra);
+  if (!body) { empty += 1; continue; }
 
   if (!byChannel.has(ch)) byChannel.set(ch, []);
   byChannel.get(ch).push({
     author,
     created_at: createdAt,
     reply: isReply,
-    content,
-    // splitIntoChunks が 1200 字で切るのに使う。正規化で少し縮むが、
+    reply_author: replyAuthor ?? null,
+    content: body,
+    // splitIntoChunks が字数で切るのに使う。正規化で少し縮むが、
     // 縮む方向なので上限を割ることはない
-    char_count: content.length
+    char_count: body.length
   });
 }
 
@@ -211,8 +233,17 @@ for (const [chIdx, rows] of byChannel) {
 
     const lines = [];
     for (const row of chunk) {
-      const text = plainText(row.content, roleOf);
+      let text = plainText(row.content, roleOf);
       if (!text) continue;                        // 正規化で空になった (メンションだけ等)
+
+      // 誰への返信かを本文の先頭に残す。evex-1 は「返信かどうか」の真偽値しか
+      // 持っていなくて相手を捨てていたが、賑やかなチャンネルでは噛み合いの信号そのもの。
+      // 既に @ で始まっているならメンションで足りているので触らない。
+      const target = row.reply_author != null && row.reply_author !== row.author
+        ? (speakerLabelOf(row.reply_author) ?? roleOf(row.reply_author))
+        : null;
+      if (target && !text.startsWith('@')) text = `@${target} ${text}`;
+
       lines.push(`${speakerLabelOf(row.author) ?? roles.get(row.author)}: ${text}`);
     }
 
