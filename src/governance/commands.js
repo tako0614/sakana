@@ -191,7 +191,7 @@ async function executeSetup(interaction, sessionId) {
     updateGovernanceSetupSession(claimed.id, { status: 'completed', last_error: null });
     await interaction.editReply([
       '統治機能を記録のみの状態で導入しました。',
-      `統治管理: <#${ux.admin.id}>`,
+      `統治手続: <#${ux.admin.id}>`,
       `参加者向け案内: <#${ux.guide.id}>`,
       `直近活動: ${backfilled}件`,
       warnings.length ? `注意: ${warnings.join(' / ')}` : null

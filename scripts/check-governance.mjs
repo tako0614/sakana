@@ -951,11 +951,11 @@ const procedureAcl = governanceProcedureOverwrites(aclGuild);
 assert.deepEqual(
   procedureAcl.map((entry) => entry.id),
   ['acl-guild', 'bot'],
-  '統治管理は全員が閲覧できる読み取り専用の手続ハブである'
+  '統治手続は全員が閲覧できる読み取り専用の手続ハブである'
 );
 assert.ok(procedureAcl[0].allow.includes(PermissionFlagsBits.ViewChannel));
 assert.ok(procedureAcl[0].deny.includes(PermissionFlagsBits.SendMessages));
-assert.ok(!procedureAcl[0].deny.includes(PermissionFlagsBits.ViewChannel), '統治管理を@everyoneから隠さない');
+assert.ok(!procedureAcl[0].deny.includes(PermissionFlagsBits.ViewChannel), '統治手続を@everyoneから隠さない');
 assert.deepEqual(
   readOnlyTextOverwrites(aclGuild).map((entry) => entry.id),
   ['acl-guild', 'bot'],

@@ -20,7 +20,7 @@ const STATUTE_TOPIC = '現行憲法と法律の公開正本です。1法令1投�
 const GAZETTE_TOPIC = '成立・改正・判決・執行・運営操作を時系列に残す公開履歴です。現行本文は法令集を参照してください。';
 export const COURT_TOPIC = '事件ごとの公開審理です。答弁・証拠・判決・執行承認・上訴を1つの事件投稿に記録します。';
 export const GOVERNANCE_GUIDE_NAME = '統治案内';
-export const GOVERNANCE_ADMIN_NAME = '統治管理';
+export const GOVERNANCE_PROCEDURE_NAME = '統治手続';
 export const GOVERNANCE_PROCEDURE_TOPIC = '全員に公開する統治手続の一覧です。投票・執行承認は対象案件で記名し、選択と変更を公開記録に残します。';
 
 function proposalStateLabel(state) {
@@ -133,7 +133,7 @@ export async function createGovernanceGuideChannel(guild, categoryId) {
 
 export async function createGovernanceProcedureChannel(guild, categoryId) {
   return guild.channels.create({
-    name: GOVERNANCE_ADMIN_NAME,
+    name: GOVERNANCE_PROCEDURE_NAME,
     type: ChannelType.GuildText,
     parent: categoryId,
     topic: GOVERNANCE_PROCEDURE_TOPIC,
