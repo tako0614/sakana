@@ -2,14 +2,23 @@
 //
 // 見ているのは1点だけ: 学習データと推論のプロンプトが同じ形かどうか。
 // ずれても例外は出ず、モデルが「学習中に一度も見ていない形」を受け取って
-// 静かに崩れた出力を返すだけなので、門を置く。
+// 静かに崩れた出力を返すだけなので、門を置く。persona検証は一時DBだけを使う。
 
-import {
+import { rmSync } from 'node:fs';
+
+const checkDatabasePath = `/tmp/sakana-mimic-check-${process.pid}.sqlite`;
+process.env.DATABASE_PATH = checkDatabasePath;
+for (const suffix of ['', '-wal', '-shm']) rmSync(`${checkDatabasePath}${suffix}`, { force: true });
+process.on('exit', () => {
+  for (const suffix of ['', '-wal', '-shm']) rmSync(`${checkDatabasePath}${suffix}`, { force: true });
+});
+
+const {
   CONTROL_TOKENS, ROLE_TOKENS, ROLE_OVERFLOW, assignRoles, buildPrompt,
   firstTurn, humanize, messageText, nextRole, normalize
-} from '../src/mimic/serialize.js';
-import { DEFAULT_ENGINE, ENGINES, engineFor, setEngine } from '../src/mimic/prefs.js';
-import { db } from '../src/db.js';
+} = await import('../src/mimic/serialize.js');
+const { DEFAULT_ENGINE, ENGINES, engineFor, setEngine } = await import('../src/mimic/prefs.js');
+const { db } = await import('../src/db.js');
 
 function fail(message) {
   throw new Error(message);

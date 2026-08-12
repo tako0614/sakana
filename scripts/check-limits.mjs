@@ -1,10 +1,19 @@
 // 使用量の上限の検証 (npm run check から呼ぶ)。
 //
 // 「ドルで決めてトークンで数える」の変換と、管理者の素通り、個別付与、移動窓を固定する。
-// 一時的な行を書くので、最後に必ず消す。
+// 一時DBだけに書く。本番設定や既存利用履歴には触れない。
 
-import { db } from '../src/db.js';
-import {
+import { rmSync } from 'node:fs';
+
+const checkDatabasePath = `/tmp/sakana-limits-check-${process.pid}.sqlite`;
+process.env.DATABASE_PATH = checkDatabasePath;
+for (const suffix of ['', '-wal', '-shm']) rmSync(`${checkDatabasePath}${suffix}`, { force: true });
+process.on('exit', () => {
+  for (const suffix of ['', '-wal', '-shm']) rmSync(`${checkDatabasePath}${suffix}`, { force: true });
+});
+
+const { db } = await import('../src/db.js');
+const {
   dailyUsdFor,
   finalizeCall,
   getTunable,
@@ -16,7 +25,7 @@ import {
   tokensToUsd,
   usdToTokens,
   weighTokens
-} from '../src/agent/ratelimit.js';
+} = await import('../src/agent/ratelimit.js');
 
 const USERS = ['check-normal', 'check-admin', 'check-granted'];
 const cleanup = () => {
