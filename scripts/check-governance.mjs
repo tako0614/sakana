@@ -636,7 +636,18 @@ await assert.rejects(
 const { governanceCommands } = await import('../src/governance/commands.js');
 assert.deepEqual(governanceCommands.map((command) => command.data.name), ['governance'],
   '公開統治slash commandは管理用governanceだけ');
-const { statutePublicationState } = await import('../src/governance/discord.js');
+const {
+  statuteForumEveryonePermissionState,
+  statutePublicationState
+} = await import('../src/governance/discord.js');
+assert.deepEqual(statuteForumEveryonePermissionState(), {
+  ViewChannel: true,
+  SendMessages: false,
+  SendMessagesInThreads: false,
+  CreatePublicThreads: false,
+  CreatePrivateThreads: false,
+  AddReactions: false
+}, '法令集は全員が閲覧でき、投稿・返信・リアクションはできない');
 assert.equal(statutePublicationState('constitution', 'active'), '現行憲法');
 assert.equal(statutePublicationState('constitution', 'superseded'), '旧憲法');
 assert.equal(statutePublicationState('law', 'active'), '現行法');

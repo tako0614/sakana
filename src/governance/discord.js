@@ -71,6 +71,45 @@ function statuteForumOverwrites(guild) {
   ];
 }
 
+export function statuteForumEveryonePermissionState() {
+  return {
+    ViewChannel: true,
+    SendMessages: false,
+    SendMessagesInThreads: false,
+    CreatePublicThreads: false,
+    CreatePrivateThreads: false,
+    AddReactions: false
+  };
+}
+
+function statuteForumBotPermissionState() {
+  return {
+    ViewChannel: true,
+    SendMessages: true,
+    SendMessagesInThreads: true,
+    CreatePublicThreads: true,
+    CreatePrivateThreads: true,
+    AttachFiles: true,
+    ReadMessageHistory: true,
+    ManageChannels: true,
+    ManageThreads: true,
+    ManageMessages: true
+  };
+}
+
+async function reconcileStatuteForumPermissions(forum, guild) {
+  await forum.permissionOverwrites.edit(
+    guild.id,
+    statuteForumEveryonePermissionState(),
+    { reason: '法令集を公開読み取り専用に同期' }
+  );
+  await forum.permissionOverwrites.edit(
+    guild.members.me.id,
+    statuteForumBotPermissionState(),
+    { reason: '法令集のbot公開権限を同期' }
+  );
+}
+
 async function createStatuteForum(guild, categoryId) {
   return guild.channels.create({
     name: '法令集',
@@ -243,6 +282,7 @@ export async function ensureGovernanceStatuteForum(guild, governance) {
     : null;
   if (existing?.type === ChannelType.GuildForum) {
     if (existing.topic !== STATUTE_TOPIC) await existing.setTopic(STATUTE_TOPIC, '法令集の説明を同期');
+    await reconcileStatuteForumPermissions(existing, guild);
     return existing;
   }
   if (!governance.category_id) throw new Error('統治カテゴリがないため法令集を作成できません。');
