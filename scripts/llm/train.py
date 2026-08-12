@@ -39,6 +39,12 @@ parser.add_argument("--threads", type=int, default=12)
 # GPU が使えるなら使う。auto は「あれば cuda」。
 # CPU 決め打ちにしていたので、GPU のある機械に移しても回せなかった。
 parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+# weight decay をどこに掛けるか。
+#   all      … 全パラメータ (evex-1 と同じ。既定はこちらにして対照を崩さない)
+#   matrices … 行列だけ。RMSNorm のゲインと埋め込みを外す
+# 1次元パラメータに weight decay を掛けるのは標準的には有害とされる。
+# 埋め込みは 5.87M のうち 105万 (18%) なので効き方が大きい。
+parser.add_argument("--wd-mode", default="all", choices=["all", "matrices"])
 args = parser.parse_args()
 
 corpus = Path(args.corpus)
@@ -75,7 +81,7 @@ val_ids = load("val")
 print(f"train {len(train_ids):,} トークン / val {len(val_ids):,} トークン")
 print(f"vocab {cfg.vocab_size} / layers {cfg.n_layers} / d_model {cfg.d_model} "
       f"/ context {cfg.context} / dropout {cfg.dropout} (attn {cfg.attn_dropout})")
-print(f"threads {args.threads} / batch {args.batch}")
+print(f"threads {args.threads} / batch {args.batch} / wd {args.wd_mode}")
 
 model = MicroLM(cfg)
 params = model.parameter_count()
@@ -136,7 +142,27 @@ warmup_steps = max(1, int(total_steps * args.warmup))
 print(f"1 step {tokens_per_step:,} トークン / 1 epoch {steps_per_epoch:,} step "
       f"/ 合計 {total_steps:,} step")
 
-opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
+def param_groups():
+    if args.wd_mode == "all":
+        return model.parameters()
+
+    # 行列 (2次元以上) だけに weight decay を掛ける。RMSNorm のゲインは 1 次元、
+    # 埋め込みは 2 次元だが名前で外す (tying しているので head も同じテンソル)。
+    decay, plain = [], []
+    seen = set()
+    for name, param in model.named_parameters():
+        if id(param) in seen:
+            continue
+        seen.add(id(param))
+        (plain if param.dim() < 2 or "embed" in name else decay).append(param)
+
+    print(f"weight decay: 掛ける {sum(p.numel() for p in decay):,} / "
+          f"外す {sum(p.numel() for p in plain):,}")
+    return [{"params": decay, "weight_decay": 0.1},
+            {"params": plain, "weight_decay": 0.0}]
+
+
+opt = torch.optim.AdamW(param_groups(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
 
 
 def lr_at(step):

@@ -43,6 +43,7 @@ import json
 import math
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -76,6 +77,10 @@ parser.add_argument("--val-batches", type=int, default=0, help="0 なら val 全
 # サンプルで判断できるので、重みを全部持つ必要はない
 parser.add_argument("--keep", type=int, default=4, help="残す epoch 数 (0 なら全部)")
 parser.add_argument("--device", default="auto")
+# bf16 は Ampere 以降だけ。Kaggle / Colab の無料枠は T4 (Turing) なので fp16 になる。
+# fp16 は重みを fp16 で持つと 5e-5 の更新が丸めで消えるので、master は fp32 で持って
+# 計算だけ fp16 にする (autocast + GradScaler)。bf16 は指数部が広いのでその必要が無い。
+parser.add_argument("--precision", default="auto", choices=["auto", "bf16", "fp16", "fp32"])
 parser.add_argument("--seed", type=int, default=0)
 args = parser.parse_args()
 
@@ -84,16 +89,34 @@ torch.manual_seed(args.seed)
 device = args.device
 if device == "auto":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-# bf16 は Ampere 以降だけ。T4 (Turing) に載せると落ちるので確かめる
-use_bf16 = device == "cuda" and torch.cuda.is_bf16_supported()
-dtype = torch.bfloat16 if use_bf16 else torch.float32
+
+precision = args.precision
+if precision == "auto":
+    if device != "cuda":
+        precision = "fp32"
+    else:
+        precision = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+
+# 重みを持つ dtype。fp16 のときだけ master を fp32 にして、計算を autocast に任せる
+weight_dtype = torch.bfloat16 if precision == "bf16" else torch.float32
+amp_dtype = torch.float16 if precision == "fp16" else None
+scaler = torch.amp.GradScaler("cuda", enabled=precision == "fp16")
+
+
+def forward_ctx():
+    """fp16 のときだけ autocast を掛ける。bf16 は重みごと bf16 なので要らない。"""
+    if amp_dtype is None:
+        return nullcontext()
+    return torch.autocast("cuda", dtype=amp_dtype)
+
 
 out = Path(args.out)
 out.mkdir(parents=True, exist_ok=True)
 
-print(f"device {device} / dtype {dtype}", flush=True)
+print(f"device {device} / precision {precision} / 重み {weight_dtype}", flush=True)
 if device == "cuda":
-    print(f"GPU {torch.cuda.get_device_name(0)}", flush=True)
+    free, total = torch.cuda.mem_get_info()
+    print(f"GPU {torch.cuda.get_device_name(0)} / {total / 1024**3:.1f} GB", flush=True)
 
 # --- データ ---
 
@@ -154,7 +177,7 @@ val_loader = DataLoader(val_set, batch_size=args.batch, shuffle=False)
 
 # --- モデル ---
 
-model = AutoModelForCausalLM.from_pretrained(args.base, dtype=dtype)
+model = AutoModelForCausalLM.from_pretrained(args.base, dtype=weight_dtype)
 model.to(device)
 if args.grad_ckpt:
     model.gradient_checkpointing_enable()
@@ -188,7 +211,8 @@ def evaluate():
     count = 0
     for x in val_loader:
         x = x.to(device)
-        loss_sum += model(input_ids=x, labels=x).loss.item()
+        with forward_ctx():
+            loss_sum += model(input_ids=x, labels=x).loss.item()
         count += 1
         # GPU なら val 全部 (214 窓) で 2 秒なので既定は無制限。
         # CPU で形を確かめるときだけ絞る — 素で 11 分かかって固まって見えた
@@ -214,10 +238,11 @@ def samples():
     got = []
     for prompt in PROMPTS:
         ids = tok(prompt, return_tensors="pt").to(device)
-        gen = model.generate(
-            **ids, max_new_tokens=48, do_sample=True, temperature=0.9, top_k=40,
-            pad_token_id=eos,
-        )
+        with forward_ctx():
+            gen = model.generate(
+                **ids, max_new_tokens=48, do_sample=True, temperature=0.9, top_k=40,
+                pad_token_id=eos,
+            )
         text = tok.decode(gen[0][ids.input_ids.shape[1]:], skip_special_tokens=True)
         got.append({"prompt": prompt, "reply": text.split("\n")[0].strip()})
     model.config.use_cache = False
@@ -249,16 +274,21 @@ for epoch in range(1, args.epochs + 1):
 
     for i, x in enumerate(train_loader):
         x = x.to(device)
-        loss = model(input_ids=x, labels=x).loss
-        (loss / args.accum).backward()
+        with forward_ctx():
+            loss = model(input_ids=x, labels=x).loss
+        scaler.scale(loss / args.accum).backward()
         loss_sum += loss.item()
         seen += 1
 
         if (i + 1) % args.accum:
             continue
 
+        # fp16 の勾配は scaler が掛けた倍率のままなので、先に戻さないと
+        # clip の閾値 1.0 が意味を持たない (何万倍かの値と比べることになる)
+        scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-        opt.step()
+        scaler.step(opt)
+        scaler.update()
         sched.step()
         opt.zero_grad(set_to_none=True)
         step += 1
@@ -267,9 +297,10 @@ for epoch in range(1, args.epochs + 1):
             done = step * args.batch * args.accum * args.seq
             rate = done / (time.time() - started)
             left = (total_steps - step) * args.batch * args.accum * args.seq / max(1, rate)
+            peak = torch.cuda.max_memory_allocated() / 1024**3 if device == "cuda" else 0
             print(f"step {step}/{total_steps} loss {loss_sum / seen:.4f} "
                   f"lr {sched.get_last_lr()[0]:.2e} {rate:,.0f} tok/s "
-                  f"残り {left / 60:.0f}分", flush=True)
+                  f"残り {left / 60:.0f}分 峰 {peak:.1f}GB", flush=True)
             loss_sum = 0.0
             seen = 0
 
