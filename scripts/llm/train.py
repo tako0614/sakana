@@ -1,0 +1,200 @@
+"""学習ループ。CPU で回す前提。
+
+    # 速度だけ測る (これで所要時間を決める)
+    .venv-llm/bin/python scripts/llm/train.py --bench
+
+    # 本番
+    .venv-llm/bin/python scripts/llm/train.py --epochs 8
+
+train / val は build-corpus.mjs が時系列で切ってある。val は最後の 14 日で、
+ランダム分割にしていない (完全一致の短文が 23% あるので時間で切らないと嘘になる)。
+epoch ごとにチェックポイントと生成サンプルを残すので、あとから
+「val が最小の点」と「文体が一番らしい点」を比べられる。
+"""
+
+import argparse
+import json
+import math
+import time
+from pathlib import Path
+
+import numpy as np
+import sentencepiece as spm
+import torch
+
+from model import Config, MicroLM
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--corpus", default="corpus")
+parser.add_argument("--out", default="scripts/llm/out")
+parser.add_argument("--epochs", type=int, default=8)
+parser.add_argument("--batch", type=int, default=24)
+parser.add_argument("--lr", type=float, default=3e-4)
+parser.add_argument("--warmup", type=float, default=0.02)
+parser.add_argument("--bench", action="store_true", help="200 step だけ回して速度を出す")
+args = parser.parse_args()
+
+corpus = Path(args.corpus)
+out = Path(args.out)
+out.mkdir(parents=True, exist_ok=True)
+
+torch.manual_seed(0)
+torch.set_num_threads(16)
+
+sp = spm.SentencePieceProcessor(model_file=str(corpus / "tok.model"))
+cfg = Config(vocab_size=sp.get_piece_size())
+
+
+def load(name):
+    """会話を連結して 1 本の列にする。会話の境界は <|conv|> / <|end|> が持っている。"""
+    cache = corpus / f"{name}.u16.npy"
+    if cache.exists():
+        return np.load(cache)
+
+    lines = (corpus / f"{name}.txt").read_text(encoding="utf8").splitlines()
+    ids = []
+    for chunk in sp.encode(lines, out_type=int):
+        ids.extend(chunk)
+
+    # 語彙 4096 なので uint16 で足りる (int64 だと 4 倍のメモリと帯域を食う)
+    arr = np.asarray(ids, dtype=np.uint16)
+    np.save(cache, arr)
+    return arr
+
+
+train_ids = load("train")
+val_ids = load("val")
+
+print(f"train {len(train_ids):,} トークン / val {len(val_ids):,} トークン")
+print(f"vocab {cfg.vocab_size} / layers {cfg.n_layers} / d_model {cfg.d_model} "
+      f"/ context {cfg.context} / dropout {cfg.dropout}")
+
+model = MicroLM(cfg)
+params = model.parameter_count()
+print(f"パラメータ {params:,} ({params / 1e6:.2f}M)")
+
+device = torch.device("cpu")
+model.to(device)
+
+
+def batches(ids, batch_size, generator):
+    """context+1 の窓を無作為に切る。端は捨てる。"""
+    high = len(ids) - cfg.context - 1
+    while True:
+        starts = torch.randint(0, high, (batch_size,), generator=generator)
+        block = np.stack([ids[s: s + cfg.context + 1] for s in starts.tolist()])
+        chunk = torch.from_numpy(block.astype(np.int64))
+        yield chunk[:, :-1].to(device), chunk[:, 1:].to(device)
+
+
+gen = torch.Generator().manual_seed(0)
+train_batches = batches(train_ids, args.batch, gen)
+
+tokens_per_step = args.batch * cfg.context
+steps_per_epoch = max(1, len(train_ids) // tokens_per_step)
+total_steps = 200 if args.bench else steps_per_epoch * args.epochs
+warmup_steps = max(1, int(total_steps * args.warmup))
+
+print(f"1 step {tokens_per_step:,} トークン / 1 epoch {steps_per_epoch:,} step "
+      f"/ 合計 {total_steps:,} step")
+
+opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
+
+
+def lr_at(step):
+    if step < warmup_steps:
+        return args.lr * (step + 1) / warmup_steps
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return args.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, progress))))
+
+
+@torch.no_grad()
+def evaluate(ids, iters=40):
+    model.eval()
+    local = torch.Generator().manual_seed(1234)
+    stream = batches(ids, args.batch, local)
+    total = 0.0
+    for _ in range(iters):
+        x, y = next(stream)
+        _, loss = model(x, y)
+        total += loss.item()
+    model.train()
+    return total / iters
+
+
+SAMPLE_PROMPTS = ["<|conv|><|s0|>", "<|conv|><|s3|>", "<|conv|>"]
+
+
+def samples(tag):
+    end_id = sp.piece_to_id("<|end|>")
+    lines = []
+    for prompt in SAMPLE_PROMPTS:
+        ids = torch.tensor([sp.encode(prompt, out_type=int)], dtype=torch.long)
+        got = model.generate(ids, max_new_tokens=120, temperature=0.9, top_k=40, stop_id=end_id)
+        lines.append(f"[{prompt}] {sp.decode(got[0].tolist())}")
+    model.train()
+    (out / f"samples-{tag}.txt").write_text("\n\n".join(lines), encoding="utf8")
+    return lines
+
+
+model.train()
+history = []
+started = time.time()
+window = time.time()
+seen = 0
+
+for step in range(total_steps):
+    for group in opt.param_groups:
+        group["lr"] = lr_at(step)
+
+    x, y = next(train_batches)
+    _, loss = model(x, y)
+
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+
+    seen += tokens_per_step
+
+    if (step + 1) % 20 == 0:
+        rate = seen / (time.time() - window)
+        print(f"step {step + 1:>6}/{total_steps}  loss {loss.item():.4f}  "
+              f"lr {lr_at(step):.2e}  {rate:,.0f} tok/s", flush=True)
+        window, seen = time.time(), 0
+
+    if args.bench and step + 1 == 200:
+        rate = 200 * tokens_per_step / (time.time() - started)
+        need = steps_per_epoch * args.epochs * tokens_per_step / rate
+        print()
+        print(f"実測 {rate:,.0f} tok/s")
+        print(f"{args.epochs} epoch = {steps_per_epoch * args.epochs:,} step "
+              f"= {need / 3600:.1f} 時間")
+        raise SystemExit(0)
+
+    # epoch の終わりごとに評価とサンプル
+    if (step + 1) % steps_per_epoch == 0:
+        epoch = (step + 1) // steps_per_epoch
+        tr = evaluate(train_ids, iters=20)
+        va = evaluate(val_ids, iters=20)
+        history.append({"epoch": epoch, "step": step + 1, "train": tr, "val": va})
+
+        print(f"--- epoch {epoch}  train {tr:.4f}  val {va:.4f}  "
+              f"({(time.time() - started) / 60:.0f} 分経過)", flush=True)
+
+        torch.save(
+            {"model": model.state_dict(), "config": vars(cfg), "epoch": epoch,
+             "train_loss": tr, "val_loss": va},
+            out / f"ckpt-e{epoch}.pt"
+        )
+        for line in samples(f"e{epoch}"):
+            print(f"    {line[:160]}", flush=True)
+
+        (out / "history.json").write_text(json.dumps(history, indent=2))
+
+print()
+print(f"完了 {(time.time() - started) / 60:.0f} 分")
+best = min(history, key=lambda h: h["val"]) if history else None
+if best:
+    print(f"val 最小は epoch {best['epoch']} ({best['val']:.4f})")
+    print("文体は val 最小より後の方が「らしい」ことがあるので、samples-*.txt を読んで選ぶ")
