@@ -151,7 +151,7 @@ writeFileSync(
 
 const body = `${documents.constitution}\n\n## Policy\n\n\`\`\`json\n${JSON.stringify(documents.policy, null, 2)}\n\`\`\`\n\ncontent hash: ${replacementHash}\npolicy hash: ${replacementPolicyHash}`;
 const published = [];
-for (const content of messageChunks('初期憲法 v1（正本・差替済み）', body)) {
+for (const content of messageChunks('初期憲法 v1', body)) {
   const message = await rest.post(Routes.channelMessages(governance.gazette_channel_id), {
     body: { content, allowed_mentions: { parse: [] } }
   });
