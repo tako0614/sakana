@@ -170,7 +170,7 @@ function canUseFullBrowser(member) {
 
 /** 末尾に出すモデル名。
  *
- * 以前はハイフンを空白にしていたが、自作モデル側が `evex-2-preview` の形なので
+ * 以前はハイフンを空白にしていたが、自作モデル側が `evex-ft-1-preview` の形なので
  * そちらと揃える。`/model` の表示・フッター・env の値が全部同じ綴りになる。
  */
 function modelLabel() {
