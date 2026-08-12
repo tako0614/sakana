@@ -31,7 +31,25 @@ const dst = process.argv[3] ?? 'sft';
 
 // 役は素の英字。方針 (出現順 / 8人まで / あとは Z) は assignRoles に任せる。
 // 定義を2箇所に持つとずれるので、ここでは形だけ差し替える。
+// **名前が付かない人だけ**がこれを使う。
 const SCHEME = { roles: ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'], overflow: 'Z' };
+
+// 発言がこれ以上ある人は表示名をそのままラベルにする。
+//
+// 相対の役 (A/B/C) だけにしていた最初の版は、狙いどおり個人を漏らさなかった —
+// 実測で役 A の中身は 1,062 人ぶんで、最多の人でも 10.4% (その人の全体シェア 9.4%
+// とほぼ同じ)。つまり `A` は「このサーバーの平均的な人」であって誰でもない。
+// おかげで「その人として喋る」が原理的に不可能だった。
+//
+// 名前をラベルにすると重みに個人の口調が入る。トークンの追加コストは実測 +1.32M
+// (素の英字 1.76M → 3.07M) で全体の +17%。
+// 閾値を 2000 件 (42人 / 被覆 83.4%) から 200 件 (147人 / 96.6%) に下げても
+// 追加コストは +0.21M しか増えないので、下げた方が得。
+const NAMED_MIN_MESSAGES = Number(process.env.LLM_NAMED_MIN ?? 200);
+
+// ラベルの長さの上限。`vivacious_flamingo_38533` のような自動生成名が 24 字あり、
+// 1 発言ごとに何トークンも食う。切っても本人の識別には足りる。
+const LABEL_MAX = 12;
 
 // 上位いくつのチャンネルに名前を与えるか。280 チャンネルのうち上位 16 で 97%。
 // 話題の手がかりになるので入れるが、名前は書き出しに無いので番号のまま使う。
@@ -42,8 +60,45 @@ const VAL_DAYS = Number(process.env.LLM_VAL_DAYS ?? 14);
 const authors = JSON.parse(await readFile(path.join(src, 'authors.json'), 'utf8'));
 const channels = JSON.parse(await readFile(path.join(src, 'channels.json'), 'utf8'));
 
-// Discord の snowflake → 書き出しの番号。本文中の `<@123>` を会話内の役に直すのに使う
+// Discord の snowflake → 書き出しの番号。本文中の `<@123>` をラベルに直すのに使う
 const authorIdxById = new Map(authors.map((a) => [a.id, a.idx]));
+
+/**
+ * 表示名をラベルに使える形にする。
+ *
+ * `:` と改行は行の構造そのものなので必ず落とす (`名前: 本文` の形が壊れる)。
+ * 空白は詰める — `it's o` のような名前で行頭が曖昧になるのを避けたい。
+ */
+function cleanName(name) {
+  return String(name ?? '')
+    .replace(/[:\n\r]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, LABEL_MAX)
+    .trim();
+}
+
+// idx → ラベル。発言数の多い順に決める。
+//
+// 表示名は重複する (実データで `.` `羽風` `だこ` `やがみ` が各2人)。そのまま使うと
+// 別人の口調が1つのラベルに混ざるので、後から来た方に連番を付ける。
+const labelByIdx = new Map();
+const takenLabels = new Set();
+
+for (const author of [...authors].sort((a, b) => b.count - a.count)) {
+  if (author.bot || author.count < NAMED_MIN_MESSAGES) continue;
+
+  const base = cleanName(author.name);
+  if (!base) continue;                      // 名前が記号だけなら諦めて役に回す
+
+  let label = base;
+  for (let n = 2; takenLabels.has(label); n += 1) label = `${base}${n}`;
+
+  takenLabels.add(label);
+  labelByIdx.set(author.idx, label);
+}
+
+const speakerLabelOf = (idx) => labelByIdx.get(idx) ?? null;
 
 // 件数の多い順に 16 個だけ名前を持つ。それ以外は #other に潰す
 const ranked = [...channels].sort((a, b) => b.count - a.count);
@@ -64,17 +119,18 @@ function shorten(url) {
 /**
  * Discord の記法を素の日本語に直す。
  *
- * メンションは**会話の中に居る人だけ**役に直す。外の人は落とす —
- * 20 桁の ID を残しても学ぶものが無いし、名前に直すと身元が戻ってくる。
- * 居る人を `@B` にできると「誰に答えているか」が本文に残るので、
- * evex-1 が捨てていた返信先の信号がここで手に入る。
+ * メンションはラベルに直す。名前を持つ人は名前、持たない人は会話の中に居れば役、
+ * 居なければ落とす — 20 桁の ID を残しても学ぶものが無い。
+ * `@たこ` の形で残ると「誰に答えているか」が本文に入るので、evex-1 が捨てていた
+ * 返信先の信号がここで手に入る。
  */
 function plainText(content, roleOf) {
   let out = content;
 
   out = out.replace(/<@!?(\d+)>/g, (match, id) => {
-    const role = roleOf(authorIdxById.get(id));
-    return role ? `@${role}` : '';
+    const idx = authorIdxById.get(id);
+    const label = speakerLabelOf(idx) ?? roleOf(idx);
+    return label ? `@${label}` : '';
   });
   out = out.replace(/<@&\d+>/g, '');                       // ロール
   out = out.replace(/<#(\d+)>/g, (match, id) => labelOf(id));
@@ -125,15 +181,17 @@ for (const [chIdx, rows] of byChannel) {
   const label = labelOf(channelIdByIdx.get(chIdx));
 
   for (const chunk of splitIntoChunks(rows)) {
-    // この会話に出てくる人だけに A,B,C... を振る。別の会話では別人になる
-    const roles = assignRoles(chunk.map((row) => row.author), SCHEME);
-    const roleOf = (idx) => (idx === undefined ? null : roles.get(idx));
+    // 名前を持たない人だけに A,B,C... を振る。名前持ちに役を配ると、
+    // 同じ会話で「たこ」と「B」が同一人物という矛盾した形になる
+    const unnamed = chunk.map((row) => row.author).filter((idx) => !labelByIdx.has(idx));
+    const roles = assignRoles(unnamed, SCHEME);
+    const roleOf = (idx) => (idx === undefined ? null : roles.get(idx) ?? null);
 
     const lines = [];
     for (const row of chunk) {
       const text = plainText(row.content, roleOf);
       if (!text) continue;                        // 正規化で空になった (メンションだけ等)
-      lines.push(`${roles.get(row.author)}: ${text}`);
+      lines.push(`${speakerLabelOf(row.author) ?? roles.get(row.author)}: ${text}`);
     }
 
     // 1 発言だけの「会話」は交代を教えないので落とす
@@ -162,6 +220,21 @@ const jsonl = (list) => `${list.map((c) => JSON.stringify({ text: c.text })).joi
 await writeFile(path.join(dst, 'train.jsonl'), jsonl(train));
 await writeFile(path.join(dst, 'val.jsonl'), jsonl(val));
 
+// bot 側がラベルを引けるようにする。これが無いと /mimic がどの文字列で
+// 呼べばいいか分からない (学習していないラベルを渡すと、モデルは一度も見ていない
+// 入力を受け取って静かに崩れる)。実 ID を含むので公開物には混ぜない。
+const idById = new Map(authors.map((a) => [a.idx, a.id]));
+const labels = [...labelByIdx.entries()]
+  .map(([idx, label]) => ({
+    label,
+    userId: idById.get(idx),
+    name: authors.find((a) => a.idx === idx)?.name ?? '',
+    count: authors.find((a) => a.idx === idx)?.count ?? 0
+  }))
+  .sort((a, b) => b.count - a.count);
+
+await writeFile(path.join(dst, 'labels.json'), `${JSON.stringify(labels, null, 1)}\n`);
+
 const chars = (list) => list.reduce((sum, c) => sum + c.text.length, 0);
 await writeFile(
   path.join(dst, 'stats.json'),
@@ -175,7 +248,9 @@ await writeFile(
     train_chars: chars(train),
     val_chars: chars(val),
     val_days: VAL_DAYS,
-    named_channels: NAMED_CHANNELS
+    named_channels: NAMED_CHANNELS,
+    named_speakers: labelByIdx.size,
+    named_min_messages: NAMED_MIN_MESSAGES
   }, null, 2)}\n`
 );
 
@@ -184,4 +259,5 @@ console.log(`読んだ           ${fmt(read)} (bot ${fmt(bots)} / 本文なし $
 console.log(`会話             ${fmt(conversations.length)}  train ${fmt(train.length)} / val ${fmt(val.length)}`);
 console.log(`文字数           train ${fmt(chars(train))} / val ${fmt(chars(val))}`);
 console.log(`1 会話あたり     ${Math.round(chars(train) / train.length)} 字`);
+console.log(`名前ラベル       ${labelByIdx.size} 人 (${NAMED_MIN_MESSAGES} 件以上)`);
 console.log(`\n--- 先頭の会話 ---\n${train[0]?.text.slice(0, 400)}`);

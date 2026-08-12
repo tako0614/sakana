@@ -65,6 +65,13 @@ elif has_piece("<|other|>"):
 else:
     raise SystemExit("tokenizer が evex-1 でも evex-2 でもない")
 
+# 実在の人物に紐づく話者トークン。持っているのは evex-1 だけで、これがあると
+# 「その人として喋る」ができる (94万件から圧縮した本人の履歴が重みに入っている)。
+# 通常の返信は今のまま ROLES で動かす — 経路を分けておかないと、既に動いている
+# ものを壊す。bot 側は申告に無いトークンを渡さないので、世代を取り違えても
+# バイト分解されて出力が崩れることはない。
+SPEAKERS = [t for t in (f"<|s{i}|>" for i in range(64)) if has_piece(t)]
+
 blob = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 saved = blob["config"]
 cfg = Config(
@@ -78,6 +85,7 @@ model.eval()
 INFO = {
     "roles": ROLES,
     "overflow": OVERFLOW,
+    "speakers": SPEAKERS,
     "epoch": blob.get("epoch"),
     "val_loss": blob.get("val_loss"),
     "train_loss": blob.get("train_loss"),

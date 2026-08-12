@@ -14,7 +14,10 @@ export const mimicConfig = {
   timeoutMs: number(process.env.MIMIC_TIMEOUT_MS, 60_000),
   maxNewTokens: number(process.env.MIMIC_MAX_NEW_TOKENS, 200),
   // 返答の末尾に出す名前。世代が上がったら env で差し替える
-  label: process.env.MIMIC_LABEL ?? 'evex-1'
+  label: process.env.MIMIC_LABEL ?? 'evex-1',
+  // 直列化の形式。tokens は独自の制御記号 (evex-1 / evex-2)、plain は素の日本語
+  // (evex-ft-1)。既定は /health の申告から判定する
+  format: process.env.MIMIC_FORMAT ?? 'auto'
 };
 
 // speakers.json は使わない。話者は会話ごとの相対トークンになったので、
@@ -77,7 +80,9 @@ export async function roleScheme() {
   const info = await status();
   if (!info.up || !info.roles?.length) return null;
 
-  scheme = { roles: info.roles, overflow: info.overflow };
+  // speakers は実在の人物に紐づくトークン。持っているのは evex-1 だけ。
+  // 申告に無いものを渡さないために、bot 側はここだけを見る
+  scheme = { roles: info.roles, overflow: info.overflow, speakers: info.speakers ?? [] };
   return scheme;
 }
 

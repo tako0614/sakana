@@ -376,6 +376,20 @@ async function handleInteractionCreate(interaction) {
     return;
   }
 
+  // 補完は isChatInputCommand() が false なので、下の分岐まで来ると黙って落ちる。
+  // 候補が出ないだけで理由が表示されないので、ここで先に捌く。
+  if (interaction.isAutocomplete()) {
+    const target = commandMap.get(interaction.commandName);
+    if (target?.autocomplete) {
+      try {
+        await target.autocomplete(interaction);
+      } catch (error) {
+        console.error(`Autocomplete failed for /${interaction.commandName}:`, error);
+      }
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) {
     return;
   }
