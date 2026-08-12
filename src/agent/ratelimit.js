@@ -317,8 +317,10 @@ function isExempt(userId, admin = false) {
 /**
  * 枠を1つ確保する。空いていなければ理由と復帰時刻を返す。
  * admin: true ならトークンとドルの上限は見ない (同時実行だけは見る)。
+ * skipUserLimitは統治側の回数枠を個人のinjection壁にする場合だけ使う。
+ * サーバー全体の費用上限と1リクエスト上限は引き続き効く。
  */
-export function reserveCall({ guildId, channelId, userId, admin = false }) {
+export function reserveCall({ guildId, channelId, userId, admin = false, skipUserLimit = false }) {
   const now = Date.now();
   const exempt = isExempt(userId, admin);
 
@@ -333,21 +335,23 @@ export function reserveCall({ guildId, channelId, userId, admin = false }) {
 
   if (!exempt) {
     // 上限はドルで持っているので、判定の直前にトークンへ直す
-    const userUsd = dailyUsdFor(userId);
-    const userLimit = userUsd > 0 ? usdToTokens(userUsd) : 0;
-    const userSince = now - agentConfig.userWindowMs;
-    const userUsed = sumUserStmt.get({ user_id: userId, since: userSince, ...weights() }).total;
+    if (!skipUserLimit) {
+      const userUsd = dailyUsdFor(userId);
+      const userLimit = userUsd > 0 ? usdToTokens(userUsd) : 0;
+      const userSince = now - agentConfig.userWindowMs;
+      const userUsed = sumUserStmt.get({ user_id: userId, since: userSince, ...weights() }).total;
 
-    if (userLimit > 0 && userUsed >= userLimit) {
-      const oldest = oldestUserStmt.get(userId, userSince).at ?? now;
-      return {
-        ok: false,
-        scope: 'user',
-        usedUsd: tokensToUsd(userUsed),
-        limitUsd: userUsd,
-        windowMs: agentConfig.userWindowMs,
-        retryAt: oldest + agentConfig.userWindowMs
-      };
+      if (userLimit > 0 && userUsed >= userLimit) {
+        const oldest = oldestUserStmt.get(userId, userSince).at ?? now;
+        return {
+          ok: false,
+          scope: 'user',
+          usedUsd: tokensToUsd(userUsed),
+          limitUsd: userUsd,
+          windowMs: agentConfig.userWindowMs,
+          retryAt: oldest + agentConfig.userWindowMs
+        };
+      }
     }
 
     const globalUsd = getTunable('global_daily_usd');
@@ -450,7 +454,7 @@ export function recordToolCalls(callId, used = []) {
  * この人が今の窓で使える残り。1リクエストの予算をここから決める。
  * 上限が 0 (無制限) のときは Infinity。
  */
-export function remainingFor(userId, admin = false) {
+export function remainingFor(userId, admin = false, { skipUserLimit = false } = {}) {
   if (isExempt(userId, admin)) return Infinity;
 
   const now = Date.now();
@@ -459,7 +463,7 @@ export function remainingFor(userId, admin = false) {
   const userUsd = dailyUsdFor(userId);
   const globalUsd = getTunable('global_daily_usd');
 
-  const userLeft = userUsd > 0
+  const userLeft = !skipUserLimit && userUsd > 0
     ? usdToTokens(userUsd) - sumUserStmt.get({ user_id: userId, since: now - agentConfig.userWindowMs, ...w }).total
     : Infinity;
   const globalLeft = globalUsd > 0

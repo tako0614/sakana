@@ -27,6 +27,23 @@ import { sweepStaleIndicators } from './agent/indicators.js';
 import { pruneCalls } from './agent/ratelimit.js';
 import { sweepEnabledGuilds } from './archive/embed-job.js';
 import { embedConfig } from './embed/config.js';
+import { governanceConfig } from './governance/config.js';
+import { handleGovernanceComponent } from './governance/commands.js';
+import { deleteActivity } from './governance/db.js';
+import {
+  onGuildChannelCreate,
+  onGuildRoleDelete,
+  onTrustedRoleChange,
+  recordCourtSubmission,
+  recordGovernanceMessage,
+  runGovernanceScheduler
+} from './governance/service.js';
+import {
+  enforceMessageRestrictions,
+  enforceReactionRestrictions,
+  enforceThreadRestrictions,
+  enforceVoiceRestrictions
+} from './governance/restrictions.js';
 
 const token = process.env.DISCORD_TOKEN;
 const ossTargetUsername = process.env.OSS_TARGET_USERNAME ?? 'kurage.1';
@@ -132,6 +149,15 @@ client.once(Events.ClientReady, (readyClient) => {
     console.error('Catch-up failed:', error);
   });
 
+  if (governanceConfig.enabled) {
+    const run = () => runGovernanceScheduler(readyClient).catch((error) => {
+      console.error('Governance scheduler failed:', error);
+    });
+    run();
+    const timer = setInterval(run, Math.max(10_000, governanceConfig.schedulerIntervalMs));
+    timer.unref();
+  }
+
   // 毎日0時00分20秒に特定のチャンネルへランキングを送信
   cron.schedule('20 0 0 * * *', async () => {
     try {
@@ -225,6 +251,14 @@ async function handleMessageCreate(message) {
     return;
   }
 
+  // 制裁はXP・活動資格・AI呼び出しより先に適用する。削除対象の発言が投票資格へ
+  // 混ざったり、制限中の依頼がモデルまで届いたりしないようにする。
+  if (governanceConfig.enabled && await enforceMessageRestrictions(message)) return;
+  if (governanceConfig.enabled) {
+    await recordCourtSubmission(message);
+    recordGovernanceMessage(message);
+  }
+
   // メッセージ送信時にText XPを付与 (ProBot仕様: 1分に1回, 15〜25XPをランダム付与)
   const now = Date.now();
   const cooldownKey = `${message.guildId}-${message.author.id}`;
@@ -267,6 +301,11 @@ client.on(Events.MessageUpdate, async (_oldMessage, newMessage) => {
     if (!isAllowedGuild(newMessage.guildId)) return;
     const message = newMessage.partial ? await newMessage.fetch() : newMessage;
     indexLiveEdit(message);
+    if (governanceConfig.enabled && !message.author.bot) {
+      deleteActivity(message.id);
+      if (await enforceMessageRestrictions(message)) return;
+      recordGovernanceMessage(message);
+    }
   } catch (error) {
     console.error('Unhandled error in message update handler:', error);
   }
@@ -276,6 +315,7 @@ client.on(Events.MessageDelete, (message) => {
   try {
     if (!isAllowedGuild(message.guildId)) return;
     markLiveDelete(message);
+    if (governanceConfig.enabled) deleteActivity(message.id);
   } catch (error) {
     console.error('Unhandled error in message delete handler:', error);
   }
@@ -286,6 +326,7 @@ client.on(Events.MessageBulkDelete, (messages) => {
     for (const message of messages.values()) {
       if (!isAllowedGuild(message.guildId)) continue;
       markLiveDelete(message);
+      if (governanceConfig.enabled) deleteActivity(message.id);
     }
   } catch (error) {
     console.error('Unhandled error in bulk delete handler:', error);
@@ -302,7 +343,14 @@ async function handleReactionChange(reaction) {
   }
 }
 
-client.on(Events.MessageReactionAdd, (reaction) => handleReactionChange(reaction));
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+  try {
+    if (governanceConfig.enabled && await enforceReactionRestrictions(reaction, user)) return;
+    await handleReactionChange(reaction);
+  } catch (error) {
+    console.error('Unhandled error in reaction add handler:', error);
+  }
+});
 client.on(Events.MessageReactionRemove, (reaction) => handleReactionChange(reaction));
 client.on(Events.MessageReactionRemoveEmoji, (reaction) => handleReactionChange(reaction));
 client.on(Events.MessageReactionRemoveAll, (message) => handleReactionChange({ message }));
@@ -310,8 +358,9 @@ client.on(Events.MessageReactionRemoveAll, (message) => handleReactionChange({ m
 // 通話の入退室時間を記録するMap
 const voiceSessions = new Map(); // guildId-userId -> timestamp
 
-client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   try {
+    if (governanceConfig.enabled && await enforceVoiceRestrictions(oldState, newState)) return;
     handleVoiceStateUpdate(oldState, newState);
   } catch (error) {
     console.error('Unhandled error in voice state handler:', error);
@@ -372,6 +421,7 @@ async function handleInteractionCreate(interaction) {
   }
 
   if (interaction.isButton()) {
+    if (governanceConfig.enabled && await handleGovernanceComponent(interaction)) return;
     await handleArchiveComponent(interaction);
     return;
   }
@@ -424,5 +474,33 @@ async function handleInteractionCreate(interaction) {
     }
   }
 }
+
+client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
+  if (!governanceConfig.enabled || !isAllowedGuild(newMember.guild.id)) return;
+  onTrustedRoleChange(oldMember, newMember).catch((error) => {
+    console.error('Failed to audit trusted role change:', error);
+  });
+});
+
+client.on(Events.ChannelCreate, (channel) => {
+  if (!governanceConfig.enabled || !isAllowedGuild(channel.guildId)) return;
+  onGuildChannelCreate(channel).catch((error) => {
+    console.error('Failed to sync governance channel permissions:', error);
+  });
+});
+
+client.on(Events.GuildRoleDelete, (role) => {
+  if (!governanceConfig.enabled || !isAllowedGuild(role.guild.id)) return;
+  onGuildRoleDelete(role).catch((error) => {
+    console.error('Failed to fail-close after trusted role deletion:', error);
+  });
+});
+
+client.on(Events.ThreadCreate, (thread) => {
+  if (!governanceConfig.enabled || !isAllowedGuild(thread.guildId)) return;
+  enforceThreadRestrictions(thread).catch((error) => {
+    console.error('Failed to enforce thread restriction:', error);
+  });
+});
 
 client.login(token);

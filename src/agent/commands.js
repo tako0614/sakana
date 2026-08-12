@@ -110,7 +110,7 @@ function usageEmbed(userId) {
   }
 
   embed.setFooter({
-    text: '管理者の実行は上限の判定を通らず、全体の集計にも乗りません (記録は残ります)。'
+    text: '未初期化サーバーの管理者は金額上限を通りません。統治初期化後はManageGuildを信頼根拠にせず、trusted roleの回数枠を別に適用します。'
       + '金額は見積りで、請求と一致する保証はありません。'
   });
 

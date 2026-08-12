@@ -1,10 +1,11 @@
 {
   "name": "sakana-discord-bot",
   "version": "1.0.0",
-  "description": "A simple Discord bot built with discord.js.",
+  "description": "Constitutional AI governance bot for Discord communities.",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
+    "precheck": "node scripts/check-governance.mjs",
     "start": "tsx src/index.js",
     "chat": ".venv-llm/bin/python scripts/llm/chat.py",
     "deploy": "node scripts/deploy-commands.js",

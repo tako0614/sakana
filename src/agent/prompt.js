@@ -39,7 +39,7 @@ export function buildSystemPrompt(ctx, toolset) {
     '- 名前は表示名をそのまま使う (`<@123...>` は通知が飛ぶので使わない)。誰の発言かは取り違えない。',
     '',
     '## 誰の話か / どの話か',
-    '- `←あなた自身の発言` と付いている行はあなたが前に書いたもの。他人の発言として扱わない。',
+    '- `←自分の発言` と付いている行はあなたが前に書いたもの。他人の発言として扱わない。',
     '  自分の発言は根拠にしない (引用番号も付けない)。会話の流れとしてだけ読む。',
     '- 話しかけてきた人は user メッセージの冒頭に書いてある。答えはその人に向けて書く。',
     '- 二人称 (お前・君・自分・あなた) は話しかけてきた人にだけ使う。',
@@ -122,21 +122,42 @@ const BACKGROUND_WITH_CHAIN = 10;
  */
 export function buildUserContent({ ctx, prompt, extras, recent, replyChain, refs }) {
   const sections = [];
+  const selfId = ctx.client?.user?.id;
+
+  // 自分の表示名。行の `←自分の発言` は発言者が自分のときにしか付かないので、
+  // 本文の中で名前や ID で呼ばれているぶん (`さっき sakana が言ってたやつ`) は
+  // 印が付かず、第三者の話として読まれていた。
+  //
+  // 名前は判定には使わない (それは selfId の側の仕事)。ここで渡すのは、
+  // 本文に出てくる名前と自分を結びつけるためだけ。ニックネームはサーバーごとに
+  // 変わるので system には置けない (前方一致キャッシュが毎回外れる)。
+  const selfName = ctx.me?.displayName
+    ?? ctx.client?.user?.displayName
+    ?? ctx.client?.user?.username
+    ?? null;
 
   // 可変な文脈はここ。system に入れるとキャッシュの前方一致を壊す。
   //
   // 話しかけてきた人は独立した行にする。以前は `/` で繋いだ見出し行の末尾に
   // 埋めていて、直前の会話の話題の人と混同され、第三者の話を二人称で書かれた
   // (別の人が聞いたのに「さっき自分で踏んだ自爆だよ」と返した)。
-  sections.push([
+  const head = [
     `サーバー: ${ctx.guild.name} / チャンネル: #${ctx.channel.name ?? ctx.channel.id}`
       + ` / 現在 ${shortTime(Date.now())} (UTC+9)`,
     `いま話しかけてきたのは ${ctx.member?.displayName ?? 'unknown'} (ID ${ctx.member?.id ?? '不明'})。`
       + 'この人に向けて答える。話題の人がこの人だとは限らない。'
-  ].join('\n'));
+  ];
+
+  if (selfName) {
+    head.push(
+      `このサーバーでのあなたの表示名は ${selfName} (ID ${selfId ?? '不明'})。`
+        + '本文中でこの名前や ID で呼ばれているのは自分のこと。'
+    );
+  }
+
+  sections.push(head.join('\n'));
 
   const hasChain = Boolean(replyChain?.length);
-  const selfId = ctx.client?.user?.id;
 
   // 背景を先、返信の鎖を後に置く。
   //

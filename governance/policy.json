@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "timezoneOffsetMinutes": 540,
+  "eligibility": {
+    "memberAgeDays": 30,
+    "windowDays": 30,
+    "minimumMessages": 500,
+    "minimumActiveDays": 20,
+    "perDayCap": 30,
+    "minimumVisibleCharacters": 5
+  },
+  "voting": {
+    "defaultScope": "all",
+    "allowedScopes": [
+      "all",
+      "trusted"
+    ],
+    "lawYesRatio": 0.5,
+    "amendmentYesRatio": 0.6666666666666666,
+    "trustedVetoRatio": 0.6666666666666666,
+    "quorumRatio": 0.25,
+    "minimumBallots": 2,
+    "publicBallots": true
+  },
+  "legislation": {
+    "draftMilliseconds": 86400000,
+    "debateMilliseconds": 86400000,
+    "voteMilliseconds": 86400000
+  },
+  "judiciary": {
+    "defenseMilliseconds": 172800000,
+    "appealMilliseconds": 172800000,
+    "constitutionalChallengesPerMemberPerDay": 3,
+    "panelSeats": 3,
+    "guiltyVotesRequired": 2,
+    "constitutionalVotesRequired": 3,
+    "unconstitutionalVotesRequired": 2,
+    "discordMaximumTimeoutSeconds": 2419200,
+    "maximumTimeoutSeconds": 604800,
+    "immediateTimeoutMaximumSeconds": 86400,
+    "timeoutApprovalsAboveSeconds": 1,
+    "kickApprovals": 2,
+    "banApprovals": 2,
+    "appealTimeoutMinimumSeconds": 259200,
+    "maximumRestrictionSeconds": 31536000,
+    "allowedSanctions": [
+      "warning",
+      "restriction",
+      "timeout",
+      "kick",
+      "ban"
+    ],
+    "restrictionPrimitives": [
+      "messages_per_window",
+      "block_links",
+      "block_attachments",
+      "block_mentions",
+      "block_reactions",
+      "block_thread_creation",
+      "block_voice",
+      "agent_calls_per_window",
+      "block_petitions",
+      "block_voting"
+    ]
+  }
+}

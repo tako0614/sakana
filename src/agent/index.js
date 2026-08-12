@@ -40,6 +40,7 @@ import { engineFor } from '../mimic/prefs.js';
 import { handleMimicRequest } from '../mimic/respond.js';
 import { ThinkingIndicator, isIndicatorMessage, toolLabel } from './thinking.js';
 import { buildToolset } from './tools.js';
+import { reserveGovernanceAgentAttempt } from '../governance/service.js';
 
 const NO_MENTIONS = { parse: [], repliedUser: false };
 
@@ -62,7 +63,7 @@ const NOTICE_HEADS = [NOTICE_BUSY, NOTICE_USER_LIMIT, NOTICE_GLOBAL_LIMIT, NOTIC
 /**
  * その発言が bot の出した定型文か。直近の会話に混ぜないために使う。
  *
- * 経過表示と同じ理由。混ぜると「上限に達しました」が `←あなた自身の発言` として
+ * 経過表示と同じ理由。混ぜると「上限に達しました」が `←自分の発言` として
  * 次の実行の材料になり、モデルが自分の断り文を会話の一部として読む。
  */
 export function isAgentNotice(message, selfId) {
@@ -174,6 +175,14 @@ function limitMessage(reservation) {
   return reservation.scope === 'user'
     ? `${NOTICE_USER_LIMIT} (1人あたり${window} ${amount})。${at} に空きます。`
     : `${NOTICE_GLOBAL_LIMIT} (${window} ${amount})。${at} に空きます。`;
+}
+
+function attemptLimitMessage(reservation) {
+  const at = reservation.retryAt ? ` <t:${Math.floor(reservation.retryAt / 1000)}:R>に空きます。` : '';
+  if (reservation.scope === 'sanction') {
+    return `${NOTICE_USER_LIMIT}。現在の判決でエージェント利用が制限されています。${at}`;
+  }
+  return `${NOTICE_USER_LIMIT} (prompt injection対策の24時間回数枠 ${reservation.used}/${reservation.limit})。${at}`;
 }
 
 /**
@@ -292,14 +301,21 @@ export async function handleAgentRequest(message, client) {
     return;
   }
 
-  // 管理者は上限を通らない。上限は荒らしを止める壁で、運営を縛るものではない。
-  const admin = canManageIndex(member);
+  // 統治サーバーではManageGuildを自動的な信頼根拠にしない。指定されたtrusted roleは
+  // 回数枠だけを増やし、ブラウザ操作権や司法・立法権限とは結び付けない。
+  const attempt = reserveGovernanceAgentAttempt(member, message.id);
+  if (!attempt.ok) {
+    await replyOrSend(message, { content: attemptLimitMessage(attempt), allowedMentions: NO_MENTIONS });
+    return;
+  }
+  const admin = !attempt.governed && canManageIndex(member);
 
   const reservation = reserveCall({
     guildId: guild.id,
     channelId: message.channelId,
     userId: message.author.id,
-    admin
+    admin,
+    skipUserLimit: attempt.governed
   });
 
   if (!reservation.ok) {
@@ -327,6 +343,9 @@ export async function handleAgentRequest(message, client) {
       guild,
       channel: message.channel,
       member,
+      // このサーバーでの bot 自身のメンバー。表示名をモデルに渡すのに要る
+      // (ニックネームはサーバーごとに違うので client.user では足りない)。
+      me,
       refs,
       screenshots: [],
       channelScope: getChannelScope(guild, member),
@@ -383,7 +402,10 @@ export async function handleAgentRequest(message, client) {
       // 止めるのはトークンだけ。上限はドルで持っているのでここで換算する。
       // 1回ぶんの暴走ガードと、その人の残りのうち小さい方。
       // 管理者は残りが Infinity なので、暴走ガードだけが効く。
-      budget: Math.min(usdToTokens(agentConfig.requestUsd), remainingFor(message.author.id, admin)),
+      budget: Math.min(
+        usdToTokens(agentConfig.requestUsd),
+        remainingFor(message.author.id, admin, { skipUserLimit: attempt.governed })
+      ),
       // 時間の壁。トークンが余っていても、同時実行の枠を何時間も押さえさせない。
       // 超えてもツールが外れるだけなので、答えはその場の材料で必ず書かれる。
       deadlineAt: Date.now() + agentConfig.deadlineMs,

@@ -1,8 +1,8 @@
 import Database from 'better-sqlite3';
-import path from 'path';
 
 // dbファイルを /home/tako/Desktop/github/sakana などに保存
-export const db = new Database('database.sqlite');
+// テストや複数instanceでは別DBへ逃がせるようにする。未指定時の保存先は従来どおり。
+export const db = new Database(process.env.DATABASE_PATH ?? 'database.sqlite');
 db.pragma('journal_mode = WAL');
 
 // guild_id と user_id ごとのテキストとボイスXPを保持するテーブル
