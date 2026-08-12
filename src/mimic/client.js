@@ -13,8 +13,9 @@ export const mimicConfig = {
   url: process.env.MIMIC_URL ?? 'http://127.0.0.1:8765',
   timeoutMs: number(process.env.MIMIC_TIMEOUT_MS, 60_000),
   maxNewTokens: number(process.env.MIMIC_MAX_NEW_TOKENS, 200),
-  // 返答の末尾に出す名前。世代が上がったら env で差し替える
-  label: process.env.MIMIC_LABEL ?? 'evex-1',
+  // 返答の末尾に出す名前。世代が上がったら env で差し替える。
+  // 中身は 12 epoch / val 4.0613 の evex-2 (ckpt を差し替え済み)
+  label: process.env.MIMIC_LABEL ?? 'evex-2-preview',
   // 直列化の形式。tokens は独自の制御記号 (evex-1 / evex-2)、plain は素の日本語
   // (evex-ft-1)。既定は /health の申告から判定する
   format: process.env.MIMIC_FORMAT ?? 'auto'
