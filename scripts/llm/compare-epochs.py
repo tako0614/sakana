@@ -41,6 +41,9 @@ parser.add_argument("--people", type=int, default=4, help="上位何人を叩く
 parser.add_argument("--times", type=int, default=3, help="1 組み合わせあたりの回数")
 parser.add_argument("--max-new", type=int, default=48)
 parser.add_argument("--threads", type=int, default=8)
+# GPU があれば使う。3 モデル × 6 通り × 3 回を CPU で回すと 10 分かかるが、
+# T4 なら数十秒。読み比べのために設定を CPU に変えて戻し忘れるより安全
+parser.add_argument("--device", default="auto")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--push", default=None, help="選んだ epoch を上げる repo id")
 parser.add_argument("--pick", type=int, default=None, help="--push と一緒に使う epoch 番号")
@@ -48,6 +51,18 @@ args = parser.parse_args()
 
 torch.set_num_threads(args.threads)
 torch.set_grad_enabled(False)
+
+device = args.device
+if device == "auto":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+# T4 は bf16 が無い (エミュレーションを is_bf16_supported が「対応」と答えるので
+# 計算能力で判定する)。読み比べは fp16 で十分
+if device == "cuda":
+    major, _ = torch.cuda.get_device_capability()
+    load_dtype = torch.bfloat16 if major >= 8 else torch.float16
+else:
+    load_dtype = torch.float32
+print(f"device {device} / dtype {load_dtype}")
 
 root = Path(args.dir)
 epochs = sorted(root.glob("epoch-*"), key=lambda p: int(p.name.split("-")[1]))
@@ -122,7 +137,7 @@ for path in epochs:
     print(f"{'=' * 70}")
 
     tok = AutoTokenizer.from_pretrained(str(path))
-    model = AutoModelForCausalLM.from_pretrained(str(path), dtype=torch.float32).eval()
+    model = AutoModelForCausalLM.from_pretrained(str(path), dtype=load_dtype).eval().to(device)
 
     copied = 0
     short = 0
@@ -137,7 +152,7 @@ for path in epochs:
             random.seed(args.seed)
 
             prompt = "#ch2\n" + (f"A: {topic}\n" if topic else "") + f"{who}:"
-            ids = tok(prompt, return_tensors="pt")
+            ids = tok(prompt, return_tensors="pt").to(device)
 
             got = []
             for _ in range(args.times):
