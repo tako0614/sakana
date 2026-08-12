@@ -35,10 +35,12 @@ import {
   GOVERNANCE_PROCEDURE_TOPIC,
   createGovernanceProcedureChannel,
   createGovernanceGuideChannel,
+  ensureGovernanceCourtForum,
   governanceProcedureOverwrites,
   governancePermissionReport,
   postGazette,
-  readOnlyTextOverwrites
+  readOnlyTextOverwrites,
+  retireGovernanceCourtChat
 } from './discord.js';
 import { setTrustedMember } from './service.js';
 
@@ -282,8 +284,11 @@ export async function ensureGovernanceUx(guild, governance = getGovernanceGuild(
   const oldCategoryName = `${guild.name}`.slice(0, 89) + ' Governance';
   if (category.name === oldCategoryName) await category.setName(governanceCategoryName(guild.name), '統治UXの既定名へ移行');
 
-  const courtChat = await guild.channels.fetch(current.court_chat_channel_id).catch(() => null);
-  if (courtChat?.name === '裁判チャット') await courtChat.setName('裁判当事者用', '統治UXの既定名へ移行');
+  await retireGovernanceCourtChat(guild, current);
+  const court = await ensureGovernanceCourtForum(guild, current);
+  if (current.court_chat_channel_id !== court.id) {
+    current = updateGovernanceGuild(guild.id, { court_chat_channel_id: court.id });
+  }
 
   let guide = current.guide_channel_id ? await guild.channels.fetch(current.guide_channel_id).catch(() => null) : null;
   if (!guide || guide.type !== ChannelType.GuildText) guide = await createGovernanceGuideChannel(guild, category.id);

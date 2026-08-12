@@ -114,8 +114,12 @@ async function assertEvidenceVisibleTo(guild, evidence, userIds) {
   for (const userId of new Set(userIds.filter(Boolean))) {
     const member = await guild.members.fetch(userId).catch(() => null);
     if (!member || !channel.permissionsFor(member)?.has(PermissionFlagsBits.ViewChannel)) {
-      throw new Error('当事者が閲覧できない場所の内容は証拠にできません。事件の当事者用チャットへ提示してください。');
+      throw new Error('当事者が閲覧できない場所の内容は証拠にできません。裁判所の事件投稿へ提示してください。');
     }
+  }
+  const everyone = guild.roles?.everyone;
+  if (!everyone || !channel.permissionsFor(everyone)?.has(PermissionFlagsBits.ViewChannel)) {
+    throw new Error('裁判は公開審理です。非公開場所の内容は、公開可能な形に整理して裁判所の事件投稿へ提示してください。');
   }
 }
 

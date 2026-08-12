@@ -1307,8 +1307,8 @@ export function getCase(id) {
   return hydrateCase(db.prepare('SELECT * FROM governance_cases WHERE id = ?').get(Number(id)));
 }
 
-export function getCaseByPrivateThread(threadId) {
-  return hydrateCase(db.prepare('SELECT * FROM governance_cases WHERE private_thread_id = ?').get(String(threadId)));
+export function getCaseByPublicThread(threadId) {
+  return hydrateCase(db.prepare('SELECT * FROM governance_cases WHERE public_thread_id = ?').get(String(threadId)));
 }
 
 export function listCases(guildId, { statuses = null, limit = 25 } = {}) {

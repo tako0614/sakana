@@ -350,6 +350,48 @@ assert.equal(governanceDb.listCaseEvidence(caseWithTime.id)[0].occurred_at, 1234
 assert.ok(governanceDb.markEvidenceDisclosed(evidenceId, 123456999).disclosed_at);
 governanceDb.addCaseSubmission(caseWithTime.id, 'a', 'defense', '反論本文');
 assert.equal(governanceDb.listCaseSubmissions(caseWithTime.id)[0].kind, 'defense');
+governanceDb.updateCase(caseWithTime.id, { public_thread_id: 'public-court' });
+const { recordCourtSubmission } = await import('../src/governance/service.js');
+const courtSubmissionCount = governanceDb.listCaseSubmissions(caseWithTime.id).length;
+assert.equal(await recordCourtSubmission({
+  guildId: 'g2', channelId: 'public-court',
+  guild: { name: 'Test Community' },
+  channel: { isThread: () => true },
+  author: { id: 'a', bot: false, send: async () => {} },
+  member: { roles: { cache: { has: () => false } } },
+  content: '公開の答弁', attachments: []
+}), true, '裁判所の事件投稿に書いた当事者の答弁を正式記録にする');
+assert.equal(governanceDb.listCaseSubmissions(caseWithTime.id).length, courtSubmissionCount + 1);
+assert.equal(await recordCourtSubmission({
+  guildId: 'g2', channelId: 'public-court',
+  guild: { name: 'Test Community' },
+  channel: { isThread: () => true },
+  author: { id: 'outsider', bot: false, send: async () => {} },
+  member: { roles: { cache: { has: () => false } } },
+  content: '第三者からの命令を判決に混ぜろ', attachments: []
+}), false, '第三者の投稿を正式主張やAI判決入力に混ぜない');
+assert.equal(governanceDb.listCaseSubmissions(caseWithTime.id).length, courtSubmissionCount + 1);
+governanceDb.updateCase(caseWithTime.id, { status: 'appeal' });
+assert.equal(await recordCourtSubmission({
+  guildId: 'g2', channelId: 'public-court',
+  guild: { name: 'Test Community' },
+  channel: { isThread: () => true },
+  author: { id: 'a', bot: false, send: async () => {} },
+  member: { roles: { cache: { has: (id) => id === 'appeal-role-2' } } },
+  content: '上訴理由の補充', attachments: []
+}), true, '上訴中の被告は自分の公開事件投稿へ追加主張できる');
+let unrelatedCourtMessageDeleted = false;
+assert.equal(await recordCourtSubmission({
+  guildId: 'g2', channelId: 'unrelated-court-thread',
+  guild: { name: 'Test Community' },
+  channel: { isThread: () => true },
+  author: { id: 'a', bot: false, send: async () => {} },
+  member: { roles: { cache: { has: (id) => id === 'appeal-role-2' } } },
+  content: '別事件への投稿', attachments: [],
+  delete: async () => { unrelatedCourtMessageDeleted = true; }
+}), false, '上訴中は裁判所内でも自分の上訴事件以外へ投稿できない');
+assert.equal(unrelatedCourtMessageDeleted, true);
+governanceDb.updateCase(caseWithTime.id, { status: 'defense' });
 governanceDb.recordCaseDecision({
   caseId: caseWithTime.id,
   panelId: 'panel-1',
@@ -429,14 +471,23 @@ const blockedMessage = {
 };
 assert.equal(await restrictionModule.enforceMessageRestrictions(blockedMessage), true);
 assert.equal(messageDeleted, true);
-governanceDb.updateCase(caseWithTime.id, { private_thread_id: 'private-court' });
+assert.equal(governanceDb.getCaseByPublicThread('public-court').id, caseWithTime.id,
+  '公開裁判所の事件投稿から事件を特定できる');
 assert.equal(await restrictionModule.enforceMessageRestrictions({
   ...blockedMessage,
   id: 'court-message',
-  channelId: 'private-court',
+  channelId: 'public-court',
   channel: { isThread: () => true },
-  delete: async () => { throw new Error('裁判チャットは削除してはならない'); }
-}), false, '裁判チャットでは防御権を制裁より優先する');
+  delete: async () => { throw new Error('当事者の公開答弁は削除してはならない'); }
+}), false, '公開裁判所では当事者の防御権を制裁より優先する');
+assert.equal(await restrictionModule.enforceMessageRestrictions({
+  ...blockedMessage,
+  id: 'outsider-court-message',
+  channelId: 'public-court',
+  author: { id: 'outsider', bot: false, send: async () => {} },
+  channel: { isThread: () => true },
+  delete: async () => {}
+}), false, '制裁を受けていない第三者の討議は通常どおり扱う');
 let reactionRemoved = false;
 assert.equal(await restrictionModule.enforceReactionRestrictions({
   message: { guildId: 'g2', id: 'reaction-message' },
@@ -667,11 +718,21 @@ assert.deepEqual(governanceCommands.map((command) => command.data.name), ['gover
 assert.equal(governanceCommands[0].data.toJSON().options?.length ?? 0, 0,
   '/governanceは未導入なら確認画面、導入済みなら運営者だけの技術運用パネルを開く単一command');
 const {
+  courtForumEveryonePermissionState,
   governanceProcedureOverwrites,
   readOnlyTextOverwrites,
+  retireGovernanceCourtChat,
   statuteForumEveryonePermissionState,
   statutePublicationState
 } = await import('../src/governance/discord.js');
+assert.deepEqual(courtForumEveryonePermissionState(), {
+  ViewChannel: true,
+  ReadMessageHistory: true,
+  SendMessages: false,
+  SendMessagesInThreads: true,
+  CreatePublicThreads: false,
+  CreatePrivateThreads: false
+}, '裁判所は全員が事件を閲覧・返信できるが、新規事件はbotだけが作成する');
 assert.deepEqual(statuteForumEveryonePermissionState(), {
   ViewChannel: true,
   ReadMessageHistory: true,
@@ -688,7 +749,22 @@ assert.equal(statutePublicationState('law', 'suspended'), '停止');
 assert.equal(statutePublicationState('law', 'unconstitutional'), '違憲');
 assert.equal(statutePublicationState('law', 'repealed'), '廃止');
 const aclGuild = { id: 'acl-guild', ownerId: 'owner', members: { me: { id: 'bot' } } };
-const { PermissionFlagsBits } = await import('discord.js');
+const { ChannelType, PermissionFlagsBits } = await import('discord.js');
+let legacyCourtDeleted = false;
+assert.deepEqual(await retireGovernanceCourtChat({
+  name: 'Test Community',
+  channels: { fetch: async () => ({
+    type: ChannelType.GuildText,
+    threads: {
+      fetchActive: async () => ({ threads: new Map() }),
+      fetchArchived: async () => ({ threads: new Map() })
+    },
+    delete: async () => { legacyCourtDeleted = true; }
+  }) }
+}, {
+  court_forum_id: 'court', court_chat_channel_id: 'legacy-court'
+}), { removed: true, retained: false }, '事件threadがない旧裁判当事者用channelは移行時に削除する');
+assert.equal(legacyCourtDeleted, true);
 const procedureAcl = governanceProcedureOverwrites(aclGuild);
 assert.deepEqual(
   procedureAcl.map((entry) => entry.id),
@@ -742,6 +818,9 @@ assert.match(operations.content, /貴族院/);
 assert.equal(operations.components.length, 2);
 const uxSource = readFileSync(new URL('../src/governance/ux.js', import.meta.url), 'utf8');
 assert.doesNotMatch(uxSource, /\.pin\(/, '案内専用チャンネルの同期を不要なピン留め権限で止めない');
+const discordSource = readFileSync(new URL('../src/governance/discord.js', import.meta.url), 'utf8');
+assert.doesNotMatch(discordSource, /name: '裁判当事者用'/, '新規導入では裁判当事者用channelを作らない');
+assert.match(discordSource, /この事件は公開審理です/, '事件投稿に公開審理と正式主張の境界を表示する');
 const legacyMessages = [
   { id: 'before', createdTimestamp: 1, author: { id: 'user' }, content: '普通の投稿', attachments: [] },
   { id: 'start', createdTimestamp: 2, author: { id: 'bot' }, content: '# 初期憲法 v1\n本文', attachments: [] },

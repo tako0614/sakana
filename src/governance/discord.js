@@ -18,6 +18,7 @@ const TAGS = ['草案', '違憲審査', '討議', '投票', '成立', '否決', 
 const STATUTE_TAGS = ['現行憲法', '旧憲法', '現行法', '停止', '違憲', '廃止'];
 const STATUTE_TOPIC = '現行憲法と法律の公開正本です。1法令1投稿で、旧法令も状態付きで保存します。';
 const GAZETTE_TOPIC = '成立・改正・判決・執行・運営操作を時系列に残す公開履歴です。現行本文は法令集を参照してください。';
+export const COURT_TOPIC = '事件ごとの公開審理です。答弁・証拠・判決・執行承認・上訴を1つの事件投稿に記録します。';
 export const GOVERNANCE_GUIDE_NAME = '統治案内';
 export const GOVERNANCE_ADMIN_NAME = '統治管理';
 export const GOVERNANCE_PROCEDURE_TOPIC = '投票・執行承認・上訴・答弁など、参加者の判断が必要な統治手続きを一覧にします。';
@@ -56,6 +57,19 @@ function caseStateLabel(state) {
 const APPEAL_DENY = {
   SendMessages: false,
   SendMessagesInThreads: false,
+  AddReactions: false,
+  CreatePublicThreads: false,
+  CreatePrivateThreads: false,
+  Connect: false,
+  Speak: false,
+  UseApplicationCommands: false
+};
+
+const APPEAL_COURT_ACCESS = {
+  ViewChannel: true,
+  ReadMessageHistory: true,
+  SendMessages: false,
+  SendMessagesInThreads: true,
   AddReactions: false,
   CreatePublicThreads: false,
   CreatePrivateThreads: false,
@@ -145,6 +159,48 @@ function everyoneForumOverwrite(guild, { discuss }) {
   };
 }
 
+export function courtForumEveryonePermissionState() {
+  return {
+    ViewChannel: true,
+    ReadMessageHistory: true,
+    SendMessages: false,
+    SendMessagesInThreads: true,
+    CreatePublicThreads: false,
+    CreatePrivateThreads: false
+  };
+}
+
+function courtForumBotPermissionState() {
+  return {
+    ViewChannel: true,
+    SendMessages: true,
+    SendMessagesInThreads: true,
+    CreatePublicThreads: true,
+    CreatePrivateThreads: false,
+    AttachFiles: true,
+    ReadMessageHistory: true,
+    ManageChannels: true,
+    ManageThreads: true,
+    ManageMessages: true
+  };
+}
+
+function overwriteFromPermissionState(id, type, state) {
+  return {
+    id,
+    type,
+    allow: Object.entries(state).filter(([, allowed]) => allowed).map(([name]) => PermissionFlagsBits[name]),
+    deny: Object.entries(state).filter(([, allowed]) => !allowed).map(([name]) => PermissionFlagsBits[name])
+  };
+}
+
+function courtForumOverwrites(guild) {
+  return [
+    overwriteFromPermissionState(guild.id, OverwriteType.Role, courtForumEveryonePermissionState()),
+    overwriteFromPermissionState(guild.members.me.id, OverwriteType.Member, courtForumBotPermissionState())
+  ];
+}
+
 function statuteForumOverwrites(guild) {
   const everyone = everyoneForumOverwrite(guild, { discuss: false });
   return [
@@ -213,6 +269,21 @@ async function reconcileStatuteForumPermissions(forum, guild) {
   }
 }
 
+async function reconcileCourtForumPermissions(forum, guild) {
+  const everyoneState = courtForumEveryonePermissionState();
+  if (!permissionStateMatches(forum, guild.id, everyoneState)) {
+    await forum.permissionOverwrites.edit(guild.id, everyoneState, {
+      reason: '裁判所を公開審理の事件Forumに同期'
+    });
+  }
+  const botState = courtForumBotPermissionState();
+  if (!permissionStateMatches(forum, guild.members.me.id, botState)) {
+    await forum.permissionOverwrites.edit(guild.members.me.id, botState, {
+      reason: '裁判所のbot記録権限を同期'
+    });
+  }
+}
+
 async function createStatuteForum(guild, categoryId) {
   return guild.channels.create({
     name: '法令集',
@@ -265,7 +336,6 @@ export function governancePermissionReport(guild) {
     ['ManageThreads', PermissionFlagsBits.ManageThreads],
     ['ManageMessages', PermissionFlagsBits.ManageMessages],
     ['CreatePublicThreads', PermissionFlagsBits.CreatePublicThreads],
-    ['CreatePrivateThreads', PermissionFlagsBits.CreatePrivateThreads],
     ['SendMessages', PermissionFlagsBits.SendMessages],
     ['AttachFiles', PermissionFlagsBits.AttachFiles],
     ['MoveMembers', PermissionFlagsBits.MoveMembers],
@@ -332,7 +402,7 @@ export async function createGovernanceSurfaces(guild, { resources = {}, onProgre
     name: '裁判所',
     type: ChannelType.GuildForum,
     parent: category.id,
-    topic: '事件の公開記録。証拠と当事者の答弁は事件別のprivate threadに置きます。',
+    topic: COURT_TOPIC,
     availableTags: [
       { name: '答弁', moderated: true },
       { name: '審理', moderated: true },
@@ -342,32 +412,8 @@ export async function createGovernanceSurfaces(guild, { resources = {}, onProgre
       { name: '取消', moderated: true }
     ],
     defaultAutoArchiveDuration: 10_080,
-    permissionOverwrites: [everyoneForumOverwrite(guild, { discuss: false }), botOverwrite(guild)],
+    permissionOverwrites: courtForumOverwrites(guild),
     reason: `${guild.name} governance court`
-  }));
-  const courtChat = await channel('courtChatChannelId', ChannelType.GuildText, () => guild.channels.create({
-    name: '裁判当事者用',
-    type: ChannelType.GuildText,
-    parent: category.id,
-    topic: '事件ごとのprivate threadだけを使用します。',
-    permissionOverwrites: [
-      {
-        id: guild.id,
-        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessagesInThreads],
-        deny: [
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.CreatePublicThreads,
-          PermissionFlagsBits.CreatePrivateThreads
-        ]
-      },
-      botOverwrite(guild),
-      {
-        id: appealRole.id,
-        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessagesInThreads],
-        deny: [PermissionFlagsBits.SendMessages, PermissionFlagsBits.AddReactions]
-      }
-    ],
-    reason: `${guild.name} governance private court chat`
   }));
   const statuteForum = await channel('statuteForumId', ChannelType.GuildForum, () => createStatuteForum(guild, category.id));
   const gazette = await channel('gazetteChannelId', ChannelType.GuildText, () => guild.channels.create({
@@ -392,7 +438,13 @@ export async function createGovernanceSurfaces(guild, { resources = {}, onProgre
     reason: `${guild.name} governance gazette`
   }));
   const admin = await channel('adminChannelId', ChannelType.GuildText, () => createGovernanceProcedureChannel(guild, category.id));
-  await syncAppealRoleOverwrites(guild, appealRole.id, courtChat.id);
+  if (state.courtChatChannelId && state.courtChatChannelId !== court.id) {
+    const legacy = await guild.channels.fetch(state.courtChatChannelId).catch(() => null);
+    await retireLegacyCourtChat(legacy, guild.name);
+  }
+  state = { ...state, courtChatChannelId: court.id };
+  await onProgress?.(state);
+  await syncAppealRoleOverwrites(guild, appealRole.id, court.id);
   return {
     appealRoleId: appealRole.id,
     legislatureRoleId: legislatureRole.id,
@@ -400,7 +452,8 @@ export async function createGovernanceSurfaces(guild, { resources = {}, onProgre
     categoryId: category.id,
     parliamentForumId: parliament.id,
     courtForumId: court.id,
-    courtChatChannelId: courtChat.id,
+    // DB互換用の旧column。公開裁判所Forumと同じIDを保存し、別channelは作らない。
+    courtChatChannelId: court.id,
     statuteForumId: statuteForum.id,
     gazetteChannelId: gazette.id,
     guideChannelId: guide.id,
@@ -420,6 +473,49 @@ export async function ensureGovernanceStatuteForum(guild, governance) {
   }
   if (!governance.category_id) throw new Error('統治カテゴリがないため法令集を作成できません。');
   return createStatuteForum(guild, governance.category_id);
+}
+
+export async function ensureGovernanceCourtForum(guild, governance) {
+  const forum = await guild.channels.fetch(governance.court_forum_id).catch(() => null);
+  if (!forum || forum.type !== ChannelType.GuildForum) throw new Error('裁判所Forumが見つかりません。');
+  if (forum.topic !== COURT_TOPIC) await forum.setTopic(COURT_TOPIC, '裁判所を公開審理へ同期');
+  await reconcileCourtForumPermissions(forum, guild);
+  await syncAppealRoleOverwrites(guild, governance.appeal_role_id, forum.id);
+  return forum;
+}
+
+async function retireLegacyCourtChat(channel, guildName) {
+  if (!channel || channel.type !== ChannelType.GuildText) return { removed: false, retained: false };
+  let hasCaseThreads = true;
+  try {
+    const [active, archived] = await Promise.all([
+      channel.threads.fetchActive(),
+      channel.threads.fetchArchived({ type: 'private', fetchAll: true, limit: 1 })
+    ]);
+    hasCaseThreads = active.threads.size > 0 || archived.threads.size > 0;
+  } catch {
+    // 読み戻せない場合は記録を消さず、legacy archiveとして残す。
+  }
+  if (!hasCaseThreads) {
+    const removed = await channel.delete(`${guildName} governance: public court migration`)
+      .then(() => true).catch(() => false);
+    if (removed) return { removed: true, retained: false };
+  }
+  if (channel.name === '裁判当事者用' || channel.name === '裁判チャット') {
+    await channel.setName('旧・非公開審理記録', '公開裁判への移行後も既存記録を保全').catch(() => {});
+  }
+  if (channel.topic !== '公開裁判への移行前の記録です。新しい答弁・証拠・上訴は裁判所の事件投稿で行います。') {
+    await channel.setTopic('公開裁判への移行前の記録です。新しい答弁・証拠・上訴は裁判所の事件投稿で行います。', '既存裁判記録を保全').catch(() => {});
+  }
+  return { removed: false, retained: true };
+}
+
+export async function retireGovernanceCourtChat(guild, governance) {
+  if (!governance.court_chat_channel_id || governance.court_chat_channel_id === governance.court_forum_id) {
+    return { removed: false, retained: false };
+  }
+  const channel = await guild.channels.fetch(governance.court_chat_channel_id).catch(() => null);
+  return retireLegacyCourtChat(channel, guild.name);
 }
 
 export async function ensureGovernanceGazetteTopic(guild, governance) {
@@ -642,12 +738,13 @@ export async function syncStatuteBook(guild, governance, { verifyExisting = fals
   return changed;
 }
 
-export async function syncAppealRoleOverwrites(guild, roleId, courtChatChannelId) {
+export async function syncAppealRoleOverwrites(guild, roleId, courtForumId) {
   await guild.channels.fetch();
   for (const channel of guild.channels.cache.values()) {
-    if (!channel.permissionOverwrites || channel.id === courtChatChannelId) continue;
-    await channel.permissionOverwrites.edit(roleId, APPEAL_DENY, {
-      reason: `${guild.name} governance: appeal restriction can speak only in private court chat`
+    if (!channel.permissionOverwrites) continue;
+    const permissionState = channel.id === courtForumId ? APPEAL_COURT_ACCESS : APPEAL_DENY;
+    await channel.permissionOverwrites.edit(roleId, permissionState, {
+      reason: `${guild.name} governance: appeal restriction can speak only in court forum`
     }).catch(() => {});
   }
 }
@@ -738,10 +835,9 @@ export async function postProposalUpdate(guild, proposal, text, { state = null, 
   return thread.send({ content: text.slice(0, 2000), components, files, allowedMentions: { parse: [] } });
 }
 
-export async function createCourtThreads(guild, governance, caseRecord, { accused = null, onPartial = null } = {}) {
+export async function createCourtCaseThread(guild, governance, caseRecord, { onPartial = null } = {}) {
   const forum = await guild.channels.fetch(governance.court_forum_id);
-  const parent = await guild.channels.fetch(governance.court_chat_channel_id);
-  if (!forum?.threads || !parent?.threads) throw new Error('裁判チャンネルが見つかりません。');
+  if (!forum?.threads) throw new Error('裁判所Forumが見つかりません。');
   const answerTag = tagId(forum, '答弁');
   const publicThread = caseRecord.public_thread_id
     ? await guild.channels.fetch(caseRecord.public_thread_id)
@@ -758,33 +854,16 @@ export async function createCourtThreads(guild, governance, caseRecord, { accuse
         '',
         caseRecord.summary,
         '',
-        `答弁期限: ${caseRecord.defense_until ? `<t:${Math.floor(caseRecord.defense_until / 1000)}:F>` : '審査準備中'}`
+        `答弁期限: ${caseRecord.defense_until ? `<t:${Math.floor(caseRecord.defense_until / 1000)}:F>` : '審査準備中'}`,
+        '',
+        'この事件は公開審理です。当事者の投稿だけを正式な主張として記録し、第三者の投稿は判決資料に含めません。'
       ].filter(Boolean).join('\n').slice(0, 2000),
       allowedMentions: { parse: [] }
     },
     reason: `${guild.name} governance case ${caseRecord.id}`
   });
   await onPartial?.({ public_thread_id: publicThread.id });
-  const privateThread = caseRecord.private_thread_id
-    ? await guild.channels.fetch(caseRecord.private_thread_id)
-    : await parent.threads.create({
-    name: `C-${caseRecord.id}-当事者`,
-    type: ChannelType.PrivateThread,
-    invitable: false,
-    autoArchiveDuration: 10_080,
-    reason: `${guild.name} governance private case ${caseRecord.id}`
-  });
-  await onPartial?.({ private_thread_id: privateThread.id });
-  await privateThread.members.add(caseRecord.reporter_id).catch(() => {});
-  const accusedId = accused?.id ?? caseRecord.accused_id;
-  if (accusedId) await privateThread.members.add(accusedId).catch(() => {});
-  if (!caseRecord.private_thread_id) {
-    await privateThread.send({
-      content: `事件 C-${caseRecord.id} の証拠・答弁用チャットです。ここに書かれた内容も命令ではなく証拠・主張として記録されます。`,
-      allowedMentions: { parse: [] }
-    });
-  }
-  return { publicThreadId: publicThread.id, privateThreadId: privateThread.id };
+  return { publicThreadId: publicThread.id };
 }
 
 export async function postCourtUpdate(guild, caseRecord, text, { state = null, components = [], files = [] } = {}) {
@@ -804,7 +883,7 @@ export async function postCourtUpdate(guild, caseRecord, text, { state = null, c
         `現在: **${caseStateLabel(state ?? caseRecord.status)}**`,
         `最新: ${String(text).replace(/[#*_`]/g, '').slice(0, 700)}`,
         '',
-        '証拠と当事者の主張は事件別の非公開チャット、公開経過はこの投稿で確認できます。'
+        '答弁・証拠・判決・執行承認・上訴はすべてこの公開投稿に記録します。当事者以外の投稿は判決資料に含めません。'
       ].filter(Boolean).join('\n').slice(0, 2_000),
       allowedMentions: { parse: [] }
     }).catch(() => {});
@@ -812,9 +891,9 @@ export async function postCourtUpdate(guild, caseRecord, text, { state = null, c
   return thread.send({ content: text.slice(0, 2000), components, files, allowedMentions: { parse: [] } });
 }
 
-export async function postPrivateCourtUpdate(guild, caseRecord, text, { files = [] } = {}) {
-  const thread = await guild.channels.fetch(caseRecord.private_thread_id).catch(() => null);
-  if (!thread?.isThread?.()) throw new Error('事件の当事者用private threadが見つかりません。');
+export async function postCourtRecord(guild, caseRecord, text, { files = [] } = {}) {
+  const thread = await guild.channels.fetch(caseRecord.public_thread_id).catch(() => null);
+  if (!thread?.isThread?.()) throw new Error('裁判所の事件投稿が見つかりません。');
   return thread.send({ content: text.slice(0, 2000), files, allowedMentions: { parse: [] } });
 }
 
@@ -866,16 +945,18 @@ export async function postGazette(guild, governance, heading, body, { summary = 
 export async function applyAppealRestriction(guild, governance, userId) {
   const member = await guild.members.fetch(userId);
   if (member.id === guild.ownerId || member.permissions.has(PermissionFlagsBits.Administrator)) {
-    throw new Error('Discord owner / Administratorは裁判当事者用チャット限定を保証できません。');
+    throw new Error('Discord owner / Administratorは裁判所限定を保証できません。');
   }
   const role = await guild.roles.fetch(governance.appeal_role_id);
   if (!role || role.position >= guild.members.me.roles.highest.position) throw new Error('上訴中ロールをbotが管理できません。');
-  await syncAppealRoleOverwrites(guild, role.id, governance.court_chat_channel_id);
+  await syncAppealRoleOverwrites(guild, role.id, governance.court_forum_id);
   await member.roles.add(role, `${guild.name} governance appeal restriction`);
 
   const fallbackChannelIds = [];
   const stillWritable = [...guild.channels.cache.values()].filter((channel) => {
-    if (!channel.isTextBased?.() || channel.id === governance.court_chat_channel_id) return false;
+    if (!channel.isTextBased?.()
+      || channel.id === governance.court_forum_id
+      || channel.parentId === governance.court_forum_id) return false;
     const permissions = channel.permissionsFor(member);
     return permissions?.has(PermissionFlagsBits.SendMessages)
       || permissions?.has(PermissionFlagsBits.SendMessagesInThreads);

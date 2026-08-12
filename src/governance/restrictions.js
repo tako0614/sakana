@@ -1,6 +1,6 @@
 import {
   activeRestrictions,
-  getCaseByPrivateThread,
+  getCaseByPublicThread,
   recordRestrictionUsage,
   restrictionUsageCount,
   restrictionUsageWindow,
@@ -66,8 +66,14 @@ function blockedMessageReason(message, restriction, now) {
 
 export async function enforceMessageRestrictions(message) {
   if (!message?.guildId || message.author?.bot) return false;
-  // 答弁・上訴のdue processを別の制裁profileで妨げない。
-  if (message.channel?.isThread?.() && getCaseByPrivateThread(message.channelId)) return false;
+  // 公開裁判所での当事者の答弁・上訴だけは、別の制裁profileで妨げない。
+  // 第三者が事件投稿へ書けば通常の制裁対象となり、裁判所を回避経路にできない。
+  const courtCase = message.channel?.isThread?.() ? getCaseByPublicThread(message.channelId) : null;
+  if (courtCase
+    && ['defense', 'appeal'].includes(courtCase.status)
+    && [courtCase.reporter_id, courtCase.accused_id].filter(Boolean).includes(message.author.id)) {
+    return false;
+  }
   const now = Date.now();
   const restrictions = activeRestrictions(message.guildId, message.author.id, now);
   for (const restriction of restrictions) {
