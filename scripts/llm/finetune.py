@@ -66,6 +66,11 @@ parser.add_argument("--accum", type=int, default=2)
 parser.add_argument("--warmup", type=float, default=0.03)
 parser.add_argument("--clip", type=float, default=1.0)
 parser.add_argument("--wd", type=float, default=0.01)
+# Adam の状態は fp32 で 2 本 = 4.77GB。重み 2.38 + 勾配 2.38 + autocast の fp16 コピー 1.19 と
+# 合わせて固定分が 10.72GB になり、T4 14.56GB では活性と logits の余地が残らない
+# (batch 1 まで落としても forward の lm_head で OOM した)。8bit にすると状態が 1.19GB になり、
+# 固定分 7.14GB で batch 2 が戻せる。量子化されるのは状態だけで、重みと更新は fp32 のまま。
+parser.add_argument("--optim", default="adamw", choices=["adamw", "adamw8bit"])
 parser.add_argument("--max-steps", type=int, default=0, help="0 なら最後まで")
 # 24GB に対して 0.6B のフル学習は約 8GB + 活性 2.3GB で収まるので既定は切る。
 # 有効にすると活性を捨てて前向きを2回走らせるので、計算が 25% 増えて時間も金も増える。
@@ -195,10 +200,14 @@ print(f"{args.base} / {total:,} params", flush=True)
 # weight decay は 1 次元 (LayerNorm / bias) から外す。掛けると害になる
 decay = [p for n, p in model.named_parameters() if p.dim() >= 2]
 plain = [p for n, p in model.named_parameters() if p.dim() < 2]
-opt = torch.optim.AdamW(
-    [{"params": decay, "weight_decay": args.wd}, {"params": plain, "weight_decay": 0.0}],
-    lr=args.lr, betas=(0.9, 0.95), eps=1e-8,
-)
+groups = [{"params": decay, "weight_decay": args.wd}, {"params": plain, "weight_decay": 0.0}]
+
+if args.optim == "adamw8bit":
+    import bitsandbytes as bnb
+    opt = bnb.optim.AdamW8bit(groups, lr=args.lr, betas=(0.9, 0.95), eps=1e-8)
+else:
+    opt = torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, 0.95), eps=1e-8)
+print(f"optimizer {args.optim}", flush=True)
 
 steps_per_epoch = max(1, len(train_loader) // args.accum)
 total_steps = steps_per_epoch * args.epochs
@@ -268,6 +277,11 @@ base_val = evaluate()
 print(f"\n学習前 val {base_val:.4f} (ppl {math.exp(min(20, base_val)):.1f})", flush=True)
 for s in samples():
     print(f"  {s['prompt'].splitlines()[-1]} → {s['reply']!r}", flush=True)
+
+# 評価と生成が確保したブロックを返す。この後 Adam の状態が乗るので、
+# 余っているキャッシュを抱えたままにすると 14.56GB では足りなくなる
+if device == "cuda":
+    torch.cuda.empty_cache()
 
 started = time.time()
 model.train()
