@@ -1,0 +1,31 @@
+[Unit]
+Description=Sakana mimic-ft (Qwen3-0.6B を追加学習したモデルの推論)
+# bot とも evex-1 とも独立させる。3つのうち1つが固まっても他は生きていてほしい。
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/sakana
+# 127.0.0.1 の別ポート。evex-1 (8765) と同時に立てて /model で選べるようにする。
+# 世代を置き換えないのは性質が違うから — あちらは 94万件だけで純度が高い代わりに
+# 荒く、こちらは Qwen の日本語を引き継いで読める代わりに借り物の知識が混ざる。
+ExecStart=/root/sakana/.venv-llm/bin/python -u src/mimic/server-ft.py \
+  --model /root/sakana/mimic-ft \
+  --port 8766 \
+  --threads 6
+
+Restart=on-failure
+RestartSec=5
+
+# fp32 の重みが 2.4GB。torch のランタイムと KV キャッシュを足して 4GB 見込み。
+# bot サーバーは RAM 12GB (bot 1GB + evex-1 0.5GB) なので収まる。
+# int8 に落とすか llama.cpp の Q8_0 (0.6GB) に移せばもっと下がる。
+MemoryMax=5G
+CPUWeight=40
+Nice=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -37,7 +37,7 @@ export const ENDPOINTS = {
   'evex-ft': {
     url: process.env.MIMIC_FT_URL ?? 'http://127.0.0.1:8766',
     timeoutMs: number(process.env.MIMIC_FT_TIMEOUT_MS, 120_000),
-    maxNewTokens: number(process.env.MIMIC_FT_MAX_NEW_TOKENS, 120),
+    maxNewTokens: number(process.env.MIMIC_FT_MAX_NEW_TOKENS, 64),
     label: process.env.MIMIC_FT_LABEL ?? 'evex-ft-1-preview',
     format: process.env.MIMIC_FT_FORMAT ?? 'plain'
   }
