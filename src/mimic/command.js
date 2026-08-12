@@ -13,6 +13,7 @@ import {
 
 import { mimicConfig, status } from './client.js';
 import { impersonate } from './impersonate.js';
+import { clearPersona, forgetPersona, personaCounts, personaFor, setPersona } from './persona.js';
 import { DEFAULT_ENGINE, ENGINES, engineCounts, engineFor, setEngine } from './prefs.js';
 import { labelledSpeakers } from './plain.js';
 import { hasOptedOut, learnedSpeakers, optIn, optOut } from './speakers.js';
@@ -197,6 +198,109 @@ export const mimicCommands = [
   },
 
   {
+    // /model と同じ形。あちらが「どのモデルで答えるか」で、こちらが「誰として答えるか」。
+    // /mimic は1回ぶんだが、これは設定として残るので会話がずっとその口調になる。
+    data: new SlashCommandBuilder()
+      .setName('as')
+      .setDescription('bot に誰として喋らせるか (自分のぶんだけ変わります)')
+      .setContexts(InteractionContextType.Guild)
+      .addStringOption((option) => option
+        .setName('who')
+        .setDescription('省略すると、いまの設定を表示します')
+        .setRequired(false)
+        .setAutocomplete(true))
+      .addBooleanOption((option) => option
+        .setName('off')
+        .setDescription('true にすると bot 自身に戻します')
+        .setRequired(false)),
+
+    async autocomplete(interaction) {
+      const typed = (interaction.options.getFocused() ?? '').toLowerCase();
+      const pool = labelledSpeakers().length ? labelledSpeakers() : learnedSpeakers();
+      const found = pool
+        .filter((row) => !hasOptedOut(row.userId))
+        .filter((row) => !typed || (row.name ?? '').toLowerCase().includes(typed))
+        .slice(0, 25);
+
+      await interaction.respond(found.map((row) => ({
+        name: `${row.name} (${(row.count ?? 0).toLocaleString('en-US')}件)`,
+        value: row.userId
+      }))).catch(() => {});
+    },
+
+    async execute(interaction) {
+      const who = interaction.options.getString('who');
+      const off = interaction.options.getBoolean('off');
+      const pool = () => (labelledSpeakers().length ? labelledSpeakers() : learnedSpeakers());
+      const nameOf = (id) => pool().find((row) => row.userId === id)?.name ?? id;
+
+      if (off) {
+        const changed = clearPersona(interaction.user.id);
+        await interaction.reply({
+          content: changed
+            ? `${mimicConfig.label} 自身に戻しました。`
+            : 'もともと bot 自身のままです。',
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
+
+      // 省略なら表示だけ。確認と切り替えを同じ入口にしておく (/model と同じ)
+      if (!who) {
+        const current = personaFor(interaction.user.id);
+        const others = personaCounts()
+          .filter((row) => row.targetId !== current)
+          .slice(0, 3)
+          .map((row) => `${nameOf(row.targetId)} (${row.users}人)`);
+
+        await interaction.reply({
+          content: [
+            current
+              ? `いまのあなた: **${nameOf(current)} として**`
+              : `いまのあなた: **${mimicConfig.label} 自身**`,
+            others.length ? `他の人がよく選んでいるのは ${others.join(' / ')}` : null,
+            '`/as who:<候補>` で変えられます。`/as off:true` で戻ります。',
+            `効くのは \`/model\` で **${ENGINES.evex.label}** を選んでいるときだけです。`
+          ].filter(Boolean).join('\n'),
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
+
+      const targetId = /^\d{5,}$/.test(who) ? who : (who.match(/\d{5,}/)?.[0] ?? null);
+      if (!targetId || !pool().some((row) => row.userId === targetId)) {
+        await interaction.reply({
+          content: '候補から選んでください (学習していない人の口調は出せません)。',
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
+
+      if (hasOptedOut(targetId)) {
+        await interaction.reply({
+          content: 'この人は対象から外れています。',
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
+
+      setPersona(interaction.user.id, targetId);
+
+      // evex を選んでいない人には効かないので、そこを黙らせない
+      const engine = engineFor(interaction.user.id);
+      await interaction.reply({
+        content: [
+          `あなたの分を **${nameOf(targetId)} として** にしました。他の人には影響しません。`,
+          engine === 'evex'
+            ? 'メンションすると、その口調で1発言返します。'
+            : `いまのあなたは **${ENGINES[engine].label}** なので効きません。\`/model engine:${ENGINES.evex.label}\` に変えてください。`
+        ].join('\n'),
+        flags: MessageFlags.Ephemeral
+      });
+    }
+  },
+
+  {
     // 実在の人の口調を誰でも呼び出せる状態にするので、本人が抜けられる入口を必ず置く
     data: new SlashCommandBuilder()
       .setName('mimic-optout')
@@ -220,8 +324,10 @@ export const mimicCommands = [
       }
 
       optOut(interaction.user.id);
+      // 自分を選んでいた人の設定も消す。残すと黙って効かなくなって理由が分からない
+      const dropped = forgetPersona(interaction.user.id);
       await interaction.reply({
-        content: '外しました。あなたとしては書かれません。`/mimic-optout back:true` で戻せます。',
+        content: `外しました。あなたとしては書かれません${dropped ? ` (${dropped}人の /as を解除しました)` : ''}。\`/mimic-optout back:true\` で戻せます。`,
         flags: MessageFlags.Ephemeral
       });
     }

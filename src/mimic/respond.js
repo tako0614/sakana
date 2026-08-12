@@ -4,16 +4,21 @@
 // 指示に従わせようとしても学習中に一度も見ていない形になるので崩れるだけ。
 // できるのは「会話の続きを1発言書く」ことだけなので、それだけをやる。
 //
-// 話者は会話ごとに出現順で振る相対トークン (<|a|>, <|b|>, ...)。実在の人物には
-// 紐づかないので、そもそも「誰かに成り代わる」ことができない。
 // bot は会話に加わる新しい参加者として、次の空いている役で喋る。
+//
+// ただし `/as` で人格を選んでいる人には、その人の話者トークンで喋る。
+// evex-1 は上位48人に固有のトークンを持っていて、94万件から圧縮した本人の履歴が
+// 重みに入っているので、トークンを差し替えるだけで口調が変わる (実測で全員ぶん
+// 明確に違うものが出た: -akku- は技術寄りで長め、it's o は「まじ？」のような短い口語)。
 //
 // 使用量の記録もしない。API を叩いていないので費用がゼロで、
 // ドル換算の上限 (agent_calls) に混ぜると請求と乖離する。
 
 import { chunkForDiscord } from '../agent/format.js';
 import { generate, mimicConfig, roleScheme } from './client.js';
+import { personaFor } from './persona.js';
 import { assignRoles, buildPrompt, firstTurn, messageText, nextRole } from './serialize.js';
+import { hasOptedOut, learnedSpeakers, tokenFor } from './speakers.js';
 
 const NO_MENTIONS = { parse: [], repliedUser: false };
 
@@ -69,8 +74,16 @@ export async function handleMimicRequest(message, client, { recent = [] } = {}) 
       content: messageText(entry.content)
     }));
 
-    // bot は新しい参加者として喋る
-    const prompt = buildPrompt(history, nextRole(roles, known));
+    // 既定は「新しい参加者」だが、/as で人格を選んでいればその人として喋る。
+    // 申告に無いトークンは渡さない — モデルが一度も見ていない記号を受け取ると
+    // バイト分解されて出力が崩れる (evex-1 に <|a|> を渡して実際に壊した)
+    const persona = personaFor(message.author.id);
+    const personaToken = persona && !hasOptedOut(persona) ? tokenFor(persona) : null;
+    const speakAs = personaToken && known?.speakers?.includes(personaToken)
+      ? personaToken
+      : nextRole(roles, known);
+
+    const prompt = buildPrompt(history, speakAs);
 
     let body = '';
     for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
@@ -88,8 +101,13 @@ export async function handleMimicRequest(message, client, { recent = [] } = {}) 
       return;
     }
 
-    // どのモデルが書いたかを毎回出す (DeepSeek 側と同じ形)
-    const note = `\n-# ${mimicConfig.label}`;
+    // どのモデルが書いたかを毎回出す (DeepSeek 側と同じ形)。
+    // 人格を差しているなら誰なのかも出す — 実在の人の口調で喋っているので、
+    // 生成物だと分かる印は必ず付ける
+    const asName = speakAs === personaToken
+      ? learnedSpeakers().find((row) => row.userId === persona)?.name
+      : null;
+    const note = `\n-# ${mimicConfig.label}${asName ? ` / ${asName} として` : ''}`;
 
     for (const [index, chunk] of chunkForDiscord(body + note).entries()) {
       const payload = { content: chunk, allowedMentions: NO_MENTIONS };

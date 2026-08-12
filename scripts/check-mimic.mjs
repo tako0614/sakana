@@ -266,3 +266,49 @@ try {
   void asRole;
   }
 }
+
+// --- 人格の設定 (/as) ---
+//
+// /model と同じで自分のぶんだけ。他人に漏れると、1人が変えて全員の見え方が変わる。
+{
+  const {
+    clearPersona, forgetPersona, personaCounts, personaFor, setPersona
+  } = await import('../src/mimic/persona.js');
+
+  const ME = 'check-persona-me';
+  const YOU = 'check-persona-you';
+  const TARGET = '1218933751950872728';
+  const wipe = () => {
+    clearPersona(ME);
+    clearPersona(YOU);
+  };
+
+  wipe();
+  try {
+    if (personaFor(ME) !== null) fail('既定は bot 自身 (null)');
+
+    setPersona(ME, TARGET);
+    if (personaFor(ME) !== TARGET) fail('設定が保存されていない');
+    if (personaFor(YOU) !== null) fail('設定が他人に漏れている');
+
+    // 上書きできる (別の人に変える)
+    setPersona(ME, '456226577798135808');
+    if (personaFor(ME) !== '456226577798135808') fail('上書きできていない');
+
+    if (!personaCounts().some((row) => row.users > 0)) fail('内訳が取れていない');
+
+    if (!clearPersona(ME)) fail('解除できていない');
+    if (personaFor(ME) !== null) fail('解除後も残っている');
+    if (clearPersona(ME)) fail('二度目の解除で変更ありと言ってはいけない');
+
+    // 対象から外れた人を選んでいた設定は消える。残すと黙って効かなくなる
+    setPersona(ME, TARGET);
+    setPersona(YOU, TARGET);
+    if (forgetPersona(TARGET) !== 2) fail('その人を選んでいた設定を消していない');
+    if (personaFor(ME) !== null || personaFor(YOU) !== null) fail('掃除できていない');
+
+    console.log('persona ok (既定は bot 自身 / 自分のぶんだけ / 解除 / 対象離脱で掃除)');
+  } finally {
+    wipe();
+  }
+}
