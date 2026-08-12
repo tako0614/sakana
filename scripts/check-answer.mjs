@@ -154,21 +154,45 @@ const userContentOf = (over = {}) => buildUserContent({
     recent: [said('21', 'さば', '昼なに食う'), said('22', 'あきら', 'ラーメン')]
   });
 
-  const thread = content.indexOf('いま返信でつながっている話');
-  const background = content.indexOf('直近の会話');
-  if (thread < 0) fail('返信の鎖の見出しが無い');
+  const background = content.indexOf('同時に流れている別の話');
+  const thread = content.indexOf('いま答えるべき話');
+  const ask = content.indexOf('## 依頼');
   if (background < 0) fail('背景の見出しが無い');
-  if (thread > background) fail('今の話題は背景より先に置く');
-  if (!/背景/.test(content.slice(background, background + 60))) {
-    fail('背景であることを見出しに書く');
+  if (thread < 0) fail('返信の鎖の見出しが無い');
+
+  // 順序が本体。鎖と依頼の間に背景を挟むと、量と位置の両方で背景が勝つ。
+  if (!(background < thread && thread < ask)) {
+    fail(`並びは 背景 → 鎖 → 依頼 (${background} / ${thread} / ${ask})`);
+  }
+  if (!/答えの材料にしない/.test(content.slice(background, background + 80))) {
+    fail('背景は材料にしないと見出しに書く');
+  }
+  if (!/続きとして答える/.test(content.slice(ask, ask + 60))) {
+    fail('依頼の見出しで鎖の続きだと指す');
   }
 
-  // 鎖は古い順
-  if (content.indexOf('デプロイどうする') > content.indexOf('まず CI 直そう')) {
+  // 鎖は古い順で、最後の1件が「いま返信された相手」だと分かること
+  const chainBlock = content.slice(thread);
+  if (chainBlock.indexOf('デプロイどうする') > chainBlock.indexOf('まず CI 直そう')) {
     fail('返信の鎖は古い順に並べる');
   }
+  const marked = chainBlock.split('\n').filter((l) => l.includes('返信して聞いている'));
+  if (marked.length !== 1) fail(`返信先の印は最後の1件だけ: ${marked.length} 件`);
+  if (!marked[0].includes('まず CI 直そう')) fail(`印が最後の1件に付いていない: ${marked[0]}`);
+
+  // 鎖があるなら背景は削る (混ざる材料を増やさない)
+  const many = Array.from({ length: 30 }, (_, i) => said(`3${i}`, 'だれか', `雑談${i}`));
+  const trimmed = userContentOf({
+    replyChain: [said('11', 'たこ', 'デプロイどうする')],
+    recent: many
+  });
+  if (trimmed.includes('雑談0')) fail('鎖があるときは背景を削る');
+  if (!trimmed.includes('雑談29')) fail('背景は新しい側を残す');
+  // 鎖が無いときは全部渡す
+  if (!userContentOf({ recent: many }).includes('雑談0')) fail('鎖が無いなら背景は削らない');
+
   // 鎖が無いときは見出しごと出さない
-  if (userContentOf({ recent: [said('21', 'さば', '昼なに食う')] }).includes('いま返信でつながっている話')) {
+  if (userContentOf({ recent: [said('21', 'さば', '昼なに食う')] }).includes('いま答えるべき話')) {
     fail('鎖が空なら見出しを出さない');
   }
 }

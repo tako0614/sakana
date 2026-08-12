@@ -41,8 +41,9 @@ export function buildSystemPrompt(ctx, toolset) {
     '- 誰の話か指定がないなら、直前の会話で話題だった人を勝手に主語にしない。',
     '  そのチャンネルで実際に起きたことから拾うか、誰のことか聞き返す。',
     '- チャンネルでは複数の話題が同時に流れている。答えるのは1つだけ。',
-    '  「いま返信でつながっている話」があるならそれが今の話題で、直近の会話は背景。',
-    '  混ぜて1つの答えにしない。行末の `↩N` がその番号への返信なので、繋がりはそこで見る。',
+    '  「いま答えるべき話」があるならそれだけが本題。「参考」の側は誰が何を話しているかの',
+    '  背景で、答えの材料にしない。混ぜて1つの答えにしない。',
+    '  行末の `↩N` がその番号への返信なので、繋がりはそこで見る。',
     '',
     '## 動き方',
     '- 直近の会話は最初から渡してある。それで答えられるなら道具を呼ばずに答える。',
@@ -91,6 +92,10 @@ export function buildSystemPrompt(ctx, toolset) {
   return lines.join('\n');
 }
 
+// 返信の鎖があるときに背景として残す件数。本題が手元にあるなら、
+// 無関係な雑談を 30 件並べても混ざる材料が増えるだけ。
+const BACKGROUND_WITH_CHAIN = 10;
+
 /**
  * 最初のユーザーメッセージ。ここで直近の会話も一緒に渡してしまう。
  * ツールを1往復減らせるので、結果的にトークンが減る。
@@ -110,30 +115,51 @@ export function buildUserContent({ ctx, prompt, recent, replyChain, refs }) {
       + 'この人に向けて答える。話題の人がこの人だとは限らない。'
   ].join('\n'));
 
-  // 返信の鎖が「いまの話題」。背景より先に、多めの文字数で置く。
-  // 話題が並行しているチャンネルでは、この2つを分けないと答えが混ざる。
-  if (replyChain?.length) {
-    sections.push([
-      '## いま返信でつながっている話 (古い順・これが今の話題)',
-      formatMessages(replyChain, {
-        refs, showChannel: false, bodyChars: 1200, selfId: ctx.client?.user?.id
-      })
-    ].join('\n'));
-  }
+  const hasChain = Boolean(replyChain?.length);
+  const selfId = ctx.client?.user?.id;
 
+  // 背景を先、返信の鎖を後に置く。
+  //
+  // 逆にしていたら効かなかった。鎖 (2〜6件) と依頼の間に背景 30 件が挟まって、
+  // 量で15倍・依頼のすぐ上という位置の両方で背景が勝っていた。
+  // いちばん効かせたいものを依頼の直前に置く。
+  //
+  // 鎖があるときは背景を削る。本題が手元にあるので、無関係な雑談を
+  // 30 件も並べる意味がない (混ざる材料を増やすだけ)。
   if (recent?.length) {
+    const shown = hasChain ? recent.slice(-BACKGROUND_WITH_CHAIN) : recent;
     sections.push([
-      '## このチャンネルの直近の会話 (古い順・背景。別の話題が混ざっている)',
-      formatMessages(recent, {
+      hasChain
+        ? '## 参考: このチャンネルで同時に流れている別の話 (答えの材料にしない)'
+        : '## このチャンネルの直近の会話 (古い順)',
+      formatMessages(shown, {
         refs,
         showChannel: false,
         bodyChars: agentConfig.preloadChars,
-        selfId: ctx.client?.user?.id
+        selfId
       })
     ].join('\n'));
   }
 
-  sections.push(['## 依頼', prompt || '(本文なし。直近の会話をまとめてください)'].join('\n'));
+  if (hasChain) {
+    // 鎖の最後が「いま返信された相手」。ここが本題の起点なので明示する。
+    const target = replyChain[replyChain.length - 1];
+    sections.push([
+      '## いま答えるべき話 (古い順。返信でつながっているぶんだけ)',
+      formatMessages(replyChain, {
+        refs,
+        showChannel: false,
+        bodyChars: 1200,
+        selfId,
+        tailOf: (message) => (message === target ? '←この発言に返信して聞いている' : null)
+      })
+    ].join('\n'));
+  }
+
+  sections.push([
+    hasChain ? '## 依頼 (上の「いま答えるべき話」の続きとして答える)' : '## 依頼',
+    prompt || '(本文なし。直近の会話をまとめてください)'
+  ].join('\n'));
 
   return sections.join('\n\n');
 }
