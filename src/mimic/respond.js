@@ -103,6 +103,23 @@ function plainRequest(messages, { wanted, channelId }) {
   };
 }
 
+/**
+ * 会話 + `/as` の指定から、その世代の形式でプロンプトを組む。
+ *
+ * `/mimic` (impersonate.js) と**別の経路**なので分けて確かめられるようにしてある。
+ * あちらはお題だけを渡すが、こちらはチャンネルの会話を並べた末尾に人格のラベルを
+ * 置く。同じラベルでも前に何が並んでいるかで出るものが変わるので、
+ * `/mimic` が動いていても `/as` が効いているとは限らない。
+ *
+ * 返すのは { prompt, cut, as }。as が null なら人格は乗っていない
+ * (その世代がその人を知らない = 渡すと未学習のラベルになるので落としている)。
+ */
+export async function buildMimicPrompt(messages, { wanted = null, engine = 'evex', channelId = null } = {}) {
+  return await mimicFormat(engine) === 'plain'
+    ? plainRequest(messages, { wanted, channelId })
+    : tokenRequest(messages, { wanted, engine });
+}
+
 // 自分の返答に付けている `-# evex-1 / たこ として` を落とす。
 // 文脈に入れるときに残すと、モデルが footer ごと真似し始める。
 const FOOTER = /\n-#[^\n]*$/;
@@ -176,9 +193,9 @@ export async function handleMimicRequest(
 
     // 載っている世代で形式が違う。取り違えるとモデルが一度も見ていない入力を
     // 受け取り、例外を出さずに静かに崩れる (evex-1 に <|a|> を渡して実際に壊した)
-    const built = await mimicFormat(engine) === 'plain'
-      ? plainRequest(messages, { wanted, channelId: message.channelId })
-      : await tokenRequest(messages, { wanted, engine });
+    const built = await buildMimicPrompt(messages, {
+      wanted, engine, channelId: message.channelId
+    });
 
     let body = '';
     for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {

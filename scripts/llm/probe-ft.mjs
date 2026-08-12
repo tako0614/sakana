@@ -15,9 +15,10 @@
 //   4. 逐語コピーの率 … その人の実発言と完全一致したもの (覚えただけなら意味がない)
 
 import { db as archive } from '../../src/archive/db.js';
-import { endpointFor, status } from '../../src/mimic/client.js';
+import { continuationOf, endpointFor, generate, status } from '../../src/mimic/client.js';
 import { impersonate } from '../../src/mimic/impersonate.js';
-import { labelFor, labelledSpeakers } from '../../src/mimic/plain.js';
+import { isUnusableReply, labelFor, labelledSpeakers } from '../../src/mimic/plain.js';
+import { buildMimicPrompt } from '../../src/mimic/respond.js';
 import { hasOptedOut } from '../../src/mimic/speakers.js';
 
 const ENGINE = 'evex-ft';
@@ -105,6 +106,49 @@ async function probe(group, people) {
 
 await probe('名前持ち (重みに口調が入っている)', named);
 await probe('名前無し (実発言を例に渡す)', unnamed);
+
+// --- /as の経路 ---
+//
+// /mimic (impersonate.js) と別物。あちらはお題だけを渡すが、/as はチャンネルの
+// 会話を並べた末尾に人格のラベルを置く。同じラベルでも前に何が並んでいるかで出る
+// ものが変わるので、/mimic が動いていても /as が効いているとは限らない。
+{
+  console.log('--- /as (会話の続きを人格で書く)');
+
+  // 会話は誰でもいい。名前持ち2人のやり取りにして、学習データと同じ形にする
+  const [a, b] = named;
+  const messages = [
+    { authorId: b?.userId, content: 'これ動かんのやけど', isReply: false },
+    { authorId: a?.userId, content: 'どこで止まってる？', isReply: false },
+    { authorId: b?.userId, content: 'ビルドのとこ', isReply: true }
+  ].filter((turn) => turn.authorId);
+
+  for (const person of named) {
+    const built = await buildMimicPrompt(messages, {
+      wanted: person.userId, engine: ENGINE, channelId: null
+    });
+
+    if (!built.as) {
+      console.error(`  ${person.name}: 人格が乗っていない (as が null)`);
+      process.exitCode = 1;
+      continue;
+    }
+
+    // 末尾がその人のラベルで終わっていないと、続きは別人として書かれる
+    if (!built.prompt.endsWith(`\n${built.as}:`)) {
+      console.error(`  ${person.name}: 末尾がラベルで終わっていない`);
+      process.exitCode = 1;
+    }
+
+    for (let i = 0; i < times; i += 1) {
+      const result = await generate({ prompt: built.prompt, engine: ENGINE });
+      let text = built.cut(continuationOf(result.text, built.prompt));
+      if (isUnusableReply(text)) text = '(使えない返答)';
+      console.log(`  ${built.as}: ${JSON.stringify(text)}`);
+    }
+  }
+  console.log('');
+}
 
 const pct = (n) => `${((n / tally.total) * 100).toFixed(0)}%`;
 console.log('--- まとめ');
