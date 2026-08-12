@@ -95,7 +95,13 @@ if precision == "auto":
     if device != "cuda":
         precision = "fp32"
     else:
-        precision = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+        # torch.cuda.is_bf16_supported() は使わない。既定で including_emulation=True
+        # なので、bf16 テンソルが作れれば True を返す = T4 (sm_75) でも True になる。
+        # 実際に Kaggle の T4 で bf16 が選ばれた。ハードウェア支援が無いまま bf16 で
+        # 回ると遅いうえ、重みが bf16 のままなので 5e-5 の更新が丸めで消える。
+        # bf16 が本当に効くのは Ampere (sm_80) 以降。
+        major, _ = torch.cuda.get_device_capability()
+        precision = "bf16" if major >= 8 else "fp16"
 
 # 重みを持つ dtype。fp16 のときだけ master を fp32 にして、計算を autocast に任せる
 weight_dtype = torch.bfloat16 if precision == "bf16" else torch.float32
