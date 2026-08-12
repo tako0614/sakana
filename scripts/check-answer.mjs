@@ -225,3 +225,97 @@ const userContentOf = (over = {}) => buildUserContent({
 }
 
 console.log('caller ok (独立した行 / 表示名と ID / 話題と背景 / 自分の発言に印)');
+
+// --- 返信の鎖 ---
+//
+// 「どの話の続きか」がここで決まるので、壊れても静かに読みにくくなるだけ。
+// discord.js の Message を作れないので、読んでいるところだけ持つ偽物で回す。
+
+const { fetchReplyChain } = await import('../src/agent/index.js');
+
+function fakeMessage({ id, content, replyTo = null, name = 'たこ', snapshots = null }) {
+  return {
+    id,
+    guildId: 'g1',
+    channelId: 'c1',
+    content,
+    author: { id: `u-${id}`, username: name, bot: false },
+    member: { displayName: name },
+    createdTimestamp: 1_700_000_000_000,
+    reference: replyTo ? { messageId: replyTo, channelId: 'c1', guildId: 'g1' } : null,
+    messageSnapshots: snapshots,
+    attachments: { size: 0 },
+    reactions: { cache: new Map() }
+  };
+}
+
+function fakeChannel(messages) {
+  const cache = new Map(messages.map((m) => [m.id, m]));
+  return {
+    name: 'general',
+    messages: {
+      cache,
+      // キャッシュに無いものは「取りに行っても無い」= 削除済みとして扱う
+      fetch: async (id) => cache.get(id) ?? Promise.reject(new Error(`no ${id}`))
+    }
+  };
+}
+
+{
+  // メンションと併用したリプライでも、リプ先が鎖に入ること
+  const a = fakeMessage({ id: '1', content: '税は控除の話' });
+  const b = fakeMessage({ id: '2', content: 'それ経費だろ', replyTo: '1', name: 'のあ' });
+  const ask = fakeMessage({ id: '3', content: '@bot このメッセージも経費だよな', replyTo: '2', name: 'さば' });
+  for (const m of [a, b, ask]) m.channel = fakeChannel([a, b, ask]);
+
+  const chain = await fetchReplyChain(ask, 'general');
+  const ids = chain.map((entry) => entry.messageId).join(',');
+  if (ids !== '1,2') fail(`鎖は古い順に親をたどる: ${ids}`);
+  if (chain[1].content !== 'それ経費だろ') fail('リプ先の本文が入っていない');
+}
+
+{
+  // 6ホップで打ち切る (無限に遡らない)
+  const msgs = Array.from({ length: 12 }, (_, i) => fakeMessage({
+    id: String(i + 1), content: `m${i + 1}`, replyTo: i === 0 ? null : String(i)
+  }));
+  const channel = fakeChannel(msgs);
+  for (const m of msgs) m.channel = channel;
+
+  const chain = await fetchReplyChain(msgs[11], 'general');
+  if (chain.length !== 6) fail(`6ホップで止める: ${chain.length}`);
+  if (chain[chain.length - 1].messageId !== '11') fail('直近の親が末尾に来る');
+}
+
+{
+  // 消されたメッセージへのリプライでも落ちない (そこで切れる)
+  const ask = fakeMessage({ id: '9', content: 'これ何', replyTo: 'gone' });
+  ask.channel = fakeChannel([ask]);
+  if ((await fetchReplyChain(ask, 'general')).length !== 0) fail('取れない親は鎖に入れない');
+}
+
+{
+  // 自分自身を参照していてもループしない
+  const loop = fakeMessage({ id: '5', content: 'じぶん', replyTo: '5' });
+  loop.channel = fakeChannel([loop]);
+  if ((await fetchReplyChain(loop, 'general')).length !== 0) fail('自己参照で回ってはいけない');
+}
+
+{
+  // 転送 (forward) は fetch では取れず、message_snapshots 側に本文が入る。
+  // 投稿者は Discord が渡してこないので、名前を出さずにそう書く。
+  const forwarded = fakeMessage({ id: 'far', content: '隠す必要ないしね', name: 'unknown' });
+  forwarded.channel = null;
+  const ask = fakeMessage({ id: '7', content: '@bot これ本当？', replyTo: 'far' });
+  ask.messageSnapshots = new Map([['far', forwarded]]);
+  ask.channel = fakeChannel([ask]);
+
+  const chain = await fetchReplyChain(ask, 'general');
+  if (chain.length !== 1) fail(`転送も鎖に入れる: ${chain.length}`);
+  if (chain[0].content !== '隠す必要ないしね') fail('転送の本文が入っていない');
+  if (!chain[0].authorName.includes('投稿者不明')) {
+    fail(`転送は投稿者不明と書く (取り違えを防ぐ): ${chain[0].authorName}`);
+  }
+}
+
+console.log('reply chain ok (リプ先 / 6ホップ / 削除 / 自己参照 / 転送)');

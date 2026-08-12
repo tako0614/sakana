@@ -137,22 +137,36 @@ async function fetchRecent(channel, excludeId, limit) {
 // 鎖をたどれば「いまの話題」だけを取り出せる。
 const REPLY_CHAIN_LIMIT = 6;
 
-async function fetchReplyChain(message, channelName) {
+export async function fetchReplyChain(message, channelName) {
   const chain = [];
   const seen = new Set([message.id]);
+  // 参照を持っているのは「いま見ている側」なので、ホップごとに進める
+  let node = message;
   let parentId = message.reference?.messageId ?? null;
 
   while (parentId && chain.length < REPLY_CHAIN_LIMIT && !seen.has(parentId)) {
     seen.add(parentId);
 
+    // 転送 (forward) は本文が message_snapshots 側に入り、参照先が別チャンネルなので
+    // channel.messages.fetch では取れない。スナップショットがあるならそれを使う。
+    const snapshot = node.messageSnapshots?.get(parentId) ?? null;
+
     // 直近30件を先に取ってあるのでキャッシュに載っていることが多い。
     // 載っていないぶんだけ取りに行く (削除済みなら鎖はそこで切れる)。
-    const parent = message.channel.messages?.cache?.get(parentId)
+    const parent = snapshot
+      ?? message.channel.messages?.cache?.get(parentId)
       ?? await message.channel.messages.fetch(parentId).catch(() => null);
 
     if (!parent) break;
 
-    chain.push(fromDiscordMessage(parent, channelName));
+    const entry = fromDiscordMessage(parent, parent.channel?.name ?? channelName);
+
+    // 転送のスナップショットに投稿者は入ってこない。分からないまま名前を出すと
+    // 取り違えるので、そう書く (誰の発言かの取り違えは捏造と同じ害になる)。
+    if (snapshot) entry.authorName = '転送された発言 (投稿者不明)';
+
+    chain.push(entry);
+    node = parent;
     parentId = parent.reference?.messageId ?? null;
   }
 
