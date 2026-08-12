@@ -1,0 +1,160 @@
+// 自作モデル (evex) 側の検証。
+//
+// 見ているのは1点だけ: 学習データと推論のプロンプトが同じ形かどうか。
+// ずれても例外は出ず、モデルが「学習中に一度も見ていない形」を受け取って
+// 静かに崩れた出力を返すだけなので、門を置く。
+
+import { CONTROL_TOKENS, buildPrompt, firstTurn, humanize, messageText, normalize } from '../src/mimic/serialize.js';
+import { DEFAULT_ENGINE, ENGINES, engineFor, setEngine } from '../src/mimic/prefs.js';
+import { db } from '../src/db.js';
+
+function fail(message) {
+  throw new Error(message);
+}
+
+// --- 正規化 ---
+
+{
+  const cases = [
+    ['https://example.com/a?b=c', '<url>'],
+    ['<@123456789012345678>', '<mention>'],
+    ['<@!123456789012345678>', '<mention>'],
+    ['<@&123456789012345678>', '<mention>'],
+    ['<#123456789012345678>', '<channel>'],
+    ['<t:1700000000:R>', '<time>'],
+    ['@everyone', '<mention>'],
+    ['<:kusa:123456789012345678>', ':kusa:'],   // カスタム絵文字は名前を残す (文化なので)
+    ['<a:party:123456789012345678>', ':party:']
+  ];
+  for (const [input, want] of cases) {
+    const got = normalize(input);
+    if (got !== want) fail(`正規化が違う: ${input} -> ${got} (期待 ${want})`);
+  }
+
+  // 残すもの。ここを潰すと文体が消える
+  for (const keep of ['草', 'www', 'ｗｗｗ', '😭', '!?', 'そうだねー', '(´・ω・｀)']) {
+    if (normalize(keep) !== keep) fail(`残すべきものが変わった: ${keep} -> ${normalize(keep)}`);
+  }
+
+  // 改行はトークンにする (会話 1 件を 1 行に収めるため)
+  if (normalize('a\nb') !== 'a<nl>b') fail(`改行が <nl> になっていない: ${normalize('a\nb')}`);
+  // U+2028 / U+2029 も潰す。JSON.stringify は素通しするのに readline は行終端として扱う
+  if (normalize('a b') !== 'a<nl>b') fail('U+2028 を潰していない');
+  if (normalize('a b') !== 'a<nl>b') fail('U+2029 を潰していない');
+
+  // コードブロックは中身を残す
+  const code = normalize('```js\nconst a = 1;\n```');
+  if (!code.includes('<code>') || !code.includes('const a = 1;')) fail(`コードが壊れた: ${code}`);
+
+  // 本文が空なら turn は残す (添付やスタンプ)
+  if (messageText('') !== '<file>') fail('空の本文を <file> にしていない');
+  if (messageText('  ') !== '<file>') fail('空白だけの本文を <file> にしていない');
+}
+
+// --- 二重適用で壊れないこと ---
+//
+// normalize は URL を潰してから改行を <nl> にする順序なので、一度通した文を
+// もう一度通すと `https://<nl>Current` の `<nl>Current` まで URL として飲まれる
+// (実データで1件出た)。buildPrompt が正規化済みの content を受ける契約を固定する。
+{
+  const raw = 'see https://\nCurrent Version';
+  const once = messageText(raw);
+  if (!once.includes('<nl>Current')) fail(`1回目で改行が消えた: ${once}`);
+
+  const turns = [{ token: '<|s0|>', reply: false, content: once }];
+  const prompt = buildPrompt(turns);
+  if (!prompt.includes('<nl>Current')) {
+    fail(`buildPrompt が正規化を二度掛けている: ${prompt}`);
+  }
+}
+
+// --- 直列化 ---
+
+{
+  const turns = [
+    { token: '<|s0|>', reply: false, content: '今日ひま？' },
+    { token: '<|s7|>', reply: true, content: 'ひま' }
+  ];
+
+  const prompt = buildPrompt(turns);
+  if (prompt !== '<|conv|><|s0|>今日ひま？<|s7|><|re|>ひま') fail(`直列化が違う: ${prompt}`);
+
+  // 末尾に話者トークンを置くと、その人として続きを書かせられる
+  const asked = buildPrompt(turns, '<|other|>');
+  if (!asked.endsWith('<|other|>')) fail(`末尾の話者トークンが無い: ${asked}`);
+}
+
+// --- 1発言だけ取り出す ---
+//
+// 放っておくとモデルは会話を続けるので、次の話者トークンで切らないと
+// 「他の人の発言まで捏造した長文」が Discord に流れる。
+{
+  const nameOf = (rank) => `s${rank}`;
+
+  // Discord に返すのは firstTurn。次の話者トークンで切る
+  const one = firstTurn('そうだねー<|s3|>いや違う<|end|>');
+  if (one !== 'そうだねー') fail(`1発言だけになっていない: ${one}`);
+
+  // <|end|> より後ろは次の会話なので捨てる
+  const after = firstTurn('はい<|end|>ぜんぜん別の話');
+  if (after !== 'はい') fail(`<|end|> の後ろを含んでいる: ${after}`);
+
+  // 会話ごと見せる方 (sample.py 用) は名前を出して続ける
+  const whole = humanize('そうだねー<|s3|>いや違う<|end|>', nameOf);
+  if (!whole.includes('s3:') || !whole.includes('いや違う')) fail(`humanize が展開しない: ${whole}`);
+
+  // 制御記号が生のまま表示に漏れない
+  const shown = firstTurn('a<nl>b<url><file><mention><|re|>');
+  for (const token of ['<nl>', '<url>', '<file>', '<mention>', '<|re|>']) {
+    if (shown.includes(token)) fail(`制御記号が表示に漏れている: ${token} in ${shown}`);
+  }
+}
+
+// --- 制御記号の一覧が tokenizer 側と食い違わないこと ---
+//
+// serialize.js が出す記号を tokenizer が知らないと、1トークンに収まらず
+// 会話の構造だけで数百トークン払うことになる。
+{
+  const emitted = new Set();
+  emitted.add(messageText(''));                          // <file>
+  emitted.add(normalize('https://x.com'));               // <url>
+  emitted.add(normalize('<@123456789012345678>'));       // <mention>
+  emitted.add(normalize('<#123456789012345678>'));       // <channel>
+  emitted.add(normalize('<t:1:R>'));                     // <time>
+  emitted.add('<nl>');
+  for (const token of ['<|conv|>', '<|end|>', '<|re|>', '<|other|>', '<code>', '</code>']) {
+    emitted.add(token);
+  }
+
+  for (const token of emitted) {
+    if (!CONTROL_TOKENS.includes(token)) {
+      fail(`serialize が出す ${token} が CONTROL_TOKENS に無い (tokenizer が知らない)`);
+    }
+  }
+}
+
+console.log(`serialize ok (制御記号 ${CONTROL_TOKENS.length} 個 / 二重適用でも壊れない)`);
+
+// --- エンジンの選択 ---
+
+const USER = 'check-model-user';
+const clear = () => db.prepare('DELETE FROM agent_engine WHERE user_id = ?').run(USER);
+
+clear();
+try {
+  if (engineFor(USER) !== DEFAULT_ENGINE) fail('既定は deepseek');
+  if (!ENGINES[DEFAULT_ENGINE]) fail('既定のエンジンが ENGINES に無い');
+
+  if (!setEngine(USER, 'evex')) fail('evex を選べない');
+  if (engineFor(USER) !== 'evex') fail('選択が保存されていない');
+
+  // 他人には影響しない (自分のぶんだけ)
+  if (engineFor('check-model-other') !== DEFAULT_ENGINE) fail('選択が他人に漏れている');
+
+  if (setEngine(USER, 'gpt-9')) fail('知らないエンジンを受け付けてはいけない');
+  if (engineFor(USER) !== 'evex') fail('無効な指定で既存の選択を壊してはいけない');
+
+  console.log(`engine ok (${Object.keys(ENGINES).join(' / ')} / 既定 ${DEFAULT_ENGINE})`);
+} finally {
+  clear();
+}

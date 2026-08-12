@@ -71,7 +71,36 @@ export function buildPrompt(turns, trailingToken = null) {
 }
 
 /**
- * 生成結果を人が読める形に戻す。
+ * 生成された続きから最初の1発言だけ取る。
+ *
+ * モデルは放っておくと `<|s3|>…<|s7|>…` と会話を続けてしまうので、
+ * 次の話者トークンか <|end|> で切る。ここを切らないと、他の人の発言を
+ * 勝手に作った長文が Discord に流れる。
+ */
+export function firstTurn(text) {
+  const raw = String(text ?? '');
+  const cut = raw.search(/<\|s\d+\|>|<\|other\|>|<\|end\|>|<\|conv\|>/);
+  return plain(cut >= 0 ? raw.slice(0, cut) : raw);
+}
+
+/** 制御記号を読める形に落とす。表示に生のまま漏らさないための一箇所。 */
+function plain(text) {
+  return String(text ?? '')
+    .replace(/<\|re\|>/g, '')
+    .replace(/<nl>/g, '\n')
+    .replace(/<code>/g, '```\n')
+    .replace(/<\/code>/g, '\n```')
+    .replace(/<file>/g, '(画像)')
+    .replace(/<url>/g, '(リンク)')
+    .replace(/<mention>/g, '(だれか)')
+    .replace(/<channel>/g, '(チャンネル)')
+    .replace(/<time>/g, '(時刻)')
+    .trim();
+}
+
+/**
+ * 生成結果を人が読める形に戻す。会話ごと見たいとき (sample.py) 用。
+ * Discord に返すのは firstTurn の方。
  * 話者トークンは名前に、<nl> は改行に、制御記号は落とす。
  */
 export function humanize(text, nameOf) {
@@ -81,14 +110,9 @@ export function humanize(text, nameOf) {
   const end = out.indexOf('<|end|>');
   if (end >= 0) out = out.slice(0, end);
 
-  out = out.replace(/<\|conv\|>/g, '').replace(/<\|re\|>/g, '');
+  out = out.replace(/<\|conv\|>/g, '');
   out = out.replace(/<\|s(\d+)\|>/g, (_, rank) => `\n${nameOf(Number(rank))}: `);
   out = out.replace(/<\|other\|>/g, '\nだれか: ');
-  out = out.replace(/<nl>/g, '\n');
-  out = out.replace(/<code>/g, '```\n').replace(/<\/code>/g, '\n```');
-  out = out.replace(/<file>/g, '(画像)').replace(/<url>/g, '(リンク)');
-  out = out.replace(/<mention>/g, '(だれか)').replace(/<channel>/g, '(チャンネル)');
-  out = out.replace(/<time>/g, '(時刻)');
 
-  return out.trim();
+  return plain(out);
 }

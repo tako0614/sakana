@@ -13,7 +13,7 @@
 
 import { chunkForDiscord } from '../agent/format.js';
 import { generate, speakerFor } from './client.js';
-import { buildPrompt, messageText } from './serialize.js';
+import { buildPrompt, firstTurn, messageText } from './serialize.js';
 
 const NO_MENTIONS = { parse: [], repliedUser: false };
 
@@ -31,30 +31,6 @@ const VOICE = '<|other|>';
 
 function speakerToken(userId) {
   return speakerFor(userId)?.token ?? VOICE;
-}
-
-/**
- * 生成された続きから最初の1発言だけ取る。
- *
- * モデルは放っておくと `<|s3|>…<|s7|>…` と会話を続けてしまうので、
- * 次の話者トークンか <|end|> で切る。ここを切らないと、他の人の発言を
- * 勝手に作った長文が Discord に流れる。
- */
-function firstTurn(text) {
-  const cut = String(text ?? '').search(/<\|s\d+\|>|<\|other\|>|<\|end\|>|<\|conv\|>/);
-  const body = cut >= 0 ? text.slice(0, cut) : text;
-
-  return body
-    .replace(/<\|re\|>/g, '')
-    .replace(/<nl>/g, '\n')
-    .replace(/<code>/g, '```\n')
-    .replace(/<\/code>/g, '\n```')
-    .replace(/<file>/g, '(画像)')
-    .replace(/<url>/g, '(リンク)')
-    .replace(/<mention>/g, '(だれか)')
-    .replace(/<channel>/g, '(チャンネル)')
-    .replace(/<time>/g, '(時刻)')
-    .trim();
 }
 
 export async function handleMimicRequest(message, client, { recent = [] } = {}) {
