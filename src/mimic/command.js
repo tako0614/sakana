@@ -11,7 +11,7 @@ import {
   SlashCommandBuilder
 } from 'discord.js';
 
-import { speakerFor, status } from './client.js';
+import { status } from './client.js';
 import { DEFAULT_ENGINE, ENGINES, engineCounts, engineFor, setEngine } from './prefs.js';
 
 async function overview(userId) {
@@ -40,14 +40,11 @@ async function overview(userId) {
 
   // evex は別プロセスなので、立っていないなら選んでも答えられない。先に出す。
   if (health.up) {
-    const speaker = speakerFor(userId);
     embed.addFields({
       name: 'Evex の状態',
       value: [
         `起動中 (epoch ${health.epoch ?? '?'} / val ${health.val_loss?.toFixed?.(4) ?? '?'})`,
-        speaker
-          ? `あなたは学習データに ${speaker.count.toLocaleString()} 件あるので、口調を真似られます`
-          : 'あなたは学習データの上位48人に入っていないので、話者の指定はできません'
+        'メンションすると会話の続きを1発言だけ返します。道具も検索も使いません。'
       ].join('\n')
     });
   } else {

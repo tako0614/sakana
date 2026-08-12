@@ -1,15 +1,19 @@
-// /model evex を選んだ人への返答。
+// /model evex を選んだ人への返答。素のチャットボットとして扱う。
 //
-// エージェントとは別経路。あのモデルは道具も system プロンプトも使えず、
-// 「会話の続きを書く」ことしかできない。無理に指示に従わせようとしても
-// 学習中に一度も見ていない形なので崩れるだけなので、素直に続きを書かせる。
+// このモデルは 94万件から作った 5.87M で、道具も system プロンプトも使えない。
+// 指示に従わせようとしても学習中に一度も見ていない形になるので崩れるだけ。
+// できるのは「会話の続きを1発言書く」ことだけなので、それだけをやる。
+//
+// 誰かに成り代わらせない。話者は <|other|> (上位48人に入らない 2,599 人ぶんの
+// 発言 = このサーバーの平均的な声) で固定する。特定の人の名前で書かせると
+// 「その人が実際に言ったこと」を思い出して出しうるので、既定にはしない。
 //
 // 使用量の記録もしない。API を叩いていないので費用がゼロで、
 // ドル換算の上限 (agent_calls) に混ぜると請求と乖離する。
 
 import { chunkForDiscord } from '../agent/format.js';
 import { generate, speakerFor } from './client.js';
-import { buildPrompt, humanize, messageText } from './serialize.js';
+import { buildPrompt, messageText } from './serialize.js';
 
 const NO_MENTIONS = { parse: [], repliedUser: false };
 
@@ -18,40 +22,39 @@ const NO_MENTIONS = { parse: [], repliedUser: false };
 let running = 0;
 const MAX_CONCURRENT = 1;
 
-// 直前の何件を文脈にするか。学習時の会話は 20 件 / 1200 字で切ってあるので、
-// それより長い文脈を渡しても学習中に見ていない形になる。
+// 直近の何件を文脈にするか。学習時の会話は 20 件 / 1200 字で切ってあるので、
+// それより長い文脈を渡すと学習中に見ていない形になる。
 const CONTEXT_MESSAGES = 16;
 
+// 返すのは1発言だけ。会話ごと生成させると「他の人の発言まで捏造した長文」になる。
+const VOICE = '<|other|>';
+
 function speakerToken(userId) {
-  return speakerFor(userId)?.token ?? '<|other|>';
+  return speakerFor(userId)?.token ?? VOICE;
 }
 
 /**
- * 直近の会話を学習時と同じ形に並べる。
- * 末尾に話者トークンを置いて、その人として続きを書かせる。
- */
-function promptFrom(messages, asUserId) {
-  const turns = messages.map((message) => ({
-    token: speakerToken(message.author?.id ?? message.authorId),
-    reply: Boolean(message.reference?.messageId ?? message.replyTo),
-    content: messageText(message.content)
-  }));
-
-  return buildPrompt(turns, speakerToken(asUserId));
-}
-
-/**
- * 誰として書かせるかを決める。
+ * 生成された続きから最初の1発言だけ取る。
  *
- * 指名が無ければ「呼んだ人以外で直近に喋っていた人」。自分自身として書かせると
- * 会話が続かないし、bot 自身の話者トークンは学習データに無い。
+ * モデルは放っておくと `<|s3|>…<|s7|>…` と会話を続けてしまうので、
+ * 次の話者トークンか <|end|> で切る。ここを切らないと、他の人の発言を
+ * 勝手に作った長文が Discord に流れる。
  */
-function pickSpeaker(messages, callerId) {
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const id = messages[i].author?.id;
-    if (id && id !== callerId && speakerFor(id)) return id;
-  }
-  return callerId;
+function firstTurn(text) {
+  const cut = String(text ?? '').search(/<\|s\d+\|>|<\|other\|>|<\|end\|>|<\|conv\|>/);
+  const body = cut >= 0 ? text.slice(0, cut) : text;
+
+  return body
+    .replace(/<\|re\|>/g, '')
+    .replace(/<nl>/g, '\n')
+    .replace(/<code>/g, '```\n')
+    .replace(/<\/code>/g, '\n```')
+    .replace(/<file>/g, '(画像)')
+    .replace(/<url>/g, '(リンク)')
+    .replace(/<mention>/g, '(だれか)')
+    .replace(/<channel>/g, '(チャンネル)')
+    .replace(/<time>/g, '(時刻)')
+    .trim();
 }
 
 export async function handleMimicRequest(message, client, { recent = [] } = {}) {
@@ -67,27 +70,27 @@ export async function handleMimicRequest(message, client, { recent = [] } = {}) 
   let typing = null;
 
   try {
-    // 生成中は typing を出す。数秒かかるので黙っていると落ちたように見える
+    // 数秒かかるので typing を出す。黙っていると落ちたように見える
     await message.channel.sendTyping().catch(() => {});
     typing = setInterval(() => message.channel.sendTyping().catch(() => {}), 8000);
     typing.unref?.();
 
+    // bot の発言は文脈に入れない。学習データが人間ぶんだけなので、
+    // bot の長い回答が混ざると学習中に見ていない形になる。
     const history = recent
-      .filter((entry) => !entry.author?.bot)
-      .slice(-CONTEXT_MESSAGES);
+      .filter((entry) => !entry.author?.bot && (entry.content ?? '').trim())
+      .slice(-CONTEXT_MESSAGES)
+      .map((entry) => ({
+        token: speakerToken(entry.author?.id),
+        reply: Boolean(entry.reference?.messageId),
+        content: messageText(entry.content)
+      }));
 
-    const asUserId = pickSpeaker(history, message.author.id);
-    const prompt = promptFrom(history, asUserId);
-
+    const prompt = buildPrompt(history, VOICE);
     const result = await generate({ prompt });
-    const nameOf = (rank) => {
-      const found = speakerFor(asUserId);
-      return found?.rank === rank ? found.name : `s${rank}`;
-    };
 
-    // プロンプトぶんを落として、生成された続きだけを見せる
-    const grown = String(result.text ?? '').slice(prompt.length);
-    const body = humanize(grown, nameOf).trim();
+    // プロンプトぶんを落として、生成された続きだけを見る
+    const body = firstTurn(String(result.text ?? '').slice(prompt.length));
 
     if (!body) {
       await message.reply({
@@ -97,10 +100,11 @@ export async function handleMimicRequest(message, client, { recent = [] } = {}) 
       return;
     }
 
-    const who = speakerFor(asUserId)?.name ?? 'だれか';
-    const head = `-# Evex (自作 5.87M) が ${who} として書いたもの。事実ではありません。`;
+    // 事実ではないことは毎回出す。94万件を何周もしているので、
+    // 実際の発言をそのまま再生していることがある。
+    const note = `\n-# Evex (このサーバーの94万件で学習した 5.87M)。事実の保証はありません。`;
 
-    for (const [index, chunk] of chunkForDiscord(`${head}\n${body}`).entries()) {
+    for (const [index, chunk] of chunkForDiscord(body + note).entries()) {
       const payload = { content: chunk, allowedMentions: NO_MENTIONS };
       if (index === 0) await message.reply(payload).catch(() => message.channel.send(payload));
       else await message.channel.send(payload).catch(() => {});
