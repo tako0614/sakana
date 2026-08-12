@@ -301,6 +301,8 @@ export function formatMessages(
     // モデルは自分の過去の回答を第三者の発言として読んでいた
     // (自分の回答を根拠として引用したり、自分の結論に反論したりする)。
     // 表示名はサーバーごとのニックネームで変わるので、ID で判定する。
+    // 「自分」だと誰の自分か曖昧になる。プロンプトはモデルに二人称で語りかけているので、
+    // そこと揃えて「あなた自身」にする (check-answer.mjs がこの文言を見ている)。
     if (selfId && message.authorId === selfId) head.push('←あなた自身の発言');
     else if (message.isBot) head.push('bot');
 

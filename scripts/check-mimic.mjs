@@ -204,3 +204,65 @@ try {
 } finally {
   clear();
 }
+
+// --- なりきり (素の日本語形式 / evex-ft-1) ---
+//
+// ここが崩れると「モデルが一度も見ていない形」を渡すことになり、例外は出ずに
+// 静かに壊れる。evex-1 に <|a|> を渡して出力を崩壊させたのと同じ形の事故になる。
+{
+  const {
+    buildPlainPrompt, channelLabel, labelFor, labelledSpeakers, plainFirstTurn, plainText
+  } = await import('../src/mimic/plain.js');
+
+  const speakers = labelledSpeakers();
+
+  // labels.json は実 ID を含むので追跡していない (corpus/ と同じ扱い)。
+  // 手元にコーパスが無い機械ではラベルの検査を飛ばして、形だけ確かめる
+  if (!speakers.length) {
+    if (plainFirstTurn('うん\nたこ: それは違う') !== 'うん') fail('名前ラベルで切れていない');
+    if (channelLabel('nonexistent') !== '#other') fail('知らないチャンネルが #other にならない');
+    console.log('mimic plain ok (labels.json 無し / 切り出しと既定ラベルだけ確認)');
+  } else {
+
+  const top = speakers[0];
+  if (labelFor(top.userId) !== top.label) fail(`ラベルが引けない: ${top.userId}`);
+  if (labelFor('000000000000000000') !== null) fail('知らない人にラベルが付いている');
+
+  // 学習側 (build-sft.mjs) が切り詰めと連番を決めている。ここで作り直すとずれるので、
+  // 12 字を超えるラベルや `:` 入りが混ざっていないことを確認する
+  for (const row of speakers) {
+    if (row.label.length > 12) fail(`ラベルが 12 字を超えている: ${row.label}`);
+    if (/[:\n\r]/.test(row.label)) fail(`ラベルに : か改行が入っている: ${row.label}`);
+  }
+  if (new Set(speakers.map((r) => r.label)).size !== speakers.length) {
+    fail('ラベルが重複している (同名の別人が混ざる)');
+  }
+
+  // プロンプトの形。末尾はラベルだけを置いて、そこから本文を書かせる
+  const prompt = buildPlainPrompt([{ role: 'A', content: 'これバグってる？' }], {
+    channelId: 'nonexistent', trailingRole: top.label
+  });
+  if (!prompt.startsWith('#other\n')) fail(`チャンネル行が先頭に無い: ${JSON.stringify(prompt)}`);
+  if (!prompt.endsWith(`\n${top.label}:`)) fail(`末尾がラベルで終わっていない: ${JSON.stringify(prompt)}`);
+  if (prompt.includes('undefined')) fail('プロンプトに undefined が混ざっている');
+
+  // 生成の切り方。名前ラベルでも切れないと他人の発言まで流れる
+  if (plainFirstTurn('うん\nたこ: それは違う') !== 'うん') fail('名前ラベルで切れていない');
+  if (plainFirstTurn('うん\nB: いや') !== 'うん') fail('英字の役で切れていない');
+  if (plainFirstTurn('うん\n#ch2\nA: 次') !== 'うん') fail('チャンネル行で切れていない');
+  if (plainFirstTurn('1行目\n2行目') !== '1行目\n2行目') fail('ただの改行で切ってはいけない');
+
+  // 正規化は build-sft.mjs と同じ規則でないと形がずれる
+  const asRole = (id) => (id === 1 ? 'B' : null);
+  if (plainText('<@1> やあ', () => 'B') !== '@B やあ') fail('メンションが役にならない');
+  if (plainText('<@999> やあ', () => null) !== 'やあ') fail('会話の外のメンションを落としていない');
+  if (plainText('見て https://github.com/a/b/c') !== '見て https://github.com') {
+    fail('URL が origin に落ちていない');
+  }
+  if (plainText('<:neko:12345> かわいい') !== ':neko: かわいい') fail('絵文字が :name: になっていない');
+  if (channelLabel('nonexistent') !== '#other') fail('知らないチャンネルが #other にならない');
+
+  console.log(`mimic plain ok (${speakers.length} ラベル / 切り出し / 正規化)`);
+  void asRole;
+  }
+}

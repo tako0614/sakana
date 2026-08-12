@@ -138,8 +138,16 @@ export function buildPlainPrompt(turns, { channelId = null, trailingRole = null 
   return `${lines.join('\n')}\n${trailingRole ? `${trailingRole}:` : ''}`;
 }
 
-// 次の話者の行。`\nB: ` の形。これで切らないと他人の発言まで作った長文になる。
-const NEXT_TURN = /\n[A-HZ]:\s/;
+// 次の話者の行。`\nB: ` だけでなく `\nたこ: ` も切る。
+//
+// 話者ラベルを表示名にしたので、英字1文字だけを見ていると名前持ちの発言で切れず、
+// 他人の発言まで含んだ長文が Discord に流れる。ラベルは 12 字以内で `:` と改行を
+// 含まない (build-sft.mjs の cleanName がそう作る) ので、その形を探す。
+//
+// 本文に `メモ: あれ` のような行があると誤爆するが、学習データにも同じ曖昧さが
+// あるのでモデルの側も同じ形を見ている。切りすぎる方が、他人の発言を捏造して
+// 流すより害が小さい。
+const NEXT_TURN = /\n[^\n:]{1,12}:[ 　]/;
 
 /** 生成された続きから最初の1発言だけ取る。 */
 export function plainFirstTurn(text) {
