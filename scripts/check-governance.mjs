@@ -751,6 +751,7 @@ assert.equal(statutePublicationState('law', 'repealed'), '廃止');
 const aclGuild = { id: 'acl-guild', ownerId: 'owner', members: { me: { id: 'bot' } } };
 const { ChannelType, PermissionFlagsBits } = await import('discord.js');
 let legacyCourtDeleted = false;
+let legacyArchiveOptions = null;
 const unrelatedActiveThread = { id: 'other-thread', parentId: 'other-channel' };
 assert.deepEqual(await retireGovernanceCourtChat({
   name: 'Test Community',
@@ -759,7 +760,10 @@ assert.deepEqual(await retireGovernanceCourtChat({
     id: 'legacy-court',
     threads: {
       fetchActive: async () => ({ threads: new Map([[unrelatedActiveThread.id, unrelatedActiveThread]]) }),
-      fetchArchived: async () => ({ threads: new Map() })
+      fetchArchived: async (options) => {
+        legacyArchiveOptions = options;
+        return { threads: new Map() };
+      }
     },
     delete: async () => { legacyCourtDeleted = true; }
   }) }
@@ -767,6 +771,8 @@ assert.deepEqual(await retireGovernanceCourtChat({
   court_forum_id: 'court', court_chat_channel_id: 'legacy-court'
 }), { removed: true, retained: false }, '事件threadがない旧裁判当事者用channelは移行時に削除する');
 assert.equal(legacyCourtDeleted, true);
+assert.deepEqual(legacyArchiveOptions, { type: 'private', fetchAll: true, limit: 2 },
+  'Discord APIが許可する最小limitでprivate archiveを確認する');
 let strandedLegacyCourtDeleted = false;
 const strandedLegacyCourt = {
   type: ChannelType.GuildText,

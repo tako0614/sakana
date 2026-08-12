@@ -490,7 +490,8 @@ async function retireLegacyCourtChat(channel, guildName) {
   try {
     const [active, archived] = await Promise.all([
       channel.threads.fetchActive(),
-      channel.threads.fetchArchived({ type: 'private', fetchAll: true, limit: 1 })
+      // Discord APIのarchive取得limitは2以上。存在確認だけなので最小値を使う。
+      channel.threads.fetchArchived({ type: 'private', fetchAll: true, limit: 2 })
     ]);
     const belongsToChannel = (thread) => thread.parentId === channel.id;
     hasCaseThreads = [...active.threads.values(), ...archived.threads.values()].some(belongsToChannel);
