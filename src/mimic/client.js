@@ -67,6 +67,20 @@ export async function generate({ prompt, maxNewTokens, temperature = 0.9, topK =
   }
 }
 
+// サーバーが申告した役の形式。世代が違うトークンを渡さないために使う。
+let scheme = null;
+
+/** 役の形式。まだ聞いていなければ /health で取りに行く。 */
+export async function roleScheme() {
+  if (scheme) return scheme;
+
+  const info = await status();
+  if (!info.up || !info.roles?.length) return null;
+
+  scheme = { roles: info.roles, overflow: info.overflow };
+  return scheme;
+}
+
 /** 生きているか。/model の表示で使う。 */
 export async function status() {
   try {

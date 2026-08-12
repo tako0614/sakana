@@ -44,6 +44,27 @@ END_ID = sp.piece_to_id("<|end|>")
 NORMALIZED = ("<file>", "<url>", "<mention>", "<channel>", "<time>", "<code>", "</code>")
 DEFAULT_BAN = [sp.piece_to_id(t) for t in NORMALIZED]
 
+
+def has_piece(piece):
+    return sp.piece_to_id(piece) != sp.unk_id()
+
+
+# 自分がどの形式で学習されたかを申告する。
+#
+# evex-1 は実在の人物に紐づく <|s0|>..<|s47|> と <|other|>、
+# evex-2 は会話ごとに振り直す <|a|>..<|h|>。
+# bot 側がこれを見ずに固定のトークンを渡すと、モデルが一度も見ていない記号を
+# 受け取ってバイト分解され、出力が崩壊する (実際に evex-1 に <|a|> を渡して壊した)。
+if has_piece("<|a|>"):
+    ROLES = [f"<|{c}|>" for c in "abcdefgh"]
+    OVERFLOW = "<|z|>"
+elif has_piece("<|other|>"):
+    # 相対の役は無いので、参加者は全員 <|other|>
+    ROLES = ["<|other|>"]
+    OVERFLOW = "<|other|>"
+else:
+    raise SystemExit("tokenizer が evex-1 でも evex-2 でもない")
+
 blob = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 saved = blob["config"]
 cfg = Config(
@@ -55,6 +76,8 @@ model.load_state_dict(blob["model"])
 model.eval()
 
 INFO = {
+    "roles": ROLES,
+    "overflow": OVERFLOW,
     "epoch": blob.get("epoch"),
     "val_loss": blob.get("val_loss"),
     "train_loss": blob.get("train_loss"),

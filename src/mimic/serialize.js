@@ -40,18 +40,30 @@ export const CONTROL_TOKENS = [
  * 同じ `<|a|>` が別の会話では別人になる。これが身元を消す仕組みそのもの。
  * 9人目以降は `<|z|>` にまとめる (実測で 0.9%)。
  */
-export function assignRoles(keys) {
+export function assignRoles(keys, scheme = null) {
+  const tokens = scheme?.roles?.length ? scheme.roles : ROLE_TOKENS;
+  const overflow = scheme?.overflow ?? ROLE_OVERFLOW;
+
   const roles = new Map();
   for (const key of keys) {
     if (roles.has(key)) continue;
-    roles.set(key, ROLE_TOKENS[roles.size] ?? ROLE_OVERFLOW);
+    roles.set(key, tokens[roles.size] ?? overflow);
   }
   return roles;
 }
 
-/** 会話に居る参加者の次に来る役 (bot が新しい参加者として喋るとき)。 */
-export function nextRole(roles) {
-  return ROLE_TOKENS[roles.size] ?? ROLE_OVERFLOW;
+/**
+ * 会話に居る参加者の次に来る役 (bot が新しい参加者として喋るとき)。
+ *
+ * scheme は推論サーバーが申告するもの。evex-1 は話者が実在の人物に紐づいていて
+ * 役が1つ (<|other|>) しか無いので、そこでは全員が同じトークンになる。
+ * ここを固定値にしていたら、evex-1 が載っている bot に <|a|> を渡して
+ * 出力を崩壊させた (実際にやった)。
+ */
+export function nextRole(roles, scheme = null) {
+  const tokens = scheme?.roles?.length ? scheme.roles : ROLE_TOKENS;
+  const overflow = scheme?.overflow ?? ROLE_OVERFLOW;
+  return tokens[roles.size] ?? overflow;
 }
 
 export function normalize(text) {
@@ -111,7 +123,10 @@ export function buildPrompt(turns, trailingToken = null) {
  */
 export function firstTurn(text) {
   const raw = String(text ?? '');
-  const cut = raw.search(/<\|[a-hz]\|>|<\|end\|>|<\|conv\|>/);
+  // 世代をまたいで切る。evex-1 は <|s0|>..<|s47|> と <|other|>、
+  // evex-2 は <|a|>..<|h|>。デプロイ中の世代を取り違えると生の記号が表示に漏れる
+  // (実際に <|s1|> が Discord に出た)。
+  const cut = raw.search(/<\|s\d+\|>|<\|other\|>|<\|[a-hz]\|>|<\|end\|>|<\|conv\|>/);
   return plain(cut >= 0 ? raw.slice(0, cut) : raw);
 }
 
@@ -143,7 +158,8 @@ export function humanize(text, nameOf) {
   if (end >= 0) out = out.slice(0, end);
 
   out = out.replace(/<\|conv\|>/g, '');
-  out = out.replace(/<\|([a-hz])\|>/g, (_, role) => `\n${nameOf(role)}: `);
+  out = out.replace(/<\|s(\d+)\|>|<\|other\|>|<\|([a-hz])\|>/g,
+    (m, num, role) => `\n${nameOf(role ?? num ?? 'other')}: `);
 
   return plain(out);
 }

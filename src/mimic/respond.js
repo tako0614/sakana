@@ -12,7 +12,7 @@
 // ドル換算の上限 (agent_calls) に混ぜると請求と乖離する。
 
 import { chunkForDiscord } from '../agent/format.js';
-import { generate, mimicConfig } from './client.js';
+import { generate, mimicConfig, roleScheme } from './client.js';
 import { assignRoles, buildPrompt, firstTurn, messageText, nextRole } from './serialize.js';
 
 const NO_MENTIONS = { parse: [], repliedUser: false };
@@ -59,8 +59,10 @@ export async function handleMimicRequest(message, client, { recent = [] } = {}) 
       .filter((entry) => !entry.author?.bot && (entry.content ?? '').trim())
       .slice(-CONTEXT_MESSAGES);
 
-    // この会話に出てくる人だけに a,b,c... を振る。誰が誰かは持たない
-    const roles = assignRoles(messages.map((entry) => entry.author?.id));
+    // この会話に出てくる人だけに役を振る。誰が誰かは持たない。
+    // 役の種類はサーバーの申告に従う (載っている世代で違う)。
+    const known = await roleScheme();
+    const roles = assignRoles(messages.map((entry) => entry.author?.id), known);
     const history = messages.map((entry) => ({
       token: roles.get(entry.author?.id),
       reply: Boolean(entry.reference?.messageId),
@@ -68,7 +70,7 @@ export async function handleMimicRequest(message, client, { recent = [] } = {}) 
     }));
 
     // bot は新しい参加者として喋る
-    const prompt = buildPrompt(history, nextRole(roles));
+    const prompt = buildPrompt(history, nextRole(roles, known));
 
     let body = '';
     for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {

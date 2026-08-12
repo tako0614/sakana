@@ -159,6 +159,26 @@ function fail(message) {
   if (other.get('u1') === roles.get('u1')) fail('会話をまたいで役が固定されてはいけない');
 }
 
+// --- 世代をまたいでも壊れないこと ---
+//
+// 相対トークンに変えたとき、デプロイ中の evex-1 に <|a|> を渡して出力を崩壊させた。
+// 役の種類は推論サーバーの申告に従わせる。
+{
+  const v1 = { roles: ['<|other|>'], overflow: '<|other|>' };
+  const roles = assignRoles(['u1', 'u2', 'u3'], v1);
+  if (new Set(roles.values()).size !== 1) fail('evex-1 では参加者が全員同じ役になる');
+  if (roles.get('u1') !== '<|other|>') fail(`申告された役を使う: ${roles.get('u1')}`);
+  if (nextRole(roles, v1) !== '<|other|>') fail(`bot の役も申告に従う: ${nextRole(roles, v1)}`);
+
+  // 申告が無ければ evex-2 の既定
+  if (assignRoles(['u1']).get('u1') !== ROLE_TOKENS[0]) fail('申告が無ければ既定の役');
+
+  // firstTurn は両世代のトークンで切る (取り違えると生の記号が Discord に漏れる)
+  if (firstTurn('そうだね<|s1|>ID: xxx') !== 'そうだね') fail('evex-1 のトークンで切れていない');
+  if (firstTurn('そうだね<|other|>はい') !== 'そうだね') fail('<|other|> で切れていない');
+  if (firstTurn('そうだね<|b|>いや') !== 'そうだね') fail('evex-2 のトークンで切れていない');
+}
+
 console.log(`serialize ok (制御記号 ${CONTROL_TOKENS.length} 個 / 役 ${ROLE_TOKENS.length} + 溢れ / 二重適用でも壊れない)`);
 
 // --- エンジンの選択 ---
