@@ -55,6 +55,28 @@ const LABEL_MAX = 12;
 // 話題の手がかりになるので入れるが、名前は書き出しに無いので番号のまま使う。
 const NAMED_CHANNELS = 16;
 
+// 会話の切り方。意味検索の既定 (15分 / 20件 / 1200字) をそのまま使っていたが、
+// あれは「検索の単位」として決めた値で、学習の窓には短すぎた。
+//
+// 実測 (トークンは 1.62 字/tok 換算):
+//   沈黙15分 上限1200   中位 262 tok / 8割位  350 / 1窓に 4.1 会話  ← 前の設定
+//   沈黙60分 上限3600   中位 557 tok / 8割位 1003 / 1窓に 1.7 会話  ← これ
+//   沈黙60分 上限8000   中位 201 tok / 8割位 1787
+//   沈黙3時間 上限8000  中位 568 tok / 8割位 1960
+//
+// 上限を外しすぎると逆に悪くなる。賑やかな時間帯だけ巨大化して単発が短いまま
+// 残るので、分布が歪んで中位が落ちる。上限 3600 が残っていると賑やかな部分が
+// 約1000トークンに切り揃えられて均一になる。
+//
+// seq 1024 に対して 8割位が 1003 なので、ほとんどの会話が1窓に収まる。
+// seq を 2048 に上げる手もあるが、vocab 151,936 の logits が倍になって
+// T4 では OOM に戻る (batch 2 × 1024 で実際に落ちた)。
+const CHUNK = {
+  gapMs: Number(process.env.LLM_CHUNK_GAP_MS ?? 60 * 60 * 1000),
+  maxMessages: Number(process.env.LLM_CHUNK_MAX_MESSAGES ?? 60),
+  maxChars: Number(process.env.LLM_CHUNK_MAX_CHARS ?? 3600)
+};
+
 const VAL_DAYS = Number(process.env.LLM_VAL_DAYS ?? 14);
 
 const authors = JSON.parse(await readFile(path.join(src, 'authors.json'), 'utf8'));
@@ -180,7 +202,7 @@ const conversations = [];
 for (const [chIdx, rows] of byChannel) {
   const label = labelOf(channelIdByIdx.get(chIdx));
 
-  for (const chunk of splitIntoChunks(rows)) {
+  for (const chunk of splitIntoChunks(rows, CHUNK)) {
     // 名前を持たない人だけに A,B,C... を振る。名前持ちに役を配ると、
     // 同じ会話で「たこ」と「B」が同一人物という矛盾した形になる
     const unnamed = chunk.map((row) => row.author).filter((idx) => !labelByIdx.has(idx));
@@ -249,6 +271,7 @@ await writeFile(
     val_chars: chars(val),
     val_days: VAL_DAYS,
     named_channels: NAMED_CHANNELS,
+    chunk: CHUNK,
     named_speakers: labelByIdx.size,
     named_min_messages: NAMED_MIN_MESSAGES
   }, null, 2)}\n`
