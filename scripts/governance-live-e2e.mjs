@@ -25,7 +25,7 @@ function usage() {
   return [
     'Usage:',
     '  node scripts/governance-live-e2e.mjs plan',
-    '  LIVE_GOVERNANCE_E2E=1 node scripts/governance-live-e2e.mjs seed --guild <guild-id> --actor <owner-id> --confirm-shadow [--provision-trusted-role <name>]',
+    '  LIVE_GOVERNANCE_E2E=1 node scripts/governance-live-e2e.mjs seed --guild <guild-id> --actor owner --confirm-shadow [--provision-trusted-role <name>]',
     '  LIVE_GOVERNANCE_E2E=1 node scripts/governance-live-e2e.mjs cleanup --guild <guild-id> --run <run-id> --confirm-shadow',
     '',
     'seedは必ずshadow執行でのみ動き、他memberの投票・承認・処分を捏造しません。',
@@ -782,7 +782,7 @@ try {
   await guild.roles.fetch();
   await guild.channels.fetch();
   const result = command === 'seed'
-    ? await seed(guild, actorId, runId)
+    ? await seed(guild, actorId === 'owner' ? guild.ownerId : actorId, runId)
     : await cleanup(guild, runId);
   console.log(JSON.stringify({ ok: true, command, runId, result }, null, 2));
 } finally {

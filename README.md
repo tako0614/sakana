@@ -68,7 +68,7 @@ AIは正式な請願だけでなく、公開チャンネルの直近7日を週�
 ```bash
 node scripts/governance-live-e2e.mjs plan
 LIVE_GOVERNANCE_E2E=1 node scripts/governance-live-e2e.mjs seed \
-  --guild GUILD_ID --actor OWNER_ID --confirm-shadow
+  --guild GUILD_ID --actor owner --confirm-shadow
 ```
 
 このスクリプトは`shadow`執行でしか動かず、既存outboxがあれば停止します。特別有権者ロールはownerに対して追加・削除を実測し、終了時に元の状態へ戻します。投票・承認はowner本人の記名操作だけを使い、他memberの票や承認を捏造しません。kick、ban、timeoutは記録経路だけを通し、Discordへ実執行しません。テスト用法律は制限primitiveの登録直後に廃止されます。
@@ -77,7 +77,7 @@ LIVE_GOVERNANCE_E2E=1 node scripts/governance-live-e2e.mjs seed \
 
 ```bash
 LIVE_GOVERNANCE_E2E=1 node scripts/governance-live-e2e.mjs seed \
-  --guild GUILD_ID --actor OWNER_ID --confirm-shadow \
+  --guild GUILD_ID --actor owner --confirm-shadow \
   --provision-trusted-role 貴族院
 ```
 
