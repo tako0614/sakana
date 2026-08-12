@@ -43,6 +43,16 @@ export function toolLabel(name, args = {}) {
  * 編集レート (5回/5秒あたり) を食い潰していた。
  * 結果、編集が走るのは「ツールが切り替わったとき」だけになる。
  */
+// 経過表示の本文の頭。これで「自分の経過表示」を見分ける。
+// 落ちた実行が消し損ねたぶんはチャンネルに残り続けるので、ID だけでは足りない。
+export const INDICATOR_PREFIX = '-# thinking ';
+
+/** その発言が経過表示かどうか。直近の会話に混ぜないために使う。 */
+export function isIndicatorMessage(message, selfId) {
+  if (!selfId || message?.authorId !== selfId) return false;
+  return String(message.content ?? '').startsWith(INDICATOR_PREFIX);
+}
+
 export class ThinkingIndicator {
   constructor(channel) {
     this.channel = channel;
@@ -62,9 +72,13 @@ export class ThinkingIndicator {
   }
 
   render() {
-    const started = Math.floor(this.startedAt / 1000);
     const suffix = this.status ? ` · ${this.status}` : '';
-    return `-# thinking <t:${started}:R>${suffix}`;
+    return `${INDICATOR_PREFIX}<t:${Math.floor(this.startedAt / 1000)}:R>${suffix}`;
+  }
+
+  /** 直近の会話から自分の経過表示を外すのに使う (start に失敗していたら null)。 */
+  get messageId() {
+    return this.message?.id ?? null;
   }
 
   async start() {

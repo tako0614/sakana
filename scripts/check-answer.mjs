@@ -58,11 +58,29 @@ function tableOf(count) {
 }
 
 {
-  // 引けない番号は本文から消すだけ。末尾には出さない (リンク切れを作らない)
+  // 引けない番号は触らない。無条件に消していたら `[2024] の話ね` が `の話ね` になった
   const out = expandCitations('よく分からん [99]。', tableOf(2));
-  if (out.includes('[99]')) fail(`引けない番号も本文から消す: ${out}`);
+  if (!out.includes('[99]')) fail(`引けない番号は残す: ${out}`);
   if (out.includes('-#')) fail(`引けない番号だけなら末尾を足さない: ${out}`);
-  if (out !== 'よく分からん。') fail(`本文の詰め方が違う: ${JSON.stringify(out)}`);
+
+  const year = expandCitations('[2024] の話ね', tableOf(2));
+  if (year !== '[2024] の話ね') fail(`数字の括弧を引用と誤らない: ${JSON.stringify(year)}`);
+}
+
+{
+  // 添字は引用ではない。引用は語の区切りに来るので空白の有無で見分ける
+  const refs = tableOf(3);
+  const idx = expandCitations('配列は items[1] が先頭だよ', refs);
+  if (idx !== '配列は items[1] が先頭だよ') fail(`添字を壊してはいけない: ${JSON.stringify(idx)}`);
+  if (idx.includes('-#')) fail('添字を引用として拾ってはいけない');
+
+  // 空白で区切られていれば引用として扱う
+  const cited = expandCitations('根拠はこれ [1]。', refs);
+  if (cited.split('\n')[0] !== '根拠はこれ。') fail(`空白区切りは引用: ${JSON.stringify(cited)}`);
+  // 行頭・括弧のあとも引用
+  for (const t of ['[1] と言ってる', '「[1]」と書いてる']) {
+    if (!expandCitations(t, refs).includes('-#')) fail(`引用として拾えていない: ${t}`);
+  }
 }
 
 {
@@ -319,3 +337,29 @@ function fakeChannel(messages) {
 }
 
 console.log('reply chain ok (リプ先 / 6ホップ / 削除 / 自己参照 / 転送)');
+
+// --- 経過表示を会話に混ぜない ---
+//
+// indicator.start() は fetchRecent より先に走るので、自分の `-# thinking …` が
+// 直近30件に入っていた。枠を食うだけでなく、自分の発言として読まれる。
+
+const { INDICATOR_PREFIX, isIndicatorMessage } = await import('../src/agent/thinking.js');
+
+{
+  const self = '111';
+  const indicator = { authorId: self, content: `${INDICATOR_PREFIX}<t:1700000000:R> · 検索` };
+  if (!isIndicatorMessage(indicator, self)) fail('自分の経過表示を見分けられていない');
+
+  // 他人が同じ文字列を書いても自分の経過表示ではない
+  if (isIndicatorMessage({ authorId: '222', content: indicator.content }, self)) {
+    fail('他人の発言を経過表示として捨ててはいけない');
+  }
+  // 自分の普通の回答は捨てない
+  if (isIndicatorMessage({ authorId: self, content: 'たこが4月に書いてる' }, self)) {
+    fail('自分の回答を経過表示として捨ててはいけない');
+  }
+  // selfId が取れないときは何も捨てない
+  if (isIndicatorMessage(indicator, null)) fail('selfId 不明なら捨てない');
+}
+
+console.log('indicator ok (経過表示を直近の会話に混ぜない)');

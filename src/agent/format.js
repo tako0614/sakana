@@ -80,16 +80,25 @@ export function messageLink(entry) {
  * 引けなかった番号は本文から消すだけで、末尾には出さない (リンク切れを作らない)。
  */
 export function expandCitations(text, refs) {
+  const raw = String(text ?? '');
   const urls = [];
   const seen = new Set();
 
   // 直前の空白ごと食う。番号を抜いた跡に空白が残ると句点の前が空く。
   // 全角スペースも食う (日本語で書かせているので混ざる)。
-  const body = String(text ?? '').replace(/[ \t　]*\[(\d{1,4})\]/g, (match, digits) => {
+  const body = raw.replace(/[ \t　]*\[(\d{1,4})\]/g, (match, digits, offset) => {
     const ref = Number(digits);
     const url = messageLink(refs.get(ref));
 
-    if (url && !seen.has(ref)) {
+    // 引けない番号は触らない。無条件に消していたら `[2024] の話ね` が
+    // `の話ね` になっていた (数字の括弧は引用とは限らない)。
+    if (!url) return match;
+
+    // `items[1]` のような添字も引用ではない。引用は必ず語の区切りに来るので、
+    // 空白で始まっていないのに直前が識別子の文字なら添字とみなす。
+    if (!/^[ \t　]/.test(match) && /[\w.)\]]/.test(raw[offset - 1] ?? '')) return match;
+
+    if (!seen.has(ref)) {
       seen.add(ref);
       urls.push(url);
     }

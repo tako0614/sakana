@@ -70,6 +70,17 @@ if (!db.pragma('table_info(agent_calls)').some((row) => row.name === 'counted'))
   db.exec('ALTER TABLE agent_calls ADD COLUMN counted INTEGER NOT NULL DEFAULT 1');
 }
 
+// 起動した時点で走っている実行は無い。status='running' で残っているのは、
+// 途中でプロセスが死んで finalizeCall / releaseCall に来られなかったぶん。
+// 放っておくと「止まったまま」の行と本当に走っている行が見分けられなくなる。
+// (トークンは 0 なので集計には影響しない。status を直すだけ。)
+{
+  const stale = db.prepare("UPDATE agent_calls SET status = 'interrupted' WHERE status = 'running'").run();
+  if (stale.changes > 0) {
+    console.warn(`Marked ${stale.changes} interrupted agent call(s) left over from a previous run.`);
+  }
+}
+
 // 換算トークンの合計。SQL 側で重みを掛ける (行を JS に運ばずに済む)。
 const WEIGHTED_SUM = `
   COALESCE(SUM(

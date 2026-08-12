@@ -27,7 +27,7 @@ import {
   usdToTokens,
   weighTokens
 } from './ratelimit.js';
-import { ThinkingIndicator, toolLabel } from './thinking.js';
+import { ThinkingIndicator, isIndicatorMessage, toolLabel } from './thinking.js';
 import { buildToolset } from './tools.js';
 
 const NO_MENTIONS = { parse: [], repliedUser: false };
@@ -113,16 +113,38 @@ function limitMessage(reservation) {
     : `サーバー全体の使用量の上限に達しました (${window} ${amount})。${at} に空きます。`;
 }
 
-async function fetchRecent(channel, excludeId, limit) {
+/**
+ * リプライで返す。失敗したらチャンネルに直接送る。
+ *
+ * 処理中に依頼が消されると `message.reply` は 50035
+ * (message_reference[MESSAGE_REFERENCE_UNKNOWN_MESSAGE]) で落ちる。
+ * 実測で2回起きていて、そのたびに出来上がった回答を丸ごと捨てていた
+ * (エラー文の返信も同じ理由で失敗するので、ユーザーには何も出ないままトークンだけ払う)。
+ * 返信先が消えていても答えは残す。
+ */
+async function replyOrSend(message, payload) {
+  try {
+    return await message.reply(payload);
+  } catch (error) {
+    console.error('reply failed, sending to the channel instead:', error?.message ?? error);
+    return await message.channel.send(payload).catch(() => null);
+  }
+}
+
+async function fetchRecent(channel, { exclude, selfId, limit }) {
   if (limit <= 0 || typeof channel.messages?.fetch !== 'function') return [];
 
   try {
-    const fetched = await channel.messages.fetch({ limit: Math.min(limit + 1, 100) });
+    // 経過表示のぶんだけ多めに取る。捨てる件数が読めないので少し余裕を持たせる。
+    const fetched = await channel.messages.fetch({ limit: Math.min(limit + 8, 100) });
     return [...fetched.values()]
-      .filter((message) => message.id !== excludeId)
+      .filter((message) => !exclude.has(message.id))
       .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
-      .slice(-limit)
-      .map((message) => fromDiscordMessage(message, channel.name));
+      .map((message) => fromDiscordMessage(message, channel.name))
+      // 自分の経過表示は会話ではない。混ぜると枠を食うし、自分の発言として読まれる。
+      // ID で除くだけでは足りない (落ちた実行が消し損ねたぶんが残っている)。
+      .filter((message) => !isIndicatorMessage(message, selfId))
+      .slice(-limit);
   } catch (error) {
     console.error('Failed to preload recent messages:', error);
     return [];
@@ -190,8 +212,7 @@ export async function handleAgentRequest(message, client) {
   });
 
   if (!reservation.ok) {
-    await message.reply({ content: limitMessage(reservation), allowedMentions: NO_MENTIONS })
-      .catch(() => {});
+    await replyOrSend(message, { content: limitMessage(reservation), allowedMentions: NO_MENTIONS });
     return;
   }
 
@@ -232,7 +253,12 @@ export async function handleAgentRequest(message, client) {
     const toolset = await buildToolset(ctx);
 
     // 直近を先に取る (鎖のたどり先がキャッシュに載るので API を叩かずに済む)
-    const preloaded = await fetchRecent(message.channel, message.id, agentConfig.preloadMessages);
+    const preloaded = await fetchRecent(message.channel, {
+      // 依頼そのものと、いま出している経過表示は渡さない
+      exclude: new Set([message.id, indicator.messageId].filter(Boolean)),
+      selfId: client.user?.id,
+      limit: agentConfig.preloadMessages
+    });
     const replyChain = await fetchReplyChain(message, message.channel.name);
 
     // 鎖に入ったものは背景から抜く。同じ発言を2回載せてもトークンだけ増える。
@@ -295,7 +321,7 @@ export async function handleAgentRequest(message, client) {
       };
 
       const sent = index === 0
-        ? await message.reply(payload)
+        ? await replyOrSend(message, payload)
         : await message.channel.send(payload);
 
       // これへのリプライを会話の続きとして受け付ける
@@ -311,10 +337,10 @@ export async function handleAgentRequest(message, client) {
     // エラー文を出す前に経過表示を片付ける
     await indicator?.stop();
 
-    await message.reply({
+    await replyOrSend(message, {
       content: 'エージェントの実行に失敗しました。しばらくしてからもう一度試してください。',
       allowedMentions: NO_MENTIONS
-    }).catch(() => {});
+    });
   } finally {
     // 取りこぼしの保険。stop() は何度呼んでも安全。
     await indicator?.stop();
