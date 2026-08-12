@@ -17,7 +17,8 @@ import os from 'node:os';
 import { gunzipSync } from 'node:zlib';
 
 process.env.ARCHIVE_DB_PATH = path.join(os.tmpdir(), 'sakana-corpus-scratch.sqlite');
-const { splitIntoChunks } = await import('../../src/embed/../archive/chunks.js');
+const { splitIntoChunks } = await import('../../src/archive/chunks.js');
+const { buildPrompt, messageText } = await import('../../src/mimic/serialize.js');
 
 const dir = process.argv[2] ?? 'corpus';
 
@@ -28,38 +29,9 @@ const SPEAKER_SLOTS = Number(process.env.LLM_SPEAKER_SLOTS ?? 48);
 // 「草」「www」のような完全一致が 23% あるので、時間で切らないと val が嘘になる。
 const VAL_DAYS = Number(process.env.LLM_VAL_DAYS ?? 14);
 
-// --- 正規化 ---
-//
-// 消すもの: そのまま入れると語彙を食うだけで、文体に寄与しないもの。
-// 残すもの: 絵文字・草・www・顔文字・伸ばし棒。文体そのもの。
-
-const RULES = [
-  // URL は真っ先に。中に記号が多くて後続の規則を巻き込む
-  [/https?:\/\/\S+/g, '<url>'],
-  [/<a?:([a-zA-Z0-9_]{2,32}):\d{15,25}>/g, ':$1:'], // カスタム絵文字は名前を残す (:kusa: は文化)
-  [/<@[!&]?\d{15,25}>/g, '<mention>'],
-  [/<#\d{15,25}>/g, '<channel>'],
-  [/<t:\d+(?::[tTdDfFR])?>/g, '<time>'],
-  [/@everyone|@here/g, '<mention>']
-];
-
-function normalize(text) {
-  let out = String(text ?? '');
-
-  // コードブロックは中身を残して囲みだけ差し替える。``` のままだと
-  // 言語名や改行と混ざって語彙が散る
-  out = out.replace(/```[a-zA-Z0-9+#-]*\n?([\s\S]*?)```/g, (_, body) => `<code>${body}</code>`);
-
-  for (const [pattern, replacement] of RULES) out = out.replace(pattern, replacement);
-
-  // 会話 1 件を 1 行に収める。改行は消さずにトークンにする
-  // (sentencepiece は行単位で読むし、学習側のデータローダも行で切りたい)
-  //
-  // U+2028 / U+2029 も潰す。JSON.stringify はこの2つを素通しするのに
-  // Node の readline は行終端として扱うので、残すと下流で行が割れる
-  // (実データに 5 件あって、書き出しの JSON が途中で切れた)。
-  return out.replace(/\r\n|[\n\r\u2028\u2029]/g, '<nl>').trim();
-}
+// 正規化と直列化は src/mimic/serialize.js に置いてある。
+// 学習データと推論のプロンプトが同じ形でないと、モデルは「一度も見ていない形」を
+// 受け取ることになる (しかも例外は出ないので静かに崩れるだけ)。
 
 // --- 話者 ---
 
@@ -91,7 +63,7 @@ for (const line of raw.split('\n')) {
   const [ch, author, createdAt, isBot, isReply, content] = JSON.parse(line);
   if (isBot) { bots += 1; continue; }
 
-  const text = normalize(content) || '<file>'; // 本文が空なのは添付かスタンプ。turn は残す
+  const text = messageText(content);
 
   if (!byChannel.has(ch)) byChannel.set(ch, []);
   byChannel.get(ch).push({
@@ -109,16 +81,13 @@ const conversations = [];
 
 for (const rows of byChannel.values()) {
   for (const chunk of splitIntoChunks(rows)) {
-    const parts = ['<|conv|>'];
-
-    for (const row of chunk) {
-      parts.push(speakerToken(row.author));
-      if (row.reply) parts.push('<|re|>');
-      parts.push(row.content);
-    }
-
-    parts.push('<|end|>');
-    conversations.push({ at: chunk[chunk.length - 1].created_at, text: parts.join('') });
+    const turns = chunk.map((row) => ({
+      token: speakerToken(row.author), reply: row.reply, content: row.content
+    }));
+    conversations.push({
+      at: chunk[chunk.length - 1].created_at,
+      text: `${buildPrompt(turns)}<|end|>`
+    });
   }
 }
 
@@ -135,8 +104,10 @@ await writeFile(path.join(dir, 'val.txt'), `${val.map((c) => c.text).join('\n')}
 await writeFile(
   path.join(dir, 'speakers.json'),
   JSON.stringify(
+    // Discord の user_id を必ず入れる。これが無いと実ユーザーを話者トークンに
+    // 対応づけられず、/model evex で「その人として書く」ができない。
     humans.slice(0, SPEAKER_SLOTS).map((a, rank) => ({
-      token: `<|s${rank}|>`, idx: a.idx, name: a.name, count: a.count
+      token: `<|s${rank}|>`, rank, userId: a.id, idx: a.idx, name: a.name, count: a.count
     })),
     null,
     2
