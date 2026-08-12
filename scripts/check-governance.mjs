@@ -730,11 +730,7 @@ assert.match(dashboard.content, /記録のみ/);
 assert.match(dashboard.content, /貴族院/);
 assert.equal(dashboard.components.length, 2);
 const uxSource = readFileSync(new URL('../src/governance/ux.js', import.meta.url), 'utf8');
-assert.equal(
-  (uxSource.match(/\.pinned && guild\.members\.me\.permissions\.has\(PermissionFlagsBits\.ManageMessages\)/g) ?? []).length,
-  2,
-  'メッセージ管理権限がなくても案内と管理画面の同期をピン留めで止めない'
-);
+assert.doesNotMatch(uxSource, /\.pin\(/, '案内専用チャンネルの同期を不要なピン留め権限で止めない');
 const legacyMessages = [
   { id: 'before', createdTimestamp: 1, author: { id: 'user' }, content: '普通の投稿', attachments: [] },
   { id: 'start', createdTimestamp: 2, author: { id: 'bot' }, content: '# 初期憲法 v1\n本文', attachments: [] },

@@ -6,7 +6,6 @@ import {
   MessageFlags,
   MessageType,
   ModalBuilder,
-  PermissionFlagsBits,
   RoleSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -236,18 +235,12 @@ export async function ensureGovernanceUx(guild, governance = getGovernanceGuild(
   let guideMessage = await fetchTrackedMessage(guide, current.guide_message_id, `# ${guild.name} 統治案内`);
   if (!guideMessage) guideMessage = await guide.send({ content: guideContent, allowedMentions: { parse: [] } });
   else if (guideMessage.content !== guideContent) await guideMessage.edit({ content: guideContent, allowedMentions: { parse: [] } });
-  if (!guideMessage.pinned && guild.members.me.permissions.has(PermissionFlagsBits.ManageMessages)) {
-    await guideMessage.pin('統治案内を固定');
-  }
 
   const dashboard = await renderGovernanceDashboard(guild, current);
   let adminMessage = await fetchTrackedMessage(admin, current.admin_dashboard_message_id, `# ${guild.name} 統治管理`);
   if (!adminMessage) adminMessage = await admin.send(dashboard);
   else if (adminMessage.content !== dashboard.content || !componentsMatch(adminMessage, dashboard.components)) {
     await adminMessage.edit(dashboard);
-  }
-  if (!adminMessage.pinned && guild.members.me.permissions.has(PermissionFlagsBits.ManageMessages)) {
-    await adminMessage.pin('統治管理画面を固定');
   }
 
   if (guideMessage.id !== current.guide_message_id || adminMessage.id !== current.admin_dashboard_message_id) {
