@@ -767,6 +767,32 @@ assert.deepEqual(await retireGovernanceCourtChat({
   court_forum_id: 'court', court_chat_channel_id: 'legacy-court'
 }), { removed: true, retained: false }, '事件threadがない旧裁判当事者用channelは移行時に削除する');
 assert.equal(legacyCourtDeleted, true);
+let strandedLegacyCourtDeleted = false;
+const strandedLegacyCourt = {
+  type: ChannelType.GuildText,
+  id: 'stranded-legacy-court',
+  name: '旧・非公開審理記録',
+  parentId: 'governance-category',
+  threads: {
+    fetchActive: async () => ({ threads: new Map() }),
+    fetchArchived: async () => ({ threads: new Map() })
+  },
+  delete: async () => { strandedLegacyCourtDeleted = true; }
+};
+const strandedChannels = new Map([
+  ['court', { id: 'court', type: ChannelType.GuildForum, name: '裁判所', parentId: 'governance-category' }],
+  [strandedLegacyCourt.id, strandedLegacyCourt]
+]);
+assert.deepEqual(await retireGovernanceCourtChat({
+  name: 'Test Community',
+  channels: {
+    cache: strandedChannels,
+    fetch: async (id) => id ? strandedChannels.get(id) ?? null : strandedChannels
+  }
+}, {
+  category_id: 'governance-category', court_forum_id: 'court', court_chat_channel_id: 'court'
+}), { removed: true, retained: false }, 'DB参照が移行済みでもcategory内に取り残された旧裁判channelを削除する');
+assert.equal(strandedLegacyCourtDeleted, true);
 const procedureAcl = governanceProcedureOverwrites(aclGuild);
 assert.deepEqual(
   procedureAcl.map((entry) => entry.id),

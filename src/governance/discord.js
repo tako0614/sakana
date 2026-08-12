@@ -512,11 +512,34 @@ async function retireLegacyCourtChat(channel, guildName) {
 }
 
 export async function retireGovernanceCourtChat(guild, governance) {
-  if (!governance.court_chat_channel_id || governance.court_chat_channel_id === governance.court_forum_id) {
-    return { removed: false, retained: false };
+  const candidates = new Map();
+  if (governance.court_chat_channel_id && governance.court_chat_channel_id !== governance.court_forum_id) {
+    const referenced = await guild.channels.fetch(governance.court_chat_channel_id).catch(() => null);
+    if (referenced) candidates.set(referenced.id, referenced);
   }
-  const channel = await guild.channels.fetch(governance.court_chat_channel_id).catch(() => null);
-  return retireLegacyCourtChat(channel, guild.name);
+
+  // 先行versionでDBの互換columnだけ先に裁判所Forumへ更新された場合も、
+  // 統治category内に取り残された旧channelを再発見して移行を完了する。
+  const knownLegacyNames = new Set(['裁判当事者用', '裁判チャット', '旧・非公開審理記録']);
+  const fetched = await guild.channels.fetch().catch(() => null);
+  const allChannels = fetched?.values ? fetched : guild.channels.cache;
+  for (const channel of allChannels?.values?.() ?? []) {
+    if (
+      channel.type === ChannelType.GuildText
+      && channel.parentId === governance.category_id
+      && channel.id !== governance.court_forum_id
+      && knownLegacyNames.has(channel.name)
+    ) candidates.set(channel.id, channel);
+  }
+
+  let removed = false;
+  let retained = false;
+  for (const channel of candidates.values()) {
+    const result = await retireLegacyCourtChat(channel, guild.name);
+    removed ||= result.removed;
+    retained ||= result.retained;
+  }
+  return { removed, retained };
 }
 
 export async function ensureGovernanceGazetteTopic(guild, governance) {
