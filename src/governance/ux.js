@@ -130,7 +130,7 @@ export async function renderGovernanceGuide(guild, governance) {
   const electorate = await electorateLabel(guild, governance);
   const counts = activeCounts(guild.id);
   return [
-    `# ${guild.name} 統治案内`,
+    `# ${guild.name} 案内`,
     '',
     `状態: **${stateLabel(governance)}** / 執行: **${enforcementLabel(governance)}**`,
     governance.enforcement_mode === 'live'
@@ -269,7 +269,7 @@ export async function renderGovernanceProcedureHub(guild, governance) {
     + Math.max(0, appeals.length + defenses.length + debates.length - responseLines.length);
   return {
     content: [
-      `# ${guild.name} 統治手続`,
+      `# ${guild.name} 進行中`,
       '',
       'ここは全員に公開された統治手続の一覧です。Bot設定ではありません。内容を読んで、リンク先の案件で投票・承認・答弁・上訴を行ってください。',
       '投票と執行承認は記名で、選択と変更の経過が対象案件へ公開されます。',
@@ -316,9 +316,10 @@ export async function ensureGovernanceUx(guild, governance = getGovernanceGuild(
 
   let guide = current.guide_channel_id ? await guild.channels.fetch(current.guide_channel_id).catch(() => null) : null;
   if (!guide || guide.type !== ChannelType.GuildText) guide = await createGovernanceGuideChannel(guild, category.id);
+  if (guide.name !== GOVERNANCE_GUIDE_NAME) await guide.setName(GOVERNANCE_GUIDE_NAME, '参加案内の名称を同期');
   const guideOverwrites = readOnlyTextOverwrites(guild);
   if (!requiredPermissionOverwritesMatch(guide, guideOverwrites)) {
-    await reconcileRequiredPermissionOverwrites(guide, guideOverwrites, '統治案内を公開読み取り専用に同期');
+    await reconcileRequiredPermissionOverwrites(guide, guideOverwrites, '案内を公開読み取り専用に同期');
   }
 
   let admin = current.admin_channel_id ? await guild.channels.fetch(current.admin_channel_id).catch(() => null) : null;
@@ -327,29 +328,29 @@ export async function ensureGovernanceUx(guild, governance = getGovernanceGuild(
   if (admin.topic !== GOVERNANCE_PROCEDURE_TOPIC) await admin.setTopic(GOVERNANCE_PROCEDURE_TOPIC, '統治手続の説明を同期');
   const adminOverwrites = governanceProcedureOverwrites(guild);
   if (!requiredPermissionOverwritesMatch(admin, adminOverwrites)) {
-    await reconcileRequiredPermissionOverwrites(admin, adminOverwrites, '統治手続を公開読み取り専用に同期');
+    await reconcileRequiredPermissionOverwrites(admin, adminOverwrites, '進行中を公開読み取り専用に同期');
   }
 
   const siblings = [...guild.channels.cache.values()].filter((channel) => channel.parentId === category.id);
   const firstPosition = Math.min(...siblings.map((channel) => channel.position));
   const lastPosition = Math.max(...siblings.map((channel) => channel.position));
   if (Number.isFinite(firstPosition) && guide.position !== firstPosition) {
-    await guide.setPosition(firstPosition, { reason: '統治案内をカテゴリ先頭へ移動' });
+    await guide.setPosition(firstPosition, { reason: '案内をカテゴリ先頭へ移動' });
   }
   if (Number.isFinite(lastPosition) && admin.position !== lastPosition) {
-    await admin.setPosition(lastPosition, { reason: '統治手続をカテゴリ末尾へ移動' });
+    await admin.setPosition(lastPosition, { reason: '進行中をカテゴリ末尾へ移動' });
   }
 
   if (guide.id !== current.guide_channel_id || admin.id !== current.admin_channel_id) {
     current = updateGovernanceGuild(guild.id, { guide_channel_id: guide.id, admin_channel_id: admin.id });
   }
   const guideContent = await renderGovernanceGuide(guild, current);
-  let guideMessage = await fetchTrackedMessage(guide, current.guide_message_id, `# ${guild.name} 統治案内`);
+  let guideMessage = await fetchTrackedMessage(guide, current.guide_message_id, `# ${guild.name} 案内`);
   if (!guideMessage) guideMessage = await guide.send({ content: guideContent, allowedMentions: { parse: [] } });
   else if (guideMessage.content !== guideContent) await guideMessage.edit({ content: guideContent, allowedMentions: { parse: [] } });
 
   const dashboard = await renderGovernanceProcedureHub(guild, current);
-  let adminMessage = await fetchTrackedMessage(admin, current.admin_dashboard_message_id, `# ${guild.name} 統治手続`);
+  let adminMessage = await fetchTrackedMessage(admin, current.admin_dashboard_message_id, `# ${guild.name} 進行中`);
   if (!adminMessage) adminMessage = await admin.send(dashboard);
   else if (adminMessage.content !== dashboard.content || !componentsMatch(adminMessage, dashboard.components)) {
     await adminMessage.edit(dashboard);

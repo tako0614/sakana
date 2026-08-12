@@ -19,8 +19,8 @@ const STATUTE_TAGS = ['現行憲法', '旧憲法', '現行法', '停止', '違�
 const STATUTE_TOPIC = '現行憲法と法律の公開正本です。1法令1投稿で、旧法令も状態付きで保存します。';
 const GAZETTE_TOPIC = '成立・改正・判決・執行・運営操作を時系列に残す公開履歴です。現行本文は法令集を参照してください。';
 export const COURT_TOPIC = '事件ごとの公開審理です。答弁・証拠・判決・執行承認・上訴を1つの事件投稿に記録します。';
-export const GOVERNANCE_GUIDE_NAME = '統治案内';
-export const GOVERNANCE_PROCEDURE_NAME = '統治手続';
+export const GOVERNANCE_GUIDE_NAME = '案内';
+export const GOVERNANCE_PROCEDURE_NAME = '進行中';
 export const GOVERNANCE_PROCEDURE_TOPIC = '全員に公開する統治手続の一覧です。投票・執行承認は対象案件で記名し、選択と変更を公開記録に残します。';
 
 function proposalStateLabel(state) {

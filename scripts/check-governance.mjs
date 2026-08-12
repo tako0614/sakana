@@ -820,6 +820,8 @@ const { ChannelType, PermissionFlagsBits, PermissionsBitField } = await import('
 const {
   appealRestrictedChannelAccessible,
   courtForumEveryonePermissionState,
+  GOVERNANCE_GUIDE_NAME,
+  GOVERNANCE_PROCEDURE_NAME,
   governanceProcedureOverwrites,
   readOnlyTextOverwrites,
   retireGovernanceCourtChat,
@@ -827,6 +829,8 @@ const {
   statuteForumEveryonePermissionState,
   statutePublicationState
 } = await import('../src/governance/discord.js');
+assert.equal(GOVERNANCE_GUIDE_NAME, '案内');
+assert.equal(GOVERNANCE_PROCEDURE_NAME, '進行中');
 assert.deepEqual(courtForumEveryonePermissionState(), {
   ViewChannel: true,
   ReadMessageHistory: true,
@@ -951,15 +955,15 @@ const procedureAcl = governanceProcedureOverwrites(aclGuild);
 assert.deepEqual(
   procedureAcl.map((entry) => entry.id),
   ['acl-guild', 'bot'],
-  '統治手続は全員が閲覧できる読み取り専用の手続ハブである'
+  '進行中は全員が閲覧できる読み取り専用の手続ハブである'
 );
 assert.ok(procedureAcl[0].allow.includes(PermissionFlagsBits.ViewChannel));
 assert.ok(procedureAcl[0].deny.includes(PermissionFlagsBits.SendMessages));
-assert.ok(!procedureAcl[0].deny.includes(PermissionFlagsBits.ViewChannel), '統治手続を@everyoneから隠さない');
+assert.ok(!procedureAcl[0].deny.includes(PermissionFlagsBits.ViewChannel), '進行中を@everyoneから隠さない');
 assert.deepEqual(
   readOnlyTextOverwrites(aclGuild).map((entry) => entry.id),
   ['acl-guild', 'bot'],
-  '統治案内は全員とbotの読み取り専用ACLである'
+  '案内は全員とbotの読み取り専用ACLである'
 );
 
 governanceDb.updateGovernanceGuild('g1', {
