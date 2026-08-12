@@ -36,7 +36,10 @@ export const PLAIN_SCHEME = { roles: ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'], o
 // ラベルを渡すことになる (`vivacious_flamingo_38533` は 12 字で切られ、
 // 同名の 4 組には連番が付いている)。
 function loadLabels() {
-  for (const file of [process.env.MIMIC_LABELS, 'sft/labels.json'].filter(Boolean)) {
+  // mimic/ はデプロイ用に pack.mjs がまとめる場所。bot サーバーには sft/ が無い
+  // (実 ID を含むので追跡していない) ので、evex-ft-1 を載せるときはここに置く。
+  const files = [process.env.MIMIC_LABELS, 'mimic/labels.json', 'sft/labels.json'];
+  for (const file of files.filter(Boolean)) {
     try {
       const rows = JSON.parse(readFileSync(path.resolve(file), 'utf8'));
       if (Array.isArray(rows) && rows.length) return rows;

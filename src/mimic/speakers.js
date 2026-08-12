@@ -18,10 +18,16 @@ import path from 'node:path';
 import { db } from '../db.js';
 import { db as archive } from '../archive/db.js';
 
-// evex-1 の tokenizer と対のもの。corpus/ を v2 で上書きしたときに evex-1 を
-// 孤児にした経験があるので、既定は凍結してある corpus-v1 を先に見る。
+// evex-1 の tokenizer と対のもの。
+//
+// mimic/ を先に見る — pack.mjs がデプロイ用に ckpt / tok.model / speakers.json を
+// まとめて置く場所で、bot サーバーにはこれしか無い (corpus/ も corpus-v1/ も
+// 追跡していないので、あちらには存在しない)。
+// corpus-v1 を corpus より先に見るのは、corpus/ を v2 で上書きして evex-1 を
+// 孤児にした経験があるから。
 const CANDIDATES = [
   process.env.MIMIC_SPEAKERS,
+  'mimic/speakers.json',
   'corpus-v1/speakers.json',
   'corpus/speakers.json'
 ].filter(Boolean);
