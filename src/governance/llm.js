@@ -50,6 +50,10 @@ function integer(value, name, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
   return value;
 }
 
+function nullableText(value, name, max = 8000) {
+  return value === null || value === undefined || value === '' ? null : text(value, name, max);
+}
+
 function assertUnique(values, name) {
   if (new Set(values).size !== values.length) throw new Error(`${name} must be unique`);
 }
@@ -337,6 +341,148 @@ Do not create an offense unless the petition actually requires a punishable rule
       activeLaws: activeLaws.map((law) => ({ id: law.id, code: law.code, title: law.title, text: law.text, provisions: law.provisions }))
     },
     validate: (raw) => validateDraft(raw, policy)
+  })).output;
+}
+
+export async function interpretLegislativeRequest({ guildId, request, constitution, activeLaws }) {
+  const policy = constitution.policy;
+  return (await callGovernanceJson({
+    guildId,
+    purpose: 'intake.legislature',
+    model: governanceConfig.drafterModel,
+    instruction: `Classify and normalize one message addressed to the legislature.
+Return exactly intent, title, summary, voteScope, question.
+intent is petition, amendment, information, or unclear.
+Use amendment only when the person explicitly asks to change the constitution or constitutional policy.
+Use petition for a proposed ordinary rule or recurring community problem.
+Use information for a question that does not request a new rule. Use unclear when required substance is missing.
+For petition or amendment, title and summary must be self-contained Japanese text, voteScope must be one of the supplied allowed scopes, and question must be null.
+Do not invent a member, past incident, punishment, or operative rule that the request did not ask for.
+For information or unclear, set title, summary, and voteScope to null and write a short Japanese question or routing explanation in question.
+This output is only an intake preview and has no power to file or enact anything.`,
+    data: {
+      request,
+      constitution: { version: constitution.version, content: constitution.content },
+      allowedVoteScopes: policy.voting.allowedScopes,
+      defaultVoteScope: policy.voting.defaultScope,
+      activeLaws: activeLaws.map((law) => ({ id: law.id, code: law.code, title: law.title }))
+    },
+    validate: (raw) => {
+      const value = assertObject(raw);
+      exactKeys(value, ['intent', 'title', 'summary', 'voteScope', 'question'], 'legislativeIntake');
+      if (!['petition', 'amendment', 'information', 'unclear'].includes(value.intent)) {
+        throw new Error('invalid legislative intake intent');
+      }
+      if (['petition', 'amendment'].includes(value.intent)) {
+        const voteScope = text(value.voteScope, 'voteScope', 20);
+        if (!policy.voting.allowedScopes.includes(voteScope)) throw new Error('invalid intake vote scope');
+        return {
+          intent: value.intent,
+          title: text(value.title, 'title', 100),
+          summary: text(value.summary, 'summary', 1800),
+          voteScope,
+          question: null
+        };
+      }
+      return {
+        intent: value.intent,
+        title: null,
+        summary: null,
+        voteScope: null,
+        question: text(value.question, 'question', 500)
+      };
+    }
+  })).output;
+}
+
+export async function interpretJudicialRequest({ guildId, request, constitution, activeLaws, recentCases }) {
+  const laws = new Map(activeLaws.map((law) => [law.id, law]));
+  return (await callGovernanceJson({
+    guildId,
+    purpose: 'intake.judiciary',
+    model: governanceConfig.drafterModel,
+    instruction: `Classify and normalize one message addressed to the judiciary.
+Return exactly intent, summary, lawId, offenseCode, targetType, targetId, caseId, question.
+intent is criminal_case, constitutional_challenge, evidence, appeal, case_status, information, or unclear.
+criminal_case requires a replied or linked evidence message and must select one exact offense from supplied active laws.
+constitutional_challenge requires targetType law, case, sanction, or administrative_act and its numeric targetId.
+evidence adds the replied or linked message to an existing caseId. appeal requires caseId and the appellant grounds in summary.
+case_status only requests information about caseId. information is a general legal question.
+Never infer identity, authorship, timestamps, permissions, guilt, or evidence contents beyond DATA. Never create a sanction.
+For an action with missing data use unclear and ask one short Japanese question in question.
+For information, use question only to route the person to the general bot mention for authoritative read-only information. For unclear, ask one short Japanese clarification. All irrelevant fields must be null.
+This output is only an intake preview and has no power to file, decide, or punish.`,
+    data: {
+      request,
+      constitution: { version: constitution.version, content: constitution.content },
+      activeLaws: activeLaws.map((law) => ({
+        id: law.id,
+        code: law.code,
+        title: law.title,
+        offenses: (law.provisions.offenses ?? []).map((offense) => ({
+          code: offense.code,
+          title: offense.title,
+          elements: offense.elements
+        }))
+      })),
+      recentCases: recentCases.map((entry) => ({
+        id: entry.id,
+        kind: entry.kind,
+        status: entry.status,
+        accusedId: entry.accused_id,
+        reporterId: entry.reporter_id
+      }))
+    },
+    validate: (raw) => {
+      const value = assertObject(raw);
+      exactKeys(value, [
+        'intent', 'summary', 'lawId', 'offenseCode', 'targetType', 'targetId',
+        'caseId', 'question'
+      ], 'judicialIntake');
+      const intents = [
+        'criminal_case', 'constitutional_challenge', 'evidence', 'appeal',
+        'case_status', 'information', 'unclear'
+      ];
+      if (!intents.includes(value.intent)) throw new Error('invalid judicial intake intent');
+      const empty = {
+        summary: null, lawId: null, offenseCode: null, targetType: null,
+        targetId: null, caseId: null, question: null
+      };
+      if (value.intent === 'criminal_case') {
+        const lawId = integer(value.lawId, 'lawId', { min: 1 });
+        const law = laws.get(lawId);
+        const offenseCode = text(value.offenseCode, 'offenseCode', 40);
+        if (!law?.provisions.offenses?.some((offense) => offense.code === offenseCode)) {
+          throw new Error('intake selected an unknown enacted offense');
+        }
+        return { intent: value.intent, ...empty, summary: text(value.summary, 'summary', 1500), lawId, offenseCode };
+      }
+      if (value.intent === 'constitutional_challenge') {
+        const targetType = text(value.targetType, 'targetType', 40);
+        if (!['law', 'case', 'sanction', 'administrative_act'].includes(targetType)) {
+          throw new Error('invalid constitutional target type');
+        }
+        return {
+          intent: value.intent,
+          ...empty,
+          summary: text(value.summary, 'summary', 1800),
+          targetType,
+          targetId: integer(value.targetId, 'targetId', { min: 1 })
+        };
+      }
+      if (['evidence', 'appeal'].includes(value.intent)) {
+        return {
+          intent: value.intent,
+          ...empty,
+          caseId: integer(value.caseId, 'caseId', { min: 1 }),
+          summary: value.intent === 'appeal' ? text(value.summary, 'summary', 1800) : nullableText(value.summary, 'summary', 1500)
+        };
+      }
+      if (value.intent === 'case_status') {
+        return { intent: value.intent, ...empty, caseId: integer(value.caseId, 'caseId', { min: 1 }) };
+      }
+      return { intent: value.intent, ...empty, question: text(value.question, 'question', 500) };
+    }
   })).output;
 }
 

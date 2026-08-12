@@ -31,6 +31,7 @@ export function toolLabel(name, args = {}) {
 
   if (name === 'read') return args.direction === 'replies' ? '返信をたどる' : '読み込み';
   if (name === 'channels') return 'チャンネル一覧';
+  if (name === 'governance') return '統治記録';
   if (name === 'browser') return args.action === 'search' ? 'web 検索' : 'ブラウザ';
 
   return name;

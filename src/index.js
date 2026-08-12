@@ -29,6 +29,7 @@ import { sweepEnabledGuilds } from './archive/embed-job.js';
 import { embedConfig } from './embed/config.js';
 import { governanceConfig } from './governance/config.js';
 import { handleGovernanceComponent } from './governance/commands.js';
+import { handleGovernanceMention } from './governance/intake.js';
 import { deleteActivity } from './governance/db.js';
 import {
   onGuildChannelCreate,
@@ -272,6 +273,12 @@ async function handleMessageCreate(message) {
 
   if (isEmotionRequest(message)) {
     await handleEmotionRequest(message);
+    return;
+  }
+
+  // @立法 / @裁判 は一般agentより先に、権限を持たない構造化受付へ渡す。
+  // role mentionを一般会話の文脈として解釈させると、統治操作との境界が曖昧になる。
+  if (governanceConfig.enabled && await handleGovernanceMention(message)) {
     return;
   }
 

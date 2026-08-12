@@ -12,11 +12,13 @@ import { topTerms } from '../archive/terms.js';
 import { prewarm } from '../embed/worker.js';
 import { browserToolDefinition, runBrowserAction } from './browser.js';
 import { infoDefinition, runInfo } from './info.js';
+import { governanceDefinition, runGovernanceInfo } from './governance.js';
 import { resolveAuthorFilter, resolveMemberId } from './members.js';
 import { looksLikeSentence } from './sentence.js';
 import { runSemanticSearch, semanticAvailable } from './semantic.js';
 import { cdpAvailable } from './cdp.js';
 import { agentConfig } from './config.js';
+import { getGovernanceGuild } from '../governance/db.js';
 import {
   formatMessages,
   fromArchiveRow,
@@ -1703,6 +1705,7 @@ async function aggregateMessages(ctx, args) {
 export async function buildToolset(ctx) {
   const archiveAvailable = Boolean(getGuildState(ctx.guild.id));
   const browserAvailable = await cdpAvailable();
+  const governanceAvailable = Boolean(getGovernanceGuild(ctx.guild.id));
 
   // ベクトルがあるときだけ意味検索のモードを出す。無いギルドで定義ぶんを払わない。
   const semanticReady = archiveAvailable && await semanticAvailable(ctx.guild.id);
@@ -1721,6 +1724,9 @@ export async function buildToolset(ctx) {
     { definition: searchToolDefinition(flags), handler: (args) => runSearch(ctx, args, flags) },
     { definition: readDefinition(archiveAvailable), handler: (args) => runRead(ctx, args) },
     { definition: channelsDefinition, handler: (args) => listChannels(ctx, args) },
+    ...(governanceAvailable
+      ? [{ definition: governanceDefinition, handler: (args) => runGovernanceInfo(ctx, args) }]
+      : []),
     { definition: infoDefinition, handler: (args) => runInfo(ctx, args) },
     ...(browserAvailable
       ? [{ definition: browserToolDefinition(ctx.browserFull), handler: (args) => runBrowserAction(ctx, args) }]
@@ -1734,6 +1740,7 @@ export async function buildToolset(ctx) {
     definitions,
     archiveAvailable,
     browserAvailable,
+    governanceAvailable,
     semanticAvailable: semanticReady,
 
     async call(name, args) {
@@ -1750,4 +1757,3 @@ export async function buildToolset(ctx) {
     }
   };
 }
-

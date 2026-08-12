@@ -51,6 +51,37 @@ function everyoneForumOverwrite(guild, { discuss }) {
   };
 }
 
+async function createMentionRole(guild, name) {
+  const role = await guild.roles.create({
+    name,
+    permissions: [],
+    mentionable: true,
+    hoist: false,
+    reason: `Governance conversational address: ${name}`
+  });
+  await guild.members.me.roles.add(role, `Enable @${name} governance address`);
+  return role;
+}
+
+export async function ensureGovernanceMentionRoles(guild, governance) {
+  await guild.roles.fetch();
+  let legislature = governance.legislature_role_id
+    ? guild.roles.cache.get(governance.legislature_role_id)
+    : null;
+  let judiciary = governance.judiciary_role_id
+    ? guild.roles.cache.get(governance.judiciary_role_id)
+    : null;
+  if (!legislature) legislature = await createMentionRole(guild, '立法');
+  if (!judiciary) judiciary = await createMentionRole(guild, '裁判');
+  for (const role of [legislature, judiciary]) {
+    if (!role.mentionable) await role.setMentionable(true, 'Governance address roles must be mentionable');
+    if (!guild.members.me.roles.cache.has(role.id)) {
+      await guild.members.me.roles.add(role, 'Restore governance conversational address');
+    }
+  }
+  return { legislatureRoleId: legislature.id, judiciaryRoleId: judiciary.id };
+}
+
 export function governancePermissionReport(guild) {
   const me = guild.members.me;
   const required = [
@@ -84,6 +115,8 @@ export async function createGovernanceSurfaces(guild) {
     hoist: false,
     reason: 'Sakana governance appeal restriction'
   });
+  const legislatureRole = await createMentionRole(guild, '立法');
+  const judiciaryRole = await createMentionRole(guild, '裁判');
   const category = await guild.channels.create({
     name: governanceCategoryName(guild.name),
     type: ChannelType.GuildCategory,
@@ -158,6 +191,8 @@ export async function createGovernanceSurfaces(guild) {
   await syncAppealRoleOverwrites(guild, appealRole.id, courtChat.id);
   return {
     appealRoleId: appealRole.id,
+    legislatureRoleId: legislatureRole.id,
+    judiciaryRoleId: judiciaryRole.id,
     categoryId: category.id,
     parliamentForumId: parliament.id,
     courtForumId: court.id,

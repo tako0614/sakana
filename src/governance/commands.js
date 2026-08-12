@@ -1,12 +1,9 @@
 import {
   InteractionContextType,
   MessageFlags,
-  PermissionFlagsBits,
   SlashCommandBuilder
 } from 'discord.js';
-import { parseDiscordRef } from '../agent/format.js';
 import {
-  governanceConfig,
   isGovernanceOperator,
   loadBootstrapDocuments,
   parseOperationalSetting
@@ -15,25 +12,13 @@ import {
   bootstrapGovernanceGuild,
   createAdministrativeAct,
   getActiveConstitution,
-  getAdministrativeAct,
-  getCase,
   getGovernanceGuild,
   getOperationalSetting,
-  getLaw,
-  getProposal,
-  listCaseDecisions,
-  listCaseEvidence,
-  listCaseSubmissions,
   listActionFailures,
-  listAdministrativeActs,
   listAudit,
   listCases,
-  listLaws,
   listOperationalSettings,
-  listProposalVotes,
   listProposals,
-  proposalVoteSummary,
-  proposalElectorate,
   retryFailedActions,
   setOperationalSetting,
   updateGovernanceGuild,
@@ -45,17 +30,12 @@ import {
   postGazette
 } from './discord.js';
 import {
-  addEvidenceToCase,
-  appealCase,
   approveCase,
   backfillGovernanceActivity,
   castAndPublishVote,
-  fileAmendment,
-  fileConstitutionalChallenge,
-  fileCriminalCase,
-  filePetition,
   setTrustedMember
 } from './service.js';
+import { handleGovernanceIntakeComponent } from './intake.js';
 
 const EPHEMERAL = MessageFlags.Ephemeral;
 
@@ -72,39 +52,6 @@ function requireInitialized(interaction) {
 
 function requireOperator(interaction) {
   if (!isGovernanceOperator(interaction.member)) throw new Error('Discord ownerまたはGOVERNANCE_OPERATOR_USERSだけが実行できます。');
-}
-
-async function fetchEvidence(interaction, raw, { requiredViewerIds = [] } = {}) {
-  const parsed = parseDiscordRef(raw);
-  if (!parsed?.messageId) throw new Error('証拠にはDiscordメッセージリンクまたはメッセージIDを指定してください。');
-  if (parsed.guildId && parsed.guildId !== interaction.guildId) throw new Error('別サーバーのメッセージは証拠にできません。');
-  const channelId = parsed.channelId ?? interaction.channelId;
-  const channel = await interaction.guild.channels.fetch(channelId).catch(() => null);
-  if (!channel?.isTextBased?.()) throw new Error('証拠チャンネルを読めません。');
-  const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
-  if (!channel.permissionsFor(member)?.has(PermissionFlagsBits.ViewChannel)) throw new Error('自分が閲覧できないメッセージは提出できません。');
-  for (const userId of new Set(requiredViewerIds.filter(Boolean))) {
-    const viewer = await interaction.guild.members.fetch(userId).catch(() => null);
-    if (!viewer || !channel.permissionsFor(viewer)?.has(PermissionFlagsBits.ViewChannel)) {
-      throw new Error('相手当事者が閲覧できないチャンネルの内容は証拠にできません。共有可能な裁判チャットへ提示してください。');
-    }
-  }
-  const message = await channel.messages.fetch(parsed.messageId).catch(() => null);
-  if (!message) throw new Error('証拠メッセージが見つかりません。');
-  const content = [message.content, ...message.attachments.map((attachment) => `[添付] ${attachment.name} ${attachment.url}`)]
-    .filter(Boolean).join('\n');
-  if (!content) throw new Error('保存できる本文または添付名がありません。');
-  return {
-    messageId: message.id,
-    channelId: message.channelId,
-    authorId: message.author.id,
-    content: content.slice(0, 8000),
-    occurredAt: message.createdTimestamp
-  };
-}
-
-function linkToThread(guildId, threadId) {
-  return `https://discord.com/channels/${guildId}/${threadId}`;
 }
 
 function statusText(governance, interaction) {
@@ -126,6 +73,7 @@ function statusText(governance, interaction) {
     `執行mode: ${governance.enforcement_mode}`,
     `憲法: v${constitution?.version ?? '?'} / ${constitution?.content_hash?.slice(0, 12) ?? '?'}`,
     `trusted role: ${governance.trusted_role_id ? `<@&${governance.trusted_role_id}> (名前はサーバー側の表示だけに使用)` : 'なし (任意機能は無効)'}`,
+    `会話入口: 立法 ${governance.legislature_role_id ? `<@&${governance.legislature_role_id}>` : '準備中'} / 裁判 ${governance.judiciary_role_id ? `<@&${governance.judiciary_role_id}>` : '準備中'} / 一般 <@${interaction.client.user.id}>`,
     `議会: <#${governance.parliament_forum_id}> / 裁判所: <#${governance.court_forum_id}> / 官報: <#${governance.gazette_channel_id}>`,
     `bot権限: ${permissions.ok ? 'OK' : `不足 ${permissions.missing.join(', ')}`}`,
     governance.weekly_last_error ? `週次AI再試行中: ${governance.weekly_last_error}` : null,
@@ -137,7 +85,7 @@ function statusText(governance, interaction) {
 const governanceCommand = {
   data: new SlashCommandBuilder()
     .setName('governance')
-    .setDescription('Sakana統治機能の初期化・状態・運用設定')
+    .setDescription('統治機能の初期化・状態・運用設定')
     .setContexts(InteractionContextType.Guild)
     .addSubcommand((sub) => sub
       .setName('bootstrap')
@@ -213,7 +161,7 @@ const governanceCommand = {
       });
       await postGazette(interaction.guild, result.guild, '初期憲法 v1', `${result.constitution.content}\n\n## Policy\n\n\`\`\`json\n${JSON.stringify(result.constitution.policy, null, 2)}\n\`\`\`\n\ncontent hash: ${result.constitution.content_hash}\npolicy hash: ${result.constitution.policy_hash}`).catch((error) => {
         console.error('Initial constitution gazette publication failed:', error);
-        warnings.push('官報への初期憲法掲載に失敗しました。`/constitution show`では取得できます。');
+        warnings.push('官報への初期憲法掲載に失敗しました。bot本体へのメンションでは正本DBから取得できます。');
       });
       await interaction.editReply(`初期化しました。trusted role: ${role ? `${role.name} (${role.id})` : 'なし'}。直近活動 ${backfilled}件を取り込みました。執行modeは ${result.guild.enforcement_mode} です。${warnings.length ? `\n注意: ${warnings.join(' ')}` : ''}`);
       return;
@@ -326,265 +274,6 @@ const governanceCommand = {
   }
 };
 
-const petitionCommand = {
-  data: new SlashCommandBuilder()
-    .setName('petition')
-    .setDescription('法律の制定を正式に請願します')
-    .setContexts(InteractionContextType.Guild)
-    .addSubcommand((sub) => sub
-      .setName('file')
-      .setDescription('AIに法案を起草させ、正式手続きを開始します')
-      .addStringOption((option) => option.setName('title').setDescription('請願の題名').setMaxLength(100).setRequired(true))
-      .addStringOption((option) => option.setName('problem').setDescription('解決したい制度上の問題').setMaxLength(1800).setRequired(true))
-      .addStringOption((option) => option.setName('scope').setDescription('投票scope (省略時は憲法既定)').setRequired(false)
-        .addChoices({ name: '全員', value: 'all' }, { name: 'trusted userのみ', value: 'trusted' })))
-    .addSubcommand((sub) => sub
-      .setName('status')
-      .setDescription('法案の状態を表示します')
-      .addIntegerOption((option) => option.setName('id').setDescription('法案ID').setRequired(true).setMinValue(1))),
-
-  async execute(interaction) {
-    requireInitialized(interaction);
-    const sub = interaction.options.getSubcommand();
-    if (sub === 'status') {
-      const proposal = getProposal(interaction.options.getInteger('id', true));
-      if (!proposal || proposal.guild_id !== interaction.guildId) throw new Error('法案が見つかりません。');
-      await interaction.reply({ content: `L-${proposal.id} ${proposal.title}\n状態: ${proposal.status}\n改訂: ${proposal.revision}\n${proposal.forum_thread_id ? linkToThread(interaction.guildId, proposal.forum_thread_id) : ''}`, flags: EPHEMERAL });
-      return;
-    }
-    await interaction.deferReply({ flags: EPHEMERAL });
-    const proposal = await filePetition(interaction.guild, interaction.member, {
-      title: interaction.options.getString('title', true),
-      summary: interaction.options.getString('problem', true),
-      voteScope: interaction.options.getString('scope'),
-      eventId: interaction.id
-    });
-    await interaction.editReply(`法案 L-${proposal.id} を起草し、草案期間を開始しました。\n${linkToThread(interaction.guildId, proposal.forum_thread_id)}`);
-  }
-};
-
-const lawCommand = {
-  data: new SlashCommandBuilder()
-    .setName('law')
-    .setDescription('法律と記名投票を確認します')
-    .setContexts(InteractionContextType.Guild)
-    .addSubcommand((sub) => sub.setName('list').setDescription('現行法を一覧表示します'))
-    .addSubcommand((sub) => sub.setName('show').setDescription('法律または法案を表示します')
-      .addStringOption((option) => option.setName('type').setDescription('対象').setRequired(true)
-        .addChoices({ name: 'law', value: 'law' }, { name: 'proposal', value: 'proposal' }))
-      .addIntegerOption((option) => option.setName('id').setDescription('ID').setRequired(true).setMinValue(1)))
-    .addSubcommand((sub) => sub.setName('votes').setDescription('法案の全記名票を表示します')
-      .addIntegerOption((option) => option.setName('proposal_id').setDescription('法案ID').setRequired(true).setMinValue(1))),
-
-  async execute(interaction) {
-    requireInitialized(interaction);
-    const sub = interaction.options.getSubcommand();
-    if (sub === 'list') {
-      const laws = listLaws(interaction.guildId);
-      await interaction.reply({ content: laws.map((law) => `#${law.id} ${law.code} ${law.title} (<t:${Math.floor(law.effective_at / 1000)}:d>)`).join('\n') || '現行法はありません。' });
-      return;
-    }
-    if (sub === 'show') {
-      const type = interaction.options.getString('type', true);
-      const id = interaction.options.getInteger('id', true);
-      const target = type === 'law' ? getLaw(id) : getProposal(id);
-      if (!target || target.guild_id !== interaction.guildId) throw new Error('対象が見つかりません。');
-      const content = type === 'law'
-        ? `# ${target.code} ${target.title}\n\n${target.text}\n\n${JSON.stringify(target.provisions, null, 2)}`
-        : `# L-${target.id} ${target.title}\n\n${target.summary}\n\n${JSON.stringify(target.body, null, 2)}`;
-      await interaction.reply({ files: [{ attachment: Buffer.from(content), name: `${type}-${id}.md` }] });
-      return;
-    }
-    const id = interaction.options.getInteger('proposal_id', true);
-    const proposal = getProposal(id);
-    if (!proposal || proposal.guild_id !== interaction.guildId) throw new Error('法案が見つかりません。');
-    const summary = proposalVoteSummary(id);
-    const rows = listProposalVotes(id);
-    const electorate = proposalElectorate(id);
-    const content = [
-      `L-${id} ${proposal.title}`,
-      `賛成 ${summary.yes} / 反対 ${summary.no} / 棄権 ${summary.abstain} / trusted反対 ${summary.trustedNo}/${summary.trustedTotal}有効票 (棄権 ${summary.trustedAbstain} / 有権者 ${summary.trustedElectorate})`,
-      '',
-      ...rows.map((row) => `${row.user_id}\t${row.choice}\ttrusted=${Boolean(row.trusted)}\t${new Date(row.updated_at).toISOString()}`),
-      '',
-      '# Electorate snapshot',
-      ...electorate.map((row) => `${row.user_id}\tgeneral=${Boolean(row.eligible_general)}\ttrusted=${Boolean(row.trusted)}`)
-    ].join('\n');
-    await interaction.reply({ content: `L-${id} の全記名票です。`, files: [{ attachment: Buffer.from(content), name: `proposal-${id}-votes.txt` }] });
-  }
-};
-
-const constitutionCommand = {
-  data: new SlashCommandBuilder()
-    .setName('constitution')
-    .setDescription('憲法の確認・改憲提案・事後違憲審査')
-    .setContexts(InteractionContextType.Guild)
-    .addSubcommand((sub) => sub.setName('show').setDescription('現行憲法とpolicyを表示します'))
-    .addSubcommand((sub) => sub.setName('propose').setDescription('改憲案をAIに起草させます')
-      .addStringOption((option) => option.setName('title').setDescription('改憲案の題名').setMaxLength(100).setRequired(true))
-      .addStringOption((option) => option.setName('change').setDescription('変更したい内容').setMaxLength(1800).setRequired(true))
-      .addStringOption((option) => option.setName('scope').setDescription('投票scope (省略時は憲法既定)').setRequired(false)
-        .addChoices({ name: '全員', value: 'all' }, { name: 'trusted userのみ', value: 'trusted' })))
-    .addSubcommand((sub) => sub.setName('challenge').setDescription('法律・判決・処分の違憲審査を申し立てます')
-      .addStringOption((option) => option.setName('target_type').setDescription('対象').setRequired(true)
-        .addChoices(
-          { name: 'law', value: 'law' },
-          { name: 'case', value: 'case' },
-          { name: 'sanction', value: 'sanction' },
-          { name: 'administrative act', value: 'administrative_act' }
-        ))
-      .addIntegerOption((option) => option.setName('target_id').setDescription('対象ID').setRequired(true).setMinValue(1))
-      .addStringOption((option) => option.setName('reason').setDescription('違憲と考える理由').setMaxLength(1800).setRequired(true))),
-
-  async execute(interaction) {
-    requireInitialized(interaction);
-    const sub = interaction.options.getSubcommand();
-    if (sub === 'show') {
-      const constitution = getActiveConstitution(interaction.guildId);
-      const content = `${constitution.content}\n\n## Policy\n\n\u0060\u0060\u0060json\n${JSON.stringify(constitution.policy, null, 2)}\n\u0060\u0060\u0060`;
-      await interaction.reply({ content: `現行憲法 v${constitution.version}`, files: [{ attachment: Buffer.from(content), name: `constitution-v${constitution.version}.md` }] });
-      return;
-    }
-    await interaction.deferReply({ flags: EPHEMERAL });
-    if (sub === 'propose') {
-      const proposal = await fileAmendment(interaction.guild, interaction.member, {
-        title: interaction.options.getString('title', true),
-        summary: interaction.options.getString('change', true),
-        voteScope: interaction.options.getString('scope'),
-        eventId: interaction.id
-      });
-      await interaction.editReply(`改憲案 L-${proposal.id} を公開しました。\n${linkToThread(interaction.guildId, proposal.forum_thread_id)}`);
-      return;
-    }
-    const caseRecord = await fileConstitutionalChallenge(interaction.guild, interaction.member, {
-      targetType: interaction.options.getString('target_type', true),
-      targetId: interaction.options.getInteger('target_id', true),
-      reason: interaction.options.getString('reason', true),
-      eventId: interaction.id
-    });
-    await interaction.editReply(`違憲審査 C-${caseRecord.id} を受理しました。\n${linkToThread(interaction.guildId, caseRecord.public_thread_id)}`);
-  }
-};
-
-const administrationCommand = {
-  data: new SlashCommandBuilder()
-    .setName('administration')
-    .setDescription('行政行為の公開台帳を確認します')
-    .setContexts(InteractionContextType.Guild)
-    .addSubcommand((sub) => sub.setName('list').setDescription('最近の行政行為を一覧表示します'))
-    .addSubcommand((sub) => sub.setName('show').setDescription('行政行為の詳細を表示します')
-      .addIntegerOption((option) => option.setName('id').setDescription('行政行為ID').setRequired(true).setMinValue(1))),
-
-  async execute(interaction) {
-    requireInitialized(interaction);
-    const sub = interaction.options.getSubcommand();
-    if (sub === 'list') {
-      const acts = listAdministrativeActs(interaction.guildId, 25);
-      await interaction.reply({
-        content: acts.map((act) => `A-${act.id} ${act.kind} / ${act.status} / <t:${Math.floor(act.created_at / 1000)}:f> / ${act.summary}`).join('\n').slice(0, 1900) || '行政行為はありません。',
-        allowedMentions: { parse: [] }
-      });
-      return;
-    }
-    const act = getAdministrativeAct(interaction.options.getInteger('id', true));
-    if (!act || act.guild_id !== interaction.guildId) throw new Error('行政行為が見つかりません。');
-    const content = `# 行政行為 A-${act.id}\n\nkind: ${act.kind}\nstatus: ${act.status}\nactor: ${act.actor_id ?? act.actor_type}\ncreated: ${new Date(act.created_at).toISOString()}\n\n${act.summary}\n\n\u0060\u0060\u0060json\n${JSON.stringify(act.detail, null, 2)}\n\u0060\u0060\u0060`;
-    await interaction.reply({ files: [{ attachment: Buffer.from(content), name: `administrative-act-${act.id}.md` }] });
-  }
-};
-
-const judgeCommand = {
-  data: new SlashCommandBuilder()
-    .setName('judge')
-    .setDescription('法律に基づく事件・証拠・上訴')
-    .setContexts(InteractionContextType.Guild)
-    .addSubcommand((sub) => sub.setName('file').setDescription('法律違反を正式に申し立てます')
-      .addUserOption((option) => option.setName('accused').setDescription('被告').setRequired(true))
-      .addIntegerOption((option) => option.setName('law_id').setDescription('現行法ID').setRequired(true).setMinValue(1))
-      .addStringOption((option) => option.setName('offense_code').setDescription('法律に定義された構成要件コード').setMaxLength(40).setRequired(true))
-      .addStringOption((option) => option.setName('summary').setDescription('申立ての概要').setMaxLength(1500).setRequired(true))
-      .addStringOption((option) => option.setName('evidence').setDescription('証拠メッセージのリンク').setRequired(true)))
-    .addSubcommand((sub) => sub.setName('evidence').setDescription('答弁中の事件に証拠を追加します')
-      .addIntegerOption((option) => option.setName('case_id').setDescription('事件ID').setRequired(true).setMinValue(1))
-      .addStringOption((option) => option.setName('message').setDescription('証拠メッセージのリンク').setRequired(true)))
-    .addSubcommand((sub) => sub.setName('status').setDescription('事件の状態を表示します')
-      .addIntegerOption((option) => option.setName('case_id').setDescription('事件ID').setRequired(true).setMinValue(1)))
-    .addSubcommand((sub) => sub.setName('record').setDescription('当事者用の証拠・主張・判決記録を取得します')
-      .addIntegerOption((option) => option.setName('case_id').setDescription('事件ID').setRequired(true).setMinValue(1)))
-    .addSubcommand((sub) => sub.setName('appeal').setDescription('banまたは3日以上timeoutの判決へ1回だけ上訴します')
-      .addIntegerOption((option) => option.setName('case_id').setDescription('事件ID').setRequired(true).setMinValue(1))
-      .addStringOption((option) => option.setName('grounds').setDescription('上訴理由').setMaxLength(1800).setRequired(true))),
-
-  async execute(interaction) {
-    requireInitialized(interaction);
-    const sub = interaction.options.getSubcommand();
-    const caseId = interaction.options.getInteger('case_id');
-    if (sub === 'status') {
-      const caseRecord = getCase(caseId);
-      if (!caseRecord || caseRecord.guild_id !== interaction.guildId) throw new Error('事件が見つかりません。');
-      await interaction.reply({ content: `C-${caseRecord.id}\n状態: ${caseRecord.status}\n被告: ${caseRecord.accused_id ? `<@${caseRecord.accused_id}>` : '-'}\n法: ${caseRecord.law_id ? `#${caseRecord.law_id} / ${caseRecord.offense_code}` : '-'}\n判決: ${caseRecord.verdict ? JSON.stringify(caseRecord.verdict) : '-'}\n${caseRecord.public_thread_id ? linkToThread(interaction.guildId, caseRecord.public_thread_id) : ''}`.slice(0, 1900), flags: EPHEMERAL, allowedMentions: { parse: [] } });
-      return;
-    }
-    if (sub === 'record') {
-      const caseRecord = getCase(caseId);
-      if (!caseRecord || caseRecord.guild_id !== interaction.guildId) throw new Error('事件が見つかりません。');
-      const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
-      if (![caseRecord.reporter_id, caseRecord.accused_id].includes(interaction.user.id) && !isGovernanceOperator(member)) {
-        throw new Error('事件当事者または技術operatorだけが完全記録を取得できます。');
-      }
-      const evidence = listCaseEvidence(caseId);
-      const submissions = listCaseSubmissions(caseId);
-      const decisions = listCaseDecisions(caseId);
-      const content = [
-        `# 事件 C-${caseId} 完全記録`,
-        '',
-        `status: ${caseRecord.status}`,
-        `law: ${caseRecord.law_id ?? '-'} / offense: ${caseRecord.offense_code ?? '-'}`,
-        `alleged_at: ${caseRecord.alleged_at ? new Date(caseRecord.alleged_at).toISOString() : '-'}`,
-        '',
-        '## 証拠',
-        ...evidence.map((entry) => `### E-${entry.id}\nauthor: ${entry.author_id ?? '-'}\noccurred_at: ${entry.occurred_at ? new Date(entry.occurred_at).toISOString() : '-'}\nhash: ${entry.content_hash}\n\n${entry.content}`),
-        '',
-        '## 当事者主張',
-        ...submissions.map((entry) => `### S-${entry.id} ${entry.kind} by ${entry.author_id}\nhash: ${entry.content_hash}\n\n${entry.content}`),
-        '',
-        '## パネル判断',
-        ...decisions.map((entry) => `### ${entry.phase} seat ${entry.seat}\n${JSON.stringify(entry.output, null, 2)}`)
-      ].join('\n');
-      await interaction.reply({ content: `C-${caseId} の完全記録です。`, files: [{ attachment: Buffer.from(content), name: `case-${caseId}-record.md` }], flags: EPHEMERAL });
-      return;
-    }
-    await interaction.deferReply({ flags: EPHEMERAL });
-    if (sub === 'file') {
-      const accused = interaction.options.getMember('accused') ?? await interaction.guild.members.fetch(interaction.options.getUser('accused', true).id);
-      if (accused.user.bot) throw new Error('botを被告にはできません。');
-      const evidence = await fetchEvidence(interaction, interaction.options.getString('evidence', true), { requiredViewerIds: [accused.id] });
-      const caseRecord = await fileCriminalCase(interaction.guild, interaction.member, {
-        accused,
-        lawId: interaction.options.getInteger('law_id', true),
-        offenseCode: interaction.options.getString('offense_code', true),
-        summary: interaction.options.getString('summary', true),
-        evidence,
-        eventId: interaction.id
-      });
-      await interaction.editReply(`事件 C-${caseRecord.id} を受理しました。答弁期限: <t:${Math.floor(caseRecord.defense_until / 1000)}:F>\n${linkToThread(interaction.guildId, caseRecord.public_thread_id)}`);
-      return;
-    }
-    if (sub === 'evidence') {
-      const caseRecord = getCase(caseId);
-      if (!caseRecord || caseRecord.guild_id !== interaction.guildId) throw new Error('事件が見つかりません。');
-      const evidence = await fetchEvidence(interaction, interaction.options.getString('message', true), {
-        requiredViewerIds: [caseRecord.reporter_id, caseRecord.accused_id].filter((id) => id !== interaction.user.id)
-      });
-      const id = await addEvidenceToCase(interaction.guild, interaction.member, caseId, evidence);
-      await interaction.editReply(`証拠 #${id} を事件 C-${caseId} に保存しました。`);
-      return;
-    }
-    const result = await appealCase(interaction.guild, interaction.member, caseId, interaction.options.getString('grounds', true));
-    await interaction.editReply(`事件 C-${result.id} の上訴を受理し、別パネルの再審を開始しました。`);
-  }
-};
-
 function safeCommandError(error) {
   const message = String(error?.message ?? error);
   if (/Governance model HTTP|Governance AI is busy|fetch failed|JSON|SQLITE|DiscordAPIError/i.test(message)) {
@@ -611,12 +300,7 @@ function withGovernanceErrors(command) {
 }
 
 export const governanceCommands = [
-  governanceCommand,
-  petitionCommand,
-  lawCommand,
-  constitutionCommand,
-  administrationCommand,
-  judgeCommand
+  governanceCommand
 ].map(withGovernanceErrors);
 
 export async function handleGovernanceComponent(interaction) {
@@ -626,6 +310,9 @@ export async function handleGovernanceComponent(interaction) {
   if (!Number.isInteger(id) || id < 1) {
     await interaction.reply({ content: '案件IDが壊れています。', flags: EPHEMERAL });
     return true;
+  }
+  if (action === 'intake') {
+    return handleGovernanceIntakeComponent(interaction, id, value);
   }
   await interaction.deferReply({ flags: EPHEMERAL });
   try {

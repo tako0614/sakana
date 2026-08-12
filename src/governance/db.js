@@ -15,6 +15,8 @@ db.exec(`
     enforcement_mode TEXT NOT NULL DEFAULT 'shadow',
     trusted_role_id TEXT NOT NULL,
     appeal_role_id TEXT NOT NULL,
+    legislature_role_id TEXT NOT NULL DEFAULT '',
+    judiciary_role_id TEXT NOT NULL DEFAULT '',
     category_id TEXT,
     parliament_forum_id TEXT NOT NULL,
     court_forum_id TEXT NOT NULL,
@@ -432,6 +434,39 @@ for (const [table, columns] of Object.entries({
 }
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (6, ?)').run(Date.now());
 
+{
+  const existing = new Set(db.pragma('table_info(governance_guilds)').map((row) => row.name));
+  for (const [name, definition] of [
+    ['legislature_role_id', "TEXT NOT NULL DEFAULT ''"],
+    ['judiciary_role_id', "TEXT NOT NULL DEFAULT ''"]
+  ]) {
+    if (!existing.has(name)) db.exec(`ALTER TABLE governance_guilds ADD COLUMN ${name} ${definition}`);
+  }
+}
+db.exec(`
+  CREATE TABLE IF NOT EXISTS governance_intakes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    action TEXT NOT NULL,
+    requester_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    source_message_id TEXT NOT NULL UNIQUE,
+    response_message_id TEXT,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    expires_at INTEGER NOT NULL,
+    result_type TEXT,
+    result_id TEXT,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_intakes_pending
+    ON governance_intakes(guild_id, requester_id, status, expires_at);
+`);
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (7, ?)').run(Date.now());
+
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
 db.prepare("UPDATE governance_outbox SET status = 'error', last_error = 'interrupted before completion' WHERE status = 'running'").run();
@@ -468,6 +503,10 @@ function hydrateAdministrativeAct(row) {
   return row ? { ...row, detail: parseJson(row.detail_json, {}) } : null;
 }
 
+function hydrateIntake(row) {
+  return row ? { ...row, payload: parseJson(row.payload_json, {}) } : null;
+}
+
 export function getGovernanceGuild(guildId) {
   return hydrateGuild(db.prepare('SELECT * FROM governance_guilds WHERE guild_id = ?').get(String(guildId)));
 }
@@ -498,15 +537,18 @@ export const bootstrapGovernanceGuild = db.transaction((input) => {
   const constitutionId = Number(inserted.lastInsertRowid);
   db.prepare(`
     INSERT INTO governance_guilds (
-      guild_id, status, enforcement_mode, trusted_role_id, appeal_role_id, category_id,
+      guild_id, status, enforcement_mode, trusted_role_id, appeal_role_id,
+      legislature_role_id, judiciary_role_id, category_id,
       parliament_forum_id, court_forum_id, court_chat_channel_id, gazette_channel_id,
       active_constitution_id, created_at, updated_at
-    ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     input.guildId,
     input.enforcementMode,
     input.trustedRoleId,
     input.appealRoleId,
+    input.legislatureRoleId ?? '',
+    input.judiciaryRoleId ?? '',
     input.categoryId ?? null,
     input.parliamentForumId,
     input.courtForumId,
@@ -534,7 +576,8 @@ export const bootstrapGovernanceGuild = db.transaction((input) => {
 
 export function updateGovernanceGuild(guildId, patch) {
   const allowed = new Set([
-    'status', 'enforcement_mode', 'trusted_role_id', 'appeal_role_id', 'category_id',
+    'status', 'enforcement_mode', 'trusted_role_id', 'appeal_role_id',
+    'legislature_role_id', 'judiciary_role_id', 'category_id',
     'parliament_forum_id', 'court_forum_id', 'court_chat_channel_id', 'gazette_channel_id',
     'active_constitution_id', 'last_weekly_scan_at', 'weekly_retry_after',
     'weekly_failure_count', 'weekly_last_error'
@@ -601,6 +644,60 @@ export function setOperationalSetting(guildId, key, value, actorId) {
 
 export function listOperationalSettings(guildId) {
   return Object.keys(OPERATIONAL_SETTING_DEFAULTS).map((key) => ({ key, value: getOperationalSetting(guildId, key) }));
+}
+
+export function createGovernanceIntake(input) {
+  const now = Date.now();
+  db.prepare(`
+    INSERT OR IGNORE INTO governance_intakes
+      (guild_id, branch, action, requester_id, channel_id, source_message_id,
+       payload_json, status, expires_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+  `).run(
+    String(input.guildId), String(input.branch), String(input.action), String(input.requesterId),
+    String(input.channelId), String(input.sourceMessageId), canonicalJson(input.payload ?? {}),
+    Number(input.expiresAt), now, now
+  );
+  return hydrateIntake(db.prepare('SELECT * FROM governance_intakes WHERE source_message_id = ?')
+    .get(String(input.sourceMessageId)));
+}
+
+export function getGovernanceIntake(id) {
+  return hydrateIntake(db.prepare('SELECT * FROM governance_intakes WHERE id = ?').get(Number(id)));
+}
+
+export function updateGovernanceIntake(id, patch) {
+  const allowed = new Set([
+    'response_message_id', 'payload_json', 'status', 'expires_at', 'result_type',
+    'result_id', 'last_error'
+  ]);
+  const normalized = { ...patch };
+  if ('payload' in normalized) {
+    normalized.payload_json = canonicalJson(normalized.payload);
+    delete normalized.payload;
+  }
+  const entries = Object.entries(normalized).filter(([key]) => allowed.has(key));
+  if (entries.length === 0) return getGovernanceIntake(id);
+  const sql = entries.map(([key]) => `${key} = @${key}`).join(', ');
+  db.prepare(`UPDATE governance_intakes SET ${sql}, updated_at = @updated_at WHERE id = @id`)
+    .run({ id: Number(id), updated_at: Date.now(), ...Object.fromEntries(entries) });
+  return getGovernanceIntake(id);
+}
+
+export function claimGovernanceIntake(id, requesterId, now = Date.now()) {
+  const result = db.prepare(`
+    UPDATE governance_intakes
+    SET status = 'processing', updated_at = ?
+    WHERE id = ? AND requester_id = ? AND status = 'pending' AND expires_at > ?
+  `).run(now, Number(id), String(requesterId), now);
+  return result.changes === 1 ? getGovernanceIntake(id) : null;
+}
+
+export function expireGovernanceIntakes(now = Date.now()) {
+  return db.prepare(`
+    UPDATE governance_intakes SET status = 'expired', updated_at = ?
+    WHERE status = 'pending' AND expires_at <= ?
+  `).run(now, now).changes;
 }
 
 export function authorizeTrustedMutation({ guildId, userId, roleId, desired, authorizedBy, ttlMs = 60_000 }) {
@@ -1357,6 +1454,7 @@ export function pruneGovernance(keepMs = 90 * 86_400_000) {
   db.prepare('DELETE FROM governance_agent_attempts WHERE created_at < ?').run(cutoff);
   db.prepare('DELETE FROM governance_activity WHERE created_at < ?').run(cutoff);
   db.prepare('DELETE FROM governance_restriction_usage WHERE created_at < ?').run(cutoff);
+  db.prepare("DELETE FROM governance_intakes WHERE status != 'pending' AND updated_at < ?").run(cutoff);
 }
 
 export { db as governanceDatabase };
