@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import 'dotenv/config';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { REST, Routes } from 'discord.js';
 import { governanceCategoryName, loadBootstrapDocuments } from '../src/governance/config.js';
@@ -41,6 +41,23 @@ function initialGazetteMessages(messages) {
     if (message.author.id !== process.env.DISCORD_CLIENT_ID) return [];
     selected.push(message);
     if (message.content.includes(`policy hash: ${PROVISIONAL_POLICY_HASH}`)) return selected;
+  }
+  return [];
+}
+
+function replacementGazetteMessages(messages, serverName, replacementPolicyHash) {
+  const ordered = [...messages].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+  const headings = [
+    `# 初期憲法 v1\n\n# ${serverName}憲法`,
+    `# 初期憲法 v1（正本・差替済み）\n\n# ${serverName}憲法`
+  ];
+  const start = ordered.findIndex((message) => headings.some((heading) => message.content.startsWith(heading)));
+  if (start < 0) return [];
+  const selected = [];
+  for (const message of ordered.slice(start)) {
+    if (message.author.id !== process.env.DISCORD_CLIENT_ID) return [];
+    selected.push(message);
+    if (message.content.includes(`policy hash: ${replacementPolicyHash}`)) return selected;
   }
   return [];
 }
@@ -97,9 +114,10 @@ if (!apply) {
 const backupDirectory = resolve('backups');
 mkdirSync(backupDirectory, { recursive: true });
 const databaseBackup = join(backupDirectory, `database-pre-constitution-replacement-${guildId}.sqlite`);
-await governanceDatabase.backup(databaseBackup);
 
 if (current.content_hash === PROVISIONAL_HASH) {
+  if (existsSync(databaseBackup)) throw new Error(`既存のDBバックアップがあります: ${databaseBackup}`);
+  await governanceDatabase.backup(databaseBackup);
   governanceDatabase.transaction(() => {
     const result = governanceDatabase.prepare(`
       UPDATE governance_constitutions
@@ -143,19 +161,30 @@ await rest.patch(Routes.channel(governance.category_id), {
 
 const messages = await rest.get(Routes.channelMessages(governance.gazette_channel_id), { query: new URLSearchParams({ limit: '100' }) });
 const provisionalMessages = initialGazetteMessages(messages);
-writeFileSync(
-  join(backupDirectory, `gazette-pre-constitution-replacement-${guildId}.json`),
-  `${JSON.stringify(provisionalMessages, null, 2)}\n`,
-  { mode: 0o600 }
-);
+const replacementMessages = replacementGazetteMessages(messages, serverName, replacementPolicyHash);
+const gazetteBackup = join(backupDirectory, `gazette-pre-constitution-replacement-${guildId}.json`);
+if (provisionalMessages.length > 0) {
+  if (existsSync(gazetteBackup)) throw new Error(`既存の官報バックアップがあります: ${gazetteBackup}`);
+  writeFileSync(gazetteBackup, `${JSON.stringify(provisionalMessages, null, 2)}\n`, { mode: 0o600 });
+}
 
 const body = `${documents.constitution}\n\n## Policy\n\n\`\`\`json\n${JSON.stringify(documents.policy, null, 2)}\n\`\`\`\n\ncontent hash: ${replacementHash}\npolicy hash: ${replacementPolicyHash}`;
 const published = [];
-for (const content of messageChunks('初期憲法 v1', body)) {
-  const message = await rest.post(Routes.channelMessages(governance.gazette_channel_id), {
-    body: { content, allowed_mentions: { parse: [] } }
-  });
-  published.push(message.id);
+if (replacementMessages.length === 0) {
+  for (const content of messageChunks('初期憲法 v1', body)) {
+    const message = await rest.post(Routes.channelMessages(governance.gazette_channel_id), {
+      body: { content, allowed_mentions: { parse: [] } }
+    });
+    published.push(message.id);
+  }
+} else {
+  const first = replacementMessages[0];
+  const legacyHeading = '# 初期憲法 v1（正本・差替済み）';
+  if (first.content.startsWith(legacyHeading)) {
+    await rest.patch(Routes.channelMessage(governance.gazette_channel_id, first.id), {
+      body: { content: first.content.replace(legacyHeading, '# 初期憲法 v1'), allowed_mentions: { parse: [] } }
+    });
+  }
 }
 for (const message of provisionalMessages) {
   await rest.delete(Routes.channelMessage(governance.gazette_channel_id, message.id), {
@@ -165,8 +194,9 @@ for (const message of provisionalMessages) {
 
 console.log(JSON.stringify({
   ...summary,
-  databaseBackup,
+  databaseBackup: existsSync(databaseBackup) ? databaseBackup : null,
   oldGazetteMessagesRemoved: provisionalMessages.map((message) => message.id),
-  newGazetteMessages: published
+  newGazetteMessages: published,
+  existingGazetteMessages: replacementMessages.map((message) => message.id)
 }, null, 2));
 governanceDatabase.close();
