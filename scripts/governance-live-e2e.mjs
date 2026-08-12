@@ -25,7 +25,7 @@ function usage() {
   return [
     'Usage:',
     '  node scripts/governance-live-e2e.mjs plan',
-    '  LIVE_GOVERNANCE_E2E=1 node scripts/governance-live-e2e.mjs seed --guild <guild-id> --actor <owner-id> --confirm-shadow',
+    '  LIVE_GOVERNANCE_E2E=1 node scripts/governance-live-e2e.mjs seed --guild <guild-id> --actor <owner-id> --confirm-shadow [--provision-trusted-role <name>]',
     '  LIVE_GOVERNANCE_E2E=1 node scripts/governance-live-e2e.mjs cleanup --guild <guild-id> --run <run-id> --confirm-shadow',
     '',
     'seedは必ずshadow執行でのみ動き、他memberの投票・承認・処分を捏造しません。',
@@ -128,7 +128,49 @@ function assertSafeTarget(governance, actorId, guild) {
   assert.equal(governance.status, 'active', '統治機能がactiveではありません。');
   assert.equal(governance.enforcement_mode, 'shadow', 'live執行ではE2Eを実行しません。');
   if (actorId) assert.equal(actorId, guild.ownerId, '--actor はDiscord ownerでなければなりません。');
-  assert.ok(governance.trusted_role_id, '特別有権者ロールがありません。');
+}
+
+async function ensureTrustedRoleForE2e(guild, governance, actorId) {
+  if (governance.trusted_role_id) return { governance, provisioned: false, created: false };
+  const requestedName = cleanRoleName(option('--provision-trusted-role'));
+  assert.ok(requestedName, '特別有権者が未設定です。明示的に --provision-trusted-role <name> を指定してください。');
+  await guild.roles.fetch();
+  let role = guild.roles.cache.find((entry) => entry.name === requestedName && !entry.managed) ?? null;
+  const created = !role;
+  if (!role) {
+    role = await guild.roles.create({
+      name: requestedName,
+      permissions: [],
+      mentionable: false,
+      hoist: false,
+      reason: `Trusted electorate provisioned by owner ${actorId} during governance E2E`
+    });
+  }
+  const updated = updateGovernanceGuild(guild.id, { trusted_role_id: role.id });
+  createAdministrativeAct({
+    guildId: guild.id,
+    kind: 'trusted_role',
+    actorId,
+    summary: `特別有権者ロールを${role.name}に設定`,
+    detail: { before: '', after: role.id, liveE2e: true, created }
+  });
+  writeAudit({
+    guildId: guild.id,
+    actorType: 'operator',
+    actorId,
+    action: 'trusted.role_changed',
+    targetType: 'role',
+    targetId: role.id,
+    detail: { before: '', liveE2e: true, created }
+  });
+  await postGazette(guild, updated, '特別有権者ロール設定', `変更後: ${role.name} (${role.id})\n運営者: <@${actorId}>\nE2Eで設定: yes`, {
+    summary: `特別有権者ロールを「${role.name}」へ設定しました。`
+  });
+  return { governance: updated, provisioned: true, created, roleId: role.id, roleName: role.name };
+}
+
+function cleanRoleName(value) {
+  return String(value ?? '').replace(/[\r\n\u0000-\u001f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100);
 }
 
 async function publishProposal(guild, governance, proposal, state, text, components = []) {
@@ -240,11 +282,14 @@ async function runAiProbes({ guild, constitution, law, caseRecord, mark }) {
 }
 
 async function seed(guild, actorId, runId) {
-  const governance = getGovernanceGuild(guild.id);
+  let governance = getGovernanceGuild(guild.id);
   const constitution = getActiveConstitution(guild.id);
   assertSafeTarget(governance, actorId, guild);
   assert.ok(constitution, '有効な憲法がありません。');
   assert.equal(pendingActions(100).length, 0, '既存のoutbox処理があるため、巻き込まないようE2Eを停止しました。');
+  const trustedRoleSetup = await ensureTrustedRoleForE2e(guild, governance, actorId);
+  governance = trustedRoleSetup.governance;
+  assert.ok(governance.trusted_role_id, '特別有権者ロールを設定できませんでした。');
   const mark = marker(runId);
   const now = Date.now();
   const owner = await guild.members.fetch(actorId);
@@ -258,6 +303,12 @@ async function seed(guild, actorId, runId) {
     enforcementMode: governance.enforcement_mode,
     startedAt: new Date().toISOString(),
     ownerTrustedInitially: initialTrusted,
+    trustedRoleSetup: {
+      provisioned: trustedRoleSetup.provisioned,
+      created: trustedRoleSetup.created,
+      roleId: governance.trusted_role_id,
+      roleName: guild.roles.cache.get(governance.trusted_role_id)?.name ?? null
+    },
     scenarios: [...SCENARIOS],
     proposals: [],
     cases: [],
@@ -653,6 +704,7 @@ assert.ok(process.env.DISCORD_TOKEN, 'DISCORD_TOKEN が必要です。');
 const [{
   addCaseEvidence,
   addCaseSubmission,
+  createAdministrativeAct,
   createCase,
   createProposal,
   createSanction,
@@ -675,6 +727,7 @@ const [{
   snapshotProposalVoters,
   updateAppeal,
   updateCase,
+  updateGovernanceGuild,
   updateLaw,
   updateProposal,
   updateSanction,

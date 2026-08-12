@@ -1100,6 +1100,8 @@ assert.match(liveE2eSource, /governance\.enforcement_mode, 'shadow'/, 'live執�
 assert.match(liveE2eSource, /pendingActions\(100\)\.length, 0/, '既存outboxを巻き込まない');
 assert.match(liveE2eSource, /currentTrusted !== initialTrusted/, '特別有権者ロールを原状復帰する');
 assert.match(liveE2eSource, /setTrustedMember/, 'owner専用の正規経路で特別有権者を操作する');
+assert.match(liveE2eSource, /--provision-trusted-role/, '未設定の特別有権者roleは明示フラグなしに作らない');
+assert.match(liveE2eSource, /permissions: \[\]/, 'E2Eで作る特別有権者roleにDiscord権限を付けない');
 assert.match(liveE2eSource, /unauthorizedChangeReverted: true/, '正規経路外の特別有権者変更を差し戻す');
 assert.match(liveE2eSource, /allSummary\.trustedTotal, 1/, 'trusted拒否を有効投票数で実測する');
 assert.match(liveE2eSource, /type: 'warning'/, 'warning刑もlive fixtureで検証する');
