@@ -492,7 +492,8 @@ async function retireLegacyCourtChat(channel, guildName) {
       channel.threads.fetchActive(),
       channel.threads.fetchArchived({ type: 'private', fetchAll: true, limit: 1 })
     ]);
-    hasCaseThreads = active.threads.size > 0 || archived.threads.size > 0;
+    const belongsToChannel = (thread) => thread.parentId === channel.id;
+    hasCaseThreads = [...active.threads.values(), ...archived.threads.values()].some(belongsToChannel);
   } catch {
     // 読み戻せない場合は記録を消さず、legacy archiveとして残す。
   }

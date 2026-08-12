@@ -751,12 +751,14 @@ assert.equal(statutePublicationState('law', 'repealed'), '廃止');
 const aclGuild = { id: 'acl-guild', ownerId: 'owner', members: { me: { id: 'bot' } } };
 const { ChannelType, PermissionFlagsBits } = await import('discord.js');
 let legacyCourtDeleted = false;
+const unrelatedActiveThread = { id: 'other-thread', parentId: 'other-channel' };
 assert.deepEqual(await retireGovernanceCourtChat({
   name: 'Test Community',
   channels: { fetch: async () => ({
     type: ChannelType.GuildText,
+    id: 'legacy-court',
     threads: {
-      fetchActive: async () => ({ threads: new Map() }),
+      fetchActive: async () => ({ threads: new Map([[unrelatedActiveThread.id, unrelatedActiveThread]]) }),
       fetchArchived: async () => ({ threads: new Map() })
     },
     delete: async () => { legacyCourtDeleted = true; }
