@@ -12,7 +12,9 @@ const number = (value, fallback) => (Number.isFinite(Number(value)) ? Number(val
 export const mimicConfig = {
   url: process.env.MIMIC_URL ?? 'http://127.0.0.1:8765',
   timeoutMs: number(process.env.MIMIC_TIMEOUT_MS, 60_000),
-  maxNewTokens: number(process.env.MIMIC_MAX_NEW_TOKENS, 200)
+  maxNewTokens: number(process.env.MIMIC_MAX_NEW_TOKENS, 200),
+  // 返答の末尾に出す名前。世代が上がったら env で差し替える
+  label: process.env.MIMIC_LABEL ?? 'evex-1'
 };
 
 // speakers.json は使わない。話者は会話ごとの相対トークンになったので、

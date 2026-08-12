@@ -12,7 +12,7 @@
 // ドル換算の上限 (agent_calls) に混ぜると請求と乖離する。
 
 import { chunkForDiscord } from '../agent/format.js';
-import { generate } from './client.js';
+import { generate, mimicConfig } from './client.js';
 import { assignRoles, buildPrompt, firstTurn, messageText, nextRole } from './serialize.js';
 
 const NO_MENTIONS = { parse: [], repliedUser: false };
@@ -86,9 +86,8 @@ export async function handleMimicRequest(message, client, { recent = [] } = {}) 
       return;
     }
 
-    // 事実ではないことは毎回出す。94万件を何周もしているので、
-    // 実際の発言をそのまま再生していることがある。
-    const note = `\n-# Evex (このサーバーの94万件で学習した 5.87M)。事実の保証はありません。`;
+    // どのモデルが書いたかを毎回出す (DeepSeek 側と同じ形)
+    const note = `\n-# ${mimicConfig.label}`;
 
     for (const [index, chunk] of chunkForDiscord(body + note).entries()) {
       const payload = { content: chunk, allowedMentions: NO_MENTIONS };

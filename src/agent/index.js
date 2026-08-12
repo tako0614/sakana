@@ -155,6 +155,11 @@ function canUseFullBrowser(member) {
   return agentConfig.browserTrustedUsers.includes(member.id);
 }
 
+/** 末尾に出すモデル名。`deepseek-v4-flash` を `deepseek v4 flash` にする。 */
+function modelLabel() {
+  return agentConfig.model.replace(/-/g, ' ');
+}
+
 function limitMessage(reservation) {
   if (reservation.scope === 'busy') {
     // 「他の人の質問」とは言わない。自分の2本目でもここに来る。
@@ -399,7 +404,7 @@ export async function handleAgentRequest(message, client) {
     await indicator.stop();
 
     const answer = result.text?.trim()
-      ? expandCitations(result.text.trim(), refs)
+      ? expandCitations(result.text.trim(), refs, { label: modelLabel() })
       : 'うまく答えをまとめられませんでした。条件を絞ってもう一度聞いてください。';
 
     // 撮ったのに貼れないときは黙らない (画像が出ている前提で読まれる)

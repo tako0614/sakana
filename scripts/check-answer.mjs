@@ -91,6 +91,25 @@ function tableOf(count) {
   if (expandCitations('', tableOf(1)) !== '') fail('空文字はそのまま');
 }
 
+{
+  // どのモデルが書いたかは毎回出す。引用があるときは同じ subtext に混ぜる
+  // (行を2本にすると会話の邪魔になる)。
+  const refs = tableOf(2);
+  const withUrls = expandCitations('4月に書いてる [1]。', refs, { label: 'deepseek v4 flash' });
+  const footer = withUrls.split('-# ')[1];
+  if (!footer.startsWith('deepseek v4 flash ')) fail(`モデル名が先頭に来ていない: ${footer}`);
+  if (!footer.includes('discord.com')) fail(`引用が消えている: ${footer}`);
+  if ((withUrls.match(/-#/g) ?? []).length !== 1) fail('subtext は1行にまとめる');
+
+  // 引用が無くてもモデル名は出す
+  const bare = expandCitations('ログに出てないから分からん。', refs, { label: 'evex-1' });
+  if (!bare.endsWith('-# evex-1')) fail(`引用0件でもモデル名を出す: ${bare}`);
+
+  // ラベルを渡さなければ従来どおり (末尾は URL だけ / 引用0件なら足さない)
+  const plain = expandCitations('分からん。', refs);
+  if (plain.includes('-#')) fail(`ラベルも引用も無いなら末尾を足さない: ${plain}`);
+}
+
 console.log('citations ok (本文に番号も URL も残らない / 末尾は素の URL)');
 
 // --- system プロンプト ---

@@ -122,7 +122,7 @@ export function messageLink(entry) {
  * 入っているので、全部並べると数百行になる。
  * 引けなかった番号は本文から消すだけで、末尾には出さない (リンク切れを作らない)。
  */
-export function expandCitations(text, refs) {
+export function expandCitations(text, refs, { label = null } = {}) {
   const raw = String(text ?? '');
   const urls = [];
   const seen = new Set();
@@ -149,9 +149,12 @@ export function expandCitations(text, refs) {
     return '';
   });
 
-  if (urls.length === 0) return body.trim();
+  // どのモデルが書いたかは毎回出す。引用があるときは同じ subtext に混ぜる
+  // (行を2本にすると会話の邪魔になる)。
+  const tail = [label, ...urls].filter(Boolean);
+  if (tail.length === 0) return body.trim();
 
-  return `${body.trim()}\n\n-# ${urls.join(' ')}`;
+  return `${body.trim()}\n\n-# ${tail.join(' ')}`;
 }
 
 function collapse(text) {
