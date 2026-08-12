@@ -92,13 +92,32 @@ export const mimicCommands = [
         return;
       }
 
-      if (!setEngine(interaction.user.id, engine)) {
+      if (!ENGINES[engine]) {
         await interaction.reply({
           content: `そのモデルは選べません: ${engine}`,
           flags: MessageFlags.Ephemeral
         });
         return;
       }
+
+      // 自作モデルは別プロセス。立っていないものを選ばせると、話しかけるたびに
+      // 「起動していません」が返るだけで、選んだ本人には理由が分からない。
+      // 選択肢は登録時に固定されるので (addChoices)、ここで断る。
+      if (ENDPOINTS[engine]) {
+        const health = await status(engine);
+        if (!health.up) {
+          await interaction.reply({
+            content: [
+              `**${ENGINES[engine].label}** はまだ動いていません (${endpointFor(engine).url})。`,
+              '推論プロセスが立っていないので、選んでも答えられません。'
+            ].join('\n'),
+            flags: MessageFlags.Ephemeral
+          });
+          return;
+        }
+      }
+
+      setEngine(interaction.user.id, engine);
 
       await interaction.reply({
         content: `あなたの分を **${ENGINES[engine].label}** にしました。他の人には影響しません。`,
