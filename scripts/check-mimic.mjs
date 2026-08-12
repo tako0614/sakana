@@ -338,19 +338,36 @@ try {
   }
 }
 
-// --- 添付だけの返答を弾く ---
+// --- 返答として使えないものを弾く ---
 //
-// [画像] を学習データに入れたので、モデルが返答としてそれを吐きうる。bot は画像を
-// 投稿できないので無意味。evex-1 で <file> を禁止したのと同じ対処。
+// [画像] / URL だけ / @名前 だけ を学習データに入れてあるので、モデルが返答として
+// それを吐きうる。**学習側 (finetune.py の UNUSABLE_BODY) が損失から外している
+// 3種と同じものを弾く**。片方だけ直すと、外した種類が推論で素通りする。
+//
+// 実測: preview (マスク前の版) は -akku- に振ると 2/2 で "https://github.com" を
+// 返し、/as を差した意味が消えていた。evex-1 で <file> を禁止したのと同じ対処。
 {
-  const { isAttachmentOnly } = await import('../src/mimic/plain.js');
+  const { isUnusableReply } = await import('../src/mimic/plain.js');
 
-  for (const bad of ['[画像]', '[動画]', ' [添付] ', '[スタンプ]', '[画像]　']) {
-    if (!isAttachmentOnly(bad)) fail(`添付だけを弾いていない: ${JSON.stringify(bad)}`);
-  }
-  for (const ok of ['[画像] かわいい', 'これ [画像]', '画像', '[]', '', 'いいね']) {
-    if (isAttachmentOnly(ok)) fail(`本文があるのに弾いている: ${JSON.stringify(ok)}`);
+  const bad = [
+    '[画像]', '[動画]', ' [添付] ', '[スタンプ]', '[画像]　',
+    'https://github.com', 'http://example.com/a?b=1', ' https://x.com ',
+    'https://a.com https://b.com',
+    '@たこ', '@A'
+  ];
+  for (const text of bad) {
+    if (!isUnusableReply(text)) fail(`使えない返答を弾いていない: ${JSON.stringify(text)}`);
   }
 
-  console.log('attachment ok (添付だけは引き直す / 本文があれば通す)');
+  // 本文があれば通す。URL に一言添えたものは返答として成り立つ
+  const ok = [
+    '[画像] かわいい', 'これ [画像]', '画像', '[]', '', 'いいね',
+    'https://github.com これ', 'これ https://github.com', '@たこ みて',
+    'https じゃなくて http', 'メール@ドメイン の話'
+  ];
+  for (const text of ok) {
+    if (isUnusableReply(text)) fail(`本文があるのに弾いている: ${JSON.stringify(text)}`);
+  }
+
+  console.log('unusable ok (添付・URL・@名前 だけは引き直す / 本文があれば通す)');
 }

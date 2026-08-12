@@ -24,7 +24,7 @@ import { continuationOf, endpointFor, generate, roleScheme } from './client.js';
 import { mimicFormat } from './impersonate.js';
 import { personaFor } from './persona.js';
 import {
-  PLAIN_SCHEME, assignPlainRoles, buildPlainPrompt, isAttachmentOnly, labelFor,
+  PLAIN_SCHEME, assignPlainRoles, buildPlainPrompt, isUnusableReply, labelFor,
   labelledSpeakers, plainFirstTurn, plainText
 } from './plain.js';
 import { assignRoles, buildPrompt, firstTurn, messageText, nextRole } from './serialize.js';
@@ -186,7 +186,7 @@ export async function handleMimicRequest(
       // プロンプトぶんを落として、生成された続きだけを見る
       body = built.cut(continuationOf(result.text, built.prompt));
       // 添付だけの返答は bot が画像を投稿できないので意味が無い。引き直す
-      if (isAttachmentOnly(body)) body = '';
+      if (isUnusableReply(body)) body = '';
       if (body.length >= MIN_CHARS) break;
     }
 
