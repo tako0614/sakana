@@ -188,10 +188,32 @@ const raw = gunzipSync(await readFile(path.join(src, 'raw.jsonl.gz'))).toString(
  * 教える (誰かが画像を貼って、他の人が反応する)。角括弧で囲って「喋った言葉では
  * ない」と分かる形にそろえる。
  */
+const KIND = [
+  [/\.(jpe?g|png|gif|webp|avif|bmp|heic)$/i, '[画像]'],
+  [/\.(mp4|mov|webm|mkv|avi)$/i, '[動画]'],
+  [/\.(mp3|wav|ogg|m4a|flac)$/i, '[音声]'],
+  [/\.(zip|7z|rar|tar|gz)$/i, '[圧縮ファイル]'],
+  [/\.(pdf|docx?|xlsx?|pptx?|txt|md|csv|json|log)$/i, '[ファイル]']
+];
+
 function fromExtra(extra) {
   const text = String(extra ?? '').trim();
   if (!text) return '';
-  return text.startsWith('[') ? text : `[添付] ${text}`;
+  // 埋め込みとスタンプは既に読める形が入っている (実データでは人間の空発言に 0 件)
+  if (text.startsWith('[')) return text;
+
+  // ファイル名は捨てて種類だけ残す。実データの空発言 17,889 件は**全部ファイル名だけ**で、
+  // `cat.jpeg` `IMG_4123.png` のような無意味なものが大半だった。
+  //
+  // 名前を残すと 8 トークン払って何も学べないうえ、モデルが返答としてそれを吐くように
+  // なれば evex-1 の `<file>` 問題を移しただけになる (あれは 1 トークンで確率が跳ね上がり、
+  // 返答の 38% が「(画像)」だけになった)。
+  //
+  // 種類だけなら 2 トークンで、しかも「画像が貼られた」という情報は残る。
+  // 学びたいのは「誰かが画像を貼って、他の人が反応する」という流れの方。
+  const first = text.split('\n')[0].trim();
+  const found = KIND.find(([pattern]) => pattern.test(first));
+  return found ? found[1] : '[添付]';
 }
 
 for (const line of raw.split('\n')) {
