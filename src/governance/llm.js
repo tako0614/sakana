@@ -7,6 +7,7 @@ import {
   sanctionNoMoreSevere,
   sha256,
   validateConstitutionPolicy,
+  validateInterimProtectionDefinition,
   validateRestrictionDefinition,
   validateSanctionAgainstOffense
 } from './policy.js';
@@ -93,7 +94,7 @@ function validateDraft(raw, policy) {
 
   const offenses = (provisions.offenses ?? []).map((offense, index) => {
     assertObject(offense, `offenses[${index}]`);
-    exactKeys(offense, ['code', 'title', 'elements', 'sanctions'], `offenses[${index}]`);
+    exactKeys(offense, ['code', 'title', 'elements', 'sanctions', 'interimProtection'], `offenses[${index}]`);
     const sanctions = (offense.sanctions ?? []).map((sanction, sanctionIndex) => {
       assertObject(sanction, `offense.sanctions[${sanctionIndex}]`);
       exactKeys(sanction, ['type', 'maximumSeconds', 'definitionCode'], `offense.sanctions[${sanctionIndex}]`);
@@ -127,11 +128,27 @@ function validateDraft(raw, policy) {
     assertUnique(sanctions.map((sanction) => `${sanction.type}:${sanction.definitionCode ?? ''}`), 'offense sanctions');
     const elements = texts(offense.elements, 'offense.elements', 12, 1000);
     if (elements.length < 1) throw new Error('each offense needs at least one element');
+    const interimProtection = offense.interimProtection === undefined
+      ? null
+      : assertObject(offense.interimProtection, 'offense.interimProtection');
+    if (interimProtection && !validateInterimProtectionDefinition(interimProtection)) {
+      throw new Error('invalid interim protection definition');
+    }
     return {
       code: text(offense.code, 'offense.code', 40),
       title: text(offense.title, 'offense.title', 100),
       elements,
-      sanctions
+      sanctions,
+      ...(interimProtection ? {
+        interimProtection: {
+          trigger: {
+            type: 'message_burst',
+            minimumMessages: interimProtection.trigger.minimumMessages,
+            windowSeconds: interimProtection.trigger.windowSeconds
+          },
+          durationSeconds: interimProtection.durationSeconds
+        }
+      } : {})
     };
   });
   if (offenses.length > 20) throw new Error('too many offenses');
@@ -330,6 +347,7 @@ Do not target or name a member, Discord user ID, message ID, case, or past incid
 Return JSON with exactly: title, summary, text, provisions.
 provisions has articles, offenses, sanctionDefinitions.
 Each article has code and text. Each offense has code, title, elements, sanctions.
+A narrowly defined spam-like offense may also declare interimProtection with trigger {type:"message_burst", minimumMessages:5-30, windowSeconds:10-300} and durationSeconds:60-900. This is a short, non-punitive court-only safeguard before judgment; omit it unless an objective burst trigger is necessary.
 A sanction type is warning, restriction, timeout, kick, or ban. timeout has maximumSeconds.
 restriction refers to a sanctionDefinitions code and has maximumSeconds.
 A sanctionDefinition has code matching uppercase letters/numbers/underscore, title, maximumDurationSeconds, and rules.

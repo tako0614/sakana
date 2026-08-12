@@ -147,6 +147,7 @@ export async function renderGovernanceGuide(guild, governance) {
     '',
     'AIが整理しただけでは正式案件になりません。表示された受付内容を本人が確認して初めて手続が始まります。',
     '投票と執行承認は記名です。誰がどの選択をしたか、変更した場合の経過も対象の議会・裁判投稿へ公開されます。',
+    '裁判中の発言範囲は事件投稿の「発言状態」に表示されます。一時保全は公開ログと成立法の条件が一致した時だけ短時間行い、自動終了します。',
     '',
     '## 公開記録',
     `- 投票・承認など、いま対応が必要な手続: <#${governance.admin_channel_id}>`,
@@ -245,23 +246,23 @@ export async function renderGovernanceProcedureHub(guild, governance) {
   const defenses = listCases(guild.id, { statuses: ['defense'], limit: 20 });
   const appeals = listCases(guild.id, { statuses: ['appeal_window'], limit: 20 });
   const votingLines = voting.slice(0, 6).map((proposal) =>
-    `- ${recordLink(guild.id, proposal.forum_thread_id, `L-${proposal.id} ${proposal.title}`)} / ${proposal.vote_scope === 'all' ? '全員投票' : '特別有権者投票'}${deadline(proposal.stage_ends_at)}`
+    `- ${recordLink(guild.id, proposal.forum_thread_id, `${proposal.title}（L-${proposal.id}）`)} / ${proposal.vote_scope === 'all' ? '全員' : '特別有権者'}${deadline(proposal.stage_ends_at)}`
   );
   const approvalLines = approvals.slice(0, 6).map((caseRecord) => {
     const sanction = getCaseSanction(caseRecord.id);
     const approved = listCaseApprovals(caseRecord.id).filter((entry) => entry.decision === 'approve').length;
-    return `- ${recordLink(guild.id, caseRecord.public_thread_id, `C-${caseRecord.id} 執行承認`)} / ${approved}/${sanction?.required_approvals ?? '?'}人承認済み`;
+    return `- ${recordLink(guild.id, caseRecord.public_thread_id, `処分の承認（C-${caseRecord.id}）`)} / ${approved}/${sanction?.required_approvals ?? '?'}人`;
   });
   const responseLines = [
     ...appeals.map((caseRecord) => {
       const sanction = getCaseSanction(caseRecord.id);
-      return `- ${recordLink(guild.id, caseRecord.public_thread_id, `C-${caseRecord.id} 上訴受付`)}${deadline(sanction?.appeal_deadline)}`;
+      return `- ${recordLink(guild.id, caseRecord.public_thread_id, `上訴を受け付けています（C-${caseRecord.id}）`)}${deadline(sanction?.appeal_deadline)}`;
     }),
     ...defenses.map((caseRecord) =>
-      `- ${recordLink(guild.id, caseRecord.public_thread_id, `C-${caseRecord.id} 答弁受付`)}${deadline(caseRecord.defense_until)}`
+      `- ${recordLink(guild.id, caseRecord.public_thread_id, `答弁を受け付けています（C-${caseRecord.id}）`)}${deadline(caseRecord.defense_until)}`
     ),
     ...debates.map((proposal) =>
-      `- ${recordLink(guild.id, proposal.forum_thread_id, `L-${proposal.id} 討議: ${proposal.title}`)}${deadline(proposal.stage_ends_at)}`
+      `- ${recordLink(guild.id, proposal.forum_thread_id, `${proposal.title}を討議中（L-${proposal.id}）`)}${deadline(proposal.stage_ends_at)}`
     )
   ].slice(0, 8);
   const omitted = Math.max(0, voting.length - votingLines.length)
@@ -271,20 +272,20 @@ export async function renderGovernanceProcedureHub(guild, governance) {
     content: [
       `# ${guild.name} 進行中`,
       '',
-      'ここは全員に公開された統治手続の一覧です。Bot設定ではありません。内容を読んで、リンク先の案件で投票・承認・答弁・上訴を行ってください。',
-      '投票と執行承認は記名で、選択と変更の経過が対象案件へ公開されます。',
+      'いま参加できる手続です。操作と説明はリンク先にまとまっています。',
+      '投票と承認は記名で公開されます。',
       '',
-      '## 投票中',
-      ...(votingLines.length ? votingLines : ['現在、投票中の法案はありません。']),
+      '## 投票する',
+      ...(votingLines.length ? votingLines : ['いま投票はありません。']),
       '',
-      '## 執行承認待ち',
-      ...(approvalLines.length ? approvalLines : ['現在、承認待ちの判決はありません。']),
+      '## 処分を承認する',
+      ...(approvalLines.length ? approvalLines : ['いま承認待ちはありません。']),
       '',
-      '## 討議・答弁・上訴受付',
-      ...(responseLines.length ? responseLines : ['現在、対応受付中の案件はありません。']),
+      '## 討議・答弁・上訴',
+      ...(responseLines.length ? responseLines : ['いま受付中の案件はありません。']),
       omitted ? `\nほか ${omitted}件は議会・裁判所から確認できます。` : null,
       '',
-      '表示されていても、投票scope・特別有権者資格・当事者資格は操作時にBotが確認します。'
+      '参加資格は操作時に確認します。'
     ].filter(Boolean).join('\n').slice(0, 1_900),
     components: procedureComponents(governance),
     allowedMentions: { parse: [] }

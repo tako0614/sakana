@@ -160,7 +160,7 @@ function intakeButtons(intake, disabled = false) {
 
 function renderIntake(intake, suffix = '') {
   const payload = intake.payload;
-  const lines = [`## ${intake.branch === 'legislature' ? '立法' : '裁判'} 受付内容`, ''];
+  const lines = ['## 受付前の確認', ''];
   if (intake.action === 'petition' || intake.action === 'amendment') {
     lines.push(
       `種別: ${intake.action === 'amendment' ? '憲法改正案' : '法律の請願'}`,
@@ -188,7 +188,7 @@ function renderIntake(intake, suffix = '') {
   } else if (intake.action === 'appeal') {
     lines.push('種別: 上訴', `事件: C-${payload.caseId}`, `上訴理由: ${payload.summary}`);
   }
-  lines.push('', suffix || 'まだ正式案件ではありません。内容を確認して本人が確定してください。');
+  lines.push('', suffix || '内容が正しければ「この内容で進める」を押してください。押すまでは正式案件になりません。');
   return lines.join('\n').slice(0, 2000);
 }
 
@@ -214,6 +214,7 @@ async function createPreview(message, branch, action, payload) {
 
 function reservationMessage(reservation) {
   const retry = reservation.retryAt ? ` <t:${Math.floor(reservation.retryAt / 1000)}:R>に空きます。` : '';
+  if (reservation.reason === 'interim_protection') return `一時保全中は自分の裁判事件でだけ発言できます。${retry}`;
   if (reservation.scope === 'sanction') return `現在の判決によりAI受付が制限されています。${retry}`;
   return `AI受付の24時間回数枠に達しました (${reservation.used}/${reservation.limit})。${retry}`;
 }
@@ -254,7 +255,7 @@ function caseStatusText(caseRecord, guildId) {
     constitutional_uncertain: '違憲判断不能', unenforceable: '執行不能'
   })[caseRecord.status] ?? caseRecord.status;
   return [
-    `C-${caseRecord.id} / ${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
+    `${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}（C-${caseRecord.id}）`,
     `状態: ${status}`,
     caseRecord.accused_id ? `被申立人: <@${caseRecord.accused_id}>` : null,
     caseRecord.law_id ? `適用法: #${caseRecord.law_id} / ${caseRecord.offense_code}` : null,
@@ -395,7 +396,7 @@ async function executeIntake(interaction, intake) {
       eventId: intake.source_message_id,
       attemptReserved: true
     });
-    return { type: 'proposal', id: result.id, text: `法案 L-${result.id} を受理しました。\n${linkToThread(interaction.guildId, result.forum_thread_id)}` };
+    return { type: 'proposal', id: result.id, text: `「${payload.title}」を受理しました（L-${result.id}）。\n${linkToThread(interaction.guildId, result.forum_thread_id)}` };
   }
   if (intake.action === 'amendment') {
     const result = await fileAmendment(interaction.guild, member, {
@@ -405,7 +406,7 @@ async function executeIntake(interaction, intake) {
       eventId: intake.source_message_id,
       attemptReserved: true
     });
-    return { type: 'proposal', id: result.id, text: `改憲案 L-${result.id} を受理しました。\n${linkToThread(interaction.guildId, result.forum_thread_id)}` };
+    return { type: 'proposal', id: result.id, text: `「${payload.title}」を改憲案として受理しました（L-${result.id}）。\n${linkToThread(interaction.guildId, result.forum_thread_id)}` };
   }
   if (intake.action === 'criminal_case') {
     await assertEvidenceVisibleTo(interaction.guild, payload.evidence, [interaction.user.id, payload.accusedId]);
@@ -419,7 +420,7 @@ async function executeIntake(interaction, intake) {
       eventId: intake.source_message_id,
       attemptReserved: true
     });
-    return { type: 'case', id: result.id, text: `事件 C-${result.id} を受理しました。\n${linkToThread(interaction.guildId, result.public_thread_id)}` };
+    return { type: 'case', id: result.id, text: `法律違反の申立てを受理しました（C-${result.id}）。\n${linkToThread(interaction.guildId, result.public_thread_id)}` };
   }
   if (intake.action === 'constitutional_challenge') {
     const result = await fileConstitutionalChallenge(interaction.guild, member, {
@@ -429,7 +430,7 @@ async function executeIntake(interaction, intake) {
       eventId: intake.source_message_id,
       attemptReserved: Boolean(payload.constitutionalAttemptReserved)
     });
-    return { type: 'case', id: result.id, text: `違憲審査 C-${result.id} を受理しました。\n${linkToThread(interaction.guildId, result.public_thread_id)}` };
+    return { type: 'case', id: result.id, text: `違憲審査を受理しました（C-${result.id}）。\n${linkToThread(interaction.guildId, result.public_thread_id)}` };
   }
   if (intake.action === 'evidence') {
     const caseRecord = getCase(payload.caseId);

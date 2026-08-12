@@ -8,6 +8,9 @@ import {
 } from 'discord.js';
 import { governanceCategoryName } from './config.js';
 import {
+  getCaseInterimProtection,
+  getCaseSanction,
+  getGovernanceGuild,
   getStatutePublication,
   listConstitutions,
   listLaws,
@@ -18,10 +21,10 @@ const TAGS = ['草案', '違憲審査', '討議', '投票', '成立', '否決', 
 const STATUTE_TAGS = ['現行憲法', '旧憲法', '現行法', '停止', '違憲', '廃止'];
 const STATUTE_TOPIC = '現行憲法と法律の公開正本です。1法令1投稿で、旧法令も状態付きで保存します。';
 const GAZETTE_TOPIC = '成立・改正・判決・執行・運営操作を時系列に残す公開履歴です。現行本文は法令集を参照してください。';
-export const COURT_TOPIC = '事件ごとの公開審理です。答弁・証拠・判決・執行承認・上訴を1つの事件投稿に記録します。';
+export const COURT_TOPIC = '事件ごとの公開審理です。状態・期限・発言範囲と、答弁から上訴までを1つの投稿にまとめます。';
 export const GOVERNANCE_GUIDE_NAME = '案内';
 export const GOVERNANCE_PROCEDURE_NAME = '進行中';
-export const GOVERNANCE_PROCEDURE_TOPIC = '全員に公開する統治手続の一覧です。投票・執行承認は対象案件で記名し、選択と変更を公開記録に残します。';
+export const GOVERNANCE_PROCEDURE_TOPIC = 'いま投票・承認・答弁・上訴できる案件を、全員に公開します。';
 
 function proposalStateLabel(state) {
   return ({
@@ -52,6 +55,36 @@ function caseStateLabel(state) {
     constitutional_uncertain: '違憲判断不能',
     unenforceable: '執行不能'
   })[state] ?? state;
+}
+
+function oneLine(value, maximum = 700) {
+  return String(value ?? '').replace(/[#*_`\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, maximum);
+}
+
+function proposalDeadline(proposal) {
+  if (!proposal.stage_ends_at || !['draft', 'debate', 'voting'].includes(proposal.status)) return null;
+  return `<t:${Math.floor(proposal.stage_ends_at / 1000)}:F>`;
+}
+
+function courtDeadline(caseRecord) {
+  if (caseRecord.status === 'defense' && caseRecord.defense_until) return caseRecord.defense_until;
+  if (caseRecord.status === 'appeal_window') return getCaseSanction(caseRecord.id)?.appeal_deadline ?? null;
+  if (caseRecord.status === 'appeal') return caseRecord.retry_after ?? null;
+  return null;
+}
+
+function courtAccessState(caseRecord) {
+  const live = getGovernanceGuild(caseRecord.guild_id)?.enforcement_mode === 'live';
+  if (caseRecord.status === 'appeal') return live
+    ? '被申立人はこの事件投稿だけ（上訴中）'
+    : '通常（上訴中・実執行停止中）';
+  const protection = getCaseInterimProtection(caseRecord.id);
+  if (protection?.status === 'active' && protection.ends_at > Date.now() && live) {
+    return `被申立人はこの事件投稿だけ（一時保全・<t:${Math.floor(protection.ends_at / 1000)}:R>まで）`;
+  }
+  if (protection?.status === 'active' && protection.ends_at > Date.now()) return '通常（実執行停止中）';
+  if (protection?.status === 'simulated') return '通常（一時保全の条件はshadowで確認済み・実制限なし）';
+  return '通常（正式な主張として記録するのは当事者だけ）';
 }
 
 const APPEAL_DENY = {
@@ -836,18 +869,21 @@ export async function createProposalPost(guild, governance, proposal) {
   const structuredDraft = proposal.kind === 'amendment' ? body.policy : body.provisions;
   const structuredName = proposal.kind === 'amendment' ? 'policy' : 'provisions';
   const thread = await forum.threads.create({
-    name: `L-${proposal.id} ${proposal.title}`.slice(0, 100),
+    name: `${proposal.title.slice(0, 84)} · L-${proposal.id}`.slice(0, 100),
     appliedTags: draftTag ? [draftTag] : [],
     autoArchiveDuration: 10_080,
     message: {
       content: [
-        `# 法案 L-${proposal.id}: ${proposal.title}`,
+        `# ${proposal.title}`,
+        `法案番号: L-${proposal.id}`,
         '',
         proposal.summary,
         '',
-        `状態: ${proposalStateLabel(proposal.status)} / 改訂: ${proposal.revision}`,
-        '草案全文と構造化された処分定義・policyは添付から確認できます。'
-      ].join('\n').slice(0, 2000),
+        `状態: ${proposalStateLabel(proposal.status)}`,
+        proposalDeadline(proposal) ? `期限: ${proposalDeadline(proposal)}` : null,
+        '次にすること: 内容を読み、この投稿で討議します。',
+        '全文と構造化定義は添付にあります。'
+      ].filter(Boolean).join('\n').slice(0, 2000),
       files: [
         { attachment: Buffer.from(fullDraft), name: `proposal-${proposal.id}-r${proposal.revision}.md` },
         {
@@ -871,15 +907,16 @@ export async function postProposalUpdate(guild, proposal, text, { state = null, 
   if (starter) {
     await starter.edit({
       content: [
-        `# 法案 L-${proposal.id}: ${proposal.title}`,
+        `# ${proposal.title}`,
+        `法案番号: L-${proposal.id}`,
         '',
         proposal.summary,
         '',
-        `現在: **${proposalStateLabel(state ?? proposal.status)}** / 改訂 ${proposal.revision}`,
-        `最新: ${String(text).replace(/[#*_`]/g, '').slice(0, 700)}`,
-        '',
-        '全文と改訂内容は添付、経過と討議はこの投稿内で確認できます。'
-      ].join('\n').slice(0, 2_000),
+        `状態: **${proposalStateLabel(state ?? proposal.status)}**`,
+        proposalDeadline(proposal) ? `期限: ${proposalDeadline(proposal)}` : null,
+        `いま必要なこと: ${oneLine(text)}`,
+        '全文は添付、経過はこの投稿内にあります。'
+      ].filter(Boolean).join('\n').slice(0, 2_000),
       allowedMentions: { parse: [] }
     }).catch(() => {});
   }
@@ -893,21 +930,23 @@ export async function createCourtCaseThread(guild, governance, caseRecord, { onP
   const publicThread = caseRecord.public_thread_id
     ? await guild.channels.fetch(caseRecord.public_thread_id)
     : await forum.threads.create({
-    name: `C-${caseRecord.id} ${caseRecord.kind === 'constitutional' ? '違憲審査' : '事件'}`,
+    name: `${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'} · C-${caseRecord.id}`,
     appliedTags: answerTag ? [answerTag] : [],
     autoArchiveDuration: 10_080,
     message: {
       content: [
-        `# 事件 C-${caseRecord.id}`,
-        `種別: ${caseRecord.kind}`,
+        `# ${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
+        `事件番号: C-${caseRecord.id}`,
         caseRecord.accused_id ? `被告: <@${caseRecord.accused_id}>` : null,
         caseRecord.law_id ? `適用法候補: #${caseRecord.law_id} / ${caseRecord.offense_code}` : null,
         '',
         caseRecord.summary,
         '',
-        `答弁期限: ${caseRecord.defense_until ? `<t:${Math.floor(caseRecord.defense_until / 1000)}:F>` : '審査準備中'}`,
+        `状態: ${caseStateLabel(caseRecord.status)}`,
+        `発言状態: ${courtAccessState(caseRecord)}`,
+        `期限: ${caseRecord.defense_until ? `<t:${Math.floor(caseRecord.defense_until / 1000)}:F>` : '審査準備中'}`,
         '',
-        'この事件は公開審理です。当事者の投稿だけを正式な主張として記録し、第三者の投稿は判決資料に含めません。'
+        '次にすること: 当事者はこの投稿で答弁・証拠提出を行います。'
       ].filter(Boolean).join('\n').slice(0, 2000),
       allowedMentions: { parse: [] }
     },
@@ -925,16 +964,17 @@ export async function postCourtUpdate(guild, caseRecord, text, { state = null, c
   if (starter) {
     await starter.edit({
       content: [
-        `# 事件 C-${caseRecord.id}`,
-        `種別: ${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
+        `# ${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
+        `事件番号: C-${caseRecord.id}`,
         caseRecord.accused_id ? `被申立人: <@${caseRecord.accused_id}>` : null,
         '',
         caseRecord.summary,
         '',
-        `現在: **${caseStateLabel(state ?? caseRecord.status)}**`,
-        `最新: ${String(text).replace(/[#*_`]/g, '').slice(0, 700)}`,
-        '',
-        '答弁・証拠・判決・執行承認・上訴はすべてこの公開投稿に記録します。当事者以外の投稿は判決資料に含めません。'
+        `状態: **${caseStateLabel(state ?? caseRecord.status)}**`,
+        `発言状態: ${courtAccessState(caseRecord)}`,
+        courtDeadline(caseRecord) ? `期限: <t:${Math.floor(courtDeadline(caseRecord) / 1000)}:F>` : null,
+        `いま必要なこと: ${oneLine(text)}`,
+        '答弁・証拠・判断・承認・上訴はこの投稿にまとまります。'
       ].filter(Boolean).join('\n').slice(0, 2_000),
       allowedMentions: { parse: [] }
     }).catch(() => {});

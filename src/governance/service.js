@@ -11,6 +11,7 @@ import {
   createAdministrativeAct,
   createAppeal,
   createCase,
+  createInterimProtection,
   createProposal,
   createSanction,
   deactivateRestrictionForSanction,
@@ -18,6 +19,7 @@ import {
   enactLaw,
   enqueueAction,
   expireRestrictions,
+  expireInterimProtections,
   expireGovernanceIntakes,
   failAction,
   findActiveProposalByNormalizedTitle,
@@ -29,6 +31,7 @@ import {
   getCaseByPublicThread,
   getCaseSanction,
   getGovernanceGuild,
+  getCaseInterimProtection,
   getLaw,
   getOperationalSetting,
   getProposal,
@@ -52,6 +55,7 @@ import {
   pruneGovernance,
   recordActivities,
   recordActivity,
+  recentUserActivity,
   recentGovernanceMessages,
   replaceCaseSubmission,
   reserveAgentAttempt,
@@ -100,6 +104,7 @@ import {
   normalizeActivityContent,
   requiredApprovals,
   sha256,
+  validateInterimProtectionDefinition,
   validateRestrictionDefinition
 } from './policy.js';
 import { governanceActionAllowed, reserveRestrictedAgentCall } from './restrictions.js';
@@ -658,7 +663,87 @@ async function finishCaseFiling(guild, caseRecord) {
   });
   await ensureEvidenceDisclosures(guild, current);
   await postCourtUpdate(guild, current, `答弁期限: <t:${Math.floor(defenseUntil / 1000)}:F>`, { state: '答弁' });
+  await applyInterimProtectionFromLogs(guild, current);
   return current;
+}
+
+export async function applyInterimProtectionFromLogs(guild, caseRecord, now = Date.now()) {
+  const { governance } = requireGovernance(guild.id);
+  const current = getCase(caseRecord.id);
+  if (!current || current.guild_id !== guild.id || current.kind !== 'criminal' || current.status !== 'defense') return null;
+  const existing = getCaseInterimProtection(current.id);
+  if (existing) return existing;
+  const law = getLaw(current.law_id);
+  if (!law || law.guild_id !== guild.id || law.status !== 'active') return null;
+  const offense = law.provisions.offenses?.find((entry) => entry.code === current.offense_code);
+  const definition = offense?.interimProtection;
+  if (!validateInterimProtectionDefinition(definition)) return null;
+  if (governance.enforcement_mode === 'live') {
+    const member = guild.members?.fetch
+      ? await guild.members.fetch(current.accused_id).catch(() => null)
+      : null;
+    if (!member || member.id === guild.ownerId || member.permissions?.has?.(PermissionFlagsBits.Administrator)) return null;
+  }
+
+  const evidence = listCaseEvidence(current.id).find((entry) => (
+    entry.author_id === current.accused_id && entry.message_id && entry.channel_id && entry.occurred_at
+  ));
+  if (!evidence) return null;
+  const trigger = definition.trigger;
+  const occurredAt = Number(evidence.occurred_at);
+  const windowMs = trigger.windowSeconds * 1000;
+  // 過去ログだけで現在の発言権を奪わない。申立て時点でも同じburst window内にある場合だけ評価する。
+  if (occurredAt > now + 30_000 || now - occurredAt > windowMs) return null;
+  const messages = recentUserActivity(
+    guild.id,
+    current.accused_id,
+    evidence.channel_id,
+    occurredAt - windowMs,
+    occurredAt,
+    100
+  );
+  if (!messages.some((message) => message.message_id === evidence.message_id)
+    || messages.length < trigger.minimumMessages) return null;
+
+  const status = governance.enforcement_mode === 'live' ? 'active' : 'simulated';
+  const protection = createInterimProtection({
+    caseId: current.id,
+    guildId: guild.id,
+    userId: current.accused_id,
+    lawId: law.id,
+    offenseCode: offense.code,
+    triggerType: trigger.type,
+    minimumEvents: trigger.minimumMessages,
+    observedEvents: messages.length,
+    windowSeconds: trigger.windowSeconds,
+    durationSeconds: definition.durationSeconds,
+    evidenceMessageId: evidence.message_id,
+    evidenceChannelId: evidence.channel_id,
+    startedAt: now,
+    endsAt: now + definition.durationSeconds * 1000,
+    status
+  });
+  writeAudit({
+    guildId: guild.id,
+    actorType: 'system',
+    action: status === 'active' ? 'interim_protection.started' : 'interim_protection.simulated',
+    targetType: 'interim_protection',
+    targetId: protection.id,
+    detail: {
+      caseId: current.id,
+      lawId: law.id,
+      offenseCode: offense.code,
+      evidenceMessageId: evidence.message_id,
+      observedEvents: messages.length,
+      minimumEvents: trigger.minimumMessages,
+      windowSeconds: trigger.windowSeconds,
+      durationSeconds: definition.durationSeconds
+    }
+  });
+  await postCourtUpdate(guild, current, status === 'active'
+    ? `一時保全を開始しました。直近${trigger.windowSeconds}秒の公開ログ${messages.length}件を確認し、<t:${Math.floor(protection.ends_at / 1000)}:T>まで被申立人の投稿先をこの事件に限ります。これは判決や刑罰ではなく、自動終了します。`
+    : `一時保全の条件をshadowで確認しました。直近${trigger.windowSeconds}秒の公開ログ${messages.length}件が基準${trigger.minimumMessages}件を満たしましたが、実際の発言制限は行っていません。`);
+  return protection;
 }
 
 export async function addEvidenceToCase(guild, member, caseId, evidence) {
@@ -679,7 +764,8 @@ function evidenceDisclosure(entry) {
     ? `https://discord.com/channels/${entry.guild_id ?? '@me'}/${entry.channel_id}/${entry.message_id}`
     : '保存された提出';
   return [
-    `## 証拠 E-${entry.id}`,
+    '## 証拠',
+    `証拠番号: E-${entry.id}`,
     `提出者: <@${entry.submitted_by}> / 原投稿者: ${entry.author_id ? `<@${entry.author_id}>` : '-'}`,
     `行為時刻: ${entry.occurred_at ? `<t:${Math.floor(entry.occurred_at / 1000)}:F>` : '-'}`,
     `hash: \`${entry.content_hash}\``,
@@ -708,7 +794,7 @@ async function publishDecisionRecord(guild, caseRecord, phase, panel) {
   ].join(' / '));
   await postCourtUpdate(guild, caseRecord, [
     `判決記録（${phaseLabel}）`,
-    `適用法: #${caseRecord.law_id} / 構成要件: ${caseRecord.offense_code}`,
+    `適用法: 法律 #${caseRecord.law_id} / 構成要件: ${caseRecord.offense_code}`,
     ...publicLines
   ].join('\n'));
 
@@ -1351,6 +1437,7 @@ export async function runGovernanceScheduler(client) {
       lastPruneAt = now;
     }
     expireRestrictions(now);
+    const expiredProtections = expireInterimProtections(now);
     const expiredIntakes = expireGovernanceIntakes(now);
     if (expiredIntakes.length > 0) {
       const { updateExpiredIntakeMessages } = await import('./intake.js');
@@ -1361,6 +1448,21 @@ export async function runGovernanceScheduler(client) {
     for (const governance of listGovernanceGuilds()) {
       const guild = client.guilds.cache.get(governance.guild_id) ?? await client.guilds.fetch(governance.guild_id).catch(() => null);
       if (!guild) continue;
+      for (const protection of expiredProtections.filter((entry) => entry.guild_id === guild.id)) {
+        const caseRecord = getCase(protection.case_id);
+        if (caseRecord?.public_thread_id) {
+          await postCourtUpdate(guild, caseRecord, '一時保全は期限どおり自動終了しました。被申立人の発言状態は通常に戻っています。')
+            .catch((error) => console.error(`Failed to publish interim protection expiry ${protection.id}:`, error));
+        }
+        writeAudit({
+          guildId: guild.id,
+          actorType: 'system',
+          action: 'interim_protection.expired',
+          targetType: 'interim_protection',
+          targetId: protection.id,
+          detail: { caseId: protection.case_id, endedAt: now }
+        });
+      }
       let currentGovernance = governance;
       try {
         const roles = await ensureGovernanceMentionRoles(guild, currentGovernance);

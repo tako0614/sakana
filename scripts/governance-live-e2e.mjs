@@ -15,6 +15,7 @@ const SCENARIOS = Object.freeze([
   '一般／特別有権者のAI利用上限とprompt injection防御',
   '特別有権者の拒否権（分母はyes+noの有効票）',
   '発言数、リンク、添付、mention、reaction、thread、voice、AI、請願、投票の制限定義',
+  '成立法と直近公開ログに基づく15分以内の一時保全（shadowでは条件評価のみ）',
   '答弁、証拠、司法パネル、違憲審査',
   '24時間以内の即時timeout、7日以内の1人承認、kick/banの2人承認',
   '3日以上timeoutとbanの上訴、上訴中の裁判所限定（shadowでは記録のみ）',
@@ -109,6 +110,10 @@ function fixtureLawBody(mark) {
           'E2E_TEST_VIOLATIONという文字列を含むテスト証拠が記録されていること',
           'その証拠が動作確認専用であること'
         ],
+        interimProtection: {
+          trigger: { type: 'message_burst', minimumMessages: 5, windowSeconds: 30 },
+          durationSeconds: 300
+        },
         sanctions: [
           { type: 'warning' },
           { type: 'restriction', definitionCode: 'E2E_ALL_LIMITS', maximumSeconds: 86_400 },
@@ -434,6 +439,71 @@ async function seed(guild, actorId, runId) {
       constitutionId: constitution.id,
       effectiveAt: now
     });
+
+    const interimAccusedId = `e2e-interim-accused-${runId}`;
+    const interimReporterId = `e2e-interim-reporter-${runId}`;
+    const interimChannelId = `e2e-public-log-${runId}`;
+    for (let index = 0; index < 5; index += 1) {
+      recordActivity({
+        messageId: `e2e-burst-${runId}-${index}`,
+        guildId: guild.id,
+        channelId: interimChannelId,
+        parentId: null,
+        userId: interimAccusedId,
+        activityDate: new Date(now).toISOString().slice(0, 10),
+        contentHash: `e2e-burst-hash-${runId}-${index}`,
+        content: `E2E message burst ${index + 1}`,
+        createdAt: now - (4 - index) * 1000
+      });
+    }
+    let interimCase = createCase({
+      guildId: guild.id,
+      kind: 'criminal',
+      reporterId: interimReporterId,
+      accusedId: interimAccusedId,
+      lawId: law.id,
+      offenseCode: 'E2E_INJECTION',
+      summary: `${mark} 公開ログによる一時保全の条件評価`,
+      status: 'defense',
+      defenseUntil: now + FAR_FUTURE,
+      allegedAt: now
+    });
+    addCaseEvidence({
+      caseId: interimCase.id,
+      submittedBy: interimReporterId,
+      messageId: `e2e-burst-${runId}-4`,
+      channelId: interimChannelId,
+      authorId: interimAccusedId,
+      content: 'E2E message burst 5',
+      occurredAt: now
+    });
+    interimCase = await publishCase(
+      guild,
+      governance,
+      interimCase,
+      '答弁',
+      '公開ログの件数・時間窓・証拠メッセージ一致を確認します。shadowのため実際の発言制限は行いません。'
+    );
+    const interimProtection = await applyInterimProtectionFromLogs(guild, interimCase, now);
+    assert.equal(interimProtection?.status, 'simulated');
+    assert.equal(interimProtection?.observed_events, 5);
+    endInterimProtection(interimCase.id, 'e2e_completed');
+    interimCase = updateCase(interimCase.id, { status: 'final', finalized_at: Date.now() });
+    await postCourtUpdate(
+      guild,
+      interimCase,
+      '直近30秒の公開ログ5件と成立法の定義が一致する場合だけ一時保全候補になることを確認しました。実制限なしで終了しました。',
+      { state: '確定' }
+    );
+    manifest.cases.push({
+      id: interimCase.id,
+      kind: 'interim-protection-log-trigger',
+      status: interimCase.status,
+      protectionId: interimProtection.id,
+      observedEvents: interimProtection.observed_events,
+      threadId: interimCase.public_thread_id
+    });
+
     updateLaw(law.id, { status: 'repealed', ended_at: Date.now() });
     lawProposal = updateProposal(lawProposal.id, { status: 'rejected', stage_ends_at: Date.now() });
     await postProposalUpdate(guild, lawProposal, '刑罰schemaを登録・検証し、通常の法適用に入る前に廃止しました。', { state: '廃止' });
@@ -730,6 +800,7 @@ async function cleanup(guild, runId) {
     cleaned.proposals.push(proposal.id);
   }
   for (let caseRecord of listCases(guild.id, { limit: 500 }).filter((entry) => entry.summary.includes(mark))) {
+    endInterimProtection(caseRecord.id, 'e2e_completed');
     const sanction = getCaseSanction(caseRecord.id);
     if (sanction && !['simulated', 'reversed'].includes(sanction.status)) {
       updateSanction(sanction.id, { status: 'reversed', reversed_at: Date.now() });
@@ -789,6 +860,7 @@ const [{
   addCaseSubmission,
   createAdministrativeAct,
   createCase,
+  endInterimProtection,
   createProposal,
   createSanction,
   enactLaw,
@@ -807,6 +879,7 @@ const [{
   listSanctionsForLaw,
   pendingActions,
   proposalVoteSummary,
+  recordActivity,
   snapshotProposalVoters,
   updateAppeal,
   updateCase,
@@ -834,6 +907,7 @@ const [{
   runConstitutionalPanel,
   runJudicialPanel
 }, {
+  applyInterimProtectionFromLogs,
   appealCase,
   approveCase,
   castAndPublishVote,

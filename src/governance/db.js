@@ -581,6 +581,32 @@ db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied
 }
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (10, ?)').run(Date.now());
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS governance_interim_protections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL UNIQUE,
+    guild_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    law_id INTEGER NOT NULL,
+    offense_code TEXT NOT NULL,
+    trigger_type TEXT NOT NULL,
+    minimum_events INTEGER NOT NULL,
+    observed_events INTEGER NOT NULL,
+    window_seconds INTEGER NOT NULL,
+    duration_seconds INTEGER NOT NULL,
+    evidence_message_id TEXT NOT NULL,
+    evidence_channel_id TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    ends_at INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    ended_at INTEGER,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_interim_protection_user
+    ON governance_interim_protections(guild_id, user_id, status, ends_at);
+`);
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (11, ?)').run(Date.now());
+
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
 db.prepare("UPDATE governance_outbox SET status = 'error', last_error = 'interrupted before completion' WHERE status = 'running'").run();
@@ -1000,6 +1026,18 @@ export function recentGovernanceMessages(guildId, since, channelIds, limit = 300
     seen.add(row.content_hash);
     return true;
   }).reverse();
+}
+
+export function recentUserActivity(guildId, userId, channelId, since, until = Date.now(), limit = 100) {
+  return db.prepare(`
+    SELECT message_id, channel_id, parent_id, content_hash, content, created_at
+    FROM governance_activity
+    WHERE guild_id = ? AND user_id = ? AND channel_id = ?
+      AND created_at >= ? AND created_at <= ?
+    ORDER BY created_at DESC, message_id DESC LIMIT ?
+  `).all(
+    String(guildId), String(userId), String(channelId), Number(since), Number(until), Number(limit)
+  ).reverse();
 }
 
 export function createProposal(input) {
@@ -1586,6 +1624,80 @@ export function deactivateRestrictionForSanction(sanctionId, status = 'reversed'
     UPDATE governance_active_restrictions SET status = ?
     WHERE sanction_id = ? AND status = 'active'
   `).run(status, sanctionId).changes;
+}
+
+export function createInterimProtection(input) {
+  const now = Date.now();
+  const result = db.prepare(`
+    INSERT INTO governance_interim_protections
+      (case_id, guild_id, user_id, law_id, offense_code, trigger_type,
+       minimum_events, observed_events, window_seconds, duration_seconds,
+       evidence_message_id, evidence_channel_id, started_at, ends_at, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    Number(input.caseId), String(input.guildId), String(input.userId), Number(input.lawId),
+    String(input.offenseCode), String(input.triggerType), Number(input.minimumEvents),
+    Number(input.observedEvents), Number(input.windowSeconds), Number(input.durationSeconds),
+    String(input.evidenceMessageId), String(input.evidenceChannelId), Number(input.startedAt),
+    Number(input.endsAt), String(input.status), now
+  );
+  return getInterimProtection(Number(result.lastInsertRowid));
+}
+
+export function getInterimProtection(id) {
+  return db.prepare('SELECT * FROM governance_interim_protections WHERE id = ?').get(Number(id)) ?? null;
+}
+
+export function getCaseInterimProtection(caseId) {
+  return db.prepare('SELECT * FROM governance_interim_protections WHERE case_id = ?').get(Number(caseId)) ?? null;
+}
+
+export function listInterimProtections(guildId, statuses = null) {
+  if (statuses?.length) {
+    const marks = statuses.map(() => '?').join(',');
+    return db.prepare(`
+      SELECT * FROM governance_interim_protections
+      WHERE guild_id = ? AND status IN (${marks}) ORDER BY id
+    `).all(String(guildId), ...statuses.map(String));
+  }
+  return db.prepare(`
+    SELECT * FROM governance_interim_protections WHERE guild_id = ? ORDER BY id
+  `).all(String(guildId));
+}
+
+export function activeInterimProtections(guildId, userId, now = Date.now()) {
+  return db.prepare(`
+    SELECT p.* FROM governance_interim_protections p
+    JOIN governance_guilds g ON g.guild_id = p.guild_id
+    WHERE p.guild_id = ? AND p.user_id = ? AND p.status = 'active'
+      AND p.ends_at > ? AND g.enforcement_mode = 'live'
+    ORDER BY p.ends_at
+  `).all(String(guildId), String(userId), Number(now));
+}
+
+export function expireInterimProtections(now = Date.now()) {
+  const expired = db.prepare(`
+    SELECT * FROM governance_interim_protections
+    WHERE status = 'active' AND ends_at <= ? ORDER BY id
+  `).all(Number(now));
+  if (expired.length > 0) {
+    db.prepare(`
+      UPDATE governance_interim_protections SET status = 'expired', ended_at = ?
+      WHERE status = 'active' AND ends_at <= ?
+    `).run(Number(now), Number(now));
+  }
+  return expired.map((row) => ({ ...row, status: 'expired', ended_at: Number(now) }));
+}
+
+export function endInterimProtection(caseId, status = 'released', now = Date.now()) {
+  if (!['released', 'expired', 'cancelled', 'e2e_completed'].includes(status)) {
+    throw new Error('一時保全の終了状態が不正です。');
+  }
+  db.prepare(`
+    UPDATE governance_interim_protections SET status = ?, ended_at = ?
+    WHERE case_id = ? AND status IN ('active', 'simulated')
+  `).run(status, Number(now), Number(caseId));
+  return getCaseInterimProtection(caseId);
 }
 
 export function restrictionUsageCount(restrictionId, kind, since) {

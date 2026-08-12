@@ -1,6 +1,14 @@
 import { createHash } from 'node:crypto';
 
 export const DAY_MS = 86_400_000;
+export const INTERIM_PROTECTION_LIMITS = Object.freeze({
+  minimumMessages: 5,
+  maximumMessages: 30,
+  minimumWindowSeconds: 10,
+  maximumWindowSeconds: 300,
+  minimumDurationSeconds: 60,
+  maximumDurationSeconds: 900
+});
 
 export function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
@@ -12,6 +20,25 @@ export function canonicalJson(value) {
     return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
   }
   return JSON.stringify(value);
+}
+
+export function validateInterimProtectionDefinition(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (Object.keys(value).some((key) => !['trigger', 'durationSeconds'].includes(key))) return false;
+  const trigger = value.trigger;
+  if (!trigger || typeof trigger !== 'object' || Array.isArray(trigger)) return false;
+  if (Object.keys(trigger).some((key) => !['type', 'minimumMessages', 'windowSeconds'].includes(key))) return false;
+  const limits = INTERIM_PROTECTION_LIMITS;
+  return trigger.type === 'message_burst'
+    && Number.isInteger(trigger.minimumMessages)
+    && trigger.minimumMessages >= limits.minimumMessages
+    && trigger.minimumMessages <= limits.maximumMessages
+    && Number.isInteger(trigger.windowSeconds)
+    && trigger.windowSeconds >= limits.minimumWindowSeconds
+    && trigger.windowSeconds <= limits.maximumWindowSeconds
+    && Number.isInteger(value.durationSeconds)
+    && value.durationSeconds >= limits.minimumDurationSeconds
+    && value.durationSeconds <= limits.maximumDurationSeconds;
 }
 
 function finite(value, name, { min = 0, max = Infinity } = {}) {
