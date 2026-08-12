@@ -61,6 +61,18 @@ export function endpointFor(engine) {
 }
 
 /**
+ * 自分で配信しているモデルか (= 127.0.0.1 の推論プロセスに投げるか)。
+ *
+ * ここを判定の唯一の入口にする。呼ぶ側でエンジン名を並べていたら、evex-1 を足した
+ * ときに `chosen === 'evex' || chosen === 'evex-ft'` の書き足しを落として、
+ * evex-1 を選んだ人が黙って DeepSeek に回っていた (料金も掛かるし、選んだものと
+ * 違う答えが返る)。名簿は ENDPOINTS だけにしておけば足し忘れが起きない。
+ */
+export function isSelfHosted(engine) {
+  return Object.hasOwn(ENDPOINTS, String(engine));
+}
+
+/**
  * 生成結果からプロンプトぶんを落として、続きだけを取る。
  *
  * `slice(prompt.length)` で済ませていたが、それは**サーバーがプロンプトを一字一句

@@ -11,7 +11,7 @@ import {
   SlashCommandBuilder
 } from 'discord.js';
 
-import { ENDPOINTS, endpointFor, status } from './client.js';
+import { ENDPOINTS, endpointFor, isSelfHosted, status } from './client.js';
 import { impersonate } from './impersonate.js';
 import { clearPersona, forgetPersona, personaCounts, personaFor, setPersona } from './persona.js';
 import { DEFAULT_ENGINE, ENGINES, engineCounts, engineFor, setEngine } from './prefs.js';
@@ -103,7 +103,7 @@ export const mimicCommands = [
       // 自作モデルは別プロセス。立っていないものを選ばせると、話しかけるたびに
       // 「起動していません」が返るだけで、選んだ本人には理由が分からない。
       // 選択肢は登録時に固定されるので (addChoices)、ここで断る。
-      if (ENDPOINTS[engine]) {
+      if (isSelfHosted(engine)) {
         const health = await status(engine);
         if (!health.up) {
           await interaction.reply({
@@ -191,7 +191,7 @@ export const mimicCommands = [
         // その人が選んでいる世代で生成する。deepseek のままだと自作モデルが
         // 使われないので、既定は evex に落とす
         const chosen = engineFor(interaction.user.id);
-        const engine = ENDPOINTS[chosen] ? chosen : 'evex';
+        const engine = isSelfHosted(chosen) ? chosen : 'evex';
         const { text, how } = await impersonate(targetId, {
           topic,
           channelId: interaction.channelId,
@@ -320,7 +320,7 @@ export const mimicCommands = [
       await interaction.reply({
         content: [
           `あなたの分を **${nameOf(targetId)} として** にしました。他の人には影響しません。`,
-          ENDPOINTS[engine]
+          isSelfHosted(engine)
             ? 'メンションすると、その口調で1発言返します。'
             : `いまのあなたは **${ENGINES[engine].label}** なので効きません。\`/model\` で自作モデルに変えてください。`
         ].join('\n'),

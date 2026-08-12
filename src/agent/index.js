@@ -36,6 +36,7 @@ import {
   usdToTokens,
   weighTokens
 } from './ratelimit.js';
+import { isSelfHosted } from '../mimic/client.js';
 import { engineFor } from '../mimic/prefs.js';
 import { handleMimicRequest } from '../mimic/respond.js';
 import { ThinkingIndicator, isIndicatorMessage, toolLabel } from './thinking.js';
@@ -296,8 +297,12 @@ export async function handleAgentRequest(message, client) {
   const governanceTopic = Boolean(getGovernanceGuild(guild.id))
     && isGovernanceAgentTopic(message.content);
   const chosen = engineFor(message.author.id);
-  // 自作モデル側はどれも「会話の続きを1発言書く」だけ。道具も検索も使えない
-  if ((chosen === 'evex' || chosen === 'evex-ft') && !governanceTopic) {
+  // 自作モデル側はどれも「会話の続きを1発言書く」だけ。道具も検索も使えない。
+  //
+  // 名前を並べていたら evex-1 を足したときに書き足し忘れ、選んだ人が黙って
+  // DeepSeek に回っていた (料金も掛かる)。自前で配信しているものは ENDPOINTS に
+  // 全部載っているので、そちらを唯一の名簿にする
+  if (isSelfHosted(chosen) && !governanceTopic) {
     const recent = await message.channel.messages
       .fetch({ limit: 20 })
       .then((found) => [...found.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp))

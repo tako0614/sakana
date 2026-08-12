@@ -18,6 +18,7 @@ const {
   firstTurn, humanize, messageText, nextRole, normalize
 } = await import('../src/mimic/serialize.js');
 const { DEFAULT_ENGINE, ENGINES, engineFor, setEngine } = await import('../src/mimic/prefs.js');
+const { isSelfHosted } = await import('../src/mimic/client.js');
 const { db } = await import('../src/db.js');
 
 function fail(message) {
@@ -209,7 +210,22 @@ try {
   if (setEngine(USER, 'gpt-9')) fail('知らないエンジンを受け付けてはいけない');
   if (engineFor(USER) !== 'evex') fail('無効な指定で既存の選択を壊してはいけない');
 
-  console.log(`engine ok (${Object.keys(ENGINES).join(' / ')} / 既定 ${DEFAULT_ENGINE})`);
+  // 選べる自作モデルは全部 127.0.0.1 に回らないといけない。
+  //
+  // agent/index.js が `chosen === 'evex' || chosen === 'evex-ft'` とエンジン名を
+  // 並べていたので、evex-1 を足したときに書き足しを落とし、選んだ人が黙って
+  // DeepSeek に回っていた。選択肢を足したら必ずここで気付く形にする。
+  for (const key of Object.keys(ENGINES)) {
+    if (key === DEFAULT_ENGINE) continue;
+    if (!isSelfHosted(key)) fail(`${key} に接続先が無い (ENDPOINTS に足す)`);
+  }
+  if (isSelfHosted(DEFAULT_ENGINE)) fail('deepseek を自作モデル扱いにしてはいけない');
+  if (isSelfHosted('gpt-9')) fail('知らないエンジンを自作モデル扱いにしてはいけない');
+
+  console.log(
+    `engine ok (${Object.keys(ENGINES).join(' / ')} / 既定 ${DEFAULT_ENGINE}`
+    + ` / 自作 ${Object.keys(ENGINES).filter(isSelfHosted).length} 個は推論プロセスへ)`
+  );
 } finally {
   clear();
 }
