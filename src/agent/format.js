@@ -157,6 +157,35 @@ export function fromArchiveRow(row, channelName) {
 }
 
 /** discord.js の Message を共通形にそろえる。 */
+/**
+ * 本文が無いメッセージの中身。画像だけ・埋め込みだけの発言は content が空なので、
+ * そのまま渡すと `(本文なし)` になって何が貼られたのか分からない。
+ *
+ * アーカイブの取り込みは同じものを extra に集めていて (`indexer.js`)、
+ * `fromArchiveRow` は `content || extra` で使う。生の Message 側だけ抜けていたので、
+ * 同じ規則にそろえる (本文があるときは足さない = 普通の発言のトークンは増えない)。
+ */
+function describeExtras(message) {
+  const parts = [];
+
+  for (const attachment of message.attachments?.values() ?? []) {
+    parts.push(attachment.description ? `${attachment.name}: ${attachment.description}` : attachment.name);
+  }
+
+  for (const embed of message.embeds ?? []) {
+    const head = [embed.title, embed.author?.name].filter(Boolean).join(' / ');
+    const body = [head, embed.description].filter(Boolean).join(' — ');
+    if (body) parts.push(`[埋め込み] ${body}`);
+  }
+
+  for (const sticker of message.stickers?.values() ?? []) {
+    parts.push(`[スタンプ] ${sticker.name}`);
+  }
+
+  // 埋め込みの説明は長いことがあるので、何が貼られたか分かる範囲で切る
+  return parts.filter(Boolean).length ? truncate(parts.filter(Boolean).join(' / '), 120) : '';
+}
+
 export function fromDiscordMessage(message, channelName) {
   return {
     guildId: message.guildId ?? message.guild?.id ?? null,
@@ -170,7 +199,7 @@ export function fromDiscordMessage(message, channelName) {
       ?? message.author?.username
       ?? 'unknown',
     isBot: Boolean(message.author?.bot),
-    content: message.content ?? '',
+    content: message.content || describeExtras(message),
     createdAt: message.createdTimestamp,
     editedAt: message.editedTimestamp ?? null,
     deleted: false,

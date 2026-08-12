@@ -363,3 +363,52 @@ const { INDICATOR_PREFIX, isIndicatorMessage } = await import('../src/agent/thin
 }
 
 console.log('indicator ok (経過表示を直近の会話に混ぜない)');
+
+// --- 本文が無い発言 ---
+//
+// 画像だけ・埋め込みだけの発言は content が空。そのまま渡すと `(本文なし)` になって
+// 何が貼られたのか分からない。アーカイブ側は extra に集めていたのに、
+// 生の Message 側 (直近の会話・返信の鎖) だけ抜けていた。
+
+const { fromDiscordMessage } = await import('../src/agent/format.js');
+
+{
+  const base = {
+    id: '1',
+    guildId: 'g',
+    channelId: 'c',
+    author: { id: 'u', username: 'たこ' },
+    member: { displayName: 'たこ' },
+    createdTimestamp: 1_700_000_000_000,
+    reactions: { cache: new Map() },
+    attachments: new Map(),
+    embeds: [],
+    stickers: new Map()
+  };
+  const contentOf = (over) => fromDiscordMessage({ ...base, ...over }, 'general').content;
+
+  const image = contentOf({ content: '', attachments: new Map([['a', { name: 'screenshot.png' }]]) });
+  if (!image.includes('screenshot.png')) fail(`画像だけの発言でファイル名が出ない: ${image}`);
+
+  const embed = contentOf({
+    content: '',
+    embeds: [{ title: 'Asahi Linux', description: 'Apple Silicon 上の Linux' }]
+  });
+  if (!embed.includes('Asahi Linux')) fail(`埋め込みだけの発言で中身が出ない: ${embed}`);
+  if (!embed.includes('Apple Silicon')) fail(`埋め込みの説明が出ない: ${embed}`);
+
+  const sticker = contentOf({ content: '', stickers: new Map([['s', { name: 'ぬこ' }]]) });
+  if (!sticker.includes('ぬこ')) fail(`スタンプ名が出ない: ${sticker}`);
+
+  // 本文があるときは足さない (普通の発言のトークンを増やさない / アーカイブ側と同じ規則)
+  const both = contentOf({ content: 'これ見て', attachments: new Map([['a', { name: 'x.png' }]]) });
+  if (both !== 'これ見て') fail(`本文があるなら足さない: ${both}`);
+
+  // 長い埋め込みは切る
+  const long = contentOf({ content: '', embeds: [{ description: 'あ'.repeat(500) }] });
+  if (long.length > 130) fail(`埋め込みが長すぎる: ${long.length} 文字`);
+
+  if (contentOf({ content: '' }) !== '') fail('何も無いなら空のまま');
+}
+
+console.log('extras ok (画像・埋め込み・スタンプの中身を渡す)');
