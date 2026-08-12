@@ -1099,6 +1099,7 @@ assert.match(liveE2eSource, /--confirm-shadow/, 'live E2Eはshadow確認フラ�
 assert.match(liveE2eSource, /governance\.enforcement_mode, 'shadow'/, 'live執行ではE2Eを拒否する');
 assert.match(liveE2eSource, /pendingActions\(100\)\.length, 0/, '既存outboxを巻き込まない');
 assert.match(liveE2eSource, /currentTrusted !== initialTrusted/, '特別有権者ロールを原状復帰する');
+assert.match(liveE2eSource, /force: true/, '特別有権者ロールはDiscord APIから強制readbackする');
 assert.match(liveE2eSource, /setTrustedMember/, 'owner専用の正規経路で特別有権者を操作する');
 assert.match(liveE2eSource, /--provision-trusted-role/, '未設定の特別有権者roleは明示フラグなしに作らない');
 assert.match(liveE2eSource, /permissions: \[\]/, 'E2Eで作る特別有権者roleにDiscord権限を付けない');
@@ -1106,6 +1107,7 @@ assert.match(liveE2eSource, /unauthorizedChangeReverted: true/, '正規経路外
 assert.match(liveE2eSource, /allSummary\.trustedTotal, 1/, 'trusted拒否を有効投票数で実測する');
 assert.match(liveE2eSource, /type: 'warning'/, 'warning刑もlive fixtureで検証する');
 assert.match(liveE2eSource, /type: 'restriction'/, '新しい制限定義とrestriction刑もlive fixtureで検証する');
+assert.match(liveE2eSource, /rejected_by_schema/, '司法AIが適用法を変えた場合もfail closedとして記録する');
 assert.doesNotMatch(liveE2eSource, /guild\.members\.(kick|ban)/, 'live E2EからDiscord処分を直接呼ばない');
 
 governanceDb.governanceDatabase.close();

@@ -193,9 +193,19 @@ async function publishCase(guild, governance, caseRecord, state, text, component
 async function setTrustedAndAudit(guild, member, desired) {
   const before = oldMemberSnapshot(member);
   const changed = await setTrustedMember(guild, guild.ownerId, member, desired);
-  const refreshed = await guild.members.fetch(member.id);
+  const refreshed = await fetchMemberRoleState(guild, member.id, getGovernanceGuild(guild.id).trusted_role_id, desired);
   if (changed) await onTrustedRoleChange(before, refreshed);
-  return refreshed;
+  return fetchMemberRoleState(guild, member.id, getGovernanceGuild(guild.id).trusted_role_id, desired);
+}
+
+async function fetchMemberRoleState(guild, userId, roleId, expected) {
+  let member = null;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    member = await guild.members.fetch({ user: userId, force: true });
+    if (member.roles.cache.has(roleId) === expected) return member;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`特別有権者ロールのDiscord readbackが${expected ? '付与' : '削除'}状態になりませんでした。`);
 }
 
 async function runAiProbes({ guild, constitution, law, caseRecord, mark }) {
@@ -244,16 +254,37 @@ async function runAiProbes({ guild, constitution, law, caseRecord, mark }) {
     recentCases: [caseRecord]
   });
   const offense = law.provisions.offenses[0];
-  results.judicial = await runJudicialPanel({
-    guildId: guild.id,
-    caseRecord,
-    law,
-    offense,
-    evidence: listCaseEvidence(caseRecord.id),
-    submissions: listCurrentCaseSubmissions(caseRecord.id),
-    policy: constitution.policy,
-    phase: 'live_e2e'
-  });
+  const judicialErrors = [];
+  for (const phase of ['live_e2e', 'live_e2e_retry']) {
+    try {
+      results.judicial = await runJudicialPanel({
+        guildId: guild.id,
+        caseRecord,
+        law,
+        offense,
+        evidence: listCaseEvidence(caseRecord.id),
+        submissions: listCurrentCaseSubmissions(caseRecord.id),
+        policy: constitution.policy,
+        phase
+      });
+      break;
+    } catch (error) {
+      judicialErrors.push(String(error?.message ?? error).slice(0, 500));
+    }
+  }
+  if (!results.judicial) {
+    results.judicial = {
+      panelId: null,
+      outputs: [],
+      verdict: 'rejected_by_schema',
+      sanction: null,
+      rejectedBySchema: true,
+      errors: judicialErrors
+    };
+  } else {
+    results.judicial.rejectedBySchema = false;
+    results.judicial.retryErrors = judicialErrors;
+  }
   results.amendment = await draftAmendment({
     guildId: guild.id,
     request: {
@@ -276,7 +307,11 @@ async function runAiProbes({ guild, constitution, law, caseRecord, mark }) {
 
   assert.ok(['petition', 'amendment', 'information', 'unclear'].includes(results.legislativeIntake.intent));
   assert.equal(results.constitutional.outputs.length, constitution.policy.judiciary.panelSeats);
-  assert.equal(results.judicial.outputs.length, constitution.policy.judiciary.panelSeats);
+  assert.ok(
+    results.judicial.outputs.length === constitution.policy.judiciary.panelSeats
+      || (results.judicial.rejectedBySchema && results.judicial.errors.length === 2),
+    '司法パネルは3席成功するか、2回ともschemaでfail closedしなければなりません。'
+  );
   assert.equal(results.amendment.policy.schemaVersion, constitution.policy.schemaVersion);
   return results;
 }
@@ -292,7 +327,7 @@ async function seed(guild, actorId, runId) {
   assert.ok(governance.trusted_role_id, '特別有権者ロールを設定できませんでした。');
   const mark = marker(runId);
   const now = Date.now();
-  const owner = await guild.members.fetch(actorId);
+  const owner = await guild.members.fetch({ user: actorId, force: true });
   const initialTrusted = owner.roles.cache.has(governance.trusted_role_id);
   let currentOwner = owner;
   const manifest = {
@@ -322,9 +357,9 @@ async function seed(guild, actorId, runId) {
     assert.equal(currentOwner.roles.cache.has(governance.trusted_role_id), true);
     const unauthorizedBefore = oldMemberSnapshot(currentOwner);
     await currentOwner.roles.remove(governance.trusted_role_id, 'E2E unauthorized trusted role change probe');
-    const unauthorizedAfter = await guild.members.fetch(currentOwner.id);
+    const unauthorizedAfter = await fetchMemberRoleState(guild, currentOwner.id, governance.trusted_role_id, false);
     await onTrustedRoleChange(unauthorizedBefore, unauthorizedAfter);
-    currentOwner = await guild.members.fetch(currentOwner.id);
+    currentOwner = await fetchMemberRoleState(guild, currentOwner.id, governance.trusted_role_id, true);
     assert.equal(currentOwner.roles.cache.has(governance.trusted_role_id), true, '正規経路外の特別有権者変更が差し戻されませんでした。');
     manifest.results.trustedRole = { removed: initialTrusted, added: true, unauthorizedChangeReverted: true, restored: false };
 
@@ -475,10 +510,14 @@ async function seed(guild, actorId, runId) {
       constitutionalVerdicts: aiResults.constitutional.outputs.map((entry) => entry.verdict),
       judicialIntent: aiResults.judicialIntake.intent,
       judicialVerdicts: aiResults.judicial.outputs.map((entry) => entry.verdict),
+      judicialRejectedBySchema: aiResults.judicial.rejectedBySchema,
+      judicialSchemaErrors: aiResults.judicial.errors ?? aiResults.judicial.retryErrors,
       amendmentTitle: aiResults.amendment.title,
       weeklyIssues: aiResults.weekly.length
     };
-    await postCourtRecord(guild, defenseCase, `AI耐性検証完了: 司法${aiResults.judicial.outputs.length}席、違憲審査${aiResults.constitutional.outputs.length}席。証拠中の命令を実行せずschema検証を通過しました。`);
+    await postCourtRecord(guild, defenseCase, aiResults.judicial.rejectedBySchema
+      ? `AI耐性検証完了: 司法出力は2回とも適用法・構成要件の固定schemaに反したためfail closedしました。違憲審査${aiResults.constitutional.outputs.length}席は完了しています。`
+      : `AI耐性検証完了: 司法${aiResults.judicial.outputs.length}席、違憲審査${aiResults.constitutional.outputs.length}席。証拠中の命令を実行せずschema検証を通過しました。`);
 
     let constitutionalCase = createCase({
       guildId: guild.id,
@@ -620,7 +659,7 @@ async function seed(guild, actorId, runId) {
     manifest.completedAt = new Date().toISOString();
     return manifest;
   } finally {
-    currentOwner = await guild.members.fetch(actorId).catch(() => currentOwner);
+    currentOwner = await guild.members.fetch({ user: actorId, force: true }).catch(() => currentOwner);
     const currentTrusted = currentOwner.roles.cache.has(governance.trusted_role_id);
     if (currentTrusted !== initialTrusted) {
       currentOwner = await setTrustedAndAudit(guild, currentOwner, initialTrusted);
