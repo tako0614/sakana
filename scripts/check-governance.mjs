@@ -22,7 +22,7 @@ assert.match(
   /^# unsafe \\# server憲法$/,
   'サーバー名をMarkdown見出しへ安全に埋め込む'
 );
-assert.equal(governanceCategoryName('Test Community'), 'Test Community Governance');
+assert.equal(governanceCategoryName('Test Community'), 'Test Community 統治');
 assert.equal(Array.from(governanceCategoryName('x'.repeat(100))).length, 100);
 policyModule.validateConstitutionPolicy(policy);
 
@@ -97,14 +97,16 @@ const activeConstitution = governanceDb.getActiveConstitution('g1');
 assert.equal(governanceDb.getGovernanceGuild('g1').legislature_role_id, 'legislature-role');
 assert.equal(governanceDb.getGovernanceGuild('g1').judiciary_role_id, 'judiciary-role');
 assert.equal(governanceDb.getGovernanceGuild('g1').statute_forum_id, 'statutes');
+assert.equal(governanceDb.getGovernanceGuild('g1').guide_channel_id, '', '既存guildはUX schedulerで案内を補完する');
 assert.equal('administration_role_id' in governanceDb.getGovernanceGuild('g1'), false, '@行政は公開入口として作らない');
 assert.equal(governanceDb.listConstitutions('g1').length, 1, '法令集backfill用に憲法の全versionを列挙できる');
 let publication = governanceDb.upsertStatutePublication({
   guildId: 'g1', instrumentType: 'constitution', instrumentId: activeConstitution.id,
-  forumThreadId: 'constitution-thread', forumMessageId: 'constitution-message',
+  forumThreadId: 'constitution-thread', forumMessageId: 'constitution-message', detailMessageId: 'constitution-detail',
   publicationStatus: '現行憲法', contentHash: activeConstitution.content_hash
 });
 assert.equal(publication.publication_status, '現行憲法');
+assert.equal(publication.detail_message_id, 'constitution-detail');
 publication = governanceDb.upsertStatutePublication({
   guildId: 'g1', instrumentType: 'constitution', instrumentId: activeConstitution.id,
   forumThreadId: 'constitution-thread', forumMessageId: 'constitution-message',
@@ -112,6 +114,31 @@ publication = governanceDb.upsertStatutePublication({
 });
 assert.equal(governanceDb.listStatutePublications('g1').length, 1, '同じ法令の掲載記録はupsertされ重複しない');
 assert.equal(publication.publication_status, '旧憲法');
+
+const setupSession = governanceDb.createGovernanceSetupSession({
+  guildId: 'new-guild', requestedBy: 'owner', constitutionHash: 'constitution-hash',
+  policyHash: 'policy-hash', expiresAt: Date.now() + 60_000
+});
+assert.equal(setupSession.status, 'preview');
+assert.equal(governanceDb.claimGovernanceSetupSession(setupSession.id, 'other'), null, '別の運営者は導入確認を奪えない');
+assert.equal(governanceDb.claimGovernanceSetupSession(setupSession.id, 'owner').status, 'provisioning');
+assert.equal(governanceDb.claimGovernanceSetupSession(setupSession.id, 'owner'), null, '導入確認の二重実行を拒否する');
+governanceDb.updateGovernanceSetupSession(setupSession.id, {
+  status: 'preview', requested_by: 'backup-operator', resources: { categoryId: 'partial-category' }
+});
+assert.equal(
+  governanceDb.claimGovernanceSetupSession(setupSession.id, 'backup-operator').status,
+  'provisioning',
+  '設定済み運営者は中断した導入を引き継げる'
+);
+const archived = governanceDb.archiveLegacyGovernanceMessage({
+  guildId: 'g1', channelId: 'gazette', messageId: 'legacy-1', authorId: 'bot',
+  content: 'legacy body', attachments: [{ name: 'policy.json', dataBase64: 'e30=' }],
+  createdAt: 1, reason: 'test'
+});
+assert.equal(archived.message_created_at, 1);
+governanceDb.markLegacyGovernanceMessageDeleted('g1', 'gazette', 'legacy-1');
+assert.ok(governanceDb.listLegacyGovernanceMessageArchive('g1')[0].deleted_at);
 
 const { governanceMentionBranch, handleGovernanceIntakeComponent, handleGovernanceMention } = await import('../src/governance/intake.js');
 const mentionMessage = (ids) => ({
@@ -142,7 +169,8 @@ const expiredIntake = governanceDb.createGovernanceIntake({
   channelId: 'public', sourceMessageId: 'intake-source-expired',
   payload: { caseId: 1 }, expiresAt: Date.now() - 1
 });
-governanceDb.expireGovernanceIntakes();
+const newlyExpired = governanceDb.expireGovernanceIntakes();
+assert.equal(newlyExpired[0].id, expiredIntake.id, '期限切れUIを無効化する対象をschedulerへ返す');
 assert.equal(governanceDb.getGovernanceIntake(expiredIntake.id).status, 'expired');
 
 let proposal = governanceDb.createProposal({
@@ -636,12 +664,17 @@ await assert.rejects(
 const { governanceCommands } = await import('../src/governance/commands.js');
 assert.deepEqual(governanceCommands.map((command) => command.data.name), ['governance'],
   '公開統治slash commandは管理用governanceだけ');
+assert.equal(governanceCommands[0].data.toJSON().options?.length ?? 0, 0,
+  '/governanceは未導入なら確認画面、導入済みなら管理画面を開く単一command');
 const {
+  adminChannelOverwrites,
+  readOnlyTextOverwrites,
   statuteForumEveryonePermissionState,
   statutePublicationState
 } = await import('../src/governance/discord.js');
 assert.deepEqual(statuteForumEveryonePermissionState(), {
   ViewChannel: true,
+  ReadMessageHistory: true,
   SendMessages: false,
   SendMessagesInThreads: false,
   CreatePublicThreads: false,
@@ -654,6 +687,72 @@ assert.equal(statutePublicationState('law', 'active'), '現行法');
 assert.equal(statutePublicationState('law', 'suspended'), '停止');
 assert.equal(statutePublicationState('law', 'unconstitutional'), '違憲');
 assert.equal(statutePublicationState('law', 'repealed'), '廃止');
+const aclGuild = { id: 'acl-guild', ownerId: 'owner', members: { me: { id: 'bot' } } };
+assert.deepEqual(
+  adminChannelOverwrites(aclGuild).map((entry) => entry.id),
+  ['acl-guild', 'owner', 'bot'],
+  '統治管理は特別有権者ではなくownerと設定運営者だけを追加する'
+);
+assert.deepEqual(
+  readOnlyTextOverwrites(aclGuild).map((entry) => entry.id),
+  ['acl-guild', 'bot'],
+  '統治案内は全員とbotの読み取り専用ACLである'
+);
+
+governanceDb.updateGovernanceGuild('g1', {
+  guide_channel_id: 'guide',
+  admin_channel_id: 'admin',
+  trusted_role_id: 'special-role'
+});
+const {
+  legacyGazetteCandidates,
+  legacyStatuteTechnicalCandidates,
+  renderGovernanceDashboard,
+  renderGovernanceGuide
+} = await import('../src/governance/ux.js');
+const uxGuild = {
+  id: 'g1',
+  name: 'Test Community',
+  ownerId: 'owner',
+  client: { user: { id: 'bot' } },
+  roles: {
+    cache: new Map([['special-role', { id: 'special-role', name: '貴族院' }]]),
+    fetch: async (id) => id === 'special-role' ? { id, name: '貴族院' } : null
+  },
+  members: { me: { permissions: { has: () => true } } }
+};
+const guideText = await renderGovernanceGuide(uxGuild, governanceDb.getGovernanceGuild('g1'));
+assert.match(guideText, /貴族院/);
+assert.match(guideText, /<@&legislature-role>/);
+assert.doesNotMatch(guideText, /trusted|shadow|policy JSON/i, '参加者案内に内部用語を出さない');
+const dashboard = await renderGovernanceDashboard(uxGuild, governanceDb.getGovernanceGuild('g1'));
+assert.match(dashboard.content, /記録のみ/);
+assert.match(dashboard.content, /貴族院/);
+assert.equal(dashboard.components.length, 2);
+const legacyMessages = [
+  { id: 'before', createdTimestamp: 1, author: { id: 'user' }, content: '普通の投稿', attachments: [] },
+  { id: 'start', createdTimestamp: 2, author: { id: 'bot' }, content: '# 初期憲法 v1\n本文', attachments: [] },
+  { id: 'continuation', createdTimestamp: 3, author: { id: 'bot' }, content: 'policy hash: abc', attachments: [] },
+  { id: 'show', createdTimestamp: 4, type: 20, interaction: { commandName: 'constitution' }, author: { id: 'user' }, content: '', attachments: [] },
+  { id: 'response', createdTimestamp: 5, author: { id: 'bot' }, content: '現行憲法 v1', attachments: [{ name: 'constitution-v1.md' }] },
+  { id: 'replacement', createdTimestamp: 5.5, author: { id: 'bot' }, content: '# 初期憲法 v1 公布\n法令集を参照', attachments: [] },
+  { id: 'after', createdTimestamp: 6, author: { id: 'bot' }, content: '# 判決 C-1', attachments: [] }
+];
+assert.deepEqual(
+  legacyGazetteCandidates(legacyMessages, 'bot').map((message) => message.id),
+  ['start', 'continuation', 'show', 'response'],
+  '旧官報cleanupは既知の技術投稿だけを対象にする'
+);
+assert.deepEqual(
+  legacyStatuteTechnicalCandidates([
+    { id: 'mistake', content: 'git pull -ff-only' },
+    { id: 'fenced', content: '```bash\ngit pull -ff-only\n```' },
+    { id: 'discussion', content: 'git pull -ff-onlyは何ですか？' },
+    { id: 'other', content: 'npm run check' }
+  ]).map((message) => message.id),
+  ['mistake', 'fenced'],
+  '法令スレッドは既知の誤送信と完全一致する投稿だけ整理する'
+);
 
 const { runGovernanceInfo } = await import('../src/agent/governance.js');
 const { isGovernanceAgentTopic } = await import('../src/agent/index.js');

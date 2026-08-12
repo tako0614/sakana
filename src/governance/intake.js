@@ -114,7 +114,7 @@ async function assertEvidenceVisibleTo(guild, evidence, userIds) {
   for (const userId of new Set(userIds.filter(Boolean))) {
     const member = await guild.members.fetch(userId).catch(() => null);
     if (!member || !channel.permissionsFor(member)?.has(PermissionFlagsBits.ViewChannel)) {
-      throw new Error('当事者が閲覧できない場所の内容は証拠にできません。共有可能な裁判チャットへ提示してください。');
+      throw new Error('当事者が閲覧できない場所の内容は証拠にできません。事件の当事者用チャットへ提示してください。');
     }
   }
 }
@@ -131,9 +131,10 @@ function intakeButtons(intake, disabled = false) {
         .setDisabled(disabled));
     }
     if (scopes.includes('trusted')) {
+      const electorate = intake.payload.electorateLabel ?? '特別有権者';
       buttons.push(new ButtonBuilder()
         .setCustomId(`gov:intake:${intake.id}:scope_trusted`)
-        .setLabel(`${intake.payload.voteScope === 'trusted' ? '✓ ' : ''}trusted投票`)
+        .setLabel(`${intake.payload.voteScope === 'trusted' ? '✓ ' : ''}${electorate}のみ`)
         .setStyle(intake.payload.voteScope === 'trusted' ? ButtonStyle.Primary : ButtonStyle.Secondary)
         .setDisabled(disabled));
     }
@@ -161,7 +162,7 @@ function renderIntake(intake, suffix = '') {
       `種別: ${intake.action === 'amendment' ? '憲法改正案' : '法律の請願'}`,
       `題名: ${payload.title}`,
       `内容: ${payload.summary}`,
-      `投票scope: ${payload.voteScope === 'trusted' ? 'trusted user' : '全員'}`
+      `投票範囲: ${payload.voteScope === 'trusted' ? `${payload.electorateLabel ?? '特別有権者'}のみ` : '全員'}`
     );
   } else if (intake.action === 'criminal_case') {
     const law = getLaw(payload.lawId);
@@ -232,6 +233,9 @@ async function handleLegislature(message, governance, request) {
     title: output.title,
     summary: output.summary,
     voteScope: output.voteScope,
+    electorateLabel: governance.trusted_role_id
+      ? (message.guild.roles?.cache?.get?.(governance.trusted_role_id)?.name ?? '特別有権者')
+      : '特別有権者',
     allowedVoteScopes: constitution.policy.voting.allowedScopes.filter((scope) => (
       scope !== 'trusted' || Boolean(governance.trusted_role_id)
     ))
@@ -239,9 +243,15 @@ async function handleLegislature(message, governance, request) {
 }
 
 function caseStatusText(caseRecord, guildId) {
+  const status = ({
+    filing: '受付中', defense: '答弁期間', deliberation: '審理中', approval: '執行承認待ち',
+    appeal_window: '上訴受付中', appeal: '上訴審理中', execution: '執行処理中', final: '確定',
+    overturned: '取消', acquitted: '責任なし', dismissed: '棄却',
+    constitutional_uncertain: '違憲判断不能', unenforceable: '執行不能'
+  })[caseRecord.status] ?? caseRecord.status;
   return [
-    `C-${caseRecord.id} / ${caseRecord.kind}`,
-    `状態: ${caseRecord.status}`,
+    `C-${caseRecord.id} / ${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
+    `状態: ${status}`,
     caseRecord.accused_id ? `被申立人: <@${caseRecord.accused_id}>` : null,
     caseRecord.law_id ? `適用法: #${caseRecord.law_id} / ${caseRecord.offense_code}` : null,
     caseRecord.challenged_type ? `違憲審査対象: ${caseRecord.challenged_type}:${caseRecord.challenged_id}` : null,
@@ -334,7 +344,7 @@ export async function handleGovernanceMention(message) {
     return true;
   }
   if (governance.status !== 'active') {
-    await message.reply({ content: `統治機能は現在 ${governance.status} です。`, allowedMentions: NO_MENTIONS });
+    await message.reply({ content: '統治機能は現在一時停止中です。', allowedMentions: NO_MENTIONS });
     return true;
   }
   const request = stripAddressMentions(message.content, governance, message.client.user?.id);
@@ -483,7 +493,7 @@ export async function handleGovernanceIntakeComponent(interaction, intakeId, val
       last_error: null
     });
     await interaction.message.edit({
-      content: renderIntake(completed, `正式受付済み: ${result.type} ${result.id}`),
+      content: renderIntake(completed, `正式受付済み\n${result.text}`),
       components: intakeButtons(completed, true),
       allowedMentions: { parse: [] }
     }).catch(() => {});
@@ -514,4 +524,23 @@ export async function handleGovernanceIntakeComponent(interaction, intakeId, val
     await interaction.editReply(`実行できません: ${safeError(error)}`);
   }
   return true;
+}
+
+export async function updateExpiredIntakeMessages(client, intakes) {
+  let updated = 0;
+  for (const intake of intakes) {
+    if (!intake.response_message_id) continue;
+    const channel = await client.channels.fetch(intake.channel_id).catch(() => null);
+    if (!channel?.isTextBased?.()) continue;
+    const message = await channel.messages.fetch(intake.response_message_id).catch(() => null);
+    if (!message) continue;
+    const expired = { ...intake, status: 'expired' };
+    await message.edit({
+      content: renderIntake(expired, '確認期限が切れました。正式案件にはなっていません。必要なら改めて呼び出してください。'),
+      components: intakeButtons(expired, true),
+      allowedMentions: NO_MENTIONS
+    }).catch(() => {});
+    updated += 1;
+  }
+  return updated;
 }

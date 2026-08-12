@@ -67,7 +67,7 @@ function constitutionServerName(value) {
 }
 
 export function governanceCategoryName(serverName) {
-  const suffix = ' Governance';
+  const suffix = ' 統治';
   return `${communityDisplayName(serverName).slice(0, 100 - suffix.length)}${suffix}`;
 }
 
@@ -99,9 +99,9 @@ export function parseOperationalSetting(key, raw) {
   const value = Number(raw);
   if (!Number.isInteger(value) || value < 0) return { ok: false, error: '0以上の整数を指定してください。' };
   if (key === 'weekly_scan_enabled' && ![0, 1].includes(value)) {
-    return { ok: false, error: 'weekly_scan_enabled は 0 または 1 です。' };
+    return { ok: false, error: '自律起案の有効・無効は 0 または 1 です。' };
   }
-  if (key === 'weekly_draft_limit' && value > 10) return { ok: false, error: 'weekly_draft_limit は10以下です。' };
-  if (key.endsWith('_daily_calls') && value > 10_000) return { ok: false, error: 'daily_calls は10000以下です。' };
+  if (key === 'weekly_draft_limit' && value > 10) return { ok: false, error: '自律起案の週最大件数は10以下です。' };
+  if (key.endsWith('_daily_calls') && value > 10_000) return { ok: false, error: 'AI受付回数は10000以下です。' };
   return { ok: true, value };
 }

@@ -427,11 +427,17 @@ async function handleInteractionCreate(interaction) {
     return;
   }
 
+  const governanceComponent = interaction.isButton()
+    || interaction.isModalSubmit()
+    || interaction.isRoleSelectMenu()
+    || interaction.isUserSelectMenu();
+  if (governanceComponent && governanceConfig.enabled && await handleGovernanceComponent(interaction)) return;
+
   if (interaction.isButton()) {
-    if (governanceConfig.enabled && await handleGovernanceComponent(interaction)) return;
     await handleArchiveComponent(interaction);
     return;
   }
+  if (governanceComponent) return;
 
   // 補完は isChatInputCommand() が false なので、下の分岐まで来ると黙って落ちる。
   // 候補が出ないだけで理由が表示されないので、ここで先に捌く。

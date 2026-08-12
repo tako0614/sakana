@@ -93,7 +93,7 @@ export async function enforceMessageRestrictions(message) {
       targetId: restriction.sanction_id,
       detail: { userId: message.author.id, messageId: message.id, reason }
     });
-    await message.author.send(`Sakanaの制裁 #${restriction.sanction_id} により投稿を削除しました: ${reason}`).catch(() => {});
+    await message.author.send(`${message.guild?.name ?? 'このコミュニティ'}の制裁 #${restriction.sanction_id} により投稿を削除しました: ${reason}`).catch(() => {});
     return true;
   }
   for (const restriction of restrictions) {
@@ -122,7 +122,7 @@ export async function enforceReactionRestrictions(reaction, user) {
 export async function enforceVoiceRestrictions(_oldState, newState) {
   if (!newState?.guild?.id || !newState.member || !newState.channelId) return false;
   if (!hasRestriction(newState.guild.id, newState.member.id, 'block_voice')) return false;
-  const disconnected = await newState.disconnect('Sakana governance restriction: voice access blocked')
+  const disconnected = await newState.disconnect(`${newState.guild?.name ?? 'Community'} governance restriction: voice access blocked`)
     .then(() => true).catch(() => false);
   if (disconnected) writeAudit({
     guildId: newState.guild.id,
@@ -138,7 +138,7 @@ export async function enforceVoiceRestrictions(_oldState, newState) {
 export async function enforceThreadRestrictions(thread) {
   const ownerId = thread?.ownerId;
   if (!thread?.guildId || !ownerId || !hasRestriction(thread.guildId, ownerId, 'block_thread_creation')) return false;
-  const deleted = await thread.delete('Sakana governance restriction: thread creation blocked')
+  const deleted = await thread.delete(`${thread.guild?.name ?? 'Community'} governance restriction: thread creation blocked`)
     .then(() => true).catch(() => false);
   if (deleted) writeAudit({
     guildId: thread.guildId,

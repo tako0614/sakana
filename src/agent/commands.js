@@ -110,7 +110,7 @@ function usageEmbed(userId) {
   }
 
   embed.setFooter({
-    text: '未初期化サーバーの管理者は金額上限を通りません。統治初期化後はManageGuildを信頼根拠にせず、trusted roleの回数枠を別に適用します。'
+    text: '未初期化サーバーの管理者は金額上限を通りません。統治初期化後はManageGuildを信頼根拠にせず、設定した特別有権者ロールの回数枠を別に適用します。'
       + '金額は見積りで、請求と一致する保証はありません。'
   });
 

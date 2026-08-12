@@ -509,6 +509,61 @@ db.exec(`
 `);
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (8, ?)').run(Date.now());
 
+{
+  const guildColumns = new Set(db.pragma('table_info(governance_guilds)').map((row) => row.name));
+  for (const [name, definition] of [
+    ['guide_channel_id', "TEXT NOT NULL DEFAULT ''"],
+    ['guide_message_id', "TEXT NOT NULL DEFAULT ''"],
+    ['admin_channel_id', "TEXT NOT NULL DEFAULT ''"],
+    ['admin_dashboard_message_id', "TEXT NOT NULL DEFAULT ''"]
+  ]) {
+    if (!guildColumns.has(name)) db.exec(`ALTER TABLE governance_guilds ADD COLUMN ${name} ${definition}`);
+  }
+  const publicationColumns = new Set(db.pragma('table_info(governance_statute_publications)').map((row) => row.name));
+  if (!publicationColumns.has('detail_message_id')) {
+    db.exec("ALTER TABLE governance_statute_publications ADD COLUMN detail_message_id TEXT NOT NULL DEFAULT ''");
+  }
+}
+db.exec(`
+  CREATE TABLE IF NOT EXISTS governance_setup_sessions (
+    id TEXT PRIMARY KEY,
+    guild_id TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    constitution_hash TEXT NOT NULL,
+    policy_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    resources_json TEXT NOT NULL DEFAULT '{}',
+    last_error TEXT,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_setup_guild
+    ON governance_setup_sessions(guild_id, status, updated_at);
+
+  CREATE TABLE IF NOT EXISTS governance_legacy_message_archive (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    author_id TEXT,
+    content TEXT NOT NULL DEFAULT '',
+    attachments_json TEXT NOT NULL DEFAULT '[]',
+    content_hash TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    message_created_at INTEGER,
+    archived_at INTEGER NOT NULL,
+    deleted_at INTEGER,
+    UNIQUE (guild_id, channel_id, message_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_legacy_archive
+    ON governance_legacy_message_archive(guild_id, channel_id, archived_at);
+`);
+if (!db.pragma('table_info(governance_legacy_message_archive)').some((row) => row.name === 'message_created_at')) {
+  db.exec('ALTER TABLE governance_legacy_message_archive ADD COLUMN message_created_at INTEGER');
+}
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (9, ?)').run(Date.now());
+
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
 db.prepare("UPDATE governance_outbox SET status = 'error', last_error = 'interrupted before completion' WHERE status = 'running'").run();
@@ -549,6 +604,10 @@ function hydrateIntake(row) {
   return row ? { ...row, payload: parseJson(row.payload_json, {}) } : null;
 }
 
+function hydrateSetupSession(row) {
+  return row ? { ...row, resources: parseJson(row.resources_json, {}) } : null;
+}
+
 export function getGovernanceGuild(guildId) {
   return hydrateGuild(db.prepare('SELECT * FROM governance_guilds WHERE guild_id = ?').get(String(guildId)));
 }
@@ -582,8 +641,9 @@ export const bootstrapGovernanceGuild = db.transaction((input) => {
       guild_id, status, enforcement_mode, trusted_role_id, appeal_role_id,
       legislature_role_id, judiciary_role_id, category_id,
       parliament_forum_id, court_forum_id, court_chat_channel_id, statute_forum_id, gazette_channel_id,
+      guide_channel_id, admin_channel_id,
       active_constitution_id, created_at, updated_at
-    ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     input.guildId,
     input.enforcementMode,
@@ -597,6 +657,8 @@ export const bootstrapGovernanceGuild = db.transaction((input) => {
     input.courtChatChannelId,
     input.statuteForumId ?? '',
     input.gazetteChannelId,
+    input.guideChannelId ?? '',
+    input.adminChannelId ?? '',
     constitutionId,
     now,
     now
@@ -622,6 +684,7 @@ export function updateGovernanceGuild(guildId, patch) {
     'status', 'enforcement_mode', 'trusted_role_id', 'appeal_role_id',
     'legislature_role_id', 'judiciary_role_id', 'category_id',
     'parliament_forum_id', 'court_forum_id', 'court_chat_channel_id', 'statute_forum_id', 'gazette_channel_id',
+    'guide_channel_id', 'guide_message_id', 'admin_channel_id', 'admin_dashboard_message_id',
     'active_constitution_id', 'last_weekly_scan_at', 'weekly_retry_after',
     'weekly_failure_count', 'weekly_last_error'
   ]);
@@ -746,10 +809,109 @@ export function claimGovernanceIntake(id, requesterId, now = Date.now()) {
 }
 
 export function expireGovernanceIntakes(now = Date.now()) {
-  return db.prepare(`
-    UPDATE governance_intakes SET status = 'expired', updated_at = ?
+  const rows = db.prepare(`
+    SELECT * FROM governance_intakes
     WHERE status = 'pending' AND expires_at <= ?
-  `).run(now, now).changes;
+    ORDER BY id
+  `).all(now).map(hydrateIntake);
+  if (rows.length > 0) {
+    db.prepare(`
+      UPDATE governance_intakes SET status = 'expired', updated_at = ?
+      WHERE status = 'pending' AND expires_at <= ?
+    `).run(now, now);
+  }
+  return rows;
+}
+
+export function createGovernanceSetupSession(input) {
+  const now = Date.now();
+  db.prepare(`
+    UPDATE governance_setup_sessions SET status = 'expired', updated_at = ?
+    WHERE guild_id = ? AND status = 'preview'
+  `).run(now, String(input.guildId));
+  const id = randomUUID();
+  db.prepare(`
+    INSERT INTO governance_setup_sessions
+      (id, guild_id, requested_by, constitution_hash, policy_hash, status,
+       resources_json, expires_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'preview', '{}', ?, ?, ?)
+  `).run(
+    id, String(input.guildId), String(input.requestedBy), String(input.constitutionHash),
+    String(input.policyHash), Number(input.expiresAt), now, now
+  );
+  return getGovernanceSetupSession(id);
+}
+
+export function getGovernanceSetupSession(id) {
+  return hydrateSetupSession(db.prepare('SELECT * FROM governance_setup_sessions WHERE id = ?').get(String(id)));
+}
+
+export function getResumableGovernanceSetup(guildId) {
+  return hydrateSetupSession(db.prepare(`
+    SELECT * FROM governance_setup_sessions
+    WHERE guild_id = ? AND status IN ('provisioning', 'failed')
+    ORDER BY updated_at DESC LIMIT 1
+  `).get(String(guildId)));
+}
+
+export function claimGovernanceSetupSession(id, requestedBy, now = Date.now()) {
+  const result = db.prepare(`
+    UPDATE governance_setup_sessions
+    SET status = 'provisioning', last_error = NULL, updated_at = ?
+    WHERE id = ? AND requested_by = ? AND status IN ('preview', 'failed')
+      AND (expires_at > ? OR resources_json <> '{}')
+  `).run(now, String(id), String(requestedBy), now);
+  return result.changes === 1 ? getGovernanceSetupSession(id) : null;
+}
+
+export function updateGovernanceSetupSession(id, patch) {
+  const normalized = { ...patch };
+  if ('resources' in normalized) {
+    normalized.resources_json = canonicalJson(normalized.resources ?? {});
+    delete normalized.resources;
+  }
+  const allowed = new Set(['status', 'resources_json', 'last_error', 'expires_at', 'requested_by']);
+  const entries = Object.entries(normalized).filter(([key]) => allowed.has(key));
+  if (entries.length === 0) return getGovernanceSetupSession(id);
+  const sql = entries.map(([key]) => `${key} = @${key}`).join(', ');
+  db.prepare(`UPDATE governance_setup_sessions SET ${sql}, updated_at = @updated_at WHERE id = @id`)
+    .run({ id: String(id), updated_at: Date.now(), ...Object.fromEntries(entries) });
+  return getGovernanceSetupSession(id);
+}
+
+export function archiveLegacyGovernanceMessage(input) {
+  const attachments = input.attachments ?? [];
+  const content = String(input.content ?? '');
+  db.prepare(`
+    INSERT INTO governance_legacy_message_archive
+      (guild_id, channel_id, message_id, author_id, content, attachments_json,
+       content_hash, reason, message_created_at, archived_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(guild_id, channel_id, message_id) DO NOTHING
+  `).run(
+    String(input.guildId), String(input.channelId), String(input.messageId),
+    input.authorId ? String(input.authorId) : null, content, canonicalJson(attachments),
+    sha256(canonicalJson({ content, attachments })), String(input.reason),
+    input.createdAt === undefined ? null : Number(input.createdAt), Date.now()
+  );
+  return db.prepare(`
+    SELECT * FROM governance_legacy_message_archive
+    WHERE guild_id = ? AND channel_id = ? AND message_id = ?
+  `).get(String(input.guildId), String(input.channelId), String(input.messageId));
+}
+
+export function markLegacyGovernanceMessageDeleted(guildId, channelId, messageId) {
+  db.prepare(`
+    UPDATE governance_legacy_message_archive SET deleted_at = ?
+    WHERE guild_id = ? AND channel_id = ? AND message_id = ?
+  `).run(Date.now(), String(guildId), String(channelId), String(messageId));
+}
+
+export function listLegacyGovernanceMessageArchive(guildId) {
+  return db.prepare(`
+    SELECT * FROM governance_legacy_message_archive
+    WHERE guild_id = ? ORDER BY id
+  `).all(String(guildId)).map((row) => ({ ...row, attachments: parseJson(row.attachments_json, []) }));
 }
 
 export function authorizeTrustedMutation({ guildId, userId, roleId, desired, authorizedBy, ttlMs = 60_000 }) {
@@ -1082,18 +1244,19 @@ export function upsertStatutePublication(input) {
   const now = Date.now();
   db.prepare(`
     INSERT INTO governance_statute_publications
-      (guild_id, instrument_type, instrument_id, forum_thread_id, forum_message_id,
+      (guild_id, instrument_type, instrument_id, forum_thread_id, forum_message_id, detail_message_id,
        publication_status, content_hash, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(guild_id, instrument_type, instrument_id) DO UPDATE SET
       forum_thread_id = excluded.forum_thread_id,
       forum_message_id = excluded.forum_message_id,
+      detail_message_id = excluded.detail_message_id,
       publication_status = excluded.publication_status,
       content_hash = excluded.content_hash,
       updated_at = excluded.updated_at
   `).run(
     String(input.guildId), String(input.instrumentType), String(input.instrumentId),
-    String(input.forumThreadId), String(input.forumMessageId), String(input.publicationStatus),
+    String(input.forumThreadId), String(input.forumMessageId), String(input.detailMessageId ?? ''), String(input.publicationStatus),
     String(input.contentHash), now, now
   );
   return getStatutePublication(input.guildId, input.instrumentType, input.instrumentId);
@@ -1543,6 +1706,7 @@ export function pruneGovernance(keepMs = 90 * 86_400_000) {
   db.prepare('DELETE FROM governance_activity WHERE created_at < ?').run(cutoff);
   db.prepare('DELETE FROM governance_restriction_usage WHERE created_at < ?').run(cutoff);
   db.prepare("DELETE FROM governance_intakes WHERE status != 'pending' AND updated_at < ?").run(cutoff);
+  db.prepare("DELETE FROM governance_setup_sessions WHERE status IN ('completed', 'expired') AND updated_at < ?").run(cutoff);
 }
 
 export { db as governanceDatabase };
