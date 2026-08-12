@@ -57,20 +57,20 @@ const MAX_TRIES = 3;
  * bot は次の空いている役 — または /as で選ばれた人の話者トークン — で喋る。
  */
 async function tokenRequest(messages, { wanted, engine }) {
-  const known = await roleScheme(engine);
-  const roles = assignRoles(messages.map((entry) => entry.author?.id), known);
+  const scheme = await roleScheme(engine);
+  const roles = assignRoles(messages.map((entry) => entry.authorId), scheme);
   const turns = messages.map((entry) => ({
-    token: roles.get(entry.author?.id),
-    reply: Boolean(entry.reference?.messageId),
+    token: roles.get(entry.authorId),
+    reply: entry.isReply,
     content: messageText(entry.content)
   }));
 
   // 申告に無いトークンは渡さない
   const token = wanted ? tokenFor(wanted) : null;
-  const as = token && known?.speakers?.includes(token) ? token : null;
+  const as = token && scheme?.speakers?.includes(token) ? token : null;
 
   return {
-    prompt: buildPrompt(turns, as ?? nextRole(roles, known)),
+    prompt: buildPrompt(turns, as ?? nextRole(roles, scheme)),
     cut: firstTurn,
     as
   };
@@ -82,12 +82,12 @@ async function tokenRequest(messages, { wanted, engine }) {
  * 「たこ」と「B」が同一人物という、学習中に一度も無かった形になる。
  */
 function plainRequest(messages, { wanted, channelId }) {
-  const ids = messages.map((entry) => entry.author?.id);
+  const ids = messages.map((entry) => entry.authorId);
   const roles = assignPlainRoles(ids.filter((id) => !labelFor(id)));
   const labelOf = (id) => labelFor(id) ?? roles.get(id) ?? null;
 
   const turns = messages.map((entry) => ({
-    role: labelOf(entry.author?.id),
+    role: labelOf(entry.authorId),
     content: plainText(entry.content, labelOf)
   })).filter((turn) => turn.role && turn.content);
 
@@ -103,7 +103,33 @@ function plainRequest(messages, { wanted, channelId }) {
   };
 }
 
-export async function handleMimicRequest(message, client, { recent = [], engine = 'evex' } = {}) {
+// 自分の返答に付けている `-# evex-1 / たこ として` を落とす。
+// 文脈に入れるときに残すと、モデルが footer ごと真似し始める。
+const FOOTER = /\n-#[^\n]*$/;
+
+function stripFooter(text) {
+  let out = String(text ?? '');
+  while (FOOTER.test(out)) out = out.replace(FOOTER, '');
+  return out.trim();
+}
+
+/**
+ * Discord のメッセージと、返信の鎖 (fromDiscordMessage の形) を同じ形にそろえる。
+ * 2つの経路から来るので、ここで1つにしないと片方の欠けに気付けない。
+ */
+function toTurn(entry) {
+  return {
+    id: entry.id ?? entry.messageId ?? null,
+    authorId: entry.author?.id ?? entry.authorId ?? null,
+    isBot: entry.author?.bot ?? Boolean(entry.isBot),
+    content: entry.content ?? '',
+    isReply: Boolean(entry.reference?.messageId ?? entry.replyTo)
+  };
+}
+
+export async function handleMimicRequest(
+  message, client, { recent = [], chain = [], engine = 'evex', remember = null, selfId = null } = {}
+) {
   if (running >= MAX_CONCURRENT) {
     await message.reply({
       content: 'いま別の生成を回しています。少し待ってからもう一度呼んでください。',
@@ -121,11 +147,28 @@ export async function handleMimicRequest(message, client, { recent = [], engine 
     typing = setInterval(() => message.channel.sendTyping().catch(() => {}), 8000);
     typing.unref?.();
 
-    // bot の発言は文脈に入れない。学習データが人間ぶんだけなので、
-    // bot の長い回答が混ざると学習中に見ていない形になる。
-    const messages = recent
-      .filter((entry) => !entry.author?.bot && (entry.content ?? '').trim())
-      .slice(-CONTEXT_MESSAGES);
+    // 他の bot の発言は文脈に入れない。学習データが人間ぶんだけなので、
+    // LLM bot の長い回答が混ざると学習中に見ていない形になる。
+    //
+    // **自分の返答だけは入れる。** 外していたので、リプで続けても前に何を言ったかを
+    // 覚えていなかった (毎回はじめて話しかけられた形になる)。短い1発言なので
+    // 学習データと同じ形に収まる。長いものは DeepSeek 側の回答なので落とす。
+    const OWN_MAX_CHARS = 120;
+    const own = (turn) => selfId && turn.authorId === selfId;
+    const usable = (turns) => turns
+      .map((turn) => (own(turn) ? { ...turn, content: stripFooter(turn.content) } : turn))
+      .filter((turn) => turn.content.trim())
+      .filter((turn) => (own(turn) ? turn.content.length <= OWN_MAX_CHARS : !turn.isBot));
+    const recentTurns = usable(recent.map(toTurn));
+
+    // 返信の鎖を足す。これが無いと「何にリプしたか」が分からないまま返answerを書く —
+    // DeepSeek 側は 6 ホップ辿って渡しているのに、こちらは直近 20 件だけ見ていた。
+    // 「/model を変えると挙動が変わり過ぎる」原因のひとつ。
+    // 鎖は古い方が先なので、直近の前に置けば時系列で並ぶ。
+    const known = new Set(recentTurns.map((turn) => turn.id).filter(Boolean));
+    const older = usable(chain.map(toTurn)).filter((turn) => !turn.id || !known.has(turn.id));
+
+    const messages = [...older, ...recentTurns].slice(-CONTEXT_MESSAGES);
 
     // /as で選ばれている人。抜けている人は無視する
     const persona = personaFor(message.author.id);
@@ -161,10 +204,15 @@ export async function handleMimicRequest(message, client, { recent = [], engine 
       : null;
     const note = `\n-# ${endpointFor(engine).label}${asName ? ` / ${asName} として` : ''}`;
 
+    // 送った返答を記録する。起動条件は「メンション or 回答へのリプライ」だが、
+    // 記録していなかったので **evex の返答にリプしても無反応**だった
+    // (DeepSeek 側だけが rememberOwnReply を呼んでいた)。
     for (const [index, chunk] of chunkForDiscord(body + note).entries()) {
       const payload = { content: chunk, allowedMentions: NO_MENTIONS };
-      if (index === 0) await message.reply(payload).catch(() => message.channel.send(payload));
-      else await message.channel.send(payload).catch(() => {});
+      const sent = index === 0
+        ? await message.reply(payload).catch(() => message.channel.send(payload).catch(() => null))
+        : await message.channel.send(payload).catch(() => null);
+      if (sent?.id) remember?.(sent.id);
     }
   } catch (error) {
     console.error('Mimic request failed:', error);

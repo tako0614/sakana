@@ -299,7 +299,15 @@ export async function handleAgentRequest(message, client) {
       .then((found) => [...found.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp))
       .catch(() => [message]);
 
-    await handleMimicRequest(message, client, { recent, engine: chosen });
+    // リプ先も渡す。DeepSeek 側は 6 ホップ辿って渡しているのに、自作モデル側は
+    // 直近 20 件だけ見ていた。「/model を変えると挙動が変わり過ぎる」原因のひとつ。
+    const chain = await fetchReplyChain(message, message.channel.name).catch(() => []);
+
+    // 記録関数を渡す (import すると agent/index.js ⇄ mimic/respond.js の循環になる)。
+    // これが無いと自作モデルの返答にリプしても起動条件に合わず無反応だった。
+    await handleMimicRequest(message, client, {
+      recent, chain, engine: chosen, remember: rememberOwnReply, selfId: client.user.id
+    });
     return;
   }
 
