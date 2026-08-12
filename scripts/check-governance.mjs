@@ -645,6 +645,11 @@ assert.equal(statutePublicationState('law', 'unconstitutional'), '違憲');
 assert.equal(statutePublicationState('law', 'repealed'), '廃止');
 
 const { runGovernanceInfo } = await import('../src/agent/governance.js');
+const { isGovernanceAgentTopic } = await import('../src/agent/index.js');
+assert.equal(isGovernanceAgentTopic('@Evex公式 現行憲法はどこで読める？'), true,
+  '雑談用mimic modelを選択中でも統治照会は正本tool側へ送る');
+assert.equal(isGovernanceAgentTopic('@Evex公式 この議論まとめて'), false,
+  '通常会話は選択中のagent engineを維持する');
 const visibleGovernanceContext = {
   member: { id: 'u1' },
   guild: {

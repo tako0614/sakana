@@ -41,6 +41,7 @@ import { handleMimicRequest } from '../mimic/respond.js';
 import { ThinkingIndicator, isIndicatorMessage, toolLabel } from './thinking.js';
 import { buildToolset } from './tools.js';
 import { reserveGovernanceAgentAttempt } from '../governance/service.js';
+import { getGovernanceGuild } from '../governance/db.js';
 
 const NO_MENTIONS = { parse: [], repliedUser: false };
 
@@ -141,6 +142,16 @@ export function stripMention(content, clientId) {
     .replace(/[^\S\n]+/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+const GOVERNANCE_TOPIC_PATTERN = /(憲法|法令集|官報|法律|現行法|法案|改憲|立法|司法|裁判|判決|違憲|上訴|処分|制裁|行政行為|統治)/;
+
+/**
+ * 統治に関する自然文は、選択中の雑談用mimic modelでは処理しない。
+ * mimic modelにはsystem promptもtoolも無く、正本DBを読めないため。
+ */
+export function isGovernanceAgentTopic(content) {
+  return GOVERNANCE_TOPIC_PATTERN.test(String(content ?? ''));
 }
 
 /**
@@ -278,7 +289,9 @@ export async function handleAgentRequest(message, client) {
   // 起動条件 (メンション / 回答へのリプライ) は共通にしておきたいので、判定の後・
   // 予約の前で分ける。予約より前なのは、あちらは API を叩かないので費用がゼロで、
   // ドル換算の上限に混ぜると請求と乖離するから。
-  if (engineFor(message.author.id) === 'evex') {
+  const governanceTopic = Boolean(getGovernanceGuild(guild.id))
+    && isGovernanceAgentTopic(message.content);
+  if (engineFor(message.author.id) === 'evex' && !governanceTopic) {
     const recent = await message.channel.messages
       .fetch({ limit: 20 })
       .then((found) => [...found.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp))
