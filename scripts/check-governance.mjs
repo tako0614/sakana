@@ -59,6 +59,10 @@ assert.equal(
 );
 assert.equal(policyModule.requiredApprovals({ type: 'timeout', durationSeconds: 86_401 }, legacyPolicy), 1,
   '進行中のv1事件は従来の承認境界を保持する');
+assert.throws(() => policyModule.validateConstitutionPolicy({
+  ...legacyPolicy,
+  legislation: { ...legacyPolicy.legislation, adjustmentDebateMilliseconds: 43_200_000 }
+}), /legislationに未対応の設定/, 'AIが発明したpolicy fieldを黙って受理しない');
 
 const eligible = policyModule.evaluateEligibility({
   joinedAt: Date.now() - 31 * policyModule.DAY_MS,
@@ -1040,6 +1044,7 @@ globalThis.fetch = async (_url, options) => {
 };
 const {
   deliberateProposal,
+  draftAmendment,
   draftBill,
   interpretJudicialRequest,
   interpretLegislativeRequest,
@@ -1126,6 +1131,32 @@ assert.equal(polished.decision, 'finalize');
 assert.equal(polished.body.summary, '読みやすく整理した狭い一般規則');
 assert.deepEqual(polished.body.provisions, safeBill.provisions,
   '執行定義を変えない表現整理は再討議なしで最終案へ進める');
+
+let amendmentSchemaCalls = 0;
+modelOutput = () => {
+  amendmentSchemaCalls += 1;
+  if (amendmentSchemaCalls === 1) {
+    return {
+      title: '立法手続改正案', summary: '討議先行手続へ改める。', content: constitution,
+      policy: {
+        ...policy,
+        legislation: {
+          draftMilliseconds: 86_400_000, debateMilliseconds: 86_400_000, voteMilliseconds: 86_400_000,
+          adjustmentDebateMilliseconds: 43_200_000, maxAdjustments: 2
+        }
+      }
+    };
+  }
+  return { title: '立法手続改正案', summary: '討議先行手続へ改める。', content: constitution, policy };
+};
+const schemaCheckedAmendment = await draftAmendment({
+  guildId: 'g2',
+  request: { title: '立法手続改正案', summary: '草案公開と同時に討議する。' },
+  constitution: { version: 1, content: constitution, policy }
+});
+assert.equal(amendmentSchemaCalls, 2, '未対応のpolicy別名は理由を添えて再生成する');
+assert.deepEqual(schemaCheckedAmendment.policy.legislation, policy.legislation);
+assert.match(capturedRequest.messages[0].content, /legislationに未対応の設定があります/);
 
 const debateNow = Date.now();
 let workflowProposal = governanceDb.createProposal({

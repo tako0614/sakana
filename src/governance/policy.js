@@ -123,12 +123,19 @@ export function validateConstitutionPolicy(policy) {
   if (!Number.isInteger(voting.minimumBallots)) throw new Error('voting.minimumBallots は整数である必要があります。');
   if (voting.publicBallots !== true) throw new Error('v1の投票は全記名です。');
   const modernLegislation = Number.isInteger(legislation.initialDebateMilliseconds);
+  const modernLegislationKeys = [
+    'initialDebateMilliseconds', 'revisionDebateMilliseconds', 'voteMilliseconds',
+    'maximumRevisions', 'extendOnLateMaterialFeedback', 'lateFeedbackWindowMilliseconds',
+    'debateExtensionMilliseconds', 'maximumDebateExtensions'
+  ];
+  const legacyLegislationKeys = ['draftMilliseconds', 'debateMilliseconds', 'voteMilliseconds'];
+  const allowedLegislationKeys = new Set(modernLegislation ? modernLegislationKeys : legacyLegislationKeys);
+  if (Object.keys(legislation).some((key) => !allowedLegislationKeys.has(key))) {
+    throw new Error('legislationに未対応の設定があります。');
+  }
   const durationKeys = modernLegislation
-    ? [
-        'initialDebateMilliseconds', 'revisionDebateMilliseconds', 'voteMilliseconds',
-        'lateFeedbackWindowMilliseconds', 'debateExtensionMilliseconds'
-      ]
-    : ['draftMilliseconds', 'debateMilliseconds', 'voteMilliseconds'];
+    ? modernLegislationKeys.filter((key) => key.endsWith('Milliseconds'))
+    : legacyLegislationKeys;
   for (const key of durationKeys) {
     finite(legislation[key], `legislation.${key}`, { min: 3_600_000 });
     if (!Number.isInteger(legislation[key])) throw new Error(`legislation.${key} は整数である必要があります。`);

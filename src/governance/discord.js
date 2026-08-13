@@ -917,7 +917,7 @@ export function reviewRequestButtons(guildId, sanctionId, disabled = false) {
 function proposalNextAction(proposal) {
   return ({
     drafting: 'AIが草案を作成しています。',
-    draft: '草案を公開討議へ移行しています。',
+    draft: '公開草案を確認できます。受付時の手続に従って次の段階へ進みます。',
     constitutional_review: '最終案を固定し、AIが憲法との整合を審査しています。',
     debate: '草案または調整案を読み、意見をこの投稿へ書きます。',
     voting: '下のボタンから投票します。',
@@ -983,7 +983,7 @@ function courtStarterContent(caseRecord, nextAction = courtNextAction(caseRecord
 export async function createProposalPost(guild, governance, proposal) {
   const forum = await guild.channels.fetch(governance.parliament_forum_id);
   if (!forum?.threads) throw new Error('議会Forumが見つかりません。');
-  const debateTag = tagId(forum, '討議');
+  const stageTag = tagId(forum, proposal.status === 'debate' ? '討議' : '草案');
   const body = proposal.body;
   const fullDraft = proposal.kind === 'amendment'
     ? `# ${body.title}\n\n${body.content}\n\n## Policy\n\n\`\`\`json\n${JSON.stringify(body.policy, null, 2)}\n\`\`\``
@@ -992,7 +992,7 @@ export async function createProposalPost(guild, governance, proposal) {
   const structuredName = proposal.kind === 'amendment' ? 'policy' : 'provisions';
   const thread = await forum.threads.create({
     name: proposal.title.slice(0, 100),
-    appliedTags: debateTag ? [debateTag] : [],
+    appliedTags: stageTag ? [stageTag] : [],
     autoArchiveDuration: 10_080,
     message: {
       content: proposalStarterContent(proposal),

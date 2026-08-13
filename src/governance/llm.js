@@ -297,7 +297,12 @@ function validateConstitutionalDecision(raw, allowedHeadings) {
 function validateAmendment(raw) {
   const value = assertObject(raw);
   exactKeys(value, ['title', 'summary', 'content', 'policy'], 'amendment');
-  const policy = validateConstitutionPolicy(value.policy);
+  let policy;
+  try {
+    policy = validateConstitutionPolicy(value.policy);
+  } catch (error) {
+    throw validationError(error.message, error.message);
+  }
   const content = text(value.content, 'content', 30_000);
   if (constitutionHeadings(content).length < 3) throw new Error('replacement constitution needs Markdown sections');
   if (/\b\d{17,20}\b/.test(content)) throw new Error('constitution may not embed Discord snowflake IDs');
@@ -602,6 +607,7 @@ Use amendment only when the person explicitly asks to change the constitution or
 Use petition for a proposed ordinary rule or recurring community problem.
 Use information for a question that does not request a new rule. Use unclear when required substance is missing.
 For petition or amendment, title and summary must be self-contained Japanese text and question must be null.
+Keep title concise: at most 50 Japanese characters. Put timing and procedural detail in summary rather than enumerating every step in title.
 Do not invent a member, past incident, punishment, or operative rule that the request did not ask for.
 For information or unclear, set title and summary to null and write a short Japanese question or routing explanation in question.
 This output is only an intake preview and has no power to file or enact anything.`,
@@ -619,7 +625,7 @@ This output is only an intake preview and has no power to file or enact anything
       if (['petition', 'amendment'].includes(value.intent)) {
         return {
           intent: value.intent,
-          title: text(value.title, 'title', 100),
+          title: text(value.title, 'title', 50),
           summary: text(value.summary, 'summary', 1800),
           question: null
         };
@@ -734,6 +740,7 @@ export async function draftAmendment({ guildId, request, constitution }) {
     instruction: `Draft a complete replacement constitution and constitutional policy implementing only the requested change.
 Preserve every unrelated protection and value exactly in substance. Every policy field must remain valid.
 Keep the current policy schema unless the requested change explicitly adopts immediate sanctions and rapid defendant-requested trials. For that procedure use schemaVersion 2, set defenseMilliseconds and appealMilliseconds to 86400000, and add judiciary.summaryProcedure exactly with panelSeats:3, votesRequired:2, trialMilliseconds:86400000, immediateSanctions:["warning","restriction","timeout"], trialFirstSanctions:["kick","ban"], unlimitedWarningReview:true.
+The legislation object has exactly one of two supported shapes. Preserve the current legacy shape {draftMilliseconds, debateMilliseconds, voteMilliseconds} when the request does not change legislative order. When the request adopts discussion-first legislation, use exactly {initialDebateMilliseconds, revisionDebateMilliseconds, voteMilliseconds, maximumRevisions, extendOnLateMaterialFeedback, lateFeedbackWindowMilliseconds, debateExtensionMilliseconds, maximumDebateExtensions}. Never invent aliases such as adjustmentDebateMilliseconds, maxAdjustments, extensionMilliseconds, or extensionTriggerMilliseconds.
 Return exactly title, summary, content, policy. content is the complete replacement Markdown text, not a patch.`,
     data: {
       request,
