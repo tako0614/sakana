@@ -36,6 +36,7 @@ import {
   getCaseInterimProtection,
   getConstitution,
   getLaw,
+  getMentionInvestigation,
   getCurrentLawVersion,
   getOperationalSetting,
   getProposal,
@@ -50,6 +51,7 @@ import {
   listCases,
   listGovernanceGuilds,
   listLaws,
+  listInvestigationEvidence,
   listOpenCasesForLaw,
   listProposals,
   listSanctionsForLaw,
@@ -266,13 +268,13 @@ function publicChannel(message, governance = null) {
   const isProposalDiscussion = channel.isThread?.()
     && channel.parentId === governance?.parliament_forum_id
     && Boolean(getProposalByForumThread(channel.id));
-  if (governanceSurface(channel, governance) && !isProposalDiscussion) return false;
+  if (governanceSurface(channel, governance) && (!isProposalDiscussion || message.author?.bot)) return false;
   const everyone = message.guild?.roles?.everyone;
   return Boolean(everyone && channel.permissionsFor?.(everyone)?.has(PermissionFlagsBits.ViewChannel));
 }
 
 export function recordGovernanceMessage(message) {
-  if (!message?.guildId || message.author?.bot) return false;
+  if (!message?.guildId) return false;
   const governance = getGovernanceGuild(message.guildId);
   if (!governance || !publicChannel(message, governance)) return false;
   const constitution = getActiveConstitution(message.guildId);
@@ -363,7 +365,7 @@ export async function backfillGovernanceActivity(guild) {
       COALESCE(c.is_private, 1) AS is_private
     FROM messages m
     LEFT JOIN channels c ON c.channel_id = m.channel_id
-    WHERE m.guild_id = ? AND m.created_at >= ? AND m.is_bot = 0 AND m.deleted = 0
+    WHERE m.guild_id = ? AND m.created_at >= ? AND m.deleted = 0
     ORDER BY m.created_at
   `).all(guild.id, since);
   const activities = [];
@@ -441,16 +443,34 @@ async function finishDraft(guild, proposal, body) {
   });
 }
 
-async function draftStoredProposal(guild, proposal, { relatedInputs = [] } = {}) {
+async function draftStoredProposal(guild, proposal, { relatedInputs = null } = {}) {
   const { constitution, policy } = requireGovernance(guild.id);
   if (proposal.body) return finishDraft(guild, proposal, proposal.body);
+  const inputs = relatedInputs ?? (Array.isArray(proposal.workflow_context?.queue?.inputs)
+    ? proposal.workflow_context.queue.inputs
+    : []);
+  const investigationId = /^mention_investigation:(\d+)$/.exec(String(proposal.source))?.[1] ?? null;
+  const investigation = investigationId ? getMentionInvestigation(investigationId) : null;
+  const investigationEvidence = investigationId
+    ? listInvestigationEvidence(investigationId, 'legislative_basis')
+    : [];
   const request = {
     title: proposal.title,
     summary: [
       proposal.summary,
-      ...relatedInputs.slice(-8).map((input) => `同一案件として寄せられた意見: ${String(input.summary ?? '').slice(0, 1200)}`)
+      ...inputs.slice(-8).map((input) => `同一案件として寄せられた意見: ${String(input.summary ?? '').slice(0, 1200)}`)
     ].join('\n').slice(0, 12_000),
-    source: proposal.source
+    source: proposal.source,
+    investigation: investigation ? {
+      id: investigation.id,
+      request: investigation.request_text,
+      evidence: investigationEvidence.map((entry) => ({
+        messageId: entry.message_id,
+        authorId: entry.author_id,
+        content: entry.content,
+        occurredAt: entry.occurred_at
+      }))
+    } : null
   };
   const targetLaw = proposal.target_type === 'law' ? getLaw(proposal.target_id) : null;
   const body = proposal.kind === 'amendment'
@@ -486,7 +506,8 @@ export async function filePetition(guild, member, {
   if (!governanceActionAllowed(guild.id, member.id, 'petition')) throw new Error('請願提出が制裁により停止されています。');
   const duplicate = findActiveProposalByNormalizedTitle(guild.id, title);
   if (duplicate) throw new Error('同名の法案が進行中です。議会で討議してください。');
-  if (source !== 'weekly' && !attemptReserved) requireGovernanceAiAttempt(member, eventId ?? `petition:${member.id}:${Date.now()}`);
+  const officialSource = source === 'weekly' || String(source).startsWith('mention_investigation:');
+  if (!officialSource && !attemptReserved) requireGovernanceAiAttempt(member, eventId ?? `petition:${member.id}:${Date.now()}`);
   let targetLaw = null;
   let targetConflict = null;
   if (relation?.relation === 'amend_law') {
@@ -505,7 +526,7 @@ export async function filePetition(guild, member, {
     source,
     title,
     summary,
-    proposerId: source === 'weekly' ? null : member.id,
+    proposerId: officialSource ? null : member.id,
     constitutionId: constitution.id,
     voteScope: scope,
     status: workflowFor({ rules: constitution.rules }, 'law').initial,
@@ -545,7 +566,8 @@ export async function filePetition(guild, member, {
 }
 
 export async function fileAmendment(guild, member, {
-  title, summary, eventId = null, voteScope = null, attemptReserved = false, relation = null
+  title, summary, eventId = null, voteScope = null, attemptReserved = false, relation = null,
+  source = 'petition'
 }) {
   const { governance, constitution, policy } = requireGovernance(guild.id);
   const scope = voteScope ?? policy.voting.defaultScope;
@@ -557,14 +579,15 @@ export async function fileAmendment(guild, member, {
   );
   const duplicate = findActiveProposalByNormalizedTitle(guild.id, title);
   if (duplicate) throw new Error('同名の改憲案が進行中です。議会で討議してください。');
-  if (!attemptReserved) requireGovernanceAiAttempt(member, eventId ?? `amendment:${member.id}:${Date.now()}`);
+  const officialSource = String(source).startsWith('mention_investigation:');
+  if (!officialSource && !attemptReserved) requireGovernanceAiAttempt(member, eventId ?? `amendment:${member.id}:${Date.now()}`);
   let proposal = createProposal({
     guildId: guild.id,
     kind: 'amendment',
-    source: 'petition',
+    source,
     title,
     summary,
-    proposerId: member.id,
+    proposerId: officialSource ? null : member.id,
     constitutionId: constitution.id,
     voteScope: scope,
     status: workflowFor({ rules: constitution.rules }, 'constitutionalAmendment').initial,
@@ -1114,7 +1137,8 @@ export async function fileCriminalCase(guild, reporter, input) {
     allegedAt: evidenceRows.at(-1).occurredAt,
     constitutionId: constitution.id,
     procedureVersion: summaryProcedure(policy) ? 2 : 1,
-    summaryEventKey: input.summaryEventKey ?? null
+    summaryEventKey: input.summaryEventKey ?? null,
+    reporterType: input.official ? 'ai' : 'member'
   });
   for (const evidence of evidenceRows) {
     addCaseEvidence({ caseId: caseRecord.id, submittedBy: reporter.id, ...evidence });
@@ -1180,6 +1204,16 @@ async function continueSummarySanction(guild, caseRecord, sanction, procedure) {
     return updateCase(caseRecord.id, sanction.type === 'warning'
       ? { status: 'final', finalized_at: caseRecord.finalized_at ?? Date.now() }
       : { status: 'summary_active' });
+  }
+  if (sanction.required_approvals > 0) {
+    if (caseRecord.status === 'approval') return caseRecord;
+    await beginCaseApproval(
+      guild,
+      caseRecord,
+      sanction,
+      `このtimeoutは即時執行上限を超えるため、執行には特別有権者${sanction.required_approvals}人の公開承認が必要です。`
+    );
+    return getCase(caseRecord.id);
   }
   if (caseRecord.status !== 'execution') {
     if (!sanction.notice_delivered) await notifySummarySanction(guild, caseRecord, sanction);
@@ -1482,7 +1516,8 @@ export async function fileConstitutionalChallenge(guild, reporter, input) {
     status: 'filing',
     defenseUntil: null,
     constitutionId: constitution.id,
-    procedureVersion: summaryProcedure(policy) ? 2 : 1
+    procedureVersion: summaryProcedure(policy) ? 2 : 1,
+    reporterType: input.official ? 'ai' : 'member'
   });
   addCaseEvidence({ caseId: caseRecord.id, submittedBy: reporter.id, content: input.reason, occurredAt: Date.now() });
   try {
@@ -2318,9 +2353,12 @@ export async function resumeProposalQueues(guild) {
 }
 
 async function syncRetriedIntake(guild, resultType, result) {
-  const { updateRetriedIntakeMessage } = await import('./intake.js');
+  const { updateRetriedIntakeMessage, updateRetriedMentionInvestigationMessage } = await import('./intake.js');
   await updateRetriedIntakeMessage(guild, resultType, result).catch((error) => {
     console.error(`Failed to update completed ${resultType} intake ${result.id}:`, error);
+  });
+  await updateRetriedMentionInvestigationMessage(guild, resultType, result).catch((error) => {
+    console.error(`Failed to update completed ${resultType} investigation ${result.id}:`, error);
   });
 }
 
@@ -2617,6 +2655,12 @@ export async function runGovernanceScheduler(client) {
         console.error(`Failed to sync governance UX in ${guild.id}:`, error);
       }
       if (currentGovernance.status !== 'active') continue;
+      try {
+        const { resumePendingMentionInvestigations } = await import('./intake.js');
+        await resumePendingMentionInvestigations(guild, now);
+      } catch (error) {
+        console.error(`Failed to resume mention investigations in ${guild.id}:`, error);
+      }
       let queueUiChanged = false;
       try {
         queueUiChanged = (await reconcileProposalQueues(guild)).length > 0;

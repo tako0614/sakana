@@ -164,6 +164,7 @@ function operationsComponents(governance) {
         .setLabel(governance.enforcement_mode === 'live' ? '実執行を停止' : '実執行を診断')
         .setStyle(governance.enforcement_mode === 'live' ? ButtonStyle.Secondary : ButtonStyle.Danger),
       new ButtonBuilder().setCustomId('gov:admin:settings').setLabel('AI利用上限').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('gov:admin:investigation').setLabel('AI調査範囲').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('gov:admin:weekly_toggle')
         .setLabel(getOperationalSetting(governance.guild_id, 'weekly_scan_enabled') === 1 ? '自律起案 ON' : '自律起案 OFF')
         .setStyle(getOperationalSetting(governance.guild_id, 'weekly_scan_enabled') === 1 ? ButtonStyle.Success : ButtonStyle.Secondary)
@@ -203,6 +204,7 @@ export async function renderGovernanceOperationsPanel(guild, governance) {
       `特別有権者: ${electorate}`,
       `自律起案: ${weeklyEnabled ? '有効' : '無効'} / 週最大 ${getOperationalSetting(guild.id, 'weekly_draft_limit')}件`,
       `AI受付: 一般 ${getOperationalSetting(guild.id, 'general_daily_calls')}回/日 / ${electorateName} ${getOperationalSetting(guild.id, 'trusted_daily_calls')}回/日`,
+      `AI調査: 会話 ${getOperationalSetting(guild.id, 'investigation_conversation_limit')}件 / 対象者 ${getOperationalSetting(guild.id, 'investigation_actor_limit')}件 / サーバー ${getOperationalSetting(guild.id, 'investigation_guild_limit')}件 / 最大事件 ${getOperationalSetting(guild.id, 'investigation_case_limit')}件`,
       `通知上限: 全体 ${getOperationalSetting(guild.id, 'notification_everyone_daily_limit')}回 / ${electorateName} ${getOperationalSetting(guild.id, 'notification_trusted_daily_limit')}回 / 当事者1人 ${getOperationalSetting(guild.id, 'notification_user_daily_limit')}回（各24時間）`,
       `通知実績（24時間）: 送信 ${notificationStats.delivered} / 上限・権限で抑制 ${notificationStats.suppressed} / 失敗 ${notificationStats.failed}`,
       '',
@@ -488,7 +490,23 @@ function settingsModal(guildId) {
     .addComponents(
       new ActionRowBuilder().addComponents(input('weekly_draft_limit', '自律起案の週最大件数', getOperationalSetting(guildId, 'weekly_draft_limit'))),
       new ActionRowBuilder().addComponents(input('general_daily_calls', '一般参加者のAI受付回数/日', getOperationalSetting(guildId, 'general_daily_calls'))),
-      new ActionRowBuilder().addComponents(input('trusted_daily_calls', '特別有権者のAI受付回数/日', getOperationalSetting(guildId, 'trusted_daily_calls')))
+      new ActionRowBuilder().addComponents(input('trusted_daily_calls', '特別有権者のAI受付回数/日', getOperationalSetting(guildId, 'trusted_daily_calls'))),
+      new ActionRowBuilder().addComponents(input('investigation_case_limit', '一度に開始する事件数（最大10）', getOperationalSetting(guildId, 'investigation_case_limit')))
+    );
+}
+
+function investigationSettingsModal(guildId) {
+  const input = (id, label, value) => new TextInputBuilder()
+    .setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short).setRequired(true).setValue(String(value));
+  return new ModalBuilder()
+    .setCustomId('gov:admin_modal:investigation')
+    .setTitle('AI調査範囲')
+    .addComponents(
+      new ActionRowBuilder().addComponents(input('investigation_conversation_limit', '同じ会話から読む件数（最大100）', getOperationalSetting(guildId, 'investigation_conversation_limit'))),
+      new ActionRowBuilder().addComponents(input('investigation_actor_limit', '対象者から読む合計件数（最大200）', getOperationalSetting(guildId, 'investigation_actor_limit'))),
+      new ActionRowBuilder().addComponents(input('investigation_guild_limit', 'サーバー全体から読む件数（最大500）', getOperationalSetting(guildId, 'investigation_guild_limit'))),
+      new ActionRowBuilder().addComponents(input('investigation_conversation_hours', '同じ会話を遡る時間（最大720）', getOperationalSetting(guildId, 'investigation_conversation_hours'))),
+      new ActionRowBuilder().addComponents(input('investigation_lookback_days', '全体を遡る日数（最大30）', getOperationalSetting(guildId, 'investigation_lookback_days')))
     );
 }
 
@@ -565,7 +583,7 @@ export async function handleGovernanceUxInteraction(interaction) {
   if (!governance) throw new Error('統治機能が初期化されていません。');
 
   if (interaction.isModalSubmit() && customId === 'gov:admin_modal:settings') {
-    const keys = ['weekly_draft_limit', 'general_daily_calls', 'trusted_daily_calls'];
+    const keys = ['weekly_draft_limit', 'general_daily_calls', 'trusted_daily_calls', 'investigation_case_limit'];
     const updates = [];
     for (const key of keys) {
       const parsed = parseOperationalSetting(key, interaction.fields.getTextInputValue(key));
@@ -575,6 +593,32 @@ export async function handleGovernanceUxInteraction(interaction) {
     for (const [key, value] of updates) setOperationalSetting(interaction.guildId, key, value, interaction.user.id);
     createAdministrativeAct({ guildId: interaction.guildId, kind: 'operational_settings', actorId: interaction.user.id, summary: 'AI受付と自律起案の設定を変更', detail: Object.fromEntries(updates) });
     await interaction.reply({ content: 'AI受付と自律起案の設定を更新しました。', flags: EPHEMERAL });
+    await refreshDashboard(interaction);
+    return true;
+  }
+  if (interaction.isModalSubmit() && customId === 'gov:admin_modal:investigation') {
+    const keys = [
+      'investigation_conversation_limit',
+      'investigation_actor_limit',
+      'investigation_guild_limit',
+      'investigation_conversation_hours',
+      'investigation_lookback_days'
+    ];
+    const updates = [];
+    for (const key of keys) {
+      const parsed = parseOperationalSetting(key, interaction.fields.getTextInputValue(key));
+      if (!parsed.ok) throw new Error(parsed.error);
+      updates.push([key, parsed.value]);
+    }
+    for (const [key, value] of updates) setOperationalSetting(interaction.guildId, key, value, interaction.user.id);
+    createAdministrativeAct({
+      guildId: interaction.guildId,
+      kind: 'operational_settings',
+      actorId: interaction.user.id,
+      summary: 'AI調査範囲を変更',
+      detail: Object.fromEntries(updates)
+    });
+    await interaction.reply({ content: 'AI調査範囲を更新しました。新しい呼びかけから適用します。', flags: EPHEMERAL });
     await refreshDashboard(interaction);
     return true;
   }
@@ -660,6 +704,10 @@ export async function handleGovernanceUxInteraction(interaction) {
   }
   if (customId === 'gov:admin:settings') {
     await interaction.showModal(settingsModal(interaction.guildId));
+    return true;
+  }
+  if (customId === 'gov:admin:investigation') {
+    await interaction.showModal(investigationSettingsModal(interaction.guildId));
     return true;
   }
   if (customId === 'gov:admin:notifications') {

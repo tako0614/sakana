@@ -919,6 +919,62 @@ db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied
 }
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (16, ?)').run(Date.now());
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS governance_mention_investigations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    requester_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    source_message_id TEXT NOT NULL UNIQUE,
+    response_message_id TEXT,
+    request_text TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'processing',
+    outcome TEXT,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    completed_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_mention_investigations
+    ON governance_mention_investigations(guild_id, status, updated_at);
+
+  CREATE TABLE IF NOT EXISTS governance_investigation_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    investigation_id INTEGER NOT NULL,
+    message_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    author_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    occurred_at INTEGER NOT NULL,
+    purpose TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (investigation_id, message_id, purpose)
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_investigation_evidence
+    ON governance_investigation_evidence(investigation_id, id);
+`);
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (17, ?)').run(Date.now());
+
+{
+  const columns = new Set(db.pragma('table_info(governance_mention_investigations)').map((row) => row.name));
+  for (const [name, definition] of [
+    ['result_type', 'TEXT'],
+    ['result_id', 'TEXT'],
+    ['record_published_at', 'INTEGER']
+  ]) {
+    if (!columns.has(name)) db.exec(`ALTER TABLE governance_mention_investigations ADD COLUMN ${name} ${definition}`);
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_gov_mention_investigation_result
+      ON governance_mention_investigations(guild_id, result_type, result_id)
+  `);
+}
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (18, ?)').run(Date.now());
+
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
 db.prepare("UPDATE governance_outbox SET status = 'error', last_error = 'interrupted before completion' WHERE status = 'running'").run();
@@ -979,6 +1035,10 @@ function hydrateAdministrativeAct(row) {
 
 function hydrateIntake(row) {
   return row ? { ...row, payload: parseJson(row.payload_json, {}) } : null;
+}
+
+function hydrateMentionInvestigation(row) {
+  return row ? { ...row, result: parseJson(row.result_json, {}) } : null;
 }
 
 function hydrateSetupSession(row) {
@@ -1246,6 +1306,110 @@ export function listPendingGovernanceIntakes(guildId, now = Date.now()) {
   `).all(String(guildId), Number(now)).map(hydrateIntake);
 }
 
+export function createMentionInvestigation(input) {
+  const now = Date.now();
+  db.prepare(`
+    INSERT OR IGNORE INTO governance_mention_investigations
+      (guild_id, branch, requester_id, channel_id, source_message_id,
+       request_text, request_hash, status, result_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', '{}', ?, ?)
+  `).run(
+    String(input.guildId), String(input.branch), String(input.requesterId),
+    String(input.channelId), String(input.sourceMessageId), String(input.requestText),
+    sha256(String(input.requestText)), now, now
+  );
+  return getMentionInvestigationBySource(input.sourceMessageId);
+}
+
+export function getMentionInvestigation(id) {
+  return hydrateMentionInvestigation(db.prepare(
+    'SELECT * FROM governance_mention_investigations WHERE id = ?'
+  ).get(Number(id)));
+}
+
+export function getMentionInvestigationBySource(sourceMessageId) {
+  return hydrateMentionInvestigation(db.prepare(
+    'SELECT * FROM governance_mention_investigations WHERE source_message_id = ?'
+  ).get(String(sourceMessageId)));
+}
+
+export function findMentionInvestigationByResult(guildId, resultType, resultId) {
+  return hydrateMentionInvestigation(db.prepare(`
+    SELECT * FROM governance_mention_investigations
+    WHERE guild_id = ? AND result_type = ? AND result_id = ?
+    ORDER BY id DESC LIMIT 1
+  `).get(String(guildId), String(resultType), String(resultId)));
+}
+
+export function findAcceptedMentionInvestigationForCase(guildId, caseId) {
+  return db.prepare(`
+    SELECT * FROM governance_mention_investigations
+    WHERE guild_id = ? AND status = 'accepted' AND result_type = 'case'
+    ORDER BY id DESC LIMIT 100
+  `).all(String(guildId)).map(hydrateMentionInvestigation).find((entry) => (
+    (entry.result?.caseIds ?? []).some((id) => String(id) === String(caseId))
+  )) ?? null;
+}
+
+export function listStaleMentionInvestigations(guildId, before, limit = 10) {
+  return db.prepare(`
+    SELECT * FROM governance_mention_investigations
+    WHERE guild_id = ? AND status = 'processing' AND updated_at <= ?
+    ORDER BY updated_at, id LIMIT ?
+  `).all(String(guildId), Number(before), Number(limit)).map(hydrateMentionInvestigation);
+}
+
+export function updateMentionInvestigation(id, patch) {
+  const allowed = new Set([
+    'response_message_id', 'status', 'outcome', 'result_json', 'last_error', 'completed_at',
+    'result_type', 'result_id', 'record_published_at'
+  ]);
+  const normalized = { ...patch };
+  if ('result' in normalized) {
+    normalized.result_json = canonicalJson(normalized.result);
+    delete normalized.result;
+  }
+  const entries = Object.entries(normalized).filter(([key]) => allowed.has(key));
+  if (entries.length === 0) return getMentionInvestigation(id);
+  const sql = entries.map(([key]) => `${key} = @${key}`).join(', ');
+  db.prepare(`UPDATE governance_mention_investigations SET ${sql}, updated_at = @updated_at WHERE id = @id`)
+    .run({ id: Number(id), updated_at: Date.now(), ...Object.fromEntries(entries) });
+  return getMentionInvestigation(id);
+}
+
+export function recordInvestigationEvidence(investigationId, rows, purpose) {
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO governance_investigation_evidence
+      (investigation_id, message_id, channel_id, author_id, content, content_hash,
+       occurred_at, purpose, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const now = Date.now();
+  const transaction = db.transaction(() => {
+    for (const row of rows) insert.run(
+      Number(investigationId), String(row.messageId), String(row.channelId),
+      String(row.authorId), String(row.content).slice(0, 8000),
+      String(row.contentHash ?? sha256(String(row.content))), Number(row.occurredAt),
+      String(purpose), now
+    );
+  });
+  transaction();
+  return listInvestigationEvidence(investigationId);
+}
+
+export function listInvestigationEvidence(investigationId, purpose = null) {
+  if (purpose === null) {
+    return db.prepare(`
+      SELECT * FROM governance_investigation_evidence
+      WHERE investigation_id = ? ORDER BY id
+    `).all(Number(investigationId));
+  }
+  return db.prepare(`
+    SELECT * FROM governance_investigation_evidence
+    WHERE investigation_id = ? AND purpose = ? ORDER BY id
+  `).all(Number(investigationId), String(purpose));
+}
+
 export function updateGovernanceIntake(id, patch) {
   const allowed = new Set([
     'response_message_id', 'payload_json', 'status', 'expires_at', 'result_type',
@@ -1443,7 +1607,7 @@ export function recentGovernanceMessages(guildId, since, channelIds, limit = 300
   if (!channelIds.length) return [];
   const marks = channelIds.map(() => '?').join(',');
   const newestFirst = db.prepare(`
-    SELECT message_id, channel_id, content_hash, content, created_at
+    SELECT message_id, channel_id, parent_id, user_id, content_hash, content, created_at
     FROM governance_activity
     WHERE guild_id = ? AND created_at >= ?
       AND (channel_id IN (${marks}) OR parent_id IN (${marks})) AND content <> ''
@@ -1455,6 +1619,33 @@ export function recentGovernanceMessages(guildId, since, channelIds, limit = 300
     seen.add(row.content_hash);
     return true;
   }).reverse();
+}
+
+export function recentConversationActivity(guildId, channelId, since, limit = 50) {
+  return db.prepare(`
+    SELECT message_id, channel_id, parent_id, user_id, content_hash, content, created_at
+    FROM governance_activity
+    WHERE guild_id = ? AND channel_id = ? AND created_at >= ? AND content <> ''
+    ORDER BY created_at DESC, message_id DESC LIMIT ?
+  `).all(String(guildId), String(channelId), Number(since), Number(limit)).reverse();
+}
+
+export function recentActorActivity(guildId, userId, since, limit = 100) {
+  return db.prepare(`
+    SELECT message_id, channel_id, parent_id, user_id, content_hash, content, created_at
+    FROM governance_activity
+    WHERE guild_id = ? AND user_id = ? AND created_at >= ? AND content <> ''
+    ORDER BY created_at DESC, message_id DESC LIMIT ?
+  `).all(String(guildId), String(userId), Number(since), Number(limit)).reverse();
+}
+
+export function recentGuildActivity(guildId, since, limit = 500) {
+  return db.prepare(`
+    SELECT message_id, channel_id, parent_id, user_id, content_hash, content, created_at
+    FROM governance_activity
+    WHERE guild_id = ? AND created_at >= ? AND content <> ''
+    ORDER BY created_at DESC, message_id DESC LIMIT ?
+  `).all(String(guildId), Number(since), Number(limit)).reverse();
 }
 
 export function proposalDiscussion(proposalId, since, until, limit = 300) {
@@ -1642,7 +1833,8 @@ export function createProposal(input) {
     stateEnteredAt: proposal.stage_started_at,
     wakeAt: proposal.stage_ends_at
   });
-  writeAudit({ guildId: input.guildId, actorType: input.source === 'weekly' ? 'ai' : 'member', actorId: input.proposerId, action: 'proposal.created', targetType: 'proposal', targetId: proposal.id, detail: { kind: proposal.kind, source: proposal.source, voteScope: proposal.vote_scope } });
+  const aiSource = input.source === 'weekly' || String(input.source).startsWith('mention_investigation:');
+  writeAudit({ guildId: input.guildId, actorType: aiSource ? 'ai' : 'member', actorId: aiSource ? null : input.proposerId, action: 'proposal.created', targetType: 'proposal', targetId: proposal.id, detail: { kind: proposal.kind, source: proposal.source, voteScope: proposal.vote_scope } });
   return getProposal(proposal.id);
 }
 
@@ -1690,7 +1882,7 @@ export const queueProposalWorkflow = db.transaction((proposalId, {
 });
 
 export const appendQueuedProposalInput = db.transaction((proposalId, {
-  intakeId, userId, summary
+  intakeId, userId = null, summary, sourceType = 'intake'
 }) => {
   const proposal = getProposal(proposalId);
   if (!proposal) throw new Error('審議待ちの案件がありません。');
@@ -1701,7 +1893,8 @@ export const appendQueuedProposalInput = db.transaction((proposalId, {
   if (inputs.some((entry) => String(entry.intakeId) === String(intakeId))) return proposal;
   const input = {
     intakeId: String(intakeId),
-    userId: String(userId),
+    userId: userId === null ? null : String(userId),
+    sourceType: String(sourceType),
     summary: String(summary ?? '').trim().slice(0, 1800),
     createdAt: Date.now()
   };
@@ -1717,12 +1910,47 @@ export const appendQueuedProposalInput = db.transaction((proposalId, {
   `).run(canonicalJson(context), input.createdAt, instance.id);
   writeAudit({
     guildId: proposal.guild_id,
-    actorType: 'member',
-    actorId: userId,
+    actorType: sourceType === 'mention_investigation' ? 'ai' : 'member',
+    actorId: sourceType === 'mention_investigation' ? null : userId,
     action: 'proposal.queue_input_added',
     targetType: 'proposal',
     targetId: proposal.id,
     detail: { intakeId: String(intakeId) }
+  });
+  return getProposal(proposal.id);
+});
+
+export const appendProposalInput = db.transaction((proposalId, {
+  sourceId, userId = null, summary, sourceType = 'mention_investigation'
+}) => {
+  const proposal = getProposal(proposalId);
+  if (!proposal) throw new Error('関連する案件がありません。');
+  const instance = getWorkflowInstance('proposal', proposal.id);
+  if (!instance || instance.status === 'completed') throw new Error('関連する案件は終了しています。');
+  const queue = { ...(instance.context.queue ?? {}) };
+  const inputs = Array.isArray(queue.inputs) ? [...queue.inputs] : [];
+  if (inputs.some((entry) => String(entry.sourceId ?? entry.intakeId) === String(sourceId))) return proposal;
+  const input = {
+    sourceId: String(sourceId),
+    userId: userId === null ? null : String(userId),
+    sourceType: String(sourceType),
+    summary: String(summary ?? '').trim().slice(0, 1800),
+    createdAt: Date.now()
+  };
+  queue.inputs = [...inputs, input].slice(-20);
+  db.prepare(`
+    UPDATE governance_workflow_instances
+    SET context_json = ?, updated_at = ?
+    WHERE id = ?
+  `).run(canonicalJson({ ...instance.context, queue }), input.createdAt, instance.id);
+  writeAudit({
+    guildId: proposal.guild_id,
+    actorType: sourceType === 'mention_investigation' ? 'ai' : 'member',
+    actorId: sourceType === 'mention_investigation' ? null : userId,
+    action: 'proposal.input_added',
+    targetType: 'proposal',
+    targetId: proposal.id,
+    detail: { sourceId: String(sourceId), sourceType }
   });
   return getProposal(proposal.id);
 });
@@ -2170,7 +2398,15 @@ export function createCase(input) {
       wakeAt: created.defense_until
     });
   }
-  writeAudit({ guildId: input.guildId, actorType: 'member', actorId: input.reporterId, action: 'case.filed', targetType: 'case', targetId: created.id, detail: { kind: created.kind, accusedId: created.accused_id } });
+  writeAudit({
+    guildId: input.guildId,
+    actorType: input.reporterType === 'ai' ? 'ai' : 'member',
+    actorId: input.reporterType === 'ai' ? null : input.reporterId,
+    action: 'case.filed',
+    targetType: 'case',
+    targetId: created.id,
+    detail: { kind: created.kind, accusedId: created.accused_id }
+  });
   return created;
 }
 
@@ -2882,6 +3118,7 @@ export function pruneGovernance(keepMs = 90 * 86_400_000) {
   db.prepare('DELETE FROM governance_activity WHERE created_at < ?').run(cutoff);
   db.prepare('DELETE FROM governance_restriction_usage WHERE created_at < ?').run(cutoff);
   db.prepare("DELETE FROM governance_intakes WHERE status != 'pending' AND updated_at < ?").run(cutoff);
+  db.prepare("DELETE FROM governance_mention_investigations WHERE status IN ('completed', 'failed') AND updated_at < ?").run(cutoff);
   db.prepare("DELETE FROM governance_setup_sessions WHERE status IN ('completed', 'expired') AND updated_at < ?").run(cutoff);
   db.prepare("DELETE FROM governance_notifications WHERE status != 'sending' AND updated_at < ?").run(cutoff);
 }

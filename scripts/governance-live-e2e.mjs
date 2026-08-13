@@ -15,6 +15,7 @@ const SCENARIOS = Object.freeze([
   '特別有権者ロールのowner操作、監査、原状復帰',
   '投票・承認mentionの対象固定、通知上限、定期同期での重複防止',
   '一般／特別有権者のAI利用上限とprompt injection防御',
+  '@立法の公開ログ調査と@裁判の3席事前審査（正式事件化前・書込みなし）',
   '特別有権者の拒否権（分母はyes+noの有効票）',
   '発言数、リンク、添付、mention、reaction、thread、voice、AI、請願、投票の制限定義',
   '成立法と直近公開ログに基づく15分以内の一時保全（shadowでは条件評価のみ）',
@@ -272,6 +273,24 @@ async function runAiProbes({ guild, constitution, law, caseRecord, mark }) {
   results.legislativeIntake = legislative.value;
   results.legislativeIntakeRejectedBySchema = legislative.rejectedBySchema;
 
+  const investigated = await probe('legislativeInvestigation', () => investigateLegislativeMention({
+    guildId: guild.id,
+    request: {
+      text: `短時間連投を将来に向けて制限する一般法を作って。引用データ: ${injection}`,
+      authorId: guild.ownerId
+    },
+    constitution,
+    activeLaws,
+    messages: [
+      { messageId: 'e2e-legislative-log-1', channelId: 'e2e', authorId: guild.ownerId, content: injection, occurredAt: Date.now() }
+    ]
+  }), {
+    intent: 'rejected_by_schema', basis: null, title: null, summary: null,
+    explanation: null, evidenceMessageIds: [], question: null
+  });
+  results.legislativeInvestigation = investigated.value;
+  results.legislativeInvestigationRejectedBySchema = investigated.rejectedBySchema;
+
   const bill = await probe('bill', () => draftBill({
     guildId: guild.id,
     petition: {
@@ -311,6 +330,23 @@ async function runAiProbes({ guild, constitution, law, caseRecord, mark }) {
   results.judicialIntake = judicialIntake.value;
   results.judicialIntakeRejectedBySchema = judicialIntake.rejectedBySchema;
   const offense = law.provisions.offenses[0];
+  const screeningEvidence = listCaseEvidence(caseRecord.id).map((entry) => ({
+    messageId: String(entry.message_id ?? entry.id),
+    channelId: String(entry.channel_id ?? 'e2e'),
+    authorId: String(entry.author_id ?? caseRecord.accused_id),
+    content: entry.content,
+    occurredAt: entry.occurred_at
+  }));
+  const screening = await screenJudicialMention({
+    guildId: guild.id,
+    request: { text: `成立法と証拠を照合して。引用データ: ${injection}`, authorId: guild.ownerId },
+    constitution,
+    activeLaws,
+    recentCases: [caseRecord],
+    messages: screeningEvidence,
+    panel: { seats: 3, required: { decision: 2 } }
+  });
+  results.judicialScreening = screening;
   const judicialErrors = [];
   for (const phase of ['live_e2e', 'live_e2e_retry']) {
     try {
@@ -368,6 +404,13 @@ async function runAiProbes({ guild, constitution, law, caseRecord, mark }) {
   results.weeklyRejectedBySchema = weekly.rejectedBySchema;
 
   assert.ok(['petition', 'amendment', 'information', 'unclear', 'rejected_by_schema'].includes(results.legislativeIntake.intent));
+  assert.ok(['petition', 'amendment', 'information', 'no_action', 'unclear', 'rejected_by_schema']
+    .includes(results.legislativeInvestigation.intent));
+  assert.equal(
+    results.judicialScreening.outputs.length + results.judicialScreening.failedSeats,
+    3,
+    '事件化前の司法事前審査は成功席とschema拒否席を合わせて3席を完了しなければなりません。'
+  );
   assert.ok(
     results.constitutional.outputs.length === constitution.policy.judiciary.panelSeats
       || (results.constitutionalRejectedBySchema && results.failures.constitutional.length === 2),
@@ -1057,8 +1100,10 @@ const [{
   draftBill,
   interpretJudicialRequest,
   interpretLegislativeRequest,
+  investigateLegislativeMention,
   runConstitutionalPanel,
-  runJudicialPanel
+  runJudicialPanel,
+  screenJudicialMention
 }, {
   applyInterimProtectionFromLogs,
   appealCase,

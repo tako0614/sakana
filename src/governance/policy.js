@@ -340,10 +340,10 @@ export function requiredApprovals(sanction, policy) {
   if (!sanction) return Infinity;
   if (sanction.type === 'kick') return policy.judiciary.kickApprovals;
   if (sanction.type === 'ban') return policy.judiciary.banApprovals;
-  if (summaryProcedure(policy)) return 0;
   if (sanction.type === 'timeout' && sanction.durationSeconds > policy.judiciary.immediateTimeoutMaximumSeconds) {
     return policy.judiciary.timeoutApprovalsAboveSeconds;
   }
+  if (summaryProcedure(policy)) return 0;
   return 0;
 }
 

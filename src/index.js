@@ -277,6 +277,12 @@ async function handleMessageCreate(message) {
   indexLiveMessage(message);
 
   if (message.author.bot) {
+    // AIだけのコミュニティではbotの通常会話も立法上の事実資料になる。
+    // 統治面の公式投稿はrecordGovernanceMessage側で除外し、botを自動処罰の対象にはしない。
+    if (governanceConfig.enabled) {
+      recordGovernanceMessage(message);
+      if (message.author.id !== client.user.id && await handleGovernanceMention(message)) return;
+    }
     return;
   }
 
@@ -343,8 +349,12 @@ client.on(Events.MessageUpdate, async (_oldMessage, newMessage) => {
     if (!isAllowedGuild(newMessage.guildId)) return;
     const message = newMessage.partial ? await newMessage.fetch() : newMessage;
     indexLiveEdit(message);
-    if (governanceConfig.enabled && !message.author.bot) {
+    if (governanceConfig.enabled) {
       deleteActivity(message.id);
+      if (message.author.bot) {
+        recordGovernanceMessage(message);
+        return;
+      }
       if (await enforceMessageRestrictions(message)) return;
       const courtResult = await recordCourtSubmissionEdit(message);
       if (courtResult === 'blocked') return;
