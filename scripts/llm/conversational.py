@@ -13,12 +13,25 @@ val loss は「口調が移ったか」しか測らない。evex-ft-1 は val 2.
     噛み合い率    質問に出た内容語が返答にも出た割合。話を受けているか
     助手っぽさ    敬体で終わる率 / markdown 記法の率。instruct の口調が漏れると上がる
     未知語率      コーパスに一度も無い語の割合。**Qwen の地が出ると上がる**
+    文章の ppl    `--judge` に別のモデルを渡すと、生成文がそもそも文章として
+                  成り立っているかを外から採点する
 
-地の値 (sft-v4 実測): 20字以上 25.6% / 敬体 2.4% / markdown 0.6% / 未知語 14.8%
+**文章の ppl は「低いほど良い」ではない。** 本物の発言を同じ審査で測った値との比で見る:
+
+    比 > 1.5   崩れている (別モデルから見て当てにくい)
+    比 ≈ 1     本物と同じ手触り
+    比 < 0.5   無難すぎる — 本物より当てやすい = evex の手触りが薄い
+
+evex-ft-1 (epoch 2) の実測は **0.19x** で、崩れてはいないが無難に寄っている。
+本物の Discord 発言は身内ネタ・断片・誤字だらけで外から見れば読みにくいので、
+そこに近づくのが「evex らしさ」になる。
+
+地の値 (sft-v5 実測 / val): 20字以上 33.4% / 敬体 3.0% / markdown 0.3% / 未知語 14.8%
 """
 
 import argparse
 import json
+import math
 import re
 from pathlib import Path
 
@@ -33,6 +46,12 @@ parser.add_argument("--max-new", type=int, default=80)
 parser.add_argument("--threads", type=int, default=10)
 parser.add_argument("--label", default=None, help="喋らせる人 (既定は labels.json の最多)")
 parser.add_argument("--show", type=int, default=8, help="出力を何本見せるか")
+# 「文章として成り立っているか」を別のモデルに採点させる。
+# 自分自身で測ると崩れた文でも自信満々に低い loss を出すので、独立した審査が要る。
+# 素の Qwen はこのサーバーの俗語を低く見るので、**同じ審査で val の本物の発言も
+# 測って**、そこを地の値にする (未知語率と同じ考え方)。
+parser.add_argument("--judge", default=None, help="流暢さを採点させる別モデルのディレクトリ")
+parser.add_argument("--judge-sample", type=int, default=200, help="地の値に使う val の発言数")
 args = parser.parse_args()
 
 torch.set_num_threads(args.threads)
@@ -152,6 +171,40 @@ for question in QUESTIONS:
 got = score(replies)
 overlap = sum(overlaps) / len(overlaps) if overlaps else 0.0
 
+# --- 文章として成り立っているか ---
+#
+# 生成文を**別のモデル**に読ませて perplexity を取る。崩れた文は当てにくいので上がる。
+# 判定は絶対値ではなく **val の本物の発言を同じ審査で測った値との比**で見る —
+# このサーバーの発言は俗語だらけで、素の Qwen から見れば元々当てにくい。
+judged = None
+if args.judge:
+    del model                                    # 2つ同時に持つと CPU の RAM が厳しい
+    j_tok = AutoTokenizer.from_pretrained(args.judge)
+    j_model = AutoModelForCausalLM.from_pretrained(args.judge, dtype=torch.float32)
+    j_model.eval()
+
+    def fluency(texts):
+        """1 発言ずつ loss を取って平均する (短文なので窓は要らない)。"""
+        total, count = 0.0, 0
+        for text in texts:
+            ids = j_tok(text, return_tensors="pt").input_ids
+            if ids.shape[1] < 2:
+                continue
+            total += j_model(input_ids=ids, labels=ids).loss.item()
+            count += 1
+        return total / count if count else float("nan")
+
+    # 地の値は長さをそろえて選ぶ。短い発言ばかりだと ppl が下がるので、
+    # 生成文と同じくらいの長さの本物と比べないと意味がない
+    lo = min(len(t) for t in replies) if replies else 0
+    similar = [t for t in val_bodies if lo <= len(t) <= max(len(t) for t in replies)]
+    judged = {
+        "model": math.exp(min(20, fluency(replies))),
+        "real": math.exp(min(20, fluency(similar[: args.judge_sample]))),
+        "n_real": len(similar[: args.judge_sample]),
+    }
+    del j_model
+
 pct = lambda x: f"{x * 100:5.1f}%"  # noqa: E731
 
 print(f"{args.model} / 喋らせた人 {label} / {len(replies)} 本\n")
@@ -163,5 +216,13 @@ print(f"{'敬体':<12} {pct(got['polite']):>10} {pct(base_line['polite']):>12}")
 print(f"{'markdown':<12} {pct(got['markdown']):>10} {pct(base_line['markdown']):>12}")
 print(f"{'未知語':<12} {pct(got['oov']):>10} {pct(base_line['oov']):>12}")
 print(f"{'平均の長さ':<12} {got['chars']:9.0f}字 {base_line['chars']:11.0f}字")
+if judged:
+    print(f"{'文章の ppl':<12} {judged['model']:9.1f} {judged['real']:11.1f}"
+          f"  ({judged['n_real']} 本の本物と比較 / 審査 {Path(args.judge).name})")
+    ratio = judged["model"] / judged["real"]
+    print(f"{'':12} 比 {ratio:.2f}x — "
+          + ("崩れている (別モデルから見て当てにくい)" if ratio > 1.5
+             else "本物と同じ手触り" if ratio > 0.5
+             else "無難すぎる (本物より当てやすい = evex の手触りが薄い)"))
 print("\n未知語が地の値より大きく上なら Qwen の地が出ている。"
       "\n敬体と markdown が上なら instruct の口調が漏れている。")
