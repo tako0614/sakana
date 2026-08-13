@@ -104,16 +104,26 @@ function caseStateLabel(value) {
   })[value] ?? value;
 }
 
+const PUBLIC_ADMINISTRATIVE_KINDS = new Set([
+  'enforcement_mode', 'trusted_role', 'trusted_member_add', 'trusted_member_remove', 'governance_status'
+]);
+
+function publicAdministrativeActs(guildId, limit) {
+  return listAdministrativeActs(guildId, Math.max(limit * 4, 100))
+    .filter((act) => PUBLIC_ADMINISTRATIVE_KINDS.has(act.kind))
+    .slice(0, limit);
+}
+
 export function runGovernanceInfo(ctx, args) {
   const guildId = ctx.guild.id;
   const governance = getGovernanceGuild(guildId);
   if (!governance) return 'このサーバーでは統治機能が初期化されていません。';
   const action = String(args.action ?? 'status');
   if (['constitution', 'laws', 'law'].includes(action)) {
-    requireVisible(ctx, governance.statute_forum_id || governance.gazette_channel_id, '法令集');
+    requireVisible(ctx, governance.statute_forum_id, '法令集');
   }
   if (['administration', 'administrative_act'].includes(action)) {
-    requireVisible(ctx, governance.gazette_channel_id, '官報');
+    requireVisible(ctx, governance.procedure_channel_id, '手続');
   }
   if (['proposals', 'proposal'].includes(action)) {
     requireVisible(ctx, governance.parliament_forum_id, '議会');
@@ -122,8 +132,8 @@ export function runGovernanceInfo(ctx, args) {
     requireVisible(ctx, governance.court_forum_id, '裁判所');
   }
   if (action === 'status') {
-    requireVisible(ctx, governance.gazette_channel_id, '官報');
-    requireVisible(ctx, governance.statute_forum_id || governance.gazette_channel_id, '法令集');
+    requireVisible(ctx, governance.procedure_channel_id, '手続');
+    requireVisible(ctx, governance.statute_forum_id, '法令集');
     requireVisible(ctx, governance.parliament_forum_id, '議会');
     requireVisible(ctx, governance.court_forum_id, '裁判所');
   }
@@ -132,7 +142,8 @@ export function runGovernanceInfo(ctx, args) {
     return [
       `状態: ${governanceStateLabel(governance.status)} / 執行: ${enforcementLabel(governance.enforcement_mode)}`,
       `憲法: v${constitution?.version ?? '?'}`,
-      `法令集: <#${governance.statute_forum_id || governance.gazette_channel_id}>`,
+      `手続: <#${governance.procedure_channel_id}>`,
+      `法令集: <#${governance.statute_forum_id}>`,
       `現行法: ${listLaws(guildId).length}件`,
       `進行中法案: ${listProposals(guildId, { statuses: ['drafting', 'draft', 'constitutional_review', 'debate', 'voting'], limit: 100 }).length}件`,
       `進行中事件: ${listCases(guildId, { statuses: ['filing', 'defense', 'deliberation', 'approval', 'appeal_window', 'appeal'], limit: 100 }).length}件`
@@ -141,17 +152,17 @@ export function runGovernanceInfo(ctx, args) {
   if (action === 'constitution') {
     const constitution = getActiveConstitution(guildId);
     return constitution
-      ? `公開場所: 法令集 <#${governance.statute_forum_id || governance.gazette_channel_id}>\n現行憲法 v${constitution.version}\n\n${constitution.content}`
+      ? `公開場所: 法令集 <#${governance.statute_forum_id}>\n現行憲法 v${constitution.version}\n\n${constitution.content}`
       : '現行憲法がありません。';
   }
   if (action === 'laws') {
     const laws = listLaws(guildId);
-    return `公開場所: 法令集 <#${governance.statute_forum_id || governance.gazette_channel_id}>\n`
+    return `公開場所: 法令集 <#${governance.statute_forum_id}>\n`
       + (laws.map((law) => `${law.title} / 施行 ${new Date(law.effective_at).toISOString()}`).join('\n') || '現行法はありません。');
   }
   if (action === 'law') {
     const law = requestedRecord(args, listLaws(guildId), guildId, '法律');
-    return `公開場所: 法令集 <#${governance.statute_forum_id || governance.gazette_channel_id}>\n${law.title}\n\n${law.text}`;
+    return `公開場所: 法令集 <#${governance.statute_forum_id}>\n${law.title}\n\n${law.text}`;
   }
   if (action === 'proposals') {
     const proposals = listProposals(guildId, { limit: 50 });
@@ -185,11 +196,11 @@ export function runGovernanceInfo(ctx, args) {
     ].filter(Boolean).join('\n');
   }
   if (action === 'administration') {
-    const acts = listAdministrativeActs(guildId, 50);
+    const acts = publicAdministrativeActs(guildId, 50);
     return acts.map((act) => `${act.status} / ${act.summary}`).join('\n') || '行政行為はありません。';
   }
   if (action === 'administrative_act') {
-    const act = requestedRecord(args, listAdministrativeActs(guildId, 100), guildId, '行政行為', 'summary');
+    const act = requestedRecord(args, publicAdministrativeActs(guildId, 100), guildId, '行政行為', 'summary');
     return `${act.status}\n${act.summary}`;
   }
   throw new Error('未知のgovernance actionです。');

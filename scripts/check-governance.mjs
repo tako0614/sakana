@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readFileSync, rmSync } from 'node:fs';
+import Database from 'better-sqlite3';
 
 const mainPath = `/tmp/sakana-governance-${process.pid}.sqlite`;
 const archivePath = `/tmp/sakana-governance-archive-${process.pid}.sqlite`;
@@ -149,7 +151,7 @@ governanceDb.bootstrapGovernanceGuild({
   courtForumId: 'court',
   courtChatChannelId: 'court-chat',
   statuteForumId: 'statutes',
-  gazetteChannelId: 'gazette',
+  procedureChannelId: 'procedure',
   enforcementMode: 'shadow',
   constitution,
   policy
@@ -203,7 +205,9 @@ const activeConstitution = governanceDb.getActiveConstitution('g1');
 assert.equal(governanceDb.getGovernanceGuild('g1').legislature_role_id, 'legislature-role');
 assert.equal(governanceDb.getGovernanceGuild('g1').judiciary_role_id, 'judiciary-role');
 assert.equal(governanceDb.getGovernanceGuild('g1').statute_forum_id, 'statutes');
-assert.equal(governanceDb.getGovernanceGuild('g1').guide_channel_id, '', '既存guildはUX schedulerで案内を補完する');
+assert.equal(governanceDb.getGovernanceGuild('g1').procedure_channel_id, 'procedure', '公開入口は手続channelへ一本化する');
+assert.equal('guide_channel_id' in governanceDb.getGovernanceGuild('g1'), false, '案内専用columnを残さない');
+assert.equal('gazette_channel_id' in governanceDb.getGovernanceGuild('g1'), false, '官報専用columnを残さない');
 assert.equal('administration_role_id' in governanceDb.getGovernanceGuild('g1'), false, '@行政は公開入口として作らない');
 assert.equal(governanceDb.listConstitutions('g1').length, 1, '法令集backfill用に憲法の全versionを列挙できる');
 let publication = governanceDb.upsertStatutePublication({
@@ -587,12 +591,29 @@ governanceDb.bootstrapGovernanceGuild({
   courtForumId: 'court-2',
   courtChatChannelId: 'court-chat-2',
   statuteForumId: 'statutes-2',
-  gazetteChannelId: 'gazette-2',
+  procedureChannelId: 'procedure-2',
   enforcementMode: 'shadow',
   constitution,
   policy
 });
 assert.equal(governanceDb.getGovernanceGuild('g2').trusted_role_id, '', 'trusted roleなしで初期化できる');
+let surfaceMigration = governanceDb.recordGovernanceSurfaceMigration({
+  guildId: 'g2', legacyGuideChannelId: 'legacy-guide', legacyGazetteChannelId: 'legacy-gazette',
+  detail: { discoveredBy: 'test' }
+});
+assert.deepEqual({
+  guide: surfaceMigration.legacy_guide_channel_id,
+  gazette: surfaceMigration.legacy_gazette_channel_id,
+  status: surfaceMigration.status,
+  detail: surfaceMigration.detail
+}, {
+  guide: 'legacy-guide', gazette: 'legacy-gazette', status: 'pending', detail: { discoveredBy: 'test' }
+}, '旧公開面のIDと移行状態をDBに永続化する');
+surfaceMigration = governanceDb.updateGovernanceSurfaceMigration('g2', {
+  status: 'running', detail: { phase: 'deleting', archivedMessages: 2 }
+});
+assert.deepEqual(surfaceMigration.detail, { phase: 'deleting', archivedMessages: 2 },
+  '削除途中の再開位置を保存する');
 assert.deepEqual(
   governanceDb.recentGovernanceMessages('g1', 0, ['public']).map((entry) => entry.content),
   ['same message', 'test m3'],
@@ -867,8 +888,32 @@ const summaryCourtThread = {
   send: async (payload) => { summaryCourtRecords.push(payload.content); return payload; }
 };
 summaryChannels.set('summary-court', summaryCourtThread);
-summaryChannels.set('court', { threads: {} });
-summaryChannels.set('gazette', { isTextBased: () => true, send: async (payload) => payload });
+let generatedCourtSequence = 0;
+summaryChannels.set('court', {
+  availableTags: [
+    { id: 'answer-tag', name: '回答待ち' },
+    { id: 'decision-tag', name: '判断中' },
+    { id: 'final-tag', name: '処分確定' },
+    { id: 'none-tag', name: '責任なし' }
+  ],
+  threads: {
+    create: async ({ message }) => {
+      const id = `generated-court-${++generatedCourtSequence}`;
+      const starter = { id, content: message.content, edit: async (payload) => Object.assign(starter, payload) };
+      const thread = {
+        id, parentId: 'court', archived: false, locked: false,
+        isThread: () => true,
+        fetchStarterMessage: async () => starter,
+        send: async (payload) => payload,
+        setAppliedTags: async () => {},
+        setLocked: async () => { thread.locked = true; },
+        setArchived: async (value) => { thread.archived = value; }
+      };
+      summaryChannels.set(id, thread);
+      return thread;
+    }
+  }
+});
 const summaryGuild = {
   id: 'g1', name: 'Test Community',
   channels: { fetch: async (id) => summaryChannels.get(id) ?? null },
@@ -2049,12 +2094,11 @@ const { ChannelType, PermissionFlagsBits, PermissionsBitField } = await import('
 const {
   appealRestrictedChannelAccessible,
   courtActionButtons,
+  courtPublicState,
   courtForumEveryonePermissionState,
-  GOVERNANCE_GUIDE_NAME,
   GOVERNANCE_PROCEDURE_NAME,
   governanceProcedureOverwrites,
   ensureGovernanceParliamentForum,
-  readOnlyTextOverwrites,
   retireGovernanceCourtChat,
   syncAppealRoleOverwrites,
   statuteForumEveryonePermissionState,
@@ -2063,8 +2107,7 @@ const {
   maskDiscordUrls,
   withoutLegacyPublicIds
 } = await import('../src/governance/discord.js');
-assert.equal(GOVERNANCE_GUIDE_NAME, '案内');
-assert.equal(GOVERNANCE_PROCEDURE_NAME, '進行中');
+assert.equal(GOVERNANCE_PROCEDURE_NAME, '手続');
 assert.equal(publicMemberLabel('123456789012345678'), '<@123456789012345678>', '実在Discord IDは名前表示用mentionにする');
 assert.equal(publicMemberLabel('e2e-accused', '動作確認用アカウント'), '動作確認用アカウント',
   '内部fixture識別子を公開mentionへ埋め込まない');
@@ -2106,8 +2149,10 @@ await ensureGovernanceParliamentForum({
 }, { parliament_forum_id: 'parliament' });
 assert.ok(synchronizedParliamentTags.some((tag) => tag.name === '待機'),
   '既存の議会Forumに審議待ちタグを追加する');
-assert.ok(synchronizedParliamentTags.some((tag) => tag.id === 'draft-tag'),
-  'タグ同期で既存の議会タグを消さない');
+assert.deepEqual(synchronizedParliamentTags.map((tag) => tag.name),
+  ['待機', '議論中', '投票中', '成立', '不成立'], '内部段階を公開タグへ漏らさない');
+assert.equal(courtPublicState({ kind: 'constitutional', status: 'final', verdict: { verdict: 'unconstitutional' } }), '違憲');
+assert.equal(courtPublicState({ kind: 'criminal', status: 'acquitted' }), '責任なし');
 assert.deepEqual(courtForumEveryonePermissionState(), {
   ViewChannel: true,
   ReadMessageHistory: true,
@@ -2243,34 +2288,26 @@ const procedureAcl = governanceProcedureOverwrites(aclGuild);
 assert.deepEqual(
   procedureAcl.map((entry) => entry.id),
   ['acl-guild', 'bot'],
-  '進行中は全員が閲覧できる読み取り専用の手続ハブである'
+  '手続は全員が閲覧できる読み取り専用の操作ハブである'
 );
 assert.ok(procedureAcl[0].allow.includes(PermissionFlagsBits.ViewChannel));
 assert.ok(procedureAcl[0].deny.includes(PermissionFlagsBits.SendMessages));
-assert.ok(!procedureAcl[0].deny.includes(PermissionFlagsBits.ViewChannel), '進行中を@everyoneから隠さない');
-assert.deepEqual(
-  readOnlyTextOverwrites(aclGuild).map((entry) => entry.id),
-  ['acl-guild', 'bot'],
-  '案内は全員とbotの読み取り専用ACLである'
-);
+assert.ok(!procedureAcl[0].deny.includes(PermissionFlagsBits.ViewChannel), '手続を@everyoneから隠さない');
 
 governanceDb.updateGovernanceGuild('g1', {
-  guide_channel_id: 'guide',
-  admin_channel_id: 'admin',
+  procedure_channel_id: 'procedure',
+  operations_thread_id: 'operations',
   trusted_role_id: '123456789012345679'
 });
 const {
-  legacyGazetteCandidates,
-  legacyStatuteTechnicalCandidates,
   reconcileRequiredPermissionOverwrites,
-  renderGovernanceGuide,
   renderGovernanceActionCards,
   renderGovernanceOperationsPanel,
   renderGovernanceProcedureHub,
   requiredPermissionOverwritesMatch,
   syncGovernanceActionCards
 } = await import('../src/governance/ux.js');
-const expectedPublicAcl = readOnlyTextOverwrites(aclGuild);
+const expectedPublicAcl = governanceProcedureOverwrites(aclGuild);
 const existingPublicAcl = new Map(expectedPublicAcl.map((entry) => [entry.id, {
   id: entry.id,
   type: entry.type,
@@ -2306,10 +2343,6 @@ const uxGuild = {
   },
   members: { me: { permissions: { has: () => true } } }
 };
-const guideText = await renderGovernanceGuide(uxGuild, governanceDb.getGovernanceGuild('g1'));
-assert.match(guideText, /貴族院/);
-assert.match(guideText, /<@&legislature-role>/);
-assert.doesNotMatch(guideText, /trusted|shadow|policy JSON/i, '参加者案内に内部用語を出さない');
 const uxConstitution = governanceDb.getActiveConstitution('g1');
 let uxQueuedProposal = governanceDb.createProposal({
   guildId: 'g1', kind: 'amendment', source: 'petition', title: '発言の自由の保障を明確にする案',
@@ -2322,29 +2355,26 @@ uxQueuedProposal = governanceDb.queueProposalWorkflow(uxQueuedProposal.id, {
   blockedByProposalId: 1, reason: 'constitution_in_progress'
 });
 const procedureHub = await renderGovernanceProcedureHub(uxGuild, governanceDb.getGovernanceGuild('g1'));
-assert.match(procedureHub.content, /いま対応できる手続/);
-assert.match(procedureHub.content, /## 投票・承認/);
-assert.doesNotMatch(procedureHub.content, /- \[test\]/,
-  '操作カードがある投票案件を上部一覧へ重複表示しない');
-assert.doesNotMatch(procedureHub.content, /## 投票\n[\s\S]*## 承認/,
-  '上部メッセージで操作カードと同じ投票・承認一覧を重複表示しない');
-assert.match(procedureHub.content, /## 審議待ち/);
-assert.match(procedureHub.content, /発言の自由の保障を明確にする案/);
-assert.match(procedureHub.content, /受付順に最新版から起草/);
+assert.match(procedureHub.content, /# Test Community 手続/);
+assert.match(procedureHub.content, /<@&legislature-role>/);
+assert.match(procedureHub.content, /<@&judiciary-role>/);
+assert.match(procedureHub.content, /いま操作できる案件/);
+assert.doesNotMatch(procedureHub.content, /発言の自由の保障を明確にする案|審議待ち|討議中|回答受付/,
+  '手続には議会・裁判所の進捗一覧を重複表示しない');
 assert.doesNotMatch(procedureHub.content, /順番\s*\d+/, '意味の薄い内部順番を公開UIに出さない');
-assert.doesNotMatch(procedureHub.content, /L-1|C-\d+/, '進行中一覧では参照IDを出さない');
+assert.doesNotMatch(procedureHub.content, /L-1|C-\d+/, '手続では参照IDを出さない');
 assert.doesNotMatch(procedureHub.content, /Bot権限|AI受付|自律起案|診断・復旧/, '公開手続に技術運用を混ぜない');
 assert.equal(procedureHub.components.length, 2);
 assert.equal(procedureHub.components[1].components[0].data.label, '自分の即時処分を確認');
 let uxVoteProposal = governanceDb.createProposal({
-  guildId: 'g1', kind: 'law', source: 'petition', title: '進行中カードで投票する法案',
+  guildId: 'g1', kind: 'law', source: 'petition', title: '手続カードで投票する法案',
   summary: '議論と投票操作を分離する。', proposerId: 'u', constitutionId: uxConstitution.id,
   status: 'voting', voteScope: 'all', stageEndsAt: Date.now() + 86_400_000
 });
 uxVoteProposal = governanceDb.updateProposal(uxVoteProposal.id, { forum_thread_id: 'vote-thread' });
 let uxApprovalCase = governanceDb.createCase({
   guildId: 'g1', reporterId: 'reporter', accusedId: 'synthetic-user',
-  summary: '進行中カードで執行承認する事件', status: 'approval'
+  summary: '手続カードで執行承認する事件', status: 'approval'
 });
 uxApprovalCase = governanceDb.updateCase(uxApprovalCase.id, { public_thread_id: 'approval-thread' });
 governanceDb.createSanction({
@@ -2367,7 +2397,7 @@ assert.doesNotMatch(approvalCard.content, /^#\s*執行承認/m, '各承認カー
 assert.match(approvalCard.content, /タイムアウト 2日 \/ 承認 0\/1人/);
 assert.match(approvalCard.content, /表示対象のアカウント/);
 assert.doesNotMatch(actionCards.map((card) => card.content).join('\n'),
-  /(?:法案|事件|参照番号|ID)\s*[:#A-]*\d+/i, '進行中カード本文に内部IDを出さない');
+  /(?:法案|事件|参照番号|ID)\s*[:#A-]*\d+/i, '手続カード本文に内部IDを出さない');
 const actionMessages = new Map();
 let actionSequence = 0;
 const actionChannel = {
@@ -2376,7 +2406,7 @@ const actionChannel = {
     const id = `action-${++actionSequence}`;
     const message = {
       id,
-      channelId: 'admin',
+      channelId: 'procedure',
       author: { id: 'bot' },
       content: payload.content,
       components: payload.components,
@@ -2390,7 +2420,7 @@ const actionChannel = {
   }
 };
 assert.equal(await syncGovernanceActionCards(uxGuild, actionChannel), actionCards.length);
-assert.equal(actionMessages.size, actionCards.length, '進行中に投票と承認を別カードとして作る');
+assert.equal(actionMessages.size, actionCards.length, '手続に投票と承認を別カードとして作る');
 const voteMessage = [...actionMessages.values()].find((message) => message.components[0].components
   .some((button) => String(button.data.custom_id ?? '').startsWith(`gov:vote:${uxVoteProposal.id}:`)));
 const approvalMessage = [...actionMessages.values()].find((message) => message.components[0].components
@@ -2450,7 +2480,7 @@ governanceDb.updateProposal(uxVoteProposal.id, { status: 'rejected' });
 governanceDb.updateCase(uxApprovalCase.id, { status: 'dismissed' });
 const remainingActionCards = renderGovernanceActionCards(uxGuild);
 assert.equal(await syncGovernanceActionCards(uxGuild, actionChannel), remainingActionCards.length);
-assert.equal(actionMessages.size, remainingActionCards.length, '終了した案件の操作カードを進行中から除去する');
+assert.equal(actionMessages.size, remainingActionCards.length, '終了した案件の操作カードを手続から除去する');
 assert.ok(![...actionMessages.values()].flatMap((message) => message.components[0].components)
   .some((button) => String(button.data.custom_id ?? '').includes(`:${uxVoteProposal.id}:`)
     || String(button.data.custom_id ?? '').includes(`:${uxApprovalCase.id}:`)),
@@ -2462,20 +2492,23 @@ assert.match(operations.content, /記録のみ/);
 assert.match(operations.content, /貴族院/);
 assert.equal(operations.components.length, 2);
 const uxSource = readFileSync(new URL('../src/governance/ux.js', import.meta.url), 'utf8');
-assert.doesNotMatch(uxSource, /\.pin\(/, '案内専用チャンネルの同期を不要なピン留め権限で止めない');
+assert.doesNotMatch(uxSource, /GOVERNANCE_GUIDE_NAME|createGovernanceGuideChannel/,
+  '案内専用channelを再作成しない');
+assert.match(uxSource, /GOVERNANCE_PROCEDURE_NAME/,
+  '公開の操作ハブは手続channelに集約する');
 const discordSource = readFileSync(new URL('../src/governance/discord.js', import.meta.url), 'utf8');
 assert.doesNotMatch(discordSource, /name: '裁判当事者用'/, '新規導入では裁判当事者用channelを作らない');
 assert.match(discordSource, /発言状態:/, '事件投稿に裁判中の発言状態を表示する');
 assert.match(discordSource, /いま必要なこと:/, '事件投稿の説明を次の行動へ絞る');
 assert.doesNotMatch(discordSource, /参照番号:|法律ID:/, '通常の公開投稿に内部IDを表示しない');
 assert.match(discordSource, /export async function syncGovernanceRecordUi/,
-  '既存の議会・裁判所・官報も番号なし表示へ移行する');
+  '既存の議会・裁判所も簡潔な表示へ移行する');
 assert.match(discordSource, /removeOldDecisionRows/,
   '既存の議会・裁判所投稿に残る投票・承認ボタンも移行時に除去する');
 assert.match(discordSource, /await closeRecordThread\(thread\)/,
   '結果を記録した完了済みの議会・裁判所投稿はロックしてアーカイブする');
-assert.match(discordSource, /withoutLegacyPublicIds\(message\.content\)/,
-  '既存官報のrole IDも公開本文から除去する');
+assert.doesNotMatch(discordSource, /postGazette|GAZETTE_TOPIC/,
+  '新しい統治記録を官報へ複製しない');
 const intakeSource = readFileSync(new URL('../src/governance/intake.js', import.meta.url), 'utf8');
 assert.doesNotMatch(intakeSource, /参照番号:|適用法: #|違憲審査対象: \$\{caseRecord\.challenged_type\}:\$\{caseRecord\.challenged_id\}/,
   'メンション受付の応答にも内部IDを表示しない');
@@ -2496,30 +2529,30 @@ assert.doesNotMatch(serviceSource, /`(?:法案|改憲案) L-\$\{proposal\.id\}|`
   '公開する再試行案内と特別有権者履歴から内部IDを外す');
 assert.doesNotMatch(serviceSource, /components:\s*(?:voteButtons|approvalButtons)/,
   '議会・裁判所の記録投稿へ投票・承認ボタンを戻さない');
-const legacyMessages = [
-  { id: 'before', createdTimestamp: 1, author: { id: 'user' }, content: '普通の投稿', attachments: [] },
-  { id: 'start', createdTimestamp: 2, author: { id: 'bot' }, content: '# 初期憲法 v1\n本文', attachments: [] },
-  { id: 'continuation', createdTimestamp: 3, author: { id: 'bot' }, content: 'policy hash: abc', attachments: [] },
-  { id: 'show', createdTimestamp: 4, type: 20, interaction: { commandName: 'constitution' }, author: { id: 'user' }, content: '', attachments: [] },
-  { id: 'response', createdTimestamp: 5, author: { id: 'bot' }, content: '現行憲法 v1', attachments: [{ name: 'constitution-v1.md' }] },
-  { id: 'replacement', createdTimestamp: 5.5, author: { id: 'bot' }, content: '# 初期憲法 v1 公布\n法令集を参照', attachments: [] },
-  { id: 'after', createdTimestamp: 6, author: { id: 'bot' }, content: '# 判決 C-1', attachments: [] }
-];
-assert.deepEqual(
-  legacyGazetteCandidates(legacyMessages, 'bot').map((message) => message.id),
-  ['start', 'continuation', 'show', 'response'],
-  '旧官報cleanupは既知の技術投稿だけを対象にする'
+const { classifyLegacyGazetteContent } = await import('../src/governance/surface-migration.js');
+assert.equal(classifyLegacyGazetteContent('# 初期憲法 v1 公布\n本文').kind, 'statute');
+assert.equal(classifyLegacyGazetteContent('# 制裁profile test v1\n本文', ['制裁profile test']).kind, 'statute');
+assert.equal(classifyLegacyGazetteContent('# 判決の処理確定\n本文').kind, 'court');
+assert.equal(classifyLegacyGazetteContent('# 特別有権者ロール変更\n本文').kind, 'authority');
+assert.equal(classifyLegacyGazetteContent('# 分類不能な記録\n本文').kind, 'unknown',
+  '分類できない旧官報投稿は推測で削除しない');
+const surfaceMigrationSource = readFileSync(new URL('../src/governance/surface-migration.js', import.meta.url), 'utf8');
+assert.match(surfaceMigrationSource, /entry\.message\.author\.id !== guild\.client\.user\.id/,
+  '人間が書いた旧官報を自動削除しない');
+assert.match(surfaceMigrationSource, /attachment\.size > 5_000_000/,
+  '保存できない大きな添付があれば移行を止める');
+assert.ok(
+  surfaceMigrationSource.indexOf('archiveLegacyGovernanceMessage({')
+    < surfaceMigrationSource.indexOf("detail: { phase: 'deleting'"),
+  '全投稿の退避後にのみ削除phaseへ進む'
 );
-assert.deepEqual(
-  legacyStatuteTechnicalCandidates([
-    { id: 'mistake', content: 'git pull -ff-only' },
-    { id: 'fenced', content: '```bash\ngit pull -ff-only\n```' },
-    { id: 'discussion', content: 'git pull -ff-onlyは何ですか？' },
-    { id: 'other', content: 'npm run check' }
-  ]).map((message) => message.id),
-  ['mistake', 'fenced'],
-  '法令スレッドは既知の誤送信と完全一致する投稿だけ整理する'
-);
+assert.match(surfaceMigrationSource, /migration\.status === 'running' && inspected\.migration\.detail\?\.phase === 'deleting'/,
+  'チャンネル削除中に停止しても再開できる');
+const surfaceMigrationCliSource = readFileSync(new URL('./migrate-governance-surfaces.mjs', import.meta.url), 'utf8');
+assert.match(surfaceMigrationCliSource, /LIVE_GOVERNANCE_SURFACE_MIGRATION/,
+  '旧公開面の削除は明示的な環境変数を必要とする');
+assert.match(surfaceMigrationCliSource, /option\('--confirm'\) !== guild\.name/,
+  '実行前に対象サーバー名を照合する');
 
 const { runGovernanceInfo } = await import('../src/agent/governance.js');
 const { isGovernanceAgentTopic } = await import('../src/agent/index.js');
@@ -2533,7 +2566,7 @@ const visibleGovernanceContext = {
     id: 'g1',
     channels: {
       cache: new Map([
-        ['gazette', { permissionsFor: () => ({ has: () => true }) }],
+        ['procedure', { permissionsFor: () => ({ has: () => true }) }],
         ['statutes', { permissionsFor: () => ({ has: () => true }) }],
         ['parliament', { permissionsFor: () => ({ has: () => true }) }],
         ['court', { permissionsFor: () => ({ has: () => true }) }]
@@ -2564,16 +2597,12 @@ assert.match(liveE2eSource, /pendingActions\(100\)\.length, 0/, '既存outboxを
 assert.match(liveE2eSource, /currentTrusted !== initialTrusted/, '特別有権者ロールを原状復帰する');
 assert.match(liveE2eSource, /thread\.delete\('E2E fixtureを公開一覧から除去'\)/,
   'E2E cleanupはテスト投稿を公開フォーラムに残さない');
-assert.match(liveE2eSource, /message\.id !== seededAudit\?\.detail\?\.gazetteMessageId/,
-  'E2E cleanupは内部監査で対応付けたbot官報だけを除去する');
-assert.match(liveE2eSource, /body\.includes\('<@e2e-'\)/,
-  '遅延outboxが添付へ残した旧E2E識別子もcleanupする');
+assert.match(liveE2eSource, /governance\.procedure_channel_id/,
+  'E2Eは投票・承認を手続で確認する');
+assert.doesNotMatch(liveE2eSource, /postGazette|gazette_channel_id|gazetteMessageId/,
+  'E2E自体が廃止した官報を再利用しない');
 assert.match(liveE2eSource, /entry\.source === sourceKey/,
   '公開題名ではなく非公開のsource keyからE2E案件を片付ける');
-assert.doesNotMatch(liveE2eSource, /postGazette\([^\n]+`\$\{mark\}/,
-  'E2E run IDを官報見出しへ表示しない');
-assert.doesNotMatch(liveE2eSource, /postGazette\([^\n]+JSON\.stringify\(manifest/,
-  '内部IDを含むE2E manifestを官報へ添付しない');
 assert.match(liveE2eSource, /force: true/, '特別有権者ロールはDiscord APIから強制readbackする');
 assert.match(liveE2eSource, /setTrustedMember/, 'owner専用の正規経路で特別有権者を操作する');
 assert.match(liveE2eSource, /--provision-trusted-role/, '未設定の特別有権者roleは明示フラグなしに作らない');
@@ -2585,8 +2614,46 @@ assert.match(liveE2eSource, /type: 'restriction'/, '新しい制限定義とrest
 assert.match(liveE2eSource, /rejected_by_schema/, '司法AIが適用法を変えた場合もfail closedとして記録する');
 assert.doesNotMatch(liveE2eSource, /guild\.members\.(kick|ban)/, 'live E2EからDiscord処分を直接呼ばない');
 
+const legacyMigrationPath = `/tmp/sakana-governance-legacy-${process.pid}.sqlite`;
+await governanceDb.governanceDatabase.backup(legacyMigrationPath);
+const legacyDatabase = new Database(legacyMigrationPath);
+legacyDatabase.exec(`
+  ALTER TABLE governance_guilds ADD COLUMN guide_channel_id TEXT NOT NULL DEFAULT '';
+  ALTER TABLE governance_guilds ADD COLUMN guide_message_id TEXT NOT NULL DEFAULT '';
+  ALTER TABLE governance_guilds ADD COLUMN admin_channel_id TEXT NOT NULL DEFAULT '';
+  ALTER TABLE governance_guilds ADD COLUMN admin_dashboard_message_id TEXT NOT NULL DEFAULT '';
+  ALTER TABLE governance_guilds ADD COLUMN gazette_channel_id TEXT NOT NULL DEFAULT '';
+  UPDATE governance_guilds
+  SET procedure_channel_id = '', procedure_message_id = '', operations_thread_id = '',
+      guide_channel_id = 'legacy-guide', guide_message_id = 'legacy-guide-message',
+      admin_channel_id = 'legacy-procedure', admin_dashboard_message_id = 'legacy-procedure-message',
+      gazette_channel_id = 'legacy-gazette'
+  WHERE guild_id = 'g1';
+`);
+legacyDatabase.close();
+const migrationCheck = spawnSync(process.execPath, ['--input-type=module', '--eval', `
+  const db = await import('./src/governance/db.js');
+  const guild = db.getGovernanceGuild('g1');
+  const migration = db.getGovernanceSurfaceMigration('g1');
+  if (guild.procedure_channel_id !== 'legacy-procedure') throw new Error('procedure channel was not migrated');
+  if (guild.procedure_message_id !== 'legacy-procedure-message') throw new Error('procedure message was not migrated');
+  for (const key of ['guide_channel_id', 'guide_message_id', 'admin_channel_id', 'admin_dashboard_message_id', 'gazette_channel_id']) {
+    if (key in guild) throw new Error('legacy column remains: ' + key);
+  }
+  if (migration?.legacy_guide_channel_id !== 'legacy-guide' || migration?.legacy_gazette_channel_id !== 'legacy-gazette') {
+    throw new Error('legacy surface ids were not preserved');
+  }
+  db.governanceDatabase.close();
+`], {
+  cwd: process.cwd(),
+  env: { ...process.env, DATABASE_PATH: legacyMigrationPath },
+  encoding: 'utf8'
+});
+assert.equal(migrationCheck.status, 0,
+  `v15相当DBの4面移行に失敗しました: ${migrationCheck.stderr || migrationCheck.stdout}`);
+
 governanceDb.governanceDatabase.close();
-for (const path of [mainPath, archivePath]) {
+for (const path of [mainPath, archivePath, legacyMigrationPath]) {
   rmSync(path, { force: true });
   rmSync(`${path}-wal`, { force: true });
   rmSync(`${path}-shm`, { force: true });

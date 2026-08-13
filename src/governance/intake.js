@@ -781,7 +781,7 @@ export async function handleGovernanceIntakeComponent(interaction, intakeId, val
         last_error: String(error.message).slice(0, 500)
       });
       await interaction.message.edit({
-        content: renderIntake(accepted, 'AI・Discord処理を自動再試行しています。'),
+        content: renderIntake(accepted, '受け付けました。準備ができると公開記録に表示されます。'),
         components: [],
         allowedMentions: { parse: [] }
       }).catch(() => {});

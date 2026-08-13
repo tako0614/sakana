@@ -21,7 +21,7 @@ const SCENARIOS = Object.freeze([
   '答弁、証拠、司法パネル、違憲審査',
   '24時間以内の即時timeout、7日以内の1人承認、kick/banの2人承認',
   '3日以上timeoutとbanの上訴、上訴中の裁判所限定（shadowでは記録のみ）',
-  '法令集、官報、進行中の公開readback'
+  '手続、議会、裁判所、法令集の公開readback'
 ]);
 
 function usage() {
@@ -47,10 +47,6 @@ function makeRunId() {
 
 function marker(runId) {
   return `[E2E:${runId}]`;
-}
-
-function link(guildId, channelId) {
-  return `https://discord.com/channels/${guildId}/${channelId}`;
 }
 
 function fakeMember(guild, id, trustedRoleId, trusted) {
@@ -166,9 +162,8 @@ async function ensureTrustedRoleForE2e(guild, governance, actorId) {
     targetId: role.id,
     detail: { before: '', liveE2e: true, created }
   });
-  await postGazette(guild, updated, '特別有権者ロール設定', `変更後: ${role.name}\n運営者による動作確認で設定しました。`, {
-    summary: `特別有権者ロールを「${role.name}」へ設定しました。`
-  });
+  await postAuthorityChange(guild, updated, '特別有権者ロール設定',
+    `変更後: ${role.name}\n運営者による動作確認で設定しました。`);
   return { governance: updated, provisioned: true, created, roleId: role.id, roleName: role.name };
 }
 
@@ -557,7 +552,7 @@ async function seed(guild, actorId, runId) {
       kind: 'law',
       source: sourceKey,
       title: '【動作確認】公開討議の動作確認',
-      summary: '公開フォーラムで討議し、期限・状態・進行中リンクが一致することを確認するfixture。',
+      summary: '公開フォーラムで討議し、期限・状態・手続への導線が一致することを確認するfixture。',
       body,
       proposerId: actorId,
       constitutionId: constitution.id,
@@ -806,15 +801,22 @@ async function seed(guild, actorId, runId) {
 
     const notificationStatsBefore = governanceNotificationStats(guild.id);
     await ensureGovernanceUx(guild, governance);
-    const procedureChannel = await guild.channels.fetch(governance.admin_channel_id);
+    governance = getGovernanceGuild(guild.id);
+    const procedureChannel = await guild.channels.fetch(governance.procedure_channel_id);
+    assert.equal(procedureChannel.name, '手続', '公開操作面の名称を手続に統一する');
     const procedureMessages = await procedureChannel.messages.fetch({ limit: 100 });
     const procedureCustomIds = [...procedureMessages.values()].flatMap(messageCustomIds);
     assert.ok(procedureCustomIds.some((id) => id.startsWith(`gov:vote:${allVote.id}:`)),
-      '全員投票の操作は進行中に表示する');
+      '全員投票の操作は手続に表示する');
     assert.ok(procedureCustomIds.some((id) => id.startsWith(`gov:vote:${trustedVote.id}:`)),
-      '特別有権者投票の操作は進行中に表示する');
+      '特別有権者投票の操作は手続に表示する');
     assert.ok(procedureCustomIds.some((id) => id.startsWith(`gov:approve:${kickCase.id}:`)),
-      '未完了の執行承認は進行中に表示する');
+      '未完了の執行承認は手続に表示する');
+    const procedureIntro = procedureMessages.get(governance.procedure_message_id);
+    assert.match(procedureIntro?.content ?? '', new RegExp(`^# ${guild.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} 手続`),
+      '手続の固定案内を先頭に保つ');
+    assert.doesNotMatch(procedureIntro?.content ?? '', /討議待ち|答弁待ち|上訴待ち|再試行キュー/,
+      '手続の固定案内に業務キューを詰め込まない');
     const actionMessageFor = (kind, id) => [...procedureMessages.values()].find((message) =>
       messageCustomIds(message).some((customId) => customId.startsWith(`gov:${kind}:${id}:`)));
     assert.match(actionMessageFor('vote', allVote.id)?.content ?? '', /^@everyone\n/,
@@ -858,23 +860,6 @@ async function seed(guild, actorId, runId) {
       duplicateFree: true,
       settingsRestored: false
     };
-    const links = [
-      `[進行中](${link(guild.id, governance.admin_channel_id)})`,
-      `[議会](${link(guild.id, governance.parliament_forum_id)})`,
-      `[裁判所](${link(guild.id, governance.court_forum_id)})`,
-      `[法令集](${link(guild.id, governance.statute_forum_id)})`
-    ];
-    const publicReport = [
-      'shadow限定で公開統治機能の動作確認を完了しました。',
-      `法案 ${manifest.proposals.length}件 / 裁判 ${manifest.cases.length}件 / AI検証 ${Object.keys(manifest.results.ai).length}項目`,
-      `一般利用者と特別有権者のAI利用上限: ${manifest.results.quotas.general.limit}回 / ${manifest.results.quotas.trusted.limit}回`,
-      `重い処分の公開承認: ${manifest.results.twoPersonApproval.approvals}/${manifest.results.twoPersonApproval.required}`,
-      '他の構成員の投票・承認は作成せず、kick・ban・timeoutのDiscord実執行は行っていません。'
-    ].join('\n');
-    const gazetteMessage = await postGazette(guild, governance, '統治機能の動作確認', publicReport, {
-      summary: publicReport,
-      links
-    });
     writeAudit({
       guildId: guild.id,
       actorType: 'operator',
@@ -889,8 +874,7 @@ async function seed(guild, actorId, runId) {
         publicThreadIds: [
           ...manifest.proposals.map((entry) => entry.threadId),
           ...manifest.cases.map((entry) => entry.threadId)
-        ].filter(Boolean),
-        gazetteMessageId: gazetteMessage?.id ?? null
+        ].filter(Boolean)
       }
     });
     manifest.completedAt = new Date().toISOString();
@@ -924,7 +908,7 @@ async function cleanup(guild, runId) {
   const proposalIds = new Set((seededAudit?.detail?.proposalIds ?? []).map(Number));
   const caseIds = new Set((seededAudit?.detail?.caseIds ?? []).map(Number));
   const lawIds = new Set((seededAudit?.detail?.lawIds ?? []).map(Number));
-  const cleaned = { proposals: [], cases: [], laws: [], publicThreads: [], gazetteMessages: [] };
+  const cleaned = { proposals: [], cases: [], laws: [], publicThreads: [] };
   const publicThreadIds = new Set(seededAudit?.detail?.publicThreadIds ?? []);
   const proposals = listProposals(guild.id, { limit: 500 }).filter((entry) => entry.source === sourceKey
     || proposalIds.has(entry.id) || entry.title.includes(mark));
@@ -968,35 +952,6 @@ async function cleanup(guild, runId) {
     if (!thread?.isThread?.()) continue;
     await thread.delete('E2E fixtureを公開一覧から除去');
     cleaned.publicThreads.push(threadId);
-  }
-  const gazette = await guild.channels.fetch(governance.gazette_channel_id).catch(() => null);
-  if (gazette?.isTextBased?.()) {
-    let before;
-    for (;;) {
-      const batch = await gazette.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
-      if (batch.size === 0) break;
-      for (const message of batch.values()) {
-        if (message.author.id !== guild.client.user.id) continue;
-        let fixtureAttachment = false;
-        for (const attachment of message.attachments.values()) {
-          if (!/\.(?:md|txt|json)$/i.test(attachment.name ?? '') || attachment.size > 1_000_000) continue;
-          const body = await fetch(attachment.url).then((response) => response.ok ? response.text() : '').catch(() => '');
-          if (body.includes('表示対象のアカウント') || body.includes('<@e2e-') || body.includes(mark)) {
-            fixtureAttachment = true;
-            break;
-          }
-        }
-        if (message.id !== seededAudit?.detail?.gazetteMessageId
-          && !message.content.includes(mark)
-          && !message.content.includes('表示対象のアカウント')
-          && !message.content.includes('<@e2e-')
-          && !fixtureAttachment) continue;
-        await message.delete();
-        cleaned.gazetteMessages.push(message.id);
-      }
-      before = batch.last()?.id;
-      if (batch.size < 100 || !before) break;
-    }
   }
   writeAudit({
     guildId: guild.id,
@@ -1071,9 +1026,9 @@ const [{
 }, {
   createCourtCaseThread,
   createProposalPost,
+  postAuthorityChange,
   postCourtRecord,
   postCourtUpdate,
-  postGazette,
   postProposalUpdate,
   syncStatuteBook
 }, {

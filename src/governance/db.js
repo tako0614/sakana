@@ -23,7 +23,9 @@ db.exec(`
     court_forum_id TEXT NOT NULL,
     court_chat_channel_id TEXT NOT NULL,
     statute_forum_id TEXT NOT NULL DEFAULT '',
-    gazette_channel_id TEXT NOT NULL,
+    procedure_channel_id TEXT NOT NULL DEFAULT '',
+    procedure_message_id TEXT NOT NULL DEFAULT '',
+    operations_thread_id TEXT NOT NULL DEFAULT '',
     active_constitution_id INTEGER,
     last_weekly_scan_at INTEGER,
     created_at INTEGER NOT NULL,
@@ -514,13 +516,16 @@ db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied
 
 {
   const guildColumns = new Set(db.pragma('table_info(governance_guilds)').map((row) => row.name));
-  for (const [name, definition] of [
-    ['guide_channel_id', "TEXT NOT NULL DEFAULT ''"],
-    ['guide_message_id', "TEXT NOT NULL DEFAULT ''"],
-    ['admin_channel_id', "TEXT NOT NULL DEFAULT ''"],
-    ['admin_dashboard_message_id', "TEXT NOT NULL DEFAULT ''"]
-  ]) {
-    if (!guildColumns.has(name)) db.exec(`ALTER TABLE governance_guilds ADD COLUMN ${name} ${definition}`);
+  // v16以降の新規DBには旧surface列を作らない。既存DBではv16が値を移行して列を削除する。
+  if (!guildColumns.has('procedure_channel_id')) {
+    for (const [name, definition] of [
+      ['guide_channel_id', "TEXT NOT NULL DEFAULT ''"],
+      ['guide_message_id', "TEXT NOT NULL DEFAULT ''"],
+      ['admin_channel_id', "TEXT NOT NULL DEFAULT ''"],
+      ['admin_dashboard_message_id', "TEXT NOT NULL DEFAULT ''"]
+    ]) {
+      if (!guildColumns.has(name)) db.exec(`ALTER TABLE governance_guilds ADD COLUMN ${name} ${definition}`);
+    }
   }
   const publicationColumns = new Set(db.pragma('table_info(governance_statute_publications)').map((row) => row.name));
   if (!publicationColumns.has('detail_message_id')) {
@@ -866,6 +871,54 @@ db.exec(`
 `);
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (15, ?)').run(Date.now());
 
+{
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS governance_surface_migrations (
+      guild_id TEXT PRIMARY KEY,
+      legacy_guide_channel_id TEXT NOT NULL DEFAULT '',
+      legacy_gazette_channel_id TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending',
+      detail_json TEXT NOT NULL DEFAULT '{}',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      completed_at INTEGER
+    )
+  `);
+  const columns = new Set(db.pragma('table_info(governance_guilds)').map((row) => row.name));
+  for (const [name, definition] of [
+    ['procedure_channel_id', "TEXT NOT NULL DEFAULT ''"],
+    ['procedure_message_id', "TEXT NOT NULL DEFAULT ''"],
+    ['operations_thread_id', "TEXT NOT NULL DEFAULT ''"]
+  ]) {
+    if (!columns.has(name)) db.exec(`ALTER TABLE governance_guilds ADD COLUMN ${name} ${definition}`);
+  }
+  const migratedColumns = new Set(db.pragma('table_info(governance_guilds)').map((row) => row.name));
+  if (migratedColumns.has('admin_channel_id')) {
+    const now = Date.now();
+    db.prepare(`
+      INSERT OR IGNORE INTO governance_surface_migrations
+        (guild_id, legacy_guide_channel_id, legacy_gazette_channel_id, status, detail_json, created_at, updated_at)
+      SELECT guild_id, guide_channel_id, gazette_channel_id, 'pending', '{}', ?, ?
+      FROM governance_guilds
+      WHERE guide_channel_id != '' OR gazette_channel_id != ''
+    `).run(now, now);
+    db.exec(`
+      UPDATE governance_guilds
+      SET procedure_channel_id = admin_channel_id,
+          procedure_message_id = admin_dashboard_message_id
+      WHERE procedure_channel_id = ''
+    `);
+    for (const name of [
+      'guide_channel_id', 'guide_message_id', 'admin_channel_id', 'admin_dashboard_message_id', 'gazette_channel_id'
+    ]) {
+      if (db.pragma('table_info(governance_guilds)').some((row) => row.name === name)) {
+        db.exec(`ALTER TABLE governance_guilds DROP COLUMN ${name}`);
+      }
+    }
+  }
+}
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (16, ?)').run(Date.now());
+
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
 db.prepare("UPDATE governance_outbox SET status = 'error', last_error = 'interrupted before completion' WHERE status = 'running'").run();
@@ -929,7 +982,12 @@ function hydrateIntake(row) {
 }
 
 function hydrateSetupSession(row) {
-  return row ? { ...row, resources: parseJson(row.resources_json, {}) } : null;
+  if (!row) return null;
+  const resources = parseJson(row.resources_json, {});
+  if (!resources.procedureChannelId && resources.adminChannelId) {
+    resources.procedureChannelId = resources.adminChannelId;
+  }
+  return { ...row, resources };
 }
 
 export function getGovernanceGuild(guildId) {
@@ -938,6 +996,55 @@ export function getGovernanceGuild(guildId) {
 
 export function listGovernanceGuilds() {
   return db.prepare('SELECT * FROM governance_guilds ORDER BY created_at').all().map(hydrateGuild);
+}
+
+export function getGovernanceSurfaceMigration(guildId) {
+  const row = db.prepare('SELECT * FROM governance_surface_migrations WHERE guild_id = ?').get(String(guildId));
+  return row ? { ...row, detail: parseJson(row.detail_json, {}) } : null;
+}
+
+export function recordGovernanceSurfaceMigration({
+  guildId,
+  legacyGuideChannelId = '',
+  legacyGazetteChannelId = '',
+  detail = {}
+}) {
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO governance_surface_migrations
+      (guild_id, legacy_guide_channel_id, legacy_gazette_channel_id, status, detail_json, created_at, updated_at)
+    VALUES (?, ?, ?, 'pending', ?, ?, ?)
+    ON CONFLICT(guild_id) DO UPDATE SET
+      legacy_guide_channel_id = CASE
+        WHEN excluded.legacy_guide_channel_id != '' THEN excluded.legacy_guide_channel_id
+        ELSE governance_surface_migrations.legacy_guide_channel_id
+      END,
+      legacy_gazette_channel_id = CASE
+        WHEN excluded.legacy_gazette_channel_id != '' THEN excluded.legacy_gazette_channel_id
+        ELSE governance_surface_migrations.legacy_gazette_channel_id
+      END,
+      detail_json = excluded.detail_json,
+      updated_at = excluded.updated_at
+  `).run(
+    String(guildId), String(legacyGuideChannelId ?? ''), String(legacyGazetteChannelId ?? ''),
+    canonicalJson(detail), now, now
+  );
+  return getGovernanceSurfaceMigration(guildId);
+}
+
+export function updateGovernanceSurfaceMigration(guildId, patch) {
+  const allowed = new Set(['status', 'detail_json', 'completed_at']);
+  const normalized = { ...patch };
+  if ('detail' in normalized) {
+    normalized.detail_json = canonicalJson(normalized.detail);
+    delete normalized.detail;
+  }
+  const entries = Object.entries(normalized).filter(([key]) => allowed.has(key));
+  if (!entries.length) return getGovernanceSurfaceMigration(guildId);
+  const sql = entries.map(([key]) => `${key} = @${key}`).join(', ');
+  db.prepare(`UPDATE governance_surface_migrations SET ${sql}, updated_at = @updated_at WHERE guild_id = @guild_id`)
+    .run({ guild_id: String(guildId), updated_at: Date.now(), ...Object.fromEntries(entries) });
+  return getGovernanceSurfaceMigration(guildId);
 }
 
 export const bootstrapGovernanceGuild = db.transaction((input) => {
@@ -969,8 +1076,8 @@ export const bootstrapGovernanceGuild = db.transaction((input) => {
     INSERT INTO governance_guilds (
       guild_id, status, enforcement_mode, trusted_role_id, appeal_role_id,
       legislature_role_id, judiciary_role_id, category_id,
-      parliament_forum_id, court_forum_id, court_chat_channel_id, statute_forum_id, gazette_channel_id,
-      guide_channel_id, admin_channel_id,
+      parliament_forum_id, court_forum_id, court_chat_channel_id, statute_forum_id,
+      procedure_channel_id, procedure_message_id, operations_thread_id,
       active_constitution_id, created_at, updated_at
     ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
@@ -985,9 +1092,9 @@ export const bootstrapGovernanceGuild = db.transaction((input) => {
     input.courtForumId,
     input.courtChatChannelId,
     input.statuteForumId ?? '',
-    input.gazetteChannelId,
-    input.guideChannelId ?? '',
-    input.adminChannelId ?? '',
+    input.procedureChannelId ?? '',
+    input.procedureMessageId ?? '',
+    input.operationsThreadId ?? '',
     constitutionId,
     now,
     now
@@ -1012,8 +1119,8 @@ export function updateGovernanceGuild(guildId, patch) {
   const allowed = new Set([
     'status', 'enforcement_mode', 'trusted_role_id', 'appeal_role_id',
     'legislature_role_id', 'judiciary_role_id', 'category_id',
-    'parliament_forum_id', 'court_forum_id', 'court_chat_channel_id', 'statute_forum_id', 'gazette_channel_id',
-    'guide_channel_id', 'guide_message_id', 'admin_channel_id', 'admin_dashboard_message_id',
+    'parliament_forum_id', 'court_forum_id', 'court_chat_channel_id', 'statute_forum_id',
+    'procedure_channel_id', 'procedure_message_id', 'operations_thread_id',
     'active_constitution_id', 'last_weekly_scan_at', 'weekly_retry_after',
     'weekly_failure_count', 'weekly_last_error'
   ]);
@@ -1263,6 +1370,13 @@ export function markLegacyGovernanceMessageDeleted(guildId, channelId, messageId
     UPDATE governance_legacy_message_archive SET deleted_at = ?
     WHERE guild_id = ? AND channel_id = ? AND message_id = ?
   `).run(Date.now(), String(guildId), String(channelId), String(messageId));
+}
+
+export function markLegacyGovernanceChannelDeleted(guildId, channelId) {
+  return db.prepare(`
+    UPDATE governance_legacy_message_archive SET deleted_at = COALESCE(deleted_at, ?)
+    WHERE guild_id = ? AND channel_id = ?
+  `).run(Date.now(), String(guildId), String(channelId)).changes;
 }
 
 export function listLegacyGovernanceMessageArchive(guildId) {

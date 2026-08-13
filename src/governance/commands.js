@@ -19,12 +19,13 @@ import {
   getGovernanceSetupSession,
   getResumableGovernanceSetup,
   listReviewableSanctions,
+  recordGovernanceSurfaceMigration,
   updateGovernanceSetupSession
 } from './db.js';
 import {
   createGovernanceSurfaces,
   governancePermissionReport,
-  postGazette,
+  postAuthorityChange,
   reviewRequestButtons,
   syncStatuteBook
 } from './discord.js';
@@ -55,7 +56,7 @@ function reviewListPayload(guildId, userId, offset = 0) {
   const lines = page.map((sanction, index) => {
     const caseRecord = getCase(sanction.case_id);
     const type = sanction.type === 'warning' ? '警告' : sanction.type === 'restriction' ? '機能制限' : 'タイムアウト';
-    return `${index + 1}. ${type}: ${String(caseRecord?.summary ?? '理由は官報を参照').replace(/\s+/g, ' ').slice(0, 180)}`;
+    return `${index + 1}. ${type}: ${String(caseRecord?.summary ?? '理由は裁判所を参照').replace(/\s+/g, ' ').slice(0, 180)}`;
   });
   const rows = page.map((sanction, index) => {
     const row = reviewRequestButtons(guildId, sanction.id)[0];
@@ -203,32 +204,31 @@ async function executeSetup(interaction, sessionId) {
         policy: documents.policy,
         ...surfaces
       });
+    if (surfaces.legacyGuideChannelId || surfaces.legacyGazetteChannelId) {
+      recordGovernanceSurfaceMigration({
+        guildId: interaction.guildId,
+        legacyGuideChannelId: surfaces.legacyGuideChannelId,
+        legacyGazetteChannelId: surfaces.legacyGazetteChannelId,
+        detail: { source: 'resumed-setup' }
+      });
+    }
     const warnings = [];
     const backfilled = await backfillGovernanceActivity(interaction.guild).catch((error) => {
       warnings.push(`活動履歴の初回取込み: ${error.message}`);
       return 0;
     });
     const constitution = result.constitution;
-    if (constitution) {
-      await postGazette(
-        interaction.guild,
-        result.guild,
-        '初期憲法 v1 公布',
-        constitution.content,
-        {
-          summary: '設定済み運営者の全文確認を経て初期憲法 v1 を公布しました。現行正文は法令集を参照してください。',
-          links: [`法令集: https://discord.com/channels/${interaction.guildId}/${result.guild.statute_forum_id}`]
-        }
-      ).catch((error) => warnings.push(`官報掲載: ${error.message}`));
-    }
     await syncStatuteBook(interaction.guild, result.guild, { verifyExisting: true })
       .catch((error) => warnings.push(`法令集掲載: ${error.message}`));
     const ux = await ensureGovernanceUx(interaction.guild, getGovernanceGuild(interaction.guildId));
+    if (constitution) {
+      await postAuthorityChange(interaction.guild, ux.governance, '統治機能を開始', `初期憲法 v${constitution.version} を法令集へ掲載しました。`)
+        .catch((error) => warnings.push(`運営変更の掲載: ${error.message}`));
+    }
     updateGovernanceSetupSession(claimed.id, { status: 'completed', last_error: null });
     await interaction.editReply([
       '統治機能を記録のみの状態で導入しました。',
-      `進行中: <#${ux.admin.id}>`,
-      `参加者向け案内: <#${ux.guide.id}>`,
+      `手続: <#${ux.procedure.id}>`,
       `直近活動: ${backfilled}件`,
       warnings.length ? `注意: ${warnings.join(' / ')}` : null
     ].filter(Boolean).join('\n'));
