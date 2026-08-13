@@ -82,6 +82,10 @@ def bodies(name):
 train_bodies = bodies("train")
 val_bodies = bodies("val")
 
+# 逐語コピーの判定に使う。切り出しを増やすと「覚えたものをそのまま出す」危険が上がる
+# (sft-v5 は噛み合い 12.3% + 長い発言 25.6% = 38% が切り出し)
+train_set = set(train_bodies)
+
 vocab = set()
 for body in train_bodies:
     for word in WORD.findall(body):
@@ -99,6 +103,9 @@ def score(texts):
         "polite": sum(1 for t in texts if POLITE.search(t)) / len(texts),
         "markdown": sum(1 for t in texts if MARKDOWN.search(t)) / len(texts),
         "oov": (sum(1 for w in words if w not in vocab) / len(words)) if words else 0.0,
+        # 学習データの発言と完全一致。「その人が言いそうなこと」ではなく
+        # 「実際に言ったこと」を出していたら、それは覚えただけ
+        "verbatim": sum(1 for t in texts if t in train_set) / len(texts),
         "chars": sum(len(t) for t in texts) / len(texts),
     }
 
@@ -215,6 +222,7 @@ print(f"{'噛み合い':<12} {pct(overlap):>10} {'—':>12}")
 print(f"{'敬体':<12} {pct(got['polite']):>10} {pct(base_line['polite']):>12}")
 print(f"{'markdown':<12} {pct(got['markdown']):>10} {pct(base_line['markdown']):>12}")
 print(f"{'未知語':<12} {pct(got['oov']):>10} {pct(base_line['oov']):>12}")
+print(f"{'逐語コピー':<12} {pct(got['verbatim']):>10} {'—':>12}")
 print(f"{'平均の長さ':<12} {got['chars']:9.0f}字 {base_line['chars']:11.0f}字")
 if judged:
     print(f"{'文章の ppl':<12} {judged['model']:9.1f} {judged['real']:11.1f}"
