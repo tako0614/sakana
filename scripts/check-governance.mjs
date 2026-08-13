@@ -2534,6 +2534,9 @@ assert.equal(classifyLegacyGazetteContent('# 初期憲法 v1 公布\n本文').ki
 assert.equal(classifyLegacyGazetteContent('# 制裁profile test v1\n本文', ['制裁profile test']).kind, 'statute');
 assert.equal(classifyLegacyGazetteContent('# 判決の処理確定\n本文').kind, 'court');
 assert.equal(classifyLegacyGazetteContent('# 特別有権者ロール変更\n本文').kind, 'authority');
+assert.equal(classifyLegacyGazetteContent('現行法はありません。').kind, 'empty',
+  '法的な出来事ではない旧空状態表示は退避のみ行う');
+assert.equal(classifyLegacyGazetteContent('行政行為はありません。').kind, 'empty');
 assert.equal(classifyLegacyGazetteContent('# 分類不能な記録\n本文').kind, 'unknown',
   '分類できない旧官報投稿は推測で削除しない');
 const surfaceMigrationSource = readFileSync(new URL('../src/governance/surface-migration.js', import.meta.url), 'utf8');

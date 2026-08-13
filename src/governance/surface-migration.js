@@ -44,6 +44,9 @@ export function classifyLegacyGazetteContent(content, lawTitles = []) {
   const text = withoutLegacyPublicIds(content);
   const heading = headingOf(text);
   if (!heading) return { kind: 'unknown', heading, text };
+  if (['行政行為はありません。', '現行法はありません。'].includes(heading)) {
+    return { kind: 'empty', heading, text };
+  }
   if (AUTHORITY_HEADINGS.some((pattern) => pattern.test(heading))) return { kind: 'authority', heading, text };
   if (/憲法.*(?:v\d+|公布|改正)/i.test(heading)
     || lawTitles.some((title) => heading === title || heading.startsWith(`${title} v`))) {
