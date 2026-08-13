@@ -490,11 +490,63 @@ function questionExcerpts(conv) {
 
 const qaExcerpts = train.flatMap(questionExcerpts);
 
+/**
+ * 切り出しの話者を**匿名の役に付け替える**。
+ *
+ * bot は `/as` を指定されていないとき匿名の役で喋る (`nextRole`)。ところが
+ * 「疑問→20字以上の答え」20,957 箇所のうち**答えた側が匿名の役なのは 11.9% だけ**で、
+ * 88.1% は名前持ち。つまり信号を増やしても既定の経路にはほとんど届かない。
+ *
+ * 実測でもそうなっていて、evex-ft-1 に同じ技術的な質問を振ると
+ *   `あかり:` → 20字以上 65% / 噛み合い 55%
+ *   `B:`     → 20字以上 30% / 噛み合い 20%  (`うーん` `うんこ`)
+ * となる。**`まじ？` の原因はモデルではなく喋らせている役。**
+ *
+ * 中身は変えず、誰が言ったかだけを出現順の役に移す。匿名の役はもともと
+ * 「このサーバーの平均的な人」(役 A の中身は 1,062人ぶん) なので、
+ * 平均的な人の振る舞いをそこに寄せるのは筋が通る。
+ * 本文中の `@名前` も同じ表に従って直す — 直さないと会話に居ない人を指す。
+ */
+function anonymise(conv) {
+  const seen = new Map();
+  const roleFor = (label) => {
+    if (!seen.has(label)) {
+      const next = seen.size < SCHEME.roles.length ? SCHEME.roles[seen.size] : SCHEME.overflow;
+      seen.set(label, next);
+    }
+    return seen.get(label);
+  };
+
+  // 先に全員へ役を振る。本文の `@名前` を直すときに、まだ喋っていない人も引けるように
+  const parsed = conv.lines.map((line) => line.match(LABELLED)).filter(Boolean);
+  for (const m of parsed) roleFor(m[1]);
+
+  // 長いラベルから先に置き換える。`あかり` を先にやると `@あかり2` が `@A2` になる
+  // (同名の人に連番を付けているので実在する形)
+  const rename = [...seen.entries()].sort((a, b) => b[0].length - a[0].length);
+
+  const lines = parsed.map((m) => {
+    let body = m[2];
+    for (const [label, role] of rename) body = body.split(`@${label}`).join(`@${role}`);
+    return `${roleFor(m[1])}: ${body}`;
+  });
+
+  return {
+    at: conv.at, from: conv.from, channel: conv.channel,
+    roles: conv.roles, counts: conv.counts, lines, primed: 0,
+    text: `${conv.channel}\n${lines.join('\n')}`
+  };
+}
+
 // **同じ切り出しを隣に並べない。** Packed は会話を EOS で継いで 1024 に切るので、
 // 隣接させると1つの窓に同じ本文が2回入って「写せば当たる」形になる。
-// 1周ぶんずつ後ろに足せば、同じものの複製は必ず数千会話ぶん離れる
+// 1周ぶんずつ後ろに足せば、同じものの複製は必ず数千会話ぶん離れる。
+//
+// 2周目は匿名の役に付け替える。名前持ちと匿名の両方に信号が通る形にしたい
 for (let round = 0; round < Math.max(0, QA_COPIES); round += 1) {
-  for (const excerpt of qaExcerpts) train.push(excerpt);
+  for (const excerpt of qaExcerpts) {
+    train.push(round % 2 === 1 ? anonymise(excerpt) : excerpt);
+  }
 }
 
 // --- 説明する口調を外から借りる ---

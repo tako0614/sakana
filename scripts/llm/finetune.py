@@ -5,6 +5,7 @@
 #   "transformers==5.15.0",
 #   "huggingface_hub",
 #   "safetensors",
+#   "peft",
 # ]
 # ///
 """Qwen3-0.6B-Base にこのサーバーの口調を移す (evex-3)。
@@ -18,18 +19,32 @@ HF Jobs で回す:
 
     .venv-llm/bin/python scripts/llm/finetune.py --local sft --max-steps 5 --device cpu
 
-## なぜ base 版か
+## base 版と instruct 版
 
-instruct 版は「承知しました」「〜がおすすめです」の口調が事前学習で焼き付いていて、
-7.46M トークンでは上書きしきれない。base は素なので口調が丸ごと入る。
-evex-1 を DeepSeek 側で読みにくいと判断して削ったのと同じ口調が、
-instruct を選ぶと最初から入っている状態になる。
+**フル学習なら base 版。** instruct 版は「承知しました」「〜がおすすめです」の口調が
+焼き付いていて、1000万トークンでは上書きしきれない。base は素なので口調が丸ごと入る。
 
-## なぜフル学習か (LoRA でない)
+**LoRA なら instruct 版。** 「上書きしきれない」が今度は欲しいものになる —
+会話のレジスタ (聞かれたら説明する形) を持っているのは instruct だけで、
+base 版は同じ問いを全部外す (実測: 日本の首都 → `関西`)。
+base を凍結すればそのレジスタは消えないので、口調だけ差分で足す。
 
-LoRA は容量が足りないときの手段。0.6B のフル学習は 24GB に収まる
-(重み 1.2 + 勾配 1.2 + Adam 4.8 = 約 8GB)。口調を移すのが目的なので、
-一部の行列だけ動かすより全部動かした方が入る。
+instruct 版も**内容は外す** (首都 → 大阪市 / 17×23 → 400)。0.6B で狙えるのは
+「話を受けてそれらしい長さで返す」までで、正しさは別の梃子 (もっと大きい base) が要る。
+
+## フル学習と LoRA (`--lora`)
+
+既定はフル学習。0.6B なら 24GB に収まる (重み 1.2 + 勾配 1.2 + Adam 4.8 = 約 8GB)
+ので、口調を移すには全部動かした方が濃く入る。
+
+**ただし「元のモデルの力を残す」なら LoRA。** evex-ft-1 (base 版 / フル学習 / 3 epoch)
+は口調は移ったが、聞かれても `まじ？` としか返さなくなった。実測では言語能力は
+残っている (学習に入っていない日本語の perplexity は base の 1.12倍) ので、
+消えたのは能力ではなく**その形を選ぶ確率**。base を凍結すれば原理的に消えない。
+
+`--lora` を付けると base を凍結して低ランクの差分だけ学習する。保存時に
+`merge_and_unload()` でマージ済みを書くので、**推論側は何も変えなくていい**
+(アダプタだけ置くと server-ft.py が base を要る)。
 
 ## 学習は会話の全体に掛ける
 
@@ -72,6 +87,10 @@ parser.add_argument("--wd", type=float, default=0.01)
 # (batch 1 まで落としても forward の lm_head で OOM した)。8bit にすると状態が 1.19GB になり、
 # 固定分 7.14GB で batch 2 が戻せる。量子化されるのは状態だけで、重みと更新は fp32 のまま。
 parser.add_argument("--optim", default="adamw", choices=["adamw", "adamw8bit"])
+# LoRA。base を凍結して低ランクの差分だけ学習する ("元の力を残す" ときに使う)
+parser.add_argument("--lora", action="store_true")
+parser.add_argument("--lora-r", type=int, default=64)
+parser.add_argument("--lora-dropout", type=float, default=0.05)
 parser.add_argument("--max-steps", type=int, default=0, help="0 なら最後まで")
 # 24GB に対して 0.6B のフル学習は約 8GB + 活性 2.3GB で収まるので既定は切る。
 # 有効にすると活性を捨てて前向きを2回走らせるので、計算が 25% 増えて時間も金も増える。
@@ -325,6 +344,26 @@ model.config.use_cache = False
 total = sum(p.numel() for p in model.parameters())
 print(f"{args.base} / {total:,} params", flush=True)
 
+if args.lora:
+    # 全 Linear を対象にする。attention だけだと口調 (語彙の選び方) が乗りにくい —
+    # そちらは MLP 側の仕事。埋め込みと lm_head は触らない (語彙を増やしていないので
+    # 動かす理由が無く、151,936 × 1024 は LoRA の意味を失うほど大きい)
+    from peft import LoraConfig, get_peft_model
+    model = get_peft_model(model, LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_r * 2,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj"
+        ],
+    ))
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"LoRA r={args.lora_r} / 学習するのは {trainable:,} "
+          f"({trainable / total * 100:.2f}%)", flush=True)
+
 # weight decay は 1 次元 (LayerNorm / bias) から外す。掛けると害になる
 decay = [p for n, p in model.named_parameters() if p.dim() >= 2]
 plain = [p for n, p in model.named_parameters() if p.dim() < 2]
@@ -492,7 +531,16 @@ for epoch in range(1, args.epochs + 1):
 
     # epoch ごとに残す。「val 最小」と「口調が濃い」がずれたときに選び直せる
     epoch_dir = out / f"epoch-{epoch}"
-    model.save_pretrained(epoch_dir, safe_serialization=True)
+    if args.lora:
+        # **マージしてから書く。** アダプタだけ置くと推論側が base を要るので、
+        # server-ft.py と bot の配布手順を LoRA 用に分ける必要が出る。
+        # merge_and_unload() は元のモデルを壊すので、コピーに対して行う
+        import copy
+        merged = copy.deepcopy(model).merge_and_unload()
+        merged.save_pretrained(epoch_dir, safe_serialization=True)
+        del merged
+    else:
+        model.save_pretrained(epoch_dir, safe_serialization=True)
     tok.save_pretrained(epoch_dir)
     (out / "history.json").write_text(json.dumps(history, ensure_ascii=False, indent=2) + "\n")
     # **その epoch ぶんだけ**を重みの隣に置く。history.json は走り全体の記録なので、
