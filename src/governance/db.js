@@ -2545,7 +2545,7 @@ export function updateAdministrativeAct(id, patch) {
   return getAdministrativeAct(id);
 }
 
-function getGovernanceNotification(eventKey) {
+export function getGovernanceNotification(eventKey) {
   return db.prepare('SELECT * FROM governance_notifications WHERE event_key = ?').get(String(eventKey)) ?? null;
 }
 

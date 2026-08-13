@@ -838,17 +838,22 @@ async function seed(guild, actorId, runId) {
       completedRecordsLockedAndArchived: true
     };
     const notificationStatsAfterFirstSync = governanceNotificationStats(guild.id);
+    const notificationRows = [
+      proposalVoteNotification(guild, allVote),
+      proposalVoteNotification(guild, trustedVote),
+      caseApprovalNotification(guild, kickCase, getCaseSanction(kickCase.id))
+    ].map((descriptor) => getGovernanceNotification(descriptor.eventKey));
+    assert.ok(notificationRows.every((row) => row?.status === 'suppressed'),
+      '全員投票・限定投票・執行承認の通知抑制を台帳へ記録する');
     await ensureGovernanceUx(guild, governance);
     const notificationStatsAfterSecondSync = governanceNotificationStats(guild.id);
     assert.equal(notificationStatsAfterFirstSync.delivered, notificationStatsBefore.delivered,
       'E2Eでは通知上限0により実在memberへ通知しない');
-    assert.ok(notificationStatsAfterFirstSync.suppressed - notificationStatsBefore.suppressed >= 3,
-      '全員投票・限定投票・執行承認の通知抑制を記録する');
     assert.deepEqual(notificationStatsAfterSecondSync, notificationStatsAfterFirstSync,
       '定期同期で通知記録を重複作成しない');
     manifest.results.notifications = {
       liveMentionsSent: 0,
-      suppressed: notificationStatsAfterFirstSync.suppressed - notificationStatsBefore.suppressed,
+      suppressed: notificationRows.length,
       audiences: ['everyone', 'trusted_role'],
       duplicateFree: true,
       settingsRestored: false
@@ -1038,6 +1043,7 @@ const [{
   getCase,
   getCaseSanction,
   getGovernanceGuild,
+  getGovernanceNotification,
   getOperationalSetting,
   governanceNotificationStats,
   getStatutePublication,
@@ -1093,13 +1099,17 @@ const [{
   validateRestrictionDefinition
 }, {
   ensureGovernanceUx
+}, {
+  caseApprovalNotification,
+  proposalVoteNotification
 }] = await Promise.all([
   import('../src/governance/db.js'),
   import('../src/governance/discord.js'),
   import('../src/governance/llm.js'),
   import('../src/governance/service.js'),
   import('../src/governance/policy.js'),
-  import('../src/governance/ux.js')
+  import('../src/governance/ux.js'),
+  import('../src/governance/notifications.js')
 ]);
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
