@@ -62,6 +62,40 @@ function assertUnique(values, name) {
   if (new Set(values).size !== values.length) throw new Error(`${name} must be unique`);
 }
 
+function restrictionDefinitionIssue(definition, policy) {
+  if (!/^[A-Z0-9_]{3,40}$/.test(definition.code)) {
+    return 'code must contain only 3-40 uppercase letters, numbers, or underscores';
+  }
+  if (!Array.isArray(definition.rules) || definition.rules.length < 1 || definition.rules.length > 12) {
+    return 'rules must contain 1-12 entries';
+  }
+  const allowed = new Set(policy.judiciary.restrictionPrimitives);
+  const seen = new Set();
+  for (const [index, rule] of definition.rules.entries()) {
+    if (!rule || typeof rule !== 'object' || Array.isArray(rule)) return `rule ${index + 1} must be an object`;
+    if (!allowed.has(rule.primitive)) return `rule ${index + 1} uses a primitive not allowed by the constitution`;
+    if (seen.has(rule.primitive)) return `rule ${index + 1} repeats a primitive`;
+    seen.add(rule.primitive);
+    if (['messages_per_window', 'agent_calls_per_window'].includes(rule.primitive)) {
+      if (Object.keys(rule).some((key) => !['primitive', 'maximum', 'windowSeconds'].includes(key))) {
+        return `count rule ${index + 1} has unsupported fields`;
+      }
+      if (!Number.isInteger(rule.maximum) || rule.maximum < 0 || rule.maximum > 10_000) {
+        return `count rule ${index + 1} maximum must be an integer from 0 through 10000`;
+      }
+      if (!Number.isInteger(rule.windowSeconds) || rule.windowSeconds < 60 || rule.windowSeconds > 2_592_000) {
+        return `count rule ${index + 1} windowSeconds must be an integer from 60 through 2592000`;
+      }
+    } else {
+      if (Object.keys(rule).some((key) => !['primitive', 'enabled'].includes(key))) {
+        return `boolean rule ${index + 1} has unsupported fields`;
+      }
+      if (rule.enabled !== true) return `boolean rule ${index + 1} must use enabled:true`;
+    }
+  }
+  return null;
+}
+
 function validateDraft(raw, policy) {
   const value = assertObject(raw);
   exactKeys(value, ['title', 'summary', 'text', 'provisions'], 'bill');
@@ -88,7 +122,12 @@ function validateDraft(raw, policy) {
       }),
       rules: definition.rules
     };
-    if (!validateRestrictionDefinition(normalized, policy)) throw new Error(`invalid restriction definition: ${normalized.code}`);
+    const issue = restrictionDefinitionIssue(normalized, policy);
+    if (issue || !validateRestrictionDefinition(normalized, policy)) {
+      const error = new Error(`invalid restriction definition: ${normalized.code}`);
+      error.governanceRetryHint = `The restriction definition is invalid: ${issue ?? 'follow the declared restriction rule schema exactly'}.`;
+      throw error;
+    }
     return normalized;
   });
   if (sanctionDefinitions.length > 20) throw new Error('too many sanctionDefinitions');
@@ -343,9 +382,12 @@ async function callGovernanceJson({ guildId, purpose, model, instruction, data, 
     callId = startAiCall(guildId, purpose, model, inputHash);
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
+        const retryInstruction = attempt === 0
+          ? ''
+          : `\n\nRETRY: The previous response was empty or invalid. ${lastError?.governanceRetryHint ?? 'Follow every requested field and constraint exactly.'} Return the complete requested JSON object immediately.`;
         const raw = await fetchJson({
           model,
-          system: `${SYSTEM_BASE}\n\nTASK:\n${instruction}${attempt === 0 ? '' : '\n\nRETRY: The previous response was empty or invalid. Return the complete requested JSON object immediately.'}`,
+          system: `${SYSTEM_BASE}\n\nTASK:\n${instruction}${retryInstruction}`,
           data,
           timeoutMs: governanceConfig.httpTimeoutMs,
           thinking
@@ -365,6 +407,10 @@ async function callGovernanceJson({ guildId, purpose, model, instruction, data, 
 }
 
 export async function draftBill({ guildId, petition, constitution, activeLaws, policy }) {
+  const countRestrictionPrimitives = policy.judiciary.restrictionPrimitives
+    .filter((primitive) => ['messages_per_window', 'agent_calls_per_window'].includes(primitive));
+  const booleanRestrictionPrimitives = policy.judiciary.restrictionPrimitives
+    .filter((primitive) => !countRestrictionPrimitives.includes(primitive));
   return (await callGovernanceJson({
     guildId,
     purpose: 'legislation.draft',
@@ -380,8 +426,10 @@ ${summaryProcedure(policy)
     : 'A narrowly defined spam-like offense may also declare interimProtection with trigger {type:"message_burst", minimumMessages:5-30, windowSeconds:10-300} and durationSeconds:60-900. This is a short, non-punitive court-only safeguard before judgment; omit it unless an objective burst trigger is necessary.'}
 A sanction type is warning, restriction, timeout, kick, or ban. timeout has maximumSeconds.
 restriction refers to a sanctionDefinitions code and has maximumSeconds.
-A sanctionDefinition has code matching uppercase letters/numbers/underscore, title, maximumDurationSeconds, and rules.
-Rules may only use primitives from the constitutional policy. Count primitives require maximum and windowSeconds; boolean primitives require enabled:true.
+A sanctionDefinition has code matching 3-40 uppercase letters/numbers/underscore, title, maximumDurationSeconds, and 1-12 rules.
+Count-rule primitives allowed by the current constitution: ${countRestrictionPrimitives.join(', ') || '(none)'}. A count rule has exactly primitive, maximum (integer 0-10000), and windowSeconds (integer 60-2592000).
+Boolean-rule primitives allowed by the current constitution: ${booleanRestrictionPrimitives.join(', ') || '(none)'}. A boolean rule has exactly primitive and enabled:true.
+Never invent another primitive or add fields to these rule shapes.
 Do not create an offense unless the petition actually requires a punishable rule.`,
     data: {
       petition,
