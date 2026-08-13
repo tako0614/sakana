@@ -42,6 +42,8 @@ function proposalStateLabel(state) {
 function caseStateLabel(state) {
   return ({
     filing: '受付中',
+    summary_review: 'AI判定中',
+    summary_active: '即時処分中・裁判請求可',
     defense: '答弁期間',
     deliberation: '審理中',
     approval: '執行承認待ち',
@@ -75,10 +77,20 @@ function courtDeadline(caseRecord) {
 
 function courtAccessState(caseRecord) {
   const live = getGovernanceGuild(caseRecord.guild_id)?.enforcement_mode === 'live';
+  if (caseRecord.procedure_version === 2 && caseRecord.status === 'appeal_window') {
+    const sanction = getCaseSanction(caseRecord.id);
+    if (live && sanction?.type === 'timeout' && sanction.review_requested_at) {
+      return '被申立人はこの事件だけ（上訴を選択中）';
+    }
+    return live ? '通常（上訴を選択中）' : '通常（上訴を選択中・実執行停止中）';
+  }
   if (caseRecord.status === 'appeal') return live
     ? '被申立人はこの事件投稿だけ（上訴中）'
     : '通常（上訴中・実執行停止中）';
   const protection = getCaseInterimProtection(caseRecord.id);
+  if (caseRecord.procedure_version === 2 && caseRecord.status === 'defense') {
+    return '全員閲覧可・当事者はボタンから回答';
+  }
   if (protection?.status === 'active' && protection.ends_at > Date.now() && live) {
     return `被申立人はこの事件投稿だけ（一時保全・<t:${Math.floor(protection.ends_at / 1000)}:R>まで）`;
   }
@@ -197,7 +209,7 @@ export function courtForumEveryonePermissionState() {
     ViewChannel: true,
     ReadMessageHistory: true,
     SendMessages: false,
-    SendMessagesInThreads: true,
+    SendMessagesInThreads: false,
     CreatePublicThreads: false,
     CreatePrivateThreads: false
   };
@@ -858,6 +870,16 @@ export function approvalButtons(caseId, disabled = false) {
   )];
 }
 
+export function reviewRequestButtons(guildId, sanctionId, disabled = false) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`gov:review:${guildId}:${sanctionId}`)
+      .setLabel('裁判を求める')
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(disabled)
+  )];
+}
+
 export async function createProposalPost(guild, governance, proposal) {
   const forum = await guild.channels.fetch(governance.parliament_forum_id);
   if (!forum?.threads) throw new Error('議会Forumが見つかりません。');
@@ -869,20 +891,21 @@ export async function createProposalPost(guild, governance, proposal) {
   const structuredDraft = proposal.kind === 'amendment' ? body.policy : body.provisions;
   const structuredName = proposal.kind === 'amendment' ? 'policy' : 'provisions';
   const thread = await forum.threads.create({
-    name: `${proposal.title.slice(0, 84)} · L-${proposal.id}`.slice(0, 100),
+    name: proposal.title.slice(0, 100),
     appliedTags: draftTag ? [draftTag] : [],
     autoArchiveDuration: 10_080,
     message: {
       content: [
         `# ${proposal.title}`,
-        `法案番号: L-${proposal.id}`,
         '',
         proposal.summary,
         '',
         `状態: ${proposalStateLabel(proposal.status)}`,
         proposalDeadline(proposal) ? `期限: ${proposalDeadline(proposal)}` : null,
         '次にすること: 内容を読み、この投稿で討議します。',
-        '全文と構造化定義は添付にあります。'
+        '全文と構造化定義は添付にあります。',
+        '',
+        `参照番号: L-${proposal.id}`
       ].filter(Boolean).join('\n').slice(0, 2000),
       files: [
         { attachment: Buffer.from(fullDraft), name: `proposal-${proposal.id}-r${proposal.revision}.md` },
@@ -908,14 +931,15 @@ export async function postProposalUpdate(guild, proposal, text, { state = null, 
     await starter.edit({
       content: [
         `# ${proposal.title}`,
-        `法案番号: L-${proposal.id}`,
         '',
         proposal.summary,
         '',
         `状態: **${proposalStateLabel(state ?? proposal.status)}**`,
         proposalDeadline(proposal) ? `期限: ${proposalDeadline(proposal)}` : null,
         `いま必要なこと: ${oneLine(text)}`,
-        '全文は添付、経過はこの投稿内にあります。'
+        '全文は添付、経過はこの投稿内にあります。',
+        '',
+        `参照番号: L-${proposal.id}`
       ].filter(Boolean).join('\n').slice(0, 2_000),
       allowedMentions: { parse: [] }
     }).catch(() => {});
@@ -930,13 +954,12 @@ export async function createCourtCaseThread(guild, governance, caseRecord, { onP
   const publicThread = caseRecord.public_thread_id
     ? await guild.channels.fetch(caseRecord.public_thread_id)
     : await forum.threads.create({
-    name: `${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'} · C-${caseRecord.id}`,
+    name: `${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反'}: ${caseRecord.summary}`.slice(0, 100),
     appliedTags: answerTag ? [answerTag] : [],
     autoArchiveDuration: 10_080,
     message: {
       content: [
         `# ${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
-        `事件番号: C-${caseRecord.id}`,
         caseRecord.accused_id ? `被告: <@${caseRecord.accused_id}>` : null,
         caseRecord.law_id ? `適用法候補: #${caseRecord.law_id} / ${caseRecord.offense_code}` : null,
         '',
@@ -946,8 +969,11 @@ export async function createCourtCaseThread(guild, governance, caseRecord, { onP
         `発言状態: ${courtAccessState(caseRecord)}`,
         `期限: ${caseRecord.defense_until ? `<t:${Math.floor(caseRecord.defense_until / 1000)}:F>` : '審査準備中'}`,
         '',
-        '次にすること: 当事者はこの投稿で答弁・証拠提出を行います。'
+        '次にすること: 当事者は下のボタンから回答します。',
+        '',
+        `参照番号: C-${caseRecord.id}`
       ].filter(Boolean).join('\n').slice(0, 2000),
+      components: courtActionButtons(caseRecord),
       allowedMentions: { parse: [] }
     },
     reason: `${guild.name} governance case ${caseRecord.id}`
@@ -965,7 +991,6 @@ export async function postCourtUpdate(guild, caseRecord, text, { state = null, c
     await starter.edit({
       content: [
         `# ${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
-        `事件番号: C-${caseRecord.id}`,
         caseRecord.accused_id ? `被申立人: <@${caseRecord.accused_id}>` : null,
         '',
         caseRecord.summary,
@@ -974,12 +999,29 @@ export async function postCourtUpdate(guild, caseRecord, text, { state = null, c
         `発言状態: ${courtAccessState(caseRecord)}`,
         courtDeadline(caseRecord) ? `期限: <t:${Math.floor(courtDeadline(caseRecord) / 1000)}:F>` : null,
         `いま必要なこと: ${oneLine(text)}`,
-        '答弁・証拠・判断・承認・上訴はこの投稿にまとまります。'
+        '答弁・証拠・判断・承認・上訴はこの投稿にまとまります。',
+        '',
+        `参照番号: C-${caseRecord.id}`
       ].filter(Boolean).join('\n').slice(0, 2_000),
+      components: courtActionButtons(caseRecord),
       allowedMentions: { parse: [] }
     }).catch(() => {});
   }
   return thread.send({ content: text.slice(0, 2000), components, files, allowedMentions: { parse: [] } });
+}
+
+export function courtActionButtons(caseRecord) {
+  if (caseRecord.status === 'appeal_window') {
+    return [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`gov:court:${caseRecord.id}:appeal`).setLabel('上訴する').setStyle(ButtonStyle.Primary)
+    )];
+  }
+  if (!['defense', 'appeal'].includes(caseRecord.status)) return [];
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`gov:court:${caseRecord.id}:answer`).setLabel('回答を書く').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`gov:court:${caseRecord.id}:evidence`).setLabel('証拠を出す').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`gov:court:${caseRecord.id}:complete`).setLabel('回答完了').setStyle(ButtonStyle.Success)
+  )];
 }
 
 export async function postCourtRecord(guild, caseRecord, text, { files = [] } = {}) {
@@ -1106,7 +1148,9 @@ export async function executeDiscordSanction(guild, sanction) {
   }
   const reason = `${guild.name} case C-${sanction.case_id} / sanction ${sanction.id}`;
   if (sanction.type === 'warning') {
-    await member.send(`${guild.name}の判決 C-${sanction.case_id} により警告を受けました。`).catch(() => {});
+    if (!sanction.notice_delivered) {
+      await member.send(`${guild.name}の判定により警告を受けました。`).catch(() => {});
+    }
     return { type: 'warning' };
   }
   if (sanction.type === 'timeout') {

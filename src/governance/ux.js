@@ -43,10 +43,11 @@ import {
   retireGovernanceCourtChat
 } from './discord.js';
 import { setTrustedMember } from './service.js';
+import { summaryProcedure } from './policy.js';
 
 const EPHEMERAL = MessageFlags.Ephemeral;
 const ACTIVE_PROPOSAL_STATUSES = ['drafting', 'draft', 'constitutional_review', 'debate', 'voting'];
-const ACTIVE_CASE_STATUSES = ['filing', 'defense', 'deliberation', 'approval', 'appeal_window', 'appeal', 'execution'];
+const ACTIVE_CASE_STATUSES = ['filing', 'summary_review', 'summary_active', 'defense', 'deliberation', 'approval', 'appeal_window', 'appeal', 'execution'];
 
 function stateLabel(governance) {
   return governance.status === 'active' ? '稼働中' : '停止中';
@@ -129,6 +130,8 @@ function componentsMatch(message, expected) {
 export async function renderGovernanceGuide(guild, governance) {
   const electorate = await electorateLabel(guild, governance);
   const counts = activeCounts(guild.id);
+  const constitution = getActiveConstitution(guild.id);
+  const summary = summaryProcedure(constitution?.policy);
   return [
     `# ${guild.name} 案内`,
     '',
@@ -147,7 +150,9 @@ export async function renderGovernanceGuide(guild, governance) {
     '',
     'AIが整理しただけでは正式案件になりません。表示された受付内容を本人が確認して初めて手続が始まります。',
     '投票と執行承認は記名です。誰がどの選択をしたか、変更した場合の経過も対象の議会・裁判投稿へ公開されます。',
-    '裁判中の発言範囲は事件投稿の「発言状態」に表示されます。一時保全は公開ログと成立法の条件が一致した時だけ短時間行い、自動終了します。',
+    summary
+      ? '警告・機能制限・タイムアウトは、成立法と3席中2席以上の判定で即時に始まる場合があります。本人は「進行中」または通知から一度だけ裁判を求められ、裁判は24時間以内に終わります。kick・banは裁判前には行いません。'
+      : '裁判中の発言範囲は事件投稿の「発言状態」に表示されます。一時保全は公開ログと成立法の条件が一致した時だけ短時間行い、自動終了します。',
     '',
     '## 公開記録',
     `- 投票・承認など、いま対応が必要な手続: <#${governance.admin_channel_id}>`,
@@ -227,42 +232,48 @@ function deadline(value, prefix = '締切') {
   return value ? ` / ${prefix} <t:${Math.floor(Number(value) / 1000)}:R>` : '';
 }
 
-function procedureComponents(governance) {
+function procedureComponents(governance, supportsImmediateReview) {
   const link = (label, channelId) => new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link)
     .setURL(`https://discord.com/channels/${governance.guild_id}/${channelId}`);
-  return [new ActionRowBuilder().addComponents(
-    link('議会', governance.parliament_forum_id),
-    link('裁判所', governance.court_forum_id),
-    link('法令集', governance.statute_forum_id),
-    link('官報', governance.gazette_channel_id),
-    link('使い方', governance.guide_channel_id)
-  )];
+  return [
+    new ActionRowBuilder().addComponents(
+      link('議会', governance.parliament_forum_id),
+      link('裁判所', governance.court_forum_id),
+      link('法令集', governance.statute_forum_id),
+      link('官報', governance.gazette_channel_id),
+      link('使い方', governance.guide_channel_id)
+    ),
+    supportsImmediateReview ? new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('gov:review_list:0').setLabel('自分の即時処分を確認').setStyle(ButtonStyle.Primary)
+    ) : null
+  ].filter(Boolean);
 }
 
 export async function renderGovernanceProcedureHub(guild, governance) {
+  const supportsImmediateReview = Boolean(summaryProcedure(getActiveConstitution(guild.id)?.policy));
   const voting = listProposals(guild.id, { statuses: ['voting'], limit: 20 });
   const approvals = listCases(guild.id, { statuses: ['approval'], limit: 20 });
   const debates = listProposals(guild.id, { statuses: ['debate'], limit: 20 });
   const defenses = listCases(guild.id, { statuses: ['defense'], limit: 20 });
   const appeals = listCases(guild.id, { statuses: ['appeal_window'], limit: 20 });
   const votingLines = voting.slice(0, 6).map((proposal) =>
-    `- ${recordLink(guild.id, proposal.forum_thread_id, `${proposal.title}（L-${proposal.id}）`)} / ${proposal.vote_scope === 'all' ? '全員' : '特別有権者'}${deadline(proposal.stage_ends_at)}`
+    `- ${recordLink(guild.id, proposal.forum_thread_id, proposal.title)} / ${proposal.vote_scope === 'all' ? '全員' : '特別有権者'}${deadline(proposal.stage_ends_at)}`
   );
   const approvalLines = approvals.slice(0, 6).map((caseRecord) => {
     const sanction = getCaseSanction(caseRecord.id);
     const approved = listCaseApprovals(caseRecord.id).filter((entry) => entry.decision === 'approve').length;
-    return `- ${recordLink(guild.id, caseRecord.public_thread_id, `処分の承認（C-${caseRecord.id}）`)} / ${approved}/${sanction?.required_approvals ?? '?'}人`;
+    return `- ${recordLink(guild.id, caseRecord.public_thread_id, `処分の承認: ${caseRecord.summary}`)} / ${approved}/${sanction?.required_approvals ?? '?'}人`;
   });
   const responseLines = [
     ...appeals.map((caseRecord) => {
       const sanction = getCaseSanction(caseRecord.id);
-      return `- ${recordLink(guild.id, caseRecord.public_thread_id, `上訴を受け付けています（C-${caseRecord.id}）`)}${deadline(sanction?.appeal_deadline)}`;
+      return `- ${recordLink(guild.id, caseRecord.public_thread_id, `上訴受付: ${caseRecord.summary}`)}${deadline(sanction?.appeal_deadline)}`;
     }),
     ...defenses.map((caseRecord) =>
-      `- ${recordLink(guild.id, caseRecord.public_thread_id, `答弁を受け付けています（C-${caseRecord.id}）`)}${deadline(caseRecord.defense_until)}`
+      `- ${recordLink(guild.id, caseRecord.public_thread_id, `回答受付: ${caseRecord.summary}`)}${deadline(caseRecord.defense_until)}`
     ),
     ...debates.map((proposal) =>
-      `- ${recordLink(guild.id, proposal.forum_thread_id, `${proposal.title}を討議中（L-${proposal.id}）`)}${deadline(proposal.stage_ends_at)}`
+      `- ${recordLink(guild.id, proposal.forum_thread_id, `${proposal.title}を討議中`)}${deadline(proposal.stage_ends_at)}`
     )
   ].slice(0, 8);
   const omitted = Math.max(0, voting.length - votingLines.length)
@@ -272,22 +283,20 @@ export async function renderGovernanceProcedureHub(guild, governance) {
     content: [
       `# ${guild.name} 進行中`,
       '',
-      'いま参加できる手続です。操作と説明はリンク先にまとまっています。',
-      '投票と承認は記名で公開されます。',
+      'いま対応できる手続です。詳しい説明と操作はリンク先にあります。',
       '',
-      '## 投票する',
+      '## 投票',
       ...(votingLines.length ? votingLines : ['いま投票はありません。']),
       '',
-      '## 処分を承認する',
+      '## 承認',
       ...(approvalLines.length ? approvalLines : ['いま承認待ちはありません。']),
       '',
-      '## 討議・答弁・上訴',
+      '## 裁判・討議',
       ...(responseLines.length ? responseLines : ['いま受付中の案件はありません。']),
       omitted ? `\nほか ${omitted}件は議会・裁判所から確認できます。` : null,
-      '',
-      '参加資格は操作時に確認します。'
+      ''
     ].filter(Boolean).join('\n').slice(0, 1_900),
-    components: procedureComponents(governance),
+    components: procedureComponents(governance, supportsImmediateReview),
     allowedMentions: { parse: [] }
   };
 }

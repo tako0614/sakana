@@ -4,35 +4,80 @@ import {
   ButtonStyle,
   InteractionContextType,
   MessageFlags,
-  SlashCommandBuilder
+  ModalBuilder,
+  SlashCommandBuilder,
+  TextInputBuilder,
+  TextInputStyle
 } from 'discord.js';
 import { isGovernanceOperator, loadBootstrapDocuments } from './config.js';
 import {
   bootstrapGovernanceGuild,
   claimGovernanceSetupSession,
   createGovernanceSetupSession,
+  getCase,
   getGovernanceGuild,
   getGovernanceSetupSession,
   getResumableGovernanceSetup,
+  listReviewableSanctions,
   updateGovernanceSetupSession
 } from './db.js';
 import {
   createGovernanceSurfaces,
   governancePermissionReport,
   postGazette,
+  reviewRequestButtons,
   syncStatuteBook
 } from './discord.js';
 import { policyHash, sha256 } from './policy.js';
 import {
   approveCase,
+  appealCase,
   backfillGovernanceActivity,
-  castAndPublishVote
+  castAndPublishVote,
+  completeCaseResponse,
+  requestSummaryTrial,
+  submitCaseAnswer
 } from './service.js';
 import { handleGovernanceIntakeComponent } from './intake.js';
 import { ensureGovernanceUx, handleGovernanceUxInteraction, renderGovernanceOperationsPanel } from './ux.js';
 
 const EPHEMERAL = MessageFlags.Ephemeral;
 const SETUP_TTL_MS = 15 * 60_000;
+
+function reviewListPayload(guildId, userId, offset = 0) {
+  const sanctions = listReviewableSanctions(guildId, userId);
+  const pageSize = 4;
+  const start = Math.max(0, Math.min(Number(offset) || 0, Math.max(0, sanctions.length - 1)));
+  const page = sanctions.slice(start, start + pageSize);
+  if (!page.length) {
+    return { content: 'いま裁判を求められる即時処分はありません。', components: [], flags: EPHEMERAL };
+  }
+  const lines = page.map((sanction, index) => {
+    const caseRecord = getCase(sanction.case_id);
+    const type = sanction.type === 'warning' ? '警告' : sanction.type === 'restriction' ? '機能制限' : 'タイムアウト';
+    return `${index + 1}. ${type}: ${String(caseRecord?.summary ?? '理由は官報を参照').replace(/\s+/g, ' ').slice(0, 180)}`;
+  });
+  const rows = page.map((sanction, index) => {
+    const row = reviewRequestButtons(guildId, sanction.id)[0];
+    row.components[0].setLabel(`${index + 1}の裁判を求める`);
+    return row;
+  });
+  const navigation = new ActionRowBuilder();
+  if (start > 0) {
+    navigation.addComponents(new ButtonBuilder().setCustomId(`gov:review_list:${Math.max(0, start - pageSize)}`)
+      .setLabel('前へ').setStyle(ButtonStyle.Secondary));
+  }
+  if (start + pageSize < sanctions.length) {
+    navigation.addComponents(new ButtonBuilder().setCustomId(`gov:review_list:${start + pageSize}`)
+      .setLabel('次へ').setStyle(ButtonStyle.Secondary));
+  }
+  if (navigation.components.length) rows.push(navigation);
+  return {
+    content: ['# 自分の即時処分', '', ...lines, '', '処分ごとに一度だけ、本人が裁判を求められます。'].join('\n'),
+    components: rows,
+    flags: EPHEMERAL
+  };
+}
 
 function requireGuild(interaction) {
   if (!interaction.guildId || !interaction.guild) throw new Error('サーバー内でのみ使えます。');
@@ -241,6 +286,45 @@ export async function handleGovernanceComponent(interaction) {
   const customId = interaction.customId ?? '';
   if (!customId.startsWith('gov:')) return false;
   try {
+    if (customId.startsWith('gov:review_list:') && interaction.isButton()) {
+      requireGuild(interaction);
+      const offset = Number(customId.split(':')[2]);
+      const payload = reviewListPayload(interaction.guildId, interaction.user.id, offset);
+      if (interaction.message?.flags?.has?.(EPHEMERAL)) {
+        const { flags: _flags, ...update } = payload;
+        await interaction.update(update);
+      }
+      else await interaction.reply(payload);
+      return true;
+    }
+    if (customId.startsWith('gov:review:') && interaction.isButton()) {
+      const [, , guildId, rawSanctionId] = customId.split(':');
+      const guild = interaction.client.guilds.cache.get(guildId)
+        ?? await interaction.client.guilds.fetch(guildId).catch(() => null);
+      if (!guild) throw new Error('対象サーバーを確認できません。');
+      const member = await guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member) throw new Error('対象サーバーのメンバーではありません。');
+      await interaction.deferReply(interaction.inGuild?.() ? { flags: EPHEMERAL } : {});
+      const result = await requestSummaryTrial(guild, member, Number(rawSanctionId));
+      await interaction.editReply(`裁判を開始しました。24時間以内に終了します。\nhttps://discord.com/channels/${guild.id}/${result.public_thread_id}`);
+      return true;
+    }
+    if (customId.startsWith('gov:court_answer:') && interaction.isModalSubmit()) {
+      const caseId = Number(customId.split(':')[2]);
+      const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
+      await interaction.deferReply({ flags: EPHEMERAL });
+      await submitCaseAnswer(interaction.guild, member, caseId, interaction.fields.getTextInputValue('answer'));
+      await interaction.editReply('回答を裁判記録へ提出しました。追記するか、事件投稿の「回答完了」を押してください。');
+      return true;
+    }
+    if (customId.startsWith('gov:court_appeal:') && interaction.isModalSubmit()) {
+      const caseId = Number(customId.split(':')[2]);
+      const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
+      await interaction.deferReply({ flags: EPHEMERAL });
+      await appealCase(interaction.guild, member, caseId, interaction.fields.getTextInputValue('grounds'));
+      await interaction.editReply('上訴を受理しました。回答を追記し、終わったら「回答完了」を押してください。');
+      return true;
+    }
     if (customId.startsWith('gov:admin')) return await handleGovernanceUxInteraction(interaction);
     if (interaction.isButton() && customId.startsWith('gov:setup:')) {
       const [, , sessionId, action] = customId.split(':');
@@ -264,17 +348,51 @@ export async function handleGovernanceComponent(interaction) {
     const id = Number(rawId);
     if (!Number.isInteger(id) || id < 1) throw new Error('案件IDが壊れています。');
     if (action === 'intake') return await handleGovernanceIntakeComponent(interaction, id, value);
+    if (action === 'court') {
+      const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
+      if (value === 'answer') {
+        const modal = new ModalBuilder().setCustomId(`gov:court_answer:${id}`).setTitle('裁判への回答')
+          .addComponents(new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('answer').setLabel('説明・反論').setStyle(TextInputStyle.Paragraph)
+              .setRequired(true).setMaxLength(4000)
+          ));
+        await interaction.showModal(modal);
+        return true;
+      }
+      if (value === 'appeal') {
+        const modal = new ModalBuilder().setCustomId(`gov:court_appeal:${id}`).setTitle('上訴')
+          .addComponents(new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('grounds').setLabel('判決を見直す理由').setStyle(TextInputStyle.Paragraph)
+              .setRequired(true).setMaxLength(4000)
+          ));
+        await interaction.showModal(modal);
+        return true;
+      }
+      if (value === 'evidence') {
+        await interaction.reply({
+          content: '証拠にしたい公開メッセージへ返信し、「@裁判 この事件へ証拠として追加」と送ってください。',
+          flags: EPHEMERAL
+        });
+        return true;
+      }
+      if (value === 'complete') {
+        await interaction.deferReply({ flags: EPHEMERAL });
+        await completeCaseResponse(interaction.guild, member, id);
+        await interaction.editReply('回答を締め切り、判定を開始しました。');
+        return true;
+      }
+    }
     await interaction.deferReply({ flags: EPHEMERAL });
     if (action === 'vote') {
       await castAndPublishVote(interaction, id, value);
       const label = { yes: '賛成', no: '反対', abstain: '棄権' }[value] ?? value;
-      await interaction.editReply(`L-${id} に「${label}」で記名投票しました。`);
+      await interaction.editReply(`「${label}」で記名投票しました。`);
       return true;
     }
     if (action === 'approve') {
       const result = await approveCase(interaction, id, value);
       const label = value === 'approve' ? '執行を承認' : '承認しない';
-      await interaction.editReply(`C-${id}: 「${label}」を記録しました（承認 ${result.approvals}/${result.required}）。`);
+      await interaction.editReply(`「${label}」を記録しました（承認 ${result.approvals}/${result.required}）。`);
       return true;
     }
     await interaction.editReply('未対応の統治操作です。');
@@ -282,9 +400,10 @@ export async function handleGovernanceComponent(interaction) {
   } catch (error) {
     console.error('Governance component failed:', error);
     const content = `実行できません: ${safeCommandError(error)}`;
+    const flags = interaction.inGuild?.() ? { flags: EPHEMERAL } : {};
     if (interaction.deferred) await interaction.editReply({ content }).catch(() => {});
-    else if (interaction.replied) await interaction.followUp({ content, flags: EPHEMERAL }).catch(() => {});
-    else await interaction.reply({ content, flags: EPHEMERAL }).catch(() => {});
+    else if (interaction.replied) await interaction.followUp({ content, ...flags }).catch(() => {});
+    else await interaction.reply({ content, ...flags }).catch(() => {});
     return true;
   }
 }

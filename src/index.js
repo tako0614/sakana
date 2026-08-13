@@ -38,6 +38,7 @@ import {
   recordCourtSubmission,
   recordCourtSubmissionEdit,
   recordGovernanceMessage,
+  detectAutomaticEnforcement,
   runGovernanceScheduler
 } from './governance/service.js';
 import {
@@ -260,7 +261,12 @@ async function handleMessageCreate(message) {
     const courtResult = await recordCourtSubmission(message);
     // 上訴制限で削除した投稿をXP・活動記録・通常agentへ流さない。
     if (courtResult === 'blocked') return;
-    recordGovernanceMessage(message);
+    const activityRecorded = recordGovernanceMessage(message);
+    if (activityRecorded) {
+      await detectAutomaticEnforcement(message).catch((error) => {
+        console.error('Automatic governance enforcement failed:', error);
+      });
+    }
   }
 
   // メッセージ送信時にText XPを付与 (ProBot仕様: 1分に1回, 15〜25XPをランダム付与)

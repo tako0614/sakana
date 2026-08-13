@@ -607,6 +607,47 @@ db.exec(`
 `);
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (11, ?)').run(Date.now());
 
+{
+  const caseColumns = new Set(db.pragma('table_info(governance_cases)').map((row) => row.name));
+  const needsConstitutionBackfill = !caseColumns.has('constitution_id');
+  for (const [name, definition] of [
+    ['constitution_id', 'INTEGER'],
+    ['procedure_version', 'INTEGER NOT NULL DEFAULT 1'],
+    ['decision_due_at', 'INTEGER'],
+    ['response_completed_at', 'INTEGER'],
+    ['summary_event_key', 'TEXT'],
+    ['review_count', 'INTEGER NOT NULL DEFAULT 0']
+  ]) {
+    if (!caseColumns.has(name)) db.exec(`ALTER TABLE governance_cases ADD COLUMN ${name} ${definition}`);
+  }
+  const sanctionColumns = new Set(db.pragma('table_info(governance_sanctions)').map((row) => row.name));
+  for (const [name, definition] of [
+    ['review_requested_at', 'INTEGER'],
+    ['notice_delivered', 'INTEGER NOT NULL DEFAULT 0']
+  ]) {
+    if (!sanctionColumns.has(name)) db.exec(`ALTER TABLE governance_sanctions ADD COLUMN ${name} ${definition}`);
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_gov_case_summary_event
+    ON governance_cases(guild_id, summary_event_key)
+    WHERE summary_event_key IS NOT NULL
+  `);
+  // 施行途中の事件は、その後に憲法が改正されても受付時の手続を維持する。
+  // v12導入前の行には当時の現行憲法を一度だけ固定する。
+  if (needsConstitutionBackfill) {
+    db.exec(`
+      UPDATE governance_cases
+      SET constitution_id = (
+        SELECT g.active_constitution_id
+        FROM governance_guilds g
+        WHERE g.guild_id = governance_cases.guild_id
+      )
+      WHERE constitution_id IS NULL
+    `);
+  }
+}
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (12, ?)').run(Date.now());
+
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
 db.prepare("UPDATE governance_outbox SET status = 'error', last_error = 'interrupted before completion' WHERE status = 'running'").run();
@@ -1343,14 +1384,16 @@ export function createCase(input) {
   const result = db.prepare(`
     INSERT INTO governance_cases
       (guild_id, kind, reporter_id, accused_id, law_id, offense_code, challenged_type, challenged_id,
-       summary, status, defense_until, alleged_at, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      summary, status, defense_until, alleged_at, constitution_id, procedure_version,
+      decision_due_at, summary_event_key, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     input.guildId, input.kind ?? 'criminal', input.reporterId, input.accusedId ?? null,
     input.lawId ?? null, input.offenseCode ?? null, input.challengedType ?? null,
     input.challengedId === null || input.challengedId === undefined ? null : String(input.challengedId),
     input.summary, input.status ?? 'filed', input.defenseUntil ?? null,
-    input.allegedAt ?? null,
+    input.allegedAt ?? null, input.constitutionId ?? null, input.procedureVersion ?? 1,
+    input.decisionDueAt ?? null, input.summaryEventKey ?? null,
     now, now
   );
   const created = getCase(Number(result.lastInsertRowid));
@@ -1376,6 +1419,21 @@ export function listCases(guildId, { statuses = null, limit = 25 } = {}) {
     .all(guildId, limit).map(hydrateCase);
 }
 
+export function findCaseBySummaryEvent(guildId, summaryEventKey) {
+  return hydrateCase(db.prepare(`
+    SELECT * FROM governance_cases WHERE guild_id = ? AND summary_event_key = ? LIMIT 1
+  `).get(String(guildId), String(summaryEventKey)));
+}
+
+export function findRecentSummaryCase(guildId, userId, lawId, offenseCode, since) {
+  return hydrateCase(db.prepare(`
+    SELECT * FROM governance_cases
+    WHERE guild_id = ? AND accused_id = ? AND law_id = ? AND offense_code = ?
+      AND procedure_version = 2 AND summary_event_key IS NOT NULL AND created_at >= ?
+    ORDER BY id DESC LIMIT 1
+  `).get(String(guildId), String(userId), Number(lawId), String(offenseCode), Number(since)));
+}
+
 export function findOpenConstitutionalCase(guildId, challengedType, challengedId) {
   return hydrateCase(db.prepare(`
     SELECT * FROM governance_cases
@@ -1397,7 +1455,9 @@ export function listOpenCasesForLaw(lawId) {
 export function updateCase(id, patch) {
   const allowed = new Set([
     'status', 'public_thread_id', 'private_thread_id', 'defense_until', 'panel_id',
-    'verdict_json', 'finalized_at', 'retry_after', 'failure_count', 'last_error', 'alleged_at'
+    'verdict_json', 'finalized_at', 'retry_after', 'failure_count', 'last_error', 'alleged_at',
+    'constitution_id', 'procedure_version', 'decision_due_at', 'response_completed_at',
+    'summary_event_key', 'review_count'
   ]);
   const normalized = { ...patch };
   if ('verdict' in normalized) {
@@ -1563,6 +1623,22 @@ export function listSanctions(guildId, statuses = null) {
     .map((row) => ({ ...row, profile: parseJson(row.profile_json, null) }));
 }
 
+export function listReviewableSanctions(guildId, userId) {
+  return db.prepare(`
+    SELECT s.* FROM governance_sanctions s
+    JOIN governance_cases c ON c.id = s.case_id
+    WHERE s.guild_id = ? AND s.user_id = ? AND c.procedure_version = 2
+      AND c.review_count = 0
+      AND (
+        (s.type = 'warning' AND s.status IN ('executed', 'simulated', 'reviewable'))
+        OR (s.type IN ('restriction', 'timeout') AND s.status IN ('executed', 'simulated', 'reviewable')
+          AND (s.restriction_started_at IS NULL OR s.restriction_started_at + COALESCE(s.duration_seconds, 0) * 1000 > ?))
+      )
+    ORDER BY s.id DESC
+  `).all(String(guildId), String(userId), Date.now())
+    .map((row) => ({ ...row, profile: parseJson(row.profile_json, null) }));
+}
+
 export function listSanctionsForLaw(lawId) {
   return db.prepare(`
     SELECT s.* FROM governance_sanctions s
@@ -1576,7 +1652,7 @@ export function updateSanction(id, patch) {
   const allowed = new Set([
     'type', 'duration_seconds', 'status', 'required_approvals', 'appealable', 'appeal_deadline',
     'restriction_started_at', 'executed_at', 'reversed_at', 'execution_detail',
-    'definition_code', 'profile_json'
+    'definition_code', 'profile_json', 'review_requested_at', 'notice_delivered'
   ]);
   const normalized = { ...patch };
   if ('profile' in normalized) {

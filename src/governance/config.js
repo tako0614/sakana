@@ -45,7 +45,7 @@ export const governanceConfig = {
   appealModels: models(process.env.GOVERNANCE_APPEAL_MODELS, defaultModel),
   maxOutputTokens: number(process.env.GOVERNANCE_MAX_OUTPUT_TOKENS, 8000),
   httpTimeoutMs: number(process.env.GOVERNANCE_HTTP_TIMEOUT_MS, 120_000),
-  maxConcurrent: Math.max(1, Math.floor(number(process.env.GOVERNANCE_MAX_CONCURRENT, 2))),
+  maxConcurrent: Math.max(1, Math.floor(number(process.env.GOVERNANCE_MAX_CONCURRENT, 3))),
   weeklyScanEnabled: flag(process.env.GOVERNANCE_WEEKLY_SCAN, true),
   weeklyDraftLimit: number(process.env.GOVERNANCE_WEEKLY_DRAFT_LIMIT, 3),
   schedulerIntervalMs: number(process.env.GOVERNANCE_SCHEDULER_INTERVAL_MS, 60_000),

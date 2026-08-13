@@ -10,6 +10,30 @@ export const INTERIM_PROTECTION_LIMITS = Object.freeze({
   maximumDurationSeconds: 900
 });
 
+export const AUTOMATIC_TRIGGER_LIMITS = Object.freeze({
+  minimumMessages: 5,
+  maximumMessages: 30,
+  minimumWindowSeconds: 10,
+  maximumWindowSeconds: 300
+});
+
+export function summaryProcedure(policy) {
+  return policy?.schemaVersion === 2 ? policy.judiciary?.summaryProcedure ?? null : null;
+}
+
+export function validateAutomaticTrigger(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (Object.keys(value).some((key) => !['type', 'minimumMessages', 'windowSeconds'].includes(key))) return false;
+  const limits = AUTOMATIC_TRIGGER_LIMITS;
+  return value.type === 'message_burst'
+    && Number.isInteger(value.minimumMessages)
+    && value.minimumMessages >= limits.minimumMessages
+    && value.minimumMessages <= limits.maximumMessages
+    && Number.isInteger(value.windowSeconds)
+    && value.windowSeconds >= limits.minimumWindowSeconds
+    && value.windowSeconds <= limits.maximumWindowSeconds;
+}
+
 export function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
 }
@@ -46,7 +70,7 @@ function finite(value, name, { min = 0, max = Infinity } = {}) {
 }
 
 export function validateConstitutionPolicy(policy) {
-  if (!policy || policy.schemaVersion !== 1) throw new Error('未対応の憲法policyです。');
+  if (!policy || ![1, 2].includes(policy.schemaVersion)) throw new Error('未対応の憲法policyです。');
   const { eligibility, voting, legislation, judiciary } = policy;
   if (!eligibility || !voting || !legislation || !judiciary) throw new Error('憲法policyの必須区分がありません。');
 
@@ -99,6 +123,39 @@ export function validateConstitutionPolicy(policy) {
   }
   if (judiciary.defenseMilliseconds < 3_600_000 || judiciary.appealMilliseconds < 3_600_000) {
     throw new Error('答弁・上訴期間は最低1時間必要です。');
+  }
+  if (policy.schemaVersion === 2) {
+    const procedure = judiciary.summaryProcedure;
+    if (!procedure || typeof procedure !== 'object' || Array.isArray(procedure)) {
+      throw new Error('summaryProcedureがありません。');
+    }
+    const allowedKeys = new Set([
+      'panelSeats', 'votesRequired', 'trialMilliseconds', 'immediateSanctions',
+      'trialFirstSanctions', 'unlimitedWarningReview'
+    ]);
+    if (Object.keys(procedure).some((key) => !allowedKeys.has(key))) {
+      throw new Error('summaryProcedureに未対応の設定があります。');
+    }
+    for (const key of ['panelSeats', 'votesRequired', 'trialMilliseconds']) {
+      if (!Number.isInteger(procedure[key])) throw new Error(`summaryProcedure.${key}は整数である必要があります。`);
+    }
+    if (procedure.panelSeats !== 3 || procedure.votesRequired !== 2) {
+      throw new Error('v2の即時判定は3席中2席で固定です。');
+    }
+    if (judiciary.panelSeats !== procedure.panelSeats || judiciary.guiltyVotesRequired !== procedure.votesRequired) {
+      throw new Error('v2の通常裁判も即時判定と同じ3席中2席である必要があります。');
+    }
+    if (procedure.trialMilliseconds !== DAY_MS) {
+      throw new Error('v2の裁判期限は24時間で固定です。');
+    }
+    const exactSanctions = (value, expected) => Array.isArray(value)
+      && value.length === expected.length
+      && value.every((entry, index) => entry === expected[index]);
+    if (!exactSanctions(procedure.immediateSanctions, ['warning', 'restriction', 'timeout'])
+      || !exactSanctions(procedure.trialFirstSanctions, ['kick', 'ban'])) {
+      throw new Error('v2の即時処分・裁判先行処分の区分が不正です。');
+    }
+    if (procedure.unlimitedWarningReview !== true) throw new Error('warningの裁判請求は期限なしである必要があります。');
   }
   if (judiciary.constitutionalChallengesPerMemberPerDay < 1
     || judiciary.constitutionalChallengesPerMemberPerDay > 100) {
@@ -218,6 +275,7 @@ export function requiredApprovals(sanction, policy) {
   if (!sanction) return Infinity;
   if (sanction.type === 'kick') return policy.judiciary.kickApprovals;
   if (sanction.type === 'ban') return policy.judiciary.banApprovals;
+  if (summaryProcedure(policy)) return 0;
   if (sanction.type === 'timeout' && sanction.durationSeconds > policy.judiciary.immediateTimeoutMaximumSeconds) {
     return policy.judiciary.timeoutApprovalsAboveSeconds;
   }
@@ -249,6 +307,20 @@ export function conservativePanelSanction(decisions) {
   });
   const middle = ranked[Math.floor(ranked.length / 2)] ?? { type: 'none', durationSeconds: 0 };
   return middle.type === 'none' ? null : middle;
+}
+
+export function leastSevereResponsibleSanction(decisions) {
+  const ranked = decisions
+    .filter((decision) => decision.verdict === 'responsible' && decision.sanction)
+    .map((decision) => decision.sanction)
+    .sort((a, b) => {
+      const rank = (SANCTION_RANK[a.type] ?? Infinity) - (SANCTION_RANK[b.type] ?? Infinity);
+      if (rank) return rank;
+      const duration = Number(a.durationSeconds ?? 0) - Number(b.durationSeconds ?? 0);
+      if (duration) return duration;
+      return String(a.definitionCode ?? '').localeCompare(String(b.definitionCode ?? ''));
+    });
+  return ranked[0] ?? null;
 }
 
 export function sanctionNoMoreSevere(candidate, original) {

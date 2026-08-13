@@ -184,9 +184,9 @@ function renderIntake(intake, suffix = '') {
       `申立理由: ${payload.summary}`
     );
   } else if (intake.action === 'evidence') {
-    lines.push('種別: 証拠追加', `事件: C-${payload.caseId}`, `証拠: ${sourceLink(intake.guild_id, payload.evidence)}`);
+    lines.push('種別: 証拠追加', '対象: 指定した裁判', `証拠: ${sourceLink(intake.guild_id, payload.evidence)}`);
   } else if (intake.action === 'appeal') {
-    lines.push('種別: 上訴', `事件: C-${payload.caseId}`, `上訴理由: ${payload.summary}`);
+    lines.push('種別: 上訴', '対象: 指定した裁判', `上訴理由: ${payload.summary}`);
   }
   lines.push('', suffix || '内容が正しければ「この内容で進める」を押してください。押すまでは正式案件になりません。');
   return lines.join('\n').slice(0, 2000);
@@ -249,18 +249,20 @@ async function handleLegislature(message, governance, request) {
 
 function caseStatusText(caseRecord, guildId) {
   const status = ({
-    filing: '受付中', defense: '答弁期間', deliberation: '審理中', approval: '執行承認待ち',
+    filing: '受付中', summary_review: 'AI判定中', summary_active: '即時処分中・裁判請求可',
+    defense: '答弁期間', deliberation: '審理中', approval: '執行承認待ち',
     appeal_window: '上訴受付中', appeal: '上訴審理中', execution: '執行処理中', final: '確定',
     overturned: '取消', acquitted: '責任なし', dismissed: '棄却',
     constitutional_uncertain: '違憲判断不能', unenforceable: '執行不能'
   })[caseRecord.status] ?? caseRecord.status;
   return [
-    `${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}（C-${caseRecord.id}）`,
+    `${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
     `状態: ${status}`,
     caseRecord.accused_id ? `被申立人: <@${caseRecord.accused_id}>` : null,
     caseRecord.law_id ? `適用法: #${caseRecord.law_id} / ${caseRecord.offense_code}` : null,
     caseRecord.challenged_type ? `違憲審査対象: ${caseRecord.challenged_type}:${caseRecord.challenged_id}` : null,
-    caseRecord.public_thread_id ? linkToThread(guildId, caseRecord.public_thread_id) : null
+    caseRecord.public_thread_id ? linkToThread(guildId, caseRecord.public_thread_id) : null,
+    `参照番号: C-${caseRecord.id}`
   ].filter(Boolean).join('\n');
 }
 
@@ -396,7 +398,7 @@ async function executeIntake(interaction, intake) {
       eventId: intake.source_message_id,
       attemptReserved: true
     });
-    return { type: 'proposal', id: result.id, text: `「${payload.title}」を受理しました（L-${result.id}）。\n${linkToThread(interaction.guildId, result.forum_thread_id)}` };
+    return { type: 'proposal', id: result.id, text: `「${payload.title}」を受理しました。\n${linkToThread(interaction.guildId, result.forum_thread_id)}` };
   }
   if (intake.action === 'amendment') {
     const result = await fileAmendment(interaction.guild, member, {
@@ -406,7 +408,7 @@ async function executeIntake(interaction, intake) {
       eventId: intake.source_message_id,
       attemptReserved: true
     });
-    return { type: 'proposal', id: result.id, text: `「${payload.title}」を改憲案として受理しました（L-${result.id}）。\n${linkToThread(interaction.guildId, result.forum_thread_id)}` };
+    return { type: 'proposal', id: result.id, text: `「${payload.title}」を改憲案として受理しました。\n${linkToThread(interaction.guildId, result.forum_thread_id)}` };
   }
   if (intake.action === 'criminal_case') {
     await assertEvidenceVisibleTo(interaction.guild, payload.evidence, [interaction.user.id, payload.accusedId]);
@@ -420,7 +422,9 @@ async function executeIntake(interaction, intake) {
       eventId: intake.source_message_id,
       attemptReserved: true
     });
-    return { type: 'case', id: result.id, text: `法律違反の申立てを受理しました（C-${result.id}）。\n${linkToThread(interaction.guildId, result.public_thread_id)}` };
+    return { type: 'case', id: result.id, text: result.public_thread_id
+      ? `法律違反の申立てを受理しました。\n${linkToThread(interaction.guildId, result.public_thread_id)}`
+      : '法律違反の申立てを受理し、AI判定を開始しました。処分がある場合は本人へ通知します。' };
   }
   if (intake.action === 'constitutional_challenge') {
     const result = await fileConstitutionalChallenge(interaction.guild, member, {
@@ -430,7 +434,7 @@ async function executeIntake(interaction, intake) {
       eventId: intake.source_message_id,
       attemptReserved: Boolean(payload.constitutionalAttemptReserved)
     });
-    return { type: 'case', id: result.id, text: `違憲審査を受理しました（C-${result.id}）。\n${linkToThread(interaction.guildId, result.public_thread_id)}` };
+    return { type: 'case', id: result.id, text: `違憲審査を受理しました。\n${linkToThread(interaction.guildId, result.public_thread_id)}` };
   }
   if (intake.action === 'evidence') {
     const caseRecord = getCase(payload.caseId);

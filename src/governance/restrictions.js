@@ -112,7 +112,7 @@ export async function enforceMessageRestrictions(message) {
   // 公開裁判所での当事者の答弁・上訴だけは、別の制裁profileで妨げない。
   // 第三者が事件投稿へ書けば通常の制裁対象となり、裁判所を回避経路にできない。
   if (courtCase
-    && ['defense', 'appeal'].includes(courtCase.status)
+    && ['defense', 'trial', 'appeal'].includes(courtCase.status)
     && [courtCase.reporter_id, courtCase.accused_id].filter(Boolean).includes(message.author.id)) {
     return false;
   }

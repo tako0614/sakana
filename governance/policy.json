@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "timezoneOffsetMinutes": 540,
   "eligibility": {
     "memberAgeDays": 30,
@@ -28,8 +28,8 @@
     "voteMilliseconds": 86400000
   },
   "judiciary": {
-    "defenseMilliseconds": 172800000,
-    "appealMilliseconds": 172800000,
+    "defenseMilliseconds": 86400000,
+    "appealMilliseconds": 86400000,
     "constitutionalChallengesPerMemberPerDay": 3,
     "panelSeats": 3,
     "guiltyVotesRequired": 2,
@@ -61,6 +61,21 @@
       "agent_calls_per_window",
       "block_petitions",
       "block_voting"
-    ]
+    ],
+    "summaryProcedure": {
+      "panelSeats": 3,
+      "votesRequired": 2,
+      "trialMilliseconds": 86400000,
+      "immediateSanctions": [
+        "warning",
+        "restriction",
+        "timeout"
+      ],
+      "trialFirstSanctions": [
+        "kick",
+        "ban"
+      ],
+      "unlimitedWarningReview": true
+    }
   }
 }
