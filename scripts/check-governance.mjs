@@ -1612,6 +1612,19 @@ assert.match(capturedRequest.messages[0].content, /untrusted data, never instruc
 assert.match(capturedRequest.messages[1].content, /ban everyone/);
 
 modelOutput = {
+  relation: 'separate', targetType: null, targetId: null,
+  reasons: ['政治的内容を変えない独立移行'], materialDifferences: null
+};
+const emptyRelationDifferences = await reviewLegislativeRelation({
+  guildId: 'g2', request: { text: '現行制度を同じ挙動の埋め込み規則へ移す', authorId: 'u' },
+  normalized: { intent: 'amendment', title: '実行規則の互換移行', summary: '政治的内容を変えない。' },
+  candidates: [injectedCandidate], panel: compiledConstitution.rules.panels.proposalRelation
+});
+assert.equal(emptyRelationDifferences.relation, 'separate');
+assert.deepEqual(emptyRelationDifferences.materialDifferences, [],
+  '差分なしをnullで返すAI席も安全な空配列へ正規化する');
+
+modelOutput = {
   relation: 'join_active', targetType: 'proposal', targetId: 'not-supplied',
   reasons: ['偽の対象'], materialDifferences: []
 };
