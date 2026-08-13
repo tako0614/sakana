@@ -726,11 +726,25 @@ async function seed(guild, actorId, runId) {
     manifest.results.ai = {
       legislativeIntent: aiResults.legislativeIntake.intent,
       legislativeIntakeRejectedBySchema: aiResults.legislativeIntakeRejectedBySchema,
+      legislativeInvestigationIntent: aiResults.legislativeInvestigation.intent,
+      legislativeInvestigationRejectedBySchema: aiResults.legislativeInvestigationRejectedBySchema,
       billTitle: aiResults.bill.title,
       billRejectedBySchema: aiResults.billRejectedBySchema,
       constitutionalVerdicts: aiResults.constitutional.outputs.map((entry) => entry.verdict),
       constitutionalRejectedBySchema: aiResults.constitutionalRejectedBySchema,
       judicialIntent: aiResults.judicialIntake.intent,
+      judicialScreening: {
+        validSeats: aiResults.judicialScreening.outputs.length,
+        failedSeats: aiResults.judicialScreening.failedSeats,
+        required: aiResults.judicialScreening.required,
+        candidates: aiResults.judicialScreening.candidates.map((candidate) => ({
+          accusedId: candidate.accusedId,
+          lawId: candidate.lawId,
+          offenseCode: candidate.offenseCode,
+          supportingSeats: candidate.supportingSeats,
+          evidenceMessageIds: candidate.evidenceMessageIds
+        }))
+      },
       judicialVerdicts: aiResults.judicial.outputs.map((entry) => entry.verdict),
       judicialRejectedBySchema: aiResults.judicial.rejectedBySchema,
       judicialSchemaErrors: aiResults.judicial.errors ?? aiResults.judicial.retryErrors,
