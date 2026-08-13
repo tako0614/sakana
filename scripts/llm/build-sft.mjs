@@ -503,7 +503,47 @@ function responseExcerpts(conv) {
   return found;
 }
 
+// **長い発言そのものを重く見せる。** 噛み合いだけ増やしても「単語しか吐かない」は
+// 直らない — 12字以上に緩めた時点で、短い応答の信号を増やしていることになる。
+//
+// 実測 (598,908 発言):
+//   30字以上 58,855 (9.8%)  うち名前持ち 93%
+//   40字以上 25,565 (4.3%)  うち名前持ち 91%
+//   60字以上  7,079 (1.2%)  うち名前持ち 85%
+//
+// **長い発言はほぼ名前持ちのもの。** つまりここを重くすると「長く喋る」と
+// 「なりきり度」が同時に上がる。両立するので迷う必要がない。
+//
+// 匿名化する割合を噛み合い側 (半分) より低くするのは、長い発言が個人の声そのもので、
+// 役に移すとなりきりの材料を減らすから。
+const LONG_MIN = Number(process.env.LLM_LONG_MIN ?? 40);
+const LONG_ANON_EVERY = Number(process.env.LLM_LONG_ANON_EVERY ?? 4);
+
+function longExcerpts(conv) {
+  const found = [];
+  const rows = [];
+  for (const line of conv.lines) {
+    const m = line.match(LABELLED);
+    if (m) rows.push({ label: m[1], body: m[2].trim(), line });
+  }
+
+  for (let i = 0; i < rows.length; i += 1) {
+    if (rows[i].body.length < LONG_MIN) continue;
+    // 直前の文脈を付ける。単発で置くと「いきなり長文を書く」ことを学ぶ
+    const from = Math.max(0, i - QA_CONTEXT);
+    if (i === from) continue;                    // 会話の頭なら文脈が無いので使わない
+    const lines = rows.slice(from, i + 1).map((r) => r.line);
+    found.push({
+      at: conv.at, from: conv.from, channel: conv.channel,
+      roles: conv.roles, counts: conv.counts, lines, primed: 0,
+      text: `${conv.channel}\n${lines.join('\n')}`
+    });
+  }
+  return found;
+}
+
 const qaExcerpts = train.flatMap(responseExcerpts);
+const longs = train.flatMap(longExcerpts);
 
 /**
  * 切り出しの話者を**匿名の役に付け替える**。
@@ -565,6 +605,11 @@ for (let round = 0; round < Math.max(0, QA_COPIES); round += 1) {
     train.push((i + round) % 2 === 1 ? anonymise(excerpt) : excerpt);
   });
 }
+
+// 長い発言は 4 本に 1 本だけ匿名化する (残り 3 本は名前持ちのまま = なりきりの材料)
+longs.forEach((excerpt, i) => {
+  train.push(i % LONG_ANON_EVERY === 0 ? anonymise(excerpt) : excerpt);
+});
 
 // --- 説明する口調を外から借りる ---
 //
@@ -686,6 +731,10 @@ await writeFile(
     prime_rate: PRIME_RATE,
     prime_turns: PRIME_TURNS,
     qa_excerpts: qaExcerpts.length,
+    long_excerpts: longs.length,
+    long_min: LONG_MIN,
+    long_anon_every: LONG_ANON_EVERY,
+    long_chars: longs.reduce((sum, c) => sum + c.text.length, 0),
     qa_copies: QA_COPIES,
     qa_context: QA_CONTEXT,
     qa_min_answer: QA_MIN_ANSWER,
@@ -709,6 +758,9 @@ const qaChars = qaExcerpts.reduce((sum, c) => sum + c.text.length, 0) * QA_COPIE
 console.log(`噛み合った箇所   ${fmt(qaExcerpts.length)} を ×${QA_COPIES} で切り出し `
   + `(応答は ${QA_MIN_ANSWER} 字以上 / ${fmt(qaChars)} 字 = train の `
   + `${(qaChars / chars(train) * 100).toFixed(1)}%)`);
+const longChars = longs.reduce((sum, c) => sum + c.text.length, 0);
+console.log(`長い発言         ${fmt(longs.length)} 箇所 (${LONG_MIN} 字以上 / ${fmt(longChars)} 字 = `
+  + `train の ${(longChars / chars(train) * 100).toFixed(1)}% / ${LONG_ANON_EVERY} 本に 1 本だけ匿名化)`);
 console.log(`外から混ぜた     ${fmt(mixedConversations)} 会話 / ${fmt(mixedChars)} 字 `
   + `(train の ${(mixedChars / chars(train) * 100).toFixed(1)}% / 長すぎて捨てた発言 ${fmt(mixedDroppedTurns)})`);
 console.log(`\n--- 先頭の会話 ---\n${train[0]?.text.slice(0, 400)}`);

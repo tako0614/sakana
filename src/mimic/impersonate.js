@@ -19,9 +19,10 @@ import {
 import { buildPrompt, messageText, ownTurns } from './serialize.js';
 import { exampleTurns, hasOptedOut, tokenFor } from './speakers.js';
 
-// 短すぎる返答は引き直す。CPU で数秒かかるので回数は絞る
-const MIN_CHARS = 3;
-const MAX_TRIES = 3;
+// 短すぎる返答は引き直す。CPU で数秒かかるので回数は絞る。
+// respond.js と同じ既定 (3 字だと「うーん」「草」が通って単語だけの返答が流れる)
+const MIN_CHARS = Number(process.env.MIMIC_MIN_CHARS ?? 8);
+const MAX_TRIES = Number(process.env.MIMIC_MAX_TRIES ?? 3);
 
 /**
  * 載っている世代がどちらの形式か。
@@ -141,13 +142,15 @@ export async function impersonate(userId, { topic = null, channelId = null, aske
     ? (text) => plainOwnTurns(text, built.trailing)
     : (text) => ownTurns(text, built.trailing);
 
+  // 一番長い候補を残す。上書きにすると、引き直しで使える返答を捨てることがある
+  // (1 回目が「うーん」で 3 回目が添付だけ → 空になる)
   let text = '';
   for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
     const result = await generate({
       prompt: built.prompt, engine, stopLabel: built.trailing
     });
-    text = cut(continuationOf(result.text, built.prompt));
-    if (isUnusableReply(text)) text = '';
+    const got = cut(continuationOf(result.text, built.prompt));
+    if (!isUnusableReply(got) && got.length > text.length) text = got;
     if (text.length >= MIN_CHARS) break;
   }
 

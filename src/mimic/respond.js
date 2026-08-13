@@ -53,8 +53,17 @@ const CONTEXT_MESSAGES = 16;
 // 短すぎる返答は引き直す。正規化トークン (<url> / <file>) はサーバー側で既定禁止に
 // してあるが、それでも「これ」のような 2 文字が 12% ほど出る
 // (禁止前は 38% が記号だけだった)。CPU で数秒かかるので回数は絞る。
-const MIN_CHARS = 3;
-const MAX_TRIES = 3;
+//
+// **3 字は緩すぎた。** 「うーん」「まじ？」「草」が全部通るので、単語だけの返答が
+// そのまま流れていた。このサーバーの発言も 45.3% が10字以下なので短いのは自然だが、
+// **話しかけられて答える場面**では引き直す方がいい。8 字にすると「うーん」は落ちて
+// 「@A UDPの方が速いと思うよ」は通る。
+//
+// 引き直しは温度そのままの再サンプリングなので、確率分布の裾から別の候補が出る。
+// 3 回引いても短いままなら、それがそのモデルの答えなのでそのまま出す
+// (空にして「何も出てきませんでした」を出す方が体験が悪い)。
+const MIN_CHARS = Number(process.env.MIMIC_MIN_CHARS ?? 8);
+const MAX_TRIES = Number(process.env.MIMIC_MAX_TRIES ?? 3);
 
 /**
  * 独自トークン形式 (evex-1 / evex-2)。会話に出てくる人に役を振って、
@@ -220,15 +229,18 @@ export async function handleMimicRequest(
       wanted, engine, channelId: message.channelId
     });
 
+    // **一番長い候補を残す。** 以前は毎回 body を上書きしていたので、1 回目が
+    // 「うーん」(短いが使える) で 3 回目が添付だけ (使えない) のとき、空になって
+    // 「何も出てきませんでした」を出していた。引き直しで悪くなるのは筋が通らない。
     let body = '';
     for (let attempt = 0; attempt < MAX_TRIES; attempt += 1) {
       const result = await generate({
         prompt: built.prompt, engine, stopLabel: built.trailing
       });
       // プロンプトぶんを落として、生成された続きだけを見る
-      body = built.cut(continuationOf(result.text, built.prompt));
+      const got = built.cut(continuationOf(result.text, built.prompt));
       // 添付だけの返答は bot が画像を投稿できないので意味が無い。引き直す
-      if (isUnusableReply(body)) body = '';
+      if (!isUnusableReply(got) && got.length > body.length) body = got;
       if (body.length >= MIN_CHARS) break;
     }
 
