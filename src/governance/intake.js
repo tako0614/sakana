@@ -531,7 +531,7 @@ export async function handleGovernanceIntakeComponent(interaction, intakeId, val
         last_error: String(error.message).slice(0, 500)
       });
       await interaction.message.edit({
-        content: renderIntake(accepted, `正式受付済み: ${error.accepted.resultType} ${error.accepted.resultId}（自動再試行中）`),
+        content: renderIntake(accepted, '正式受付済み（自動再試行中）'),
         components: intakeButtons(accepted, true),
         allowedMentions: { parse: [] }
       }).catch(() => {});
