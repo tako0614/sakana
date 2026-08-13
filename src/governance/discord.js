@@ -757,7 +757,7 @@ export async function syncStatuteBook(guild, governance, { verifyExisting = fals
   const instruments = [
     ...listConstitutions(guild.id, { limit: 100 }).map((instrument) => ({ instrumentType: 'constitution', instrument })),
     ...listLaws(guild.id, { activeOnly: false, limit: 500 }).map((instrument) => ({ instrumentType: 'law', instrument }))
-  ];
+  ].filter(({ instrument }) => !String(instrument.title ?? '').startsWith('[E2E:'));
   let changed = 0;
   for (const { instrumentType, instrument } of instruments) {
     const document = statuteDocument(instrumentType, instrument);

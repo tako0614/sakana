@@ -1497,6 +1497,10 @@ assert.match(liveE2eSource, /--confirm-shadow/, 'live E2Eはshadow確認フラ�
 assert.match(liveE2eSource, /governance\.enforcement_mode, 'shadow'/, 'live執行ではE2Eを拒否する');
 assert.match(liveE2eSource, /pendingActions\(100\)\.length, 0/, '既存outboxを巻き込まない');
 assert.match(liveE2eSource, /currentTrusted !== initialTrusted/, '特別有権者ロールを原状復帰する');
+assert.match(liveE2eSource, /thread\.delete\('E2E fixtureを公開一覧から除去'\)/,
+  'E2E cleanupはテスト投稿を公開フォーラムに残さない');
+assert.match(liveE2eSource, /message\.author\.id !== guild\.client\.user\.id \|\| !message\.content\.includes\(mark\)/,
+  'E2E cleanupは同じrun markerを持つbot官報だけを除去する');
 assert.match(liveE2eSource, /force: true/, '特別有権者ロールはDiscord APIから強制readbackする');
 assert.match(liveE2eSource, /setTrustedMember/, 'owner専用の正規経路で特別有権者を操作する');
 assert.match(liveE2eSource, /--provision-trusted-role/, '未設定の特別有権者roleは明示フラグなしに作らない');

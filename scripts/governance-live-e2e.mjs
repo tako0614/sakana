@@ -797,8 +797,10 @@ async function cleanup(guild, runId) {
   const governance = getGovernanceGuild(guild.id);
   assertSafeTarget(governance, null, guild);
   const mark = marker(runId);
-  const cleaned = { proposals: [], cases: [], laws: [] };
+  const cleaned = { proposals: [], cases: [], laws: [], publicThreads: [], gazetteMessages: [] };
+  const publicThreadIds = new Set();
   for (let proposal of listProposals(guild.id, { limit: 500 }).filter((entry) => entry.title.includes(mark))) {
+    if (proposal.forum_thread_id) publicThreadIds.add(proposal.forum_thread_id);
     if (ACTIVE_PROPOSAL_STATES.has(proposal.status)) {
       proposal = updateProposal(proposal.id, { status: 'rejected', stage_ends_at: Date.now(), retry_after: null });
       await postProposalUpdate(guild, proposal, 'E2E fixtureを後片付けしました。正式な投票結果ではなく、動作確認記録の終了です。', { state: '否決', components: voteButtons(proposal.id, true) });
@@ -806,6 +808,7 @@ async function cleanup(guild, runId) {
     cleaned.proposals.push(proposal.id);
   }
   for (let caseRecord of listCases(guild.id, { limit: 500 }).filter((entry) => entry.summary.includes(mark))) {
+    if (caseRecord.public_thread_id) publicThreadIds.add(caseRecord.public_thread_id);
     endInterimProtection(caseRecord.id, 'e2e_completed');
     const sanction = getCaseSanction(caseRecord.id);
     if (sanction && !['simulated', 'reversed'].includes(sanction.status)) {
@@ -818,6 +821,8 @@ async function cleanup(guild, runId) {
     cleaned.cases.push(caseRecord.id);
   }
   for (const law of listLaws(guild.id, { activeOnly: false, limit: 500 }).filter((entry) => entry.title.includes(mark))) {
+    const publication = getStatutePublication(guild.id, 'law', law.id);
+    if (publication?.forum_thread_id) publicThreadIds.add(publication.forum_thread_id);
     if (law.status === 'active') updateLaw(law.id, { status: 'repealed', ended_at: Date.now() });
     for (const sanction of listSanctionsForLaw(law.id)) {
       if (!['simulated', 'reversed'].includes(sanction.status)) updateSanction(sanction.id, { status: 'reversed', reversed_at: Date.now() });
@@ -826,6 +831,29 @@ async function cleanup(guild, runId) {
   }
   await syncStatuteBook(guild, governance, { verifyExisting: true });
   await ensureGovernanceUx(guild, governance);
+  for (const threadId of publicThreadIds) {
+    const thread = await guild.channels.fetch(threadId).catch(() => null);
+    if (!thread?.isThread?.()) continue;
+    const starter = await thread.fetchStarterMessage().catch(() => null);
+    if (!thread.name.includes(mark) && !starter?.content?.includes(mark)) continue;
+    await thread.delete('E2E fixtureを公開一覧から除去');
+    cleaned.publicThreads.push(threadId);
+  }
+  const gazette = await guild.channels.fetch(governance.gazette_channel_id).catch(() => null);
+  if (gazette?.isTextBased?.()) {
+    let before;
+    for (;;) {
+      const batch = await gazette.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+      if (batch.size === 0) break;
+      for (const message of batch.values()) {
+        if (message.author.id !== guild.client.user.id || !message.content.includes(mark)) continue;
+        await message.delete();
+        cleaned.gazetteMessages.push(message.id);
+      }
+      before = batch.last()?.id;
+      if (batch.size < 100 || !before) break;
+    }
+  }
   writeAudit({
     guildId: guild.id,
     actorType: 'operator',
@@ -834,9 +862,6 @@ async function cleanup(guild, runId) {
     targetType: 'run',
     targetId: runId,
     detail: cleaned
-  });
-  await postGazette(guild, governance, `${mark} E2E後片付け`, `終了したfixture:\n${JSON.stringify(cleaned, null, 2)}`, {
-    summary: `proposal ${cleaned.proposals.length}件 / case ${cleaned.cases.length}件 / law ${cleaned.laws.length}件を終了状態へ移しました。履歴は監査のため削除していません。`
   });
   return cleaned;
 }
@@ -875,6 +900,7 @@ const [{
   getCaseSanction,
   getGovernanceGuild,
   getOperationalSetting,
+  getStatutePublication,
   listCaseEvidence,
   listCaseApprovals,
   listCases,
