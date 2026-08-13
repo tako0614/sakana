@@ -55,7 +55,7 @@ export const ENDPOINTS = {
     timeoutMs: number(process.env.MIMIC_FT_TIMEOUT_MS, 120_000),
     // 連投を許すぶん長く取る。実際は stop_label で必要なところで止まる
     maxNewTokens: number(process.env.MIMIC_FT_MAX_NEW_TOKENS, 160),
-    label: process.env.MIMIC_FT_LABEL ?? 'evex-ft-1-preview',
+    label: process.env.MIMIC_FT_LABEL ?? 'evex-ft-1',
     format: process.env.MIMIC_FT_FORMAT ?? 'plain'
   }
 };

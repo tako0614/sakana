@@ -42,7 +42,7 @@ from transformers import (
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", default="mimic-ft", help="重みのディレクトリ")
-parser.add_argument("--label", default=os.environ.get("MIMIC_FT_LABEL", "evex-ft-1-preview"))
+parser.add_argument("--label", default=os.environ.get("MIMIC_FT_LABEL", "evex-ft-1"))
 parser.add_argument("--host", default="127.0.0.1")
 parser.add_argument("--port", type=int, default=8766)
 # 生成は 1 トークンずつなので並列度が上がらない。bot と同居するならコアを全部

@@ -371,13 +371,34 @@ def evaluate():
 # **名前ラベルを叩く。** 最初は末尾を `B:` にしていたが、あれは名前を持たない
 # 少数派の役 (58万発言のうち約1.5万件) で、今回の主目的である個人の口調を
 # 一切確認できていなかった。同じお題を別人に振って、読み分けられるかを見る。
+#
+# ラベルは**コーパスの labels.json から取る**。名前を直に書いていたので、
+# コーパスを作り直して改名が反映されると (`-akku-` → `あかり`) **未学習のラベルを
+# 叩いていることに気付けない** — サンプルだけ崩れて、モデルは正常なのに
+# 「壊れた」と読み違える。実際に正式版で `it's o:` が `943@0:942:943` を返した。
+def sample_labels(count=3):
+    """コーパスと同じ場所から labels.json を引く。無ければ役だけで済ませる。"""
+    try:
+        if args.local:
+            path = Path(args.local) / "labels.json"
+        else:
+            from huggingface_hub import hf_hub_download
+            path = Path(hf_hub_download(args.dataset, "labels.json", repo_type="dataset"))
+        rows = json.loads(path.read_text(encoding="utf8"))
+    except Exception:  # noqa: BLE001 - サンプルの飾りなので学習は止めない
+        return []
+    rows.sort(key=lambda r: -r.get("count", 0))
+    return [r["label"] for r in rows[:count]]
+
+
+_top = sample_labels()
+_asker = _top[0] if _top else "A"
 PROMPTS = [
-    "#ch2\nたこ: これバグってる？\n-akku-:",
-    "#ch2\nたこ: これバグってる？\nit's o:",
-    "#ch2\nA: Cloudflare Containers ってどうなん\n-akku-:",
-    "#ch0\nA: 眠い\nにょ:",
+    *[f"#ch2\n{_asker}: これバグってる？\n{label}:" for label in _top[1:]],
+    *[f"#ch2\nA: Cloudflare Containers ってどうなん\n{label}:" for label in _top[:1]],
     "#ch0\nA: 眠い\nB:",
 ]
+print(f"サンプルに使うラベル: {_top or '(labels.json 無し / 役だけ)'}", flush=True)
 
 
 @torch.no_grad()

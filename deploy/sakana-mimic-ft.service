@@ -10,7 +10,7 @@ WorkingDirectory=/root/sakana
 # 世代を置き換えないのは性質が違うから — あちらは 94万件だけで純度が高い代わりに
 # 荒く、こちらは Qwen の日本語を引き継いで読める代わりに借り物の知識が混ざる。
 ExecStart=/root/sakana/.venv-llm/bin/python -u src/mimic/server-ft.py \
-  --model /root/sakana/mimic-ft \
+  --model /root/sakana/ft1/epoch-2 \
   --port 8766 \
   --threads 6
 
