@@ -1721,6 +1721,13 @@ async function advanceProposal(guild, proposal, now) {
   return proposal;
 }
 
+async function syncRetriedIntake(guild, resultType, result) {
+  const { updateRetriedIntakeMessage } = await import('./intake.js');
+  await updateRetriedIntakeMessage(guild, resultType, result).catch((error) => {
+    console.error(`Failed to update completed ${resultType} intake ${result.id}:`, error);
+  });
+}
+
 async function advanceCase(guild, caseRecord, now) {
   if (caseRecord.retry_after && caseRecord.retry_after > now) return;
   if (caseRecord.status === 'summary_review') {
@@ -1935,7 +1942,8 @@ export async function runGovernanceScheduler(client) {
       if (currentGovernance.status !== 'active') continue;
       for (const proposal of listProposals(guild.id, { statuses: ['drafting', 'draft', 'constitutional_review', 'debate', 'voting'], limit: 100 })) {
         try {
-          await advanceProposal(guild, proposal, now);
+          const current = await advanceProposal(guild, proposal, now) ?? getProposal(proposal.id);
+          if (current?.status !== 'drafting') await syncRetriedIntake(guild, 'proposal', current);
         } catch (error) {
           updateProposal(proposal.id, retryPatch(getProposal(proposal.id), error));
           console.error(`Failed to advance proposal ${proposal.id}:`, error);
@@ -1945,6 +1953,10 @@ export async function runGovernanceScheduler(client) {
       for (const caseRecord of cases) {
         try {
           await advanceCase(guild, caseRecord, now);
+          const current = getCase(caseRecord.id);
+          if (current && !current.retry_after && !['filing', 'summary_review'].includes(current.status)) {
+            await syncRetriedIntake(guild, 'case', current);
+          }
         } catch (error) {
           updateCase(caseRecord.id, retryPatch(getCase(caseRecord.id), error));
           console.error(`Failed to advance case ${caseRecord.id}:`, error);

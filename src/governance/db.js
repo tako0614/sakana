@@ -865,6 +865,15 @@ export function getGovernanceIntake(id) {
   return hydrateIntake(db.prepare('SELECT * FROM governance_intakes WHERE id = ?').get(Number(id)));
 }
 
+export function findGovernanceIntakeByResult(guildId, resultType, resultId) {
+  return hydrateIntake(db.prepare(`
+    SELECT * FROM governance_intakes
+    WHERE guild_id = ? AND status = 'completed' AND result_type = ? AND result_id = ?
+      AND last_error IS NOT NULL
+    ORDER BY id DESC LIMIT 1
+  `).get(String(guildId), String(resultType), String(resultId)));
+}
+
 export function updateGovernanceIntake(id, patch) {
   const allowed = new Set([
     'response_message_id', 'payload_json', 'status', 'expires_at', 'result_type',

@@ -9,6 +9,7 @@ import { parseDiscordRef } from '../agent/format.js';
 import {
   claimGovernanceIntake,
   createGovernanceIntake,
+  findGovernanceIntakeByResult,
   getActiveConstitution,
   getCase,
   getGovernanceGuild,
@@ -160,12 +161,13 @@ function intakeButtons(intake, disabled = false) {
 
 function renderIntake(intake, suffix = '') {
   const payload = intake.payload;
-  const lines = ['## 受付前の確認', ''];
+  const pending = intake.status === 'pending' || intake.status === 'processing';
+  const lines = [intake.status === 'completed' ? '## 正式受付済み' : pending ? '## 受付前の確認' : '## 受付結果', ''];
   if (intake.action === 'petition' || intake.action === 'amendment') {
     lines.push(
       `種別: ${intake.action === 'amendment' ? '憲法改正案' : '法律の請願'}`,
       `題名: ${payload.title}`,
-      `内容: ${payload.summary}`,
+      pending ? `内容: ${payload.summary}` : null,
       `投票範囲: ${payload.voteScope === 'trusted' ? `${payload.electorateLabel ?? '特別有権者'}のみ` : '全員'}`
     );
   } else if (intake.action === 'criminal_case') {
@@ -176,8 +178,8 @@ function renderIntake(intake, suffix = '') {
       `被申立人: <@${payload.accusedId}>`,
       `適用法候補: ${law?.title ?? '裁判記録に記載'}`,
       offense?.title ? `対象となる違反: ${offense.title}` : null,
-      `申立内容: ${payload.summary}`,
-      `証拠: ${sourceLink(intake.guild_id, payload.evidence)}`
+      pending ? `申立内容: ${payload.summary}` : null,
+      pending ? `証拠: ${sourceLink(intake.guild_id, payload.evidence)}` : null
     );
   } else if (intake.action === 'constitutional_challenge') {
     const target = payload.targetType === 'law'
@@ -188,15 +190,45 @@ function renderIntake(intake, suffix = '') {
     lines.push(
       '種別: 違憲審査',
       `対象: ${target ?? '指定した統治行為'}`,
-      `申立理由: ${payload.summary}`
+      pending ? `申立理由: ${payload.summary}` : null
     );
   } else if (intake.action === 'evidence') {
     lines.push('種別: 証拠追加', '対象: 指定した裁判', `証拠: ${sourceLink(intake.guild_id, payload.evidence)}`);
   } else if (intake.action === 'appeal') {
     lines.push('種別: 上訴', '対象: 指定した裁判', `上訴理由: ${payload.summary}`);
   }
-  lines.push('', suffix || '内容が正しければ「この内容で進める」を押してください。押すまでは正式案件になりません。');
-  return lines.join('\n').slice(0, 2000);
+  lines.push('', suffix || '内容が正しければ「この内容で正式受付」を押してください。押すまでは正式案件になりません。');
+  return lines.filter((line) => line !== null).join('\n').slice(0, 2000);
+}
+
+function retriedResultText(intake, resultType, result) {
+  if (resultType === 'proposal') {
+    const acceptedAs = intake.action === 'amendment' ? '改憲案' : '請願';
+    const link = result.forum_thread_id ? `\n${linkToThread(intake.guild_id, result.forum_thread_id)}` : '';
+    return `「${result.title}」を${acceptedAs}として受理し、草案を公開しました。${link}`;
+  }
+  if (resultType === 'case') {
+    const link = result.public_thread_id ? `\n${linkToThread(intake.guild_id, result.public_thread_id)}` : '';
+    return `裁判所の受付処理が完了しました。${link}`;
+  }
+  return '受付処理が完了しました。';
+}
+
+export async function updateRetriedIntakeMessage(guild, resultType, result) {
+  const intake = findGovernanceIntakeByResult(guild.id, resultType, result.id);
+  if (!intake?.response_message_id) return false;
+  const channel = await guild.channels.fetch(intake.channel_id).catch(() => null);
+  if (!channel?.isTextBased?.()) return false;
+  const message = await channel.messages.fetch(intake.response_message_id).catch(() => null);
+  if (!message) return false;
+  const completed = { ...intake, last_error: null };
+  await message.edit({
+    content: renderIntake(completed, retriedResultText(completed, resultType, result)),
+    components: [],
+    allowedMentions: NO_MENTIONS
+  });
+  updateGovernanceIntake(intake.id, { last_error: null });
+  return true;
 }
 
 async function createPreview(message, branch, action, payload) {
@@ -492,7 +524,7 @@ export async function handleGovernanceIntakeComponent(interaction, intakeId, val
     const updated = updateGovernanceIntake(intake.id, { status: 'cancelled' });
     await interaction.update({
       content: renderIntake(updated, '本人が取り消しました。正式案件にはなっていません。'),
-      components: intakeButtons(updated, true),
+      components: [],
       allowedMentions: { parse: [] }
     });
     return true;
@@ -516,8 +548,8 @@ export async function handleGovernanceIntakeComponent(interaction, intakeId, val
       last_error: null
     });
     await interaction.message.edit({
-      content: renderIntake(completed, `正式受付済み\n${result.text}`),
-      components: intakeButtons(completed, true),
+      content: renderIntake(completed, result.text),
+      components: [],
       allowedMentions: { parse: [] }
     }).catch(() => {});
     await interaction.editReply(result.text);
@@ -531,8 +563,8 @@ export async function handleGovernanceIntakeComponent(interaction, intakeId, val
         last_error: String(error.message).slice(0, 500)
       });
       await interaction.message.edit({
-        content: renderIntake(accepted, '正式受付済み（自動再試行中）'),
-        components: intakeButtons(accepted, true),
+        content: renderIntake(accepted, 'AI・Discord処理を自動再試行しています。'),
+        components: [],
         allowedMentions: { parse: [] }
       }).catch(() => {});
       await interaction.editReply(error.message);
@@ -541,7 +573,7 @@ export async function handleGovernanceIntakeComponent(interaction, intakeId, val
     const failed = updateGovernanceIntake(claimed.id, { status: 'failed', last_error: String(error?.message ?? error).slice(0, 500) });
     await interaction.message.edit({
       content: renderIntake(failed, '受付処理に失敗しました。重複防止のため再実行はしません。内容を直して新しく呼び出してください。'),
-      components: intakeButtons(failed, true),
+      components: [],
       allowedMentions: { parse: [] }
     }).catch(() => {});
     await interaction.editReply(`実行できません: ${safeError(error)}`);
@@ -560,7 +592,7 @@ export async function updateExpiredIntakeMessages(client, intakes) {
     const expired = { ...intake, status: 'expired' };
     await message.edit({
       content: renderIntake(expired, '確認期限が切れました。正式案件にはなっていません。必要なら改めて呼び出してください。'),
-      components: intakeButtons(expired, true),
+      components: [],
       allowedMentions: NO_MENTIONS
     }).catch(() => {});
     updated += 1;

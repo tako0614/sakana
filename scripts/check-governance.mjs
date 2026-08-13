@@ -168,7 +168,12 @@ assert.equal(archived.message_created_at, 1);
 governanceDb.markLegacyGovernanceMessageDeleted('g1', 'gazette', 'legacy-1');
 assert.ok(governanceDb.listLegacyGovernanceMessageArchive('g1')[0].deleted_at);
 
-const { governanceMentionBranch, handleGovernanceIntakeComponent, handleGovernanceMention } = await import('../src/governance/intake.js');
+const {
+  governanceMentionBranch,
+  handleGovernanceIntakeComponent,
+  handleGovernanceMention,
+  updateRetriedIntakeMessage
+} = await import('../src/governance/intake.js');
 const mentionMessage = (ids) => ({
   guildId: 'g1',
   author: { bot: false },
@@ -200,6 +205,42 @@ const expiredIntake = governanceDb.createGovernanceIntake({
 const newlyExpired = governanceDb.expireGovernanceIntakes();
 assert.equal(newlyExpired[0].id, expiredIntake.id, '期限切れUIを無効化する対象をschedulerへ返す');
 assert.equal(governanceDb.getGovernanceIntake(expiredIntake.id).status, 'expired');
+
+let retriedIntake = governanceDb.createGovernanceIntake({
+  guildId: 'g1', branch: 'legislature', action: 'amendment', requesterId: 'u1',
+  channelId: 'public', sourceMessageId: 'intake-source-retried',
+  payload: { title: '迅速裁判', summary: '確定後には重複表示しない長い説明', voteScope: 'all' },
+  expiresAt: Date.now() + 60_000
+});
+retriedIntake = governanceDb.updateGovernanceIntake(retriedIntake.id, {
+  response_message_id: 'intake-response-retried',
+  status: 'completed',
+  result_type: 'proposal',
+  result_id: '77',
+  last_error: 'temporary draft failure'
+});
+let retriedEdit = null;
+const retriedGuild = {
+  id: 'g1',
+  channels: {
+    fetch: async () => ({
+      isTextBased: () => true,
+      messages: { fetch: async () => ({ edit: async (payload) => { retriedEdit = payload; } }) }
+    })
+  }
+};
+assert.equal(await updateRetriedIntakeMessage(retriedGuild, 'proposal', {
+  id: 77, title: '迅速裁判', forum_thread_id: 'parliament-thread'
+}), true);
+assert.match(retriedEdit.content, /^## 正式受付済み/m);
+assert.match(retriedEdit.content, /草案を公開しました/);
+assert.doesNotMatch(retriedEdit.content, /重複表示しない長い説明/,
+  '正式受付後は元発言と同じ長文を受付結果へ重ねない');
+assert.deepEqual(retriedEdit.components, [], '確定後の無効な確認ボタンは表示しない');
+assert.equal(governanceDb.getGovernanceIntake(retriedIntake.id).last_error, null);
+assert.equal(await updateRetriedIntakeMessage(retriedGuild, 'proposal', {
+  id: 77, title: '迅速裁判', forum_thread_id: 'parliament-thread'
+}), false, '再試行完了メッセージは一度だけ更新する');
 
 let proposal = governanceDb.createProposal({
   guildId: 'g1',
