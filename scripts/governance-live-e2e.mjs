@@ -8,6 +8,7 @@ const ACTIVE_PROPOSAL_STATES = new Set(['drafting', 'draft', 'constitutional_rev
 const ACTIVE_CASE_STATES = new Set(['filing', 'defense', 'deliberation', 'approval', 'appeal_window', 'appeal', 'execution']);
 const DAY_MS = 86_400_000;
 const FAR_FUTURE = 30 * DAY_MS;
+const E2E_STARTED_AT = Date.now();
 
 const SCENARIOS = Object.freeze([
   '公開討議・全員投票・特別有権者限定投票',
@@ -49,15 +50,6 @@ function marker(runId) {
 
 function link(guildId, channelId) {
   return `https://discord.com/channels/${guildId}/${channelId}`;
-}
-
-function oldMemberSnapshot(member) {
-  const ids = new Set(member.roles.cache.keys());
-  return {
-    id: member.id,
-    guild: member.guild,
-    roles: { cache: { has: (id) => ids.has(id) } }
-  };
 }
 
 function fakeMember(guild, id, trustedRoleId, trusted) {
@@ -196,21 +188,42 @@ async function publishCase(guild, governance, caseRecord, state, text, component
 }
 
 async function setTrustedAndAudit(guild, member, desired) {
-  const before = oldMemberSnapshot(member);
   const changed = await setTrustedMember(guild, guild.ownerId, member, desired);
-  const refreshed = await guild.members.fetch({ user: member.id, force: true });
-  if (changed) await onTrustedRoleChange(before, refreshed);
-  return fetchMemberRoleState(guild, member.id, getGovernanceGuild(guild.id).trusted_role_id, desired);
+  const refreshed = await fetchMemberRoleState(
+    guild,
+    member.id,
+    getGovernanceGuild(guild.id).trusted_role_id,
+    desired
+  );
+  if (changed) {
+    await waitForTrustedAudit(
+      guild.id,
+      member.id,
+      desired ? 'trusted.added' : 'trusted.removed'
+    );
+  }
+  return refreshed;
 }
 
 async function fetchMemberRoleState(guild, userId, roleId, expected) {
   let member = null;
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
     member = await guild.members.fetch({ user: userId, force: true });
     if (member.roles.cache.has(roleId) === expected) return member;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`特別有権者ロールのDiscord readbackが${expected ? '付与' : '削除'}状態になりませんでした。`);
+}
+
+async function waitForTrustedAudit(guildId, userId, action) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const found = listAudit(guildId, 100).some((entry) => entry.action === action
+      && String(entry.target_id) === String(userId)
+      && entry.created_at >= E2E_STARTED_AT);
+    if (found) return;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`特別有権者変更の監査記録が確認できません: ${action}`);
 }
 
 async function runAiProbes({ guild, constitution, law, caseRecord, mark }) {
@@ -398,11 +411,9 @@ async function seed(guild, actorId, runId) {
     if (initialTrusted) currentOwner = await setTrustedAndAudit(guild, currentOwner, false);
     currentOwner = await setTrustedAndAudit(guild, currentOwner, true);
     assert.equal(currentOwner.roles.cache.has(governance.trusted_role_id), true);
-    const unauthorizedBefore = oldMemberSnapshot(currentOwner);
     await currentOwner.roles.remove(governance.trusted_role_id, 'E2E unauthorized trusted role change probe');
-    const unauthorizedAfter = await fetchMemberRoleState(guild, currentOwner.id, governance.trusted_role_id, false);
-    await onTrustedRoleChange(unauthorizedBefore, unauthorizedAfter);
     currentOwner = await fetchMemberRoleState(guild, currentOwner.id, governance.trusted_role_id, true);
+    await waitForTrustedAudit(guild.id, currentOwner.id, 'trusted.unauthorized_change_reverted');
     assert.equal(currentOwner.roles.cache.has(governance.trusted_role_id), true, '正規経路外の特別有権者変更が差し戻されませんでした。');
     manifest.results.trustedRole = { removed: initialTrusted, added: true, unauthorizedChangeReverted: true, restored: false };
 
@@ -919,7 +930,8 @@ const [{
   updateLaw,
   updateProposal,
   updateSanction,
-  writeAudit
+  writeAudit,
+  listAudit
 }, {
   approvalButtons,
   createCourtCaseThread,
@@ -943,7 +955,6 @@ const [{
   appealCase,
   approveCase,
   castAndPublishVote,
-  onTrustedRoleChange,
   processGovernanceOutbox,
   reserveGovernanceAgentAttempt,
   setTrustedMember
