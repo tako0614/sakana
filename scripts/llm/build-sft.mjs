@@ -444,25 +444,33 @@ for (const conv of train) {
 // 実測では能力が消えたわけではない (別の日本語での perplexity は base の 1.12倍)。
 // **その形を選ぶ確率**が低いだけなので、信号を増やす。2つやる。
 
-const QA_COPIES = Number(process.env.LLM_QA_COPIES ?? 2);
-const QA_MIN_ANSWER = Number(process.env.LLM_QA_MIN_ANSWER ?? 20);
+const QA_COPIES = Number(process.env.LLM_QA_COPIES ?? 1);
+const QA_MIN_ANSWER = Number(process.env.LLM_QA_MIN_ANSWER ?? 12);
 const QA_CONTEXT = Number(process.env.LLM_QA_CONTEXT ?? 2);
 
 // 継続行 (ラベルの無い行) は前の発言の一部なので飛ばす
 const LABELLED = /^([^\n:]{1,12}): ([\s\S]*)$/;
 
 /**
- * 疑問符で終わる発言に**別人が**それなりの長さで答えている箇所を、
- * 前後だけ切り出して返す。
+ * **前の人に噛み合っている**箇所を、前後だけ切り出して返す。
+ *
+ * 拾うのは2種類。どちらも「直前の発言を受けて別人が中身のあることを言った」形:
+ *
+ *   1. 直前が疑問符で終わり、別人が答えている      24,146 箇所 (12字以上 …)
+ *   2. 直前の人に `@名前` で宛てている            30,304 箇所 (12字以上 12,566)
+ *
+ * **長さではなく噛み合いを狙う。** `うーん` が駄目なのは短いからではなく前の発言を
+ * 受けていないから。最初は 20字以上に絞っていたが、それだと 6,418 箇所しか無くて
+ * 信号が足りない (このコーパスは 76.6% が20字以下で、長く説明する蓄えがそもそも無い)。
+ * 12字なら「@えだまめ Trie Treeとradixどっちも搭載ってどう？」のような、
+ * 短いが確実に噛み合っている発言が入る。
  *
  * **会話ごと複製してはいけない。** 最初はそうしたが、この条件に当たる会話は
- * 平均 1,505 字 (全体平均 1,008 字) で長く、×3 にしたら QA 分が全体の 64% を占めた
+ * 平均 1,505 字 (全体平均 1,008 字) で長く、×3 にしたら該当分が全体の 64% を占めた
  * (16.4M → 30.4M 字)。学習時間が倍になるうえ、その会話ごと暗記する。
- *
- * 欲しいのは「聞かれたら答える」という並びだけなので、質問の直前数行から
- * 答えまでを短い会話として切り出す。4 行前後 = 250 字程度で済む。
+ * 直前数行から応答までを短い会話として切り出す。
  */
-function questionExcerpts(conv) {
+function responseExcerpts(conv) {
   const found = [];
   const rows = [];
   for (const line of conv.lines) {
@@ -471,11 +479,18 @@ function questionExcerpts(conv) {
   }
 
   for (let i = 1; i < rows.length; i += 1) {
-    const q = rows[i - 1];
-    const a = rows[i];
-    if (q.label === a.label) continue;
-    if (!/[?？][\s　]*$/.test(q.body)) continue;
-    if (a.body.length < QA_MIN_ANSWER) continue;
+    const before = rows[i - 1];
+    const after = rows[i];
+    if (before.label === after.label) continue;
+
+    // 宛先の `@名前` は「誰に答えたか」の印なので、中身の長さから除いて数える
+    const addressed = after.body.match(/^@([^\s]{1,12})[\s　]+([\s\S]*)$/);
+    const body = addressed ? addressed[2].trim() : after.body;
+    if (body.length < QA_MIN_ANSWER) continue;
+
+    const answersQuestion = /[?？][\s　]*$/.test(before.body);
+    const addressesPrev = Boolean(addressed && addressed[1] === before.label);
+    if (!answersQuestion && !addressesPrev) continue;
 
     const from = Math.max(0, i - 1 - QA_CONTEXT);
     const lines = rows.slice(from, i + 1).map((r) => r.line);
@@ -488,7 +503,7 @@ function questionExcerpts(conv) {
   return found;
 }
 
-const qaExcerpts = train.flatMap(questionExcerpts);
+const qaExcerpts = train.flatMap(responseExcerpts);
 
 /**
  * 切り出しの話者を**匿名の役に付け替える**。
@@ -538,15 +553,17 @@ function anonymise(conv) {
   };
 }
 
-// **同じ切り出しを隣に並べない。** Packed は会話を EOS で継いで 1024 に切るので、
-// 隣接させると1つの窓に同じ本文が2回入って「写せば当たる」形になる。
-// 1周ぶんずつ後ろに足せば、同じものの複製は必ず数千会話ぶん離れる。
+// **1周が既定。** 2周にすると切り出しが train の 28.5% を占めて、窓の中身が
+// 3〜4行の短い会話ばかりになる (元の長い会話が学べなくなる)。1周なら 16% 程度。
 //
-// 2周目は匿名の役に付け替える。名前持ちと匿名の両方に信号が通る形にしたい
+// **交互に匿名の役へ付け替える。** 半分は名前持ちのまま、半分は役に移す形にすると、
+// なりきり (名前→口調) を薄めずに匿名側の信号だけ増やせる。
+// 同じ切り出しを隣に並べないのも大事 — Packed は会話を EOS で継いで 1024 に切るので、
+// 隣接させると1つの窓に同じ本文が2回入って「写せば当たる」形になる。
 for (let round = 0; round < Math.max(0, QA_COPIES); round += 1) {
-  for (const excerpt of qaExcerpts) {
-    train.push(round % 2 === 1 ? anonymise(excerpt) : excerpt);
-  }
+  qaExcerpts.forEach((excerpt, i) => {
+    train.push((i + round) % 2 === 1 ? anonymise(excerpt) : excerpt);
+  });
 }
 
 // --- 説明する口調を外から借りる ---
@@ -564,7 +581,10 @@ for (let round = 0; round < Math.max(0, QA_COPIES); round += 1) {
 // が混ざる。匿名の役だけに割り、役は会話ごとに振り直す — `B` に固定すると
 // 「説明するのは B」を学んで、bot が別の役になった推論時に出てこない。
 const MIX_FILE = process.env.LLM_MIX_FILE ?? null;
-const MIX_RATE = Number(process.env.LLM_MIX_RATE ?? 0.03);
+// 既定 0 = 混ぜない。**外部データは定義上 evex ではない**ので、
+// 「中の qwen が出てくるのを減らしたい / なりきり要素を減らしたくない」なら入れない。
+// 説明する口調が欲しいときだけ明示的に上げる (敬体率が地の値 2.4% から跳ねる)
+const MIX_RATE = Number(process.env.LLM_MIX_RATE ?? 0);
 const MIX_MAX_CHARS = Number(process.env.LLM_MIX_MAX_CHARS ?? 300);
 
 let mixedConversations = 0;
@@ -686,8 +706,8 @@ console.log(`1 会話あたり     ${Math.round(chars(train) / train.length)} �
 console.log(`名前ラベル       ${labelByIdx.size} 人 (${NAMED_MIN_MESSAGES} 件以上)`);
 console.log(`priming          ${fmt(primedConversations)} 会話 / ${fmt(primedLines)} 行`);
 const qaChars = qaExcerpts.reduce((sum, c) => sum + c.text.length, 0) * QA_COPIES;
-console.log(`聞かれて答えた箇所 ${fmt(qaExcerpts.length)} を ×${QA_COPIES} で切り出し `
-  + `(答えは ${QA_MIN_ANSWER} 字以上 / ${fmt(qaChars)} 字 = train の `
+console.log(`噛み合った箇所   ${fmt(qaExcerpts.length)} を ×${QA_COPIES} で切り出し `
+  + `(応答は ${QA_MIN_ANSWER} 字以上 / ${fmt(qaChars)} 字 = train の `
   + `${(qaChars / chars(train) * 100).toFixed(1)}%)`);
 console.log(`外から混ぜた     ${fmt(mixedConversations)} 会話 / ${fmt(mixedChars)} 字 `
   + `(train の ${(mixedChars / chars(train) * 100).toFixed(1)}% / 長すぎて捨てた発言 ${fmt(mixedDroppedTurns)})`);
