@@ -239,7 +239,7 @@ async function runAiProbes({ guild, constitution, law, caseRecord, mark }) {
     },
     constitution,
     activeLaws
-  }), { intent: 'rejected_by_schema', title: null, summary: null, voteScope: null, question: null });
+  }), { intent: 'rejected_by_schema', title: null, summary: null, question: null });
   results.legislativeIntake = legislative.value;
   results.legislativeIntakeRejectedBySchema = legislative.rejectedBySchema;
 

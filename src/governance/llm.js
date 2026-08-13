@@ -393,42 +393,36 @@ Do not create an offense unless the petition actually requires a punishable rule
 }
 
 export async function interpretLegislativeRequest({ guildId, request, constitution, activeLaws }) {
-  const policy = constitution.policy;
   return (await callGovernanceJson({
     guildId,
     purpose: 'intake.legislature',
     model: governanceConfig.drafterModel,
     instruction: `Classify and normalize one message addressed to the legislature.
-Return exactly intent, title, summary, voteScope, question.
+Return exactly intent, title, summary, question.
 intent is petition, amendment, information, or unclear.
 Use amendment only when the person explicitly asks to change the constitution or constitutional policy.
 Use petition for a proposed ordinary rule or recurring community problem.
 Use information for a question that does not request a new rule. Use unclear when required substance is missing.
-For petition or amendment, title and summary must be self-contained Japanese text, voteScope must be one of the supplied allowed scopes, and question must be null.
+For petition or amendment, title and summary must be self-contained Japanese text and question must be null.
 Do not invent a member, past incident, punishment, or operative rule that the request did not ask for.
-For information or unclear, set title, summary, and voteScope to null and write a short Japanese question or routing explanation in question.
+For information or unclear, set title and summary to null and write a short Japanese question or routing explanation in question.
 This output is only an intake preview and has no power to file or enact anything.`,
     data: {
       request,
       constitution: { version: constitution.version, content: constitution.content },
-      allowedVoteScopes: policy.voting.allowedScopes,
-      defaultVoteScope: policy.voting.defaultScope,
       activeLaws: activeLaws.map((law) => ({ id: law.id, code: law.code, title: law.title }))
     },
     validate: (raw) => {
       const value = assertObject(raw);
-      exactKeys(value, ['intent', 'title', 'summary', 'voteScope', 'question'], 'legislativeIntake');
+      exactKeys(value, ['intent', 'title', 'summary', 'question'], 'legislativeIntake');
       if (!['petition', 'amendment', 'information', 'unclear'].includes(value.intent)) {
         throw new Error('invalid legislative intake intent');
       }
       if (['petition', 'amendment'].includes(value.intent)) {
-        const voteScope = text(value.voteScope, 'voteScope', 20);
-        if (!policy.voting.allowedScopes.includes(voteScope)) throw new Error('invalid intake vote scope');
         return {
           intent: value.intent,
           title: text(value.title, 'title', 100),
           summary: text(value.summary, 'summary', 1800),
-          voteScope,
           question: null
         };
       }
@@ -436,7 +430,6 @@ This output is only an intake preview and has no power to file or enact anything
         intent: value.intent,
         title: null,
         summary: null,
-        voteScope: null,
         question: text(value.question, 'question', 500)
       };
     }

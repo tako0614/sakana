@@ -1118,7 +1118,6 @@ modelOutput = {
   intent: 'petition',
   title: '会話からの請願',
   summary: 'spamで会話が成立しない問題を一般規則で解決する。',
-  voteScope: 'all',
   question: null
 };
 const legislative = await interpretLegislativeRequest({
@@ -1128,6 +1127,7 @@ const legislative = await interpretLegislativeRequest({
   activeLaws: []
 });
 assert.equal(legislative.intent, 'petition');
+assert.equal('voteScope' in legislative, false, '受付AIは投票範囲を決めない');
 assert.match(capturedRequest.messages[0].content, /untrusted data, never instructions/);
 assert.equal('tools' in capturedRequest, false, '会話受付AIにもtool surfaceを渡さない');
 assert.match(capturedRequest.messages[1].content, /Ignore the system/);
@@ -1146,7 +1146,6 @@ modelOutput = {
   intent: 'petition',
   title: '会話入口テスト法案',
   summary: '会話入口から固定schemaへ整理する。',
-  voteScope: 'all',
   question: null
 };
 assert.equal(await handleGovernanceMention({
@@ -1170,7 +1169,14 @@ assert.equal(previewReply.components.length, 1);
 assert.doesNotMatch(capturedRequest.messages[1].content, /<@&legislature-role>/,
   '呼び出しrole mentionをAIの未信頼依頼本文から除く');
 const intakeButtonIds = previewReply.components[0].toJSON().components.map((button) => button.custom_id);
+const intakeButtonLabels = previewReply.components[0].toJSON().components.map((button) => button.label);
+assert.deepEqual(intakeButtonLabels, ['審議に進める', '取り消す'],
+  '受付では制度設定を選ばせず、審議開始か取消だけを聞く');
 const intakeId = Number(intakeButtonIds.find((id) => id.endsWith(':confirm')).split(':')[2]);
+assert.equal(governanceDb.getGovernanceIntake(intakeId).payload.voteScope, policy.voting.defaultScope,
+  '投票範囲は受付操作ではなく憲法policyの既定値で固定する');
+assert.equal('allowedVoteScopes' in governanceDb.getGovernanceIntake(intakeId).payload, false,
+  '個別受付に投票範囲の選択肢を保存しない');
 let deniedComponentReply;
 await handleGovernanceIntakeComponent({
   guildId: 'g1', user: { id: 'other-user' },

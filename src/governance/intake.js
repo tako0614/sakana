@@ -124,38 +124,17 @@ async function assertEvidenceVisibleTo(guild, evidence, userIds) {
   }
 }
 
-function intakeButtons(intake, disabled = false) {
-  const buttons = [];
-  if (intake.branch === 'legislature') {
-    const scopes = intake.payload.allowedVoteScopes ?? ['all'];
-    if (scopes.includes('all')) {
-      buttons.push(new ButtonBuilder()
-        .setCustomId(`gov:intake:${intake.id}:scope_all`)
-        .setLabel(`${intake.payload.voteScope === 'all' ? '✓ ' : ''}全員投票`)
-        .setStyle(intake.payload.voteScope === 'all' ? ButtonStyle.Primary : ButtonStyle.Secondary)
-        .setDisabled(disabled));
-    }
-    if (scopes.includes('trusted')) {
-      const electorate = intake.payload.electorateLabel ?? '特別有権者';
-      buttons.push(new ButtonBuilder()
-        .setCustomId(`gov:intake:${intake.id}:scope_trusted`)
-        .setLabel(`${intake.payload.voteScope === 'trusted' ? '✓ ' : ''}${electorate}のみ`)
-        .setStyle(intake.payload.voteScope === 'trusted' ? ButtonStyle.Primary : ButtonStyle.Secondary)
-        .setDisabled(disabled));
-    }
-  }
-  buttons.push(
+function intakeButtons(intake) {
+  const buttons = [
     new ButtonBuilder()
       .setCustomId(`gov:intake:${intake.id}:confirm`)
-      .setLabel('この内容で正式受付')
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(disabled),
+      .setLabel('審議に進める')
+      .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId(`gov:intake:${intake.id}:cancel`)
       .setLabel('取り消す')
       .setStyle(ButtonStyle.Danger)
-      .setDisabled(disabled)
-  );
+  ];
   return [new ActionRowBuilder().addComponents(buttons)];
 }
 
@@ -197,7 +176,7 @@ function renderIntake(intake, suffix = '') {
   } else if (intake.action === 'appeal') {
     lines.push('種別: 上訴', '対象: 指定した裁判', `上訴理由: ${payload.summary}`);
   }
-  lines.push('', suffix || '内容が正しければ「この内容で正式受付」を押してください。押すまでは正式案件になりません。');
+  lines.push('', suffix || '内容が正しければ「審議に進める」を押してください。押すまでは正式案件になりません。');
   return lines.filter((line) => line !== null).join('\n').slice(0, 2000);
 }
 
@@ -270,19 +249,17 @@ async function handleLegislature(message, governance, request) {
     await message.reply({ content: output.question, allowedMentions: NO_MENTIONS });
     return true;
   }
-  if (output.voteScope === 'trusted' && !governance.trusted_role_id) {
-    output.voteScope = 'all';
+  const voteScope = constitution.policy.voting.defaultScope;
+  if (voteScope === 'trusted' && !governance.trusted_role_id) {
+    throw new Error('既定の投票範囲に使う特別有権者ロールが設定されていません。');
   }
   return createPreview(message, 'legislature', output.intent, {
     title: output.title,
     summary: output.summary,
-    voteScope: output.voteScope,
+    voteScope,
     electorateLabel: governance.trusted_role_id
       ? (message.guild.roles?.cache?.get?.(governance.trusted_role_id)?.name ?? '特別有権者')
-      : '特別有権者',
-    allowedVoteScopes: constitution.policy.voting.allowedScopes.filter((scope) => (
-      scope !== 'trusted' || Boolean(governance.trusted_role_id)
-    ))
+      : '特別有権者'
   });
 }
 
@@ -508,16 +485,6 @@ export async function handleGovernanceIntakeComponent(interaction, intakeId, val
   }
   if (intake.status !== 'pending' || intake.expires_at <= Date.now()) {
     await interaction.reply({ content: 'この受付は確定済み、取消済み、または期限切れです。', flags: MessageFlags.Ephemeral });
-    return true;
-  }
-  if (value === 'scope_all' || value === 'scope_trusted') {
-    const scope = value === 'scope_trusted' ? 'trusted' : 'all';
-    if (intake.branch !== 'legislature' || !intake.payload.allowedVoteScopes?.includes(scope)) {
-      await interaction.reply({ content: 'この投票scopeは選べません。', flags: MessageFlags.Ephemeral });
-      return true;
-    }
-    const updated = updateGovernanceIntake(intake.id, { payload: { ...intake.payload, voteScope: scope } });
-    await interaction.update({ content: renderIntake(updated), components: intakeButtons(updated), allowedMentions: { parse: [] } });
     return true;
   }
   if (value === 'cancel') {
