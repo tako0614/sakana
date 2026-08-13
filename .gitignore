@@ -18,5 +18,18 @@ dist/
 # evex-1 の tokenizer 一式 (チェックポイントと対なので凍結)
 corpus-v1/
 
-# 学習データ。実 ID と発言本文が入るのでコミットしない (corpus/ と同じ扱い)
+# 学習データ。実 ID と発言本文が入るのでコミットしない (corpus/ と同じ扱い)。
+# **世代付きも塞ぐ** — sft-v3/ sft-v4/ corpus-v3/ が漏れていて、追跡されない前提で
+# 実発言と Discord の user ID を置いていた
 sft/
+sft-v*/
+corpus-v*/
+
+# 追加学習に混ぜる公開データ (llm-jp/oasst1-21k-ja など)。HF から落とせるので持たない
+mix/
+
+# 推論サーバーに置く重みと対応表 (mimic-ft / ft1 は 2.3GB)
+mimic/
+mimic-ft/
+ft1/
+ft2/

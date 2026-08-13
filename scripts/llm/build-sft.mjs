@@ -434,6 +434,139 @@ for (const conv of train) {
   primedLines += head.length;
 }
 
+// --- 聞かれたら答える形を足す ---
+//
+// evex-ft-1 は口調は移ったが**話を受けて返さない** (`git rebase と merge の違い` →
+// `まじ？`)。原因はコーパスの分布で、発言 598,908 のうち 45.3% が10字以下・
+// 76.6% が20字以下、疑問符に別人が20字以上で答えた組は 6,418 = 全体の 1.1% しかない。
+// 「聞かれたら答える」信号がほぼ無いので、確率がフィラーに寄る。
+//
+// 実測では能力が消えたわけではない (別の日本語での perplexity は base の 1.12倍)。
+// **その形を選ぶ確率**が低いだけなので、信号を増やす。2つやる。
+
+const QA_COPIES = Number(process.env.LLM_QA_COPIES ?? 2);
+const QA_MIN_ANSWER = Number(process.env.LLM_QA_MIN_ANSWER ?? 20);
+const QA_CONTEXT = Number(process.env.LLM_QA_CONTEXT ?? 2);
+
+// 継続行 (ラベルの無い行) は前の発言の一部なので飛ばす
+const LABELLED = /^([^\n:]{1,12}): ([\s\S]*)$/;
+
+/**
+ * 疑問符で終わる発言に**別人が**それなりの長さで答えている箇所を、
+ * 前後だけ切り出して返す。
+ *
+ * **会話ごと複製してはいけない。** 最初はそうしたが、この条件に当たる会話は
+ * 平均 1,505 字 (全体平均 1,008 字) で長く、×3 にしたら QA 分が全体の 64% を占めた
+ * (16.4M → 30.4M 字)。学習時間が倍になるうえ、その会話ごと暗記する。
+ *
+ * 欲しいのは「聞かれたら答える」という並びだけなので、質問の直前数行から
+ * 答えまでを短い会話として切り出す。4 行前後 = 250 字程度で済む。
+ */
+function questionExcerpts(conv) {
+  const found = [];
+  const rows = [];
+  for (const line of conv.lines) {
+    const m = line.match(LABELLED);
+    if (m) rows.push({ label: m[1], body: m[2].trim(), line });
+  }
+
+  for (let i = 1; i < rows.length; i += 1) {
+    const q = rows[i - 1];
+    const a = rows[i];
+    if (q.label === a.label) continue;
+    if (!/[?？][\s　]*$/.test(q.body)) continue;
+    if (a.body.length < QA_MIN_ANSWER) continue;
+
+    const from = Math.max(0, i - 1 - QA_CONTEXT);
+    const lines = rows.slice(from, i + 1).map((r) => r.line);
+    found.push({
+      at: conv.at, from: conv.from, channel: conv.channel,
+      roles: conv.roles, counts: conv.counts, lines, primed: 0,
+      text: `${conv.channel}\n${lines.join('\n')}`
+    });
+  }
+  return found;
+}
+
+const qaExcerpts = train.flatMap(questionExcerpts);
+
+// **同じ切り出しを隣に並べない。** Packed は会話を EOS で継いで 1024 に切るので、
+// 隣接させると1つの窓に同じ本文が2回入って「写せば当たる」形になる。
+// 1周ぶんずつ後ろに足せば、同じものの複製は必ず数千会話ぶん離れる
+for (let round = 0; round < Math.max(0, QA_COPIES); round += 1) {
+  for (const excerpt of qaExcerpts) train.push(excerpt);
+}
+
+// --- 説明する口調を外から借りる ---
+//
+// 上の複製だけでは足りない (元が 1.1% なので ×3 でも 3% 台)。公開の日本語対話を
+// 少量混ぜて、「長く答える」形そのものを残す。
+//
+// llm-jp/oasst1-21k-ja (Apache-2.0 / 人が書いた多ターン / 中位4往復) を使う。
+// dolly-ja は CC-BY-SA-3.0、alpaca 系は OpenAI 由来なのでどちらも採らない。
+//
+//   hf download llm-jp/oasst1-21k-ja oasst1-21k-ja.jsonl --repo-type dataset --local-dir mix
+//   LLM_MIX_FILE=mix/oasst1-21k-ja.jsonl node scripts/llm/build-sft.mjs corpus-v3 sft-v5
+//
+// **名前ラベルには絶対に付けない。** 付けると実在の人の口調に「ご質問がありましたら」
+// が混ざる。匿名の役だけに割り、役は会話ごとに振り直す — `B` に固定すると
+// 「説明するのは B」を学んで、bot が別の役になった推論時に出てこない。
+const MIX_FILE = process.env.LLM_MIX_FILE ?? null;
+const MIX_RATE = Number(process.env.LLM_MIX_RATE ?? 0.03);
+const MIX_MAX_CHARS = Number(process.env.LLM_MIX_MAX_CHARS ?? 300);
+
+let mixedConversations = 0;
+let mixedChars = 0;
+let mixedDroppedTurns = 0;
+
+if (MIX_FILE && MIX_RATE > 0) {
+  const rows = (await readFile(MIX_FILE, 'utf8'))
+    .split('\n')
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line));
+
+  const trainChars = train.reduce((sum, c) => sum + c.text.length, 0);
+  const budget = Math.round(trainChars * MIX_RATE / (1 - MIX_RATE));
+
+  // 決定的に混ぜる。priming と同じ種から引いて、作り直しても同じものが入るようにする
+  const order = rows.map((row, i) => ({ row, key: rand() * (i + 1) }))
+    .sort((a, b) => a.key - b.key)
+    .map((x) => x.row);
+
+  for (const row of order) {
+    if (mixedChars >= budget) break;
+
+    const turns = row.conversations ?? row.messages ?? [];
+    if (!Array.isArray(turns) || turns.length < 2) continue;
+
+    // 役は2つだけ引く。会話ごとに振り直して、説明する側が特定の役に固定されないようにする
+    const pool = SCHEME.roles;
+    const first = Math.floor(rand() * pool.length);
+    const second = (first + 1 + Math.floor(rand() * (pool.length - 1))) % pool.length;
+    const roleOfTurn = (from) => (from === 'gpt' || from === 'assistant' ? pool[second] : pool[first]);
+
+    const lines = [];
+    let dropped = false;
+    for (const turn of turns) {
+      const body = String(turn.value ?? turn.content ?? '').replace(/\s*\n\s*/g, ' ').trim();
+      if (!body) continue;
+      // 長大な答えは捨てる。76% が20字以下のコーパスに壁のような返答を入れると、
+      // そういう返答を学んでしまう
+      if (body.length > MIX_MAX_CHARS) { dropped = true; mixedDroppedTurns += 1; continue; }
+      lines.push(`${roleOfTurn(turn.from ?? turn.role)}: ${body}`);
+    }
+
+    // 途中を捨てると噛み合わなくなるので、1つでも落ちた会話は丸ごと使わない
+    if (dropped || lines.length < 2) continue;
+
+    // #other 固定。実在チャンネルの話題分布を汚さない
+    const text = `#other\n${lines.join('\n')}`;
+    train.push({ at: 0, from: 0, channel: '#other', roles: new Map(), counts: new Map(), lines, primed: 0, text });
+    mixedConversations += 1;
+    mixedChars += text.length;
+  }
+}
+
 await mkdir(dst, { recursive: true });
 
 // primed は「先頭から何行が条件か」。finetune.py がこの行数ぶんの本文を損失から外す。
@@ -479,7 +612,17 @@ await writeFile(
     primed_conversations: primedConversations,
     primed_lines: primedLines,
     prime_rate: PRIME_RATE,
-    prime_turns: PRIME_TURNS
+    prime_turns: PRIME_TURNS,
+    qa_excerpts: qaExcerpts.length,
+    qa_copies: QA_COPIES,
+    qa_context: QA_CONTEXT,
+    qa_min_answer: QA_MIN_ANSWER,
+    qa_chars: qaExcerpts.reduce((sum, c) => sum + c.text.length, 0) * QA_COPIES,
+    mixed_conversations: mixedConversations,
+    mixed_chars: mixedChars,
+    mixed_dropped_turns: mixedDroppedTurns,
+    mix_rate: MIX_RATE,
+    mix_file: MIX_FILE
   }, null, 2)}\n`
 );
 
@@ -489,6 +632,11 @@ console.log(`会話             ${fmt(conversations.length)}  train ${fmt(train.
 console.log(`文字数           train ${fmt(chars(train))} / val ${fmt(chars(val))}`);
 console.log(`1 会話あたり     ${Math.round(chars(train) / train.length)} 字`);
 console.log(`名前ラベル       ${labelByIdx.size} 人 (${NAMED_MIN_MESSAGES} 件以上)`);
-console.log(`priming          ${fmt(primedConversations)} 会話 / ${fmt(primedLines)} 行 `
-  + `(train の ${(primedConversations / train.length * 100).toFixed(0)}%)`);
+console.log(`priming          ${fmt(primedConversations)} 会話 / ${fmt(primedLines)} 行`);
+const qaChars = qaExcerpts.reduce((sum, c) => sum + c.text.length, 0) * QA_COPIES;
+console.log(`聞かれて答えた箇所 ${fmt(qaExcerpts.length)} を ×${QA_COPIES} で切り出し `
+  + `(答えは ${QA_MIN_ANSWER} 字以上 / ${fmt(qaChars)} 字 = train の `
+  + `${(qaChars / chars(train) * 100).toFixed(1)}%)`);
+console.log(`外から混ぜた     ${fmt(mixedConversations)} 会話 / ${fmt(mixedChars)} 字 `
+  + `(train の ${(mixedChars / chars(train) * 100).toFixed(1)}% / 長すぎて捨てた発言 ${fmt(mixedDroppedTurns)})`);
 console.log(`\n--- 先頭の会話 ---\n${train[0]?.text.slice(0, 400)}`);
