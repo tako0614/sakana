@@ -318,6 +318,21 @@ function validateAmendment(raw) {
   };
 }
 
+function migrateLegacyConstitutionToEmbeddedRules(request, constitution, rules) {
+  const base = String(constitution.content ?? '').trimEnd();
+  const content = `${base}\n\n## 付則（統治実行規則）\n\n次の \`governance-rules\` ブロックは、この憲法と一体をなす国家権力の手続規範である。変更には憲法改正手続を要する。\n\n\`\`\`governance-rules\n${JSON.stringify(rules, null, 2)}\n\`\`\`\n`;
+  const amendment = validateAmendment({
+    title: request?.title ?? '憲法実行規則の互換移行',
+    summary: request?.summary ?? '現行制度の内容を変えず、統治実行規則を憲法本文へ移す。',
+    content,
+    policy: null
+  });
+  if (canonicalJson(amendment.policy) !== canonicalJson(constitution.policy)) {
+    throw new Error('互換移行後の実行規則が現行制度と一致しません。');
+  }
+  return amendment;
+}
+
 function validateProposalDeliberation(raw, proposal, policy) {
   const value = assertObject(raw, 'deliberation');
   exactKeys(value, [
@@ -839,7 +854,16 @@ This output is only an intake preview and has no power to file, decide, or punis
 export async function draftAmendment({ guildId, request, constitution }) {
   const requestedText = typeof request === 'string' ? request : JSON.stringify(request);
   const migrationRequested = /(実行可能憲法|実行規則|governance-rules|憲法主導|rulesブロック)/i.test(requestedText);
-  const currentRules = constitution.rules ?? extractGovernanceRules(constitution.content);
+  const embeddedRules = extractGovernanceRules(constitution.content);
+  const currentRules = constitution.rules
+    ?? embeddedRules
+    ?? compileConstitution({ content: constitution.content, policy: constitution.policy }).rules;
+  if (migrationRequested && !embeddedRules) {
+    // A format-only migration has no political drafting discretion. Materialize
+    // the already compiled rules directly so an LLM cannot accidentally change
+    // a threshold, deadline, sanction, right, or workflow while copying them.
+    return migrateLegacyConstitutionToEmbeddedRules(request, constitution, currentRules);
+  }
   const executable = constitution.source_format === 'embedded-rules-v1'
     || Boolean(currentRules)
     || migrationRequested;

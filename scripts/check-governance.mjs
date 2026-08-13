@@ -1192,6 +1192,25 @@ assert.equal(polished.body.summary, '読みやすく整理した狭い一般規�
 assert.deepEqual(polished.body.provisions, safeBill.provisions,
   '執行定義を変えない表現整理は再討議なしで最終案へ進める');
 
+const requestBeforeMigration = capturedRequest;
+modelOutput = { title: '呼ばれてはいけない', summary: 'LLMを使わない', content: 'invalid', policy: null };
+const migratedConstitution = await draftAmendment({
+  guildId: 'g2',
+  request: {
+    title: '憲法実行規則の互換移行',
+    summary: '現行の政治的内容を変えずgovernance-rulesブロックへ移す。'
+  },
+  constitution: { version: 1, content: constitutionalProse, policy, source_format: 'legacy-policy' }
+});
+assert.equal(capturedRequest, requestBeforeMigration,
+  '内容不変の実行規則移行ではAIに全文転記させない');
+assert.equal(migratedConstitution.sourceFormat, 'embedded-rules-v1');
+assert.deepEqual(migratedConstitution.policy, policy,
+  '互換移行後の全しきい値・期間・制裁・投票条件は現行policyと一致する');
+assert.equal((migratedConstitution.content.match(/```governance-rules/g) ?? []).length, 1);
+assert.ok(migratedConstitution.content.startsWith(constitutionalProse),
+  '既存の憲法本文を一字も書き換えず実行規則だけを末尾へ追加する');
+
 let amendmentSchemaCalls = 0;
 modelOutput = () => {
   amendmentSchemaCalls += 1;
