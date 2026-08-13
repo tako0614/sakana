@@ -1145,12 +1145,40 @@ async function syncRecordThread(thread, { name, content, components, state }) {
   if (wasArchived) await thread.setArchived(true, '公開表示の同期完了');
 }
 
-function withoutLegacyPublicIds(content) {
-  return String(content ?? '')
+export function withoutLegacyPublicIds(content) {
+  return maskDiscordUrls(String(content ?? '')
+    .replace(/<@!?([^>]+)>/g, (mention, userId) => /^\d{17,20}$/.test(userId) ? mention : '表示対象のアカウント')
+    .replace(/\[E2E:[^\]]+\]/g, '【動作確認】')
+    .replace(/制裁\s*#\d+/g, '制裁')
     .replace(/^\s*(?:参照番号|法律ID|ロールID):[^\n]*\n?/gim, '')
     .replace(/(^#{1,6}\s+[^\n]*?)\s+(?:L|C|A)-\d+\s*$/gim, '$1')
     .replace(/\n{3,}/g, '\n\n')
-    .trim();
+    .trim());
+}
+
+async function sanitizedGazetteAttachments(message) {
+  const retained = [];
+  const files = [];
+  let changed = false;
+  for (const attachment of message.attachments.values()) {
+    if (!/\.(?:md|txt|json)$/i.test(attachment.name ?? '') || attachment.size > 1_000_000) {
+      retained.push({ id: attachment.id });
+      continue;
+    }
+    const original = await fetch(attachment.url).then((response) => response.ok ? response.text() : null).catch(() => null);
+    if (original === null) {
+      retained.push({ id: attachment.id });
+      continue;
+    }
+    const sanitized = withoutLegacyPublicIds(original);
+    if (sanitized === original) {
+      retained.push({ id: attachment.id });
+      continue;
+    }
+    changed = true;
+    files.push({ attachment: Buffer.from(sanitized), name: attachment.name });
+  }
+  return { changed, retained, files };
 }
 
 export async function syncGovernanceRecordUi(guild, governance) {
@@ -1197,8 +1225,15 @@ export async function syncGovernanceRecordUi(guild, governance) {
       for (const message of batch.values()) {
         if (message.author.id !== guild.client.user.id) continue;
         const content = withoutLegacyPublicIds(message.content);
-        if (content !== message.content) {
-          await message.edit({ content });
+        const attachmentUpdate = await sanitizedGazetteAttachments(message);
+        if (content !== message.content || attachmentUpdate.changed) {
+          await message.edit({
+            content,
+            ...(attachmentUpdate.changed ? {
+              attachments: attachmentUpdate.retained,
+              files: attachmentUpdate.files
+            } : {})
+          });
           changed += 1;
         }
       }

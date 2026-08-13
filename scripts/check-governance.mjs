@@ -2024,7 +2024,8 @@ const {
   statuteForumEveryonePermissionState,
   statutePublicationState,
   publicMemberLabel,
-  maskDiscordUrls
+  maskDiscordUrls,
+  withoutLegacyPublicIds
 } = await import('../src/governance/discord.js');
 assert.equal(GOVERNANCE_GUIDE_NAME, '案内');
 assert.equal(GOVERNANCE_PROCEDURE_NAME, '進行中');
@@ -2040,6 +2041,11 @@ assert.equal(
   maskDiscordUrls('[法令集](https://discord.com/channels/123456789012345678/223456789012345678)'),
   '[法令集](https://discord.com/channels/123456789012345678/223456789012345678)',
   'すでに名前付きのリンクを二重変換しない'
+);
+assert.equal(
+  withoutLegacyPublicIds('対象: <@e2e-accused-run-1>\n制裁 #42\n[E2E:run-1] 動作確認'),
+  '対象: 表示対象のアカウント\n制裁\n【動作確認】 動作確認',
+  '既存の公開記録に残ったfixture IDと内部制裁番号も移行する'
 );
 const { publicPanelOutputs } = await import('../src/governance/service.js');
 const publicDecision = publicPanelOutputs([{

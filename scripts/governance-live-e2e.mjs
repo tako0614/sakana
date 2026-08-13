@@ -899,7 +899,10 @@ async function cleanup(guild, runId) {
       if (batch.size === 0) break;
       for (const message of batch.values()) {
         if (message.author.id !== guild.client.user.id
-          || (message.id !== seededAudit?.detail?.gazetteMessageId && !message.content.includes(mark))) continue;
+          || (message.id !== seededAudit?.detail?.gazetteMessageId
+            && !message.content.includes(mark)
+            && !message.content.includes('表示対象のアカウント')
+            && !message.content.includes('<@e2e-'))) continue;
         await message.delete();
         cleaned.gazetteMessages.push(message.id);
       }
