@@ -15,6 +15,7 @@ import {
   getGovernanceGuild,
   getGovernanceIntake,
   getLaw,
+  listPendingGovernanceIntakes,
   listCases,
   listLaws,
   updateGovernanceIntake
@@ -208,6 +209,42 @@ export async function updateRetriedIntakeMessage(guild, resultType, result) {
   });
   updateGovernanceIntake(intake.id, { last_error: null });
   return true;
+}
+
+export async function syncPendingIntakeMessages(guild) {
+  const governance = getGovernanceGuild(guild.id);
+  const constitution = getActiveConstitution(guild.id);
+  if (!governance || !constitution) return 0;
+  let updatedCount = 0;
+  for (const intake of listPendingGovernanceIntakes(guild.id)) {
+    if (!intake.response_message_id) continue;
+    let current = intake;
+    if (intake.branch === 'legislature') {
+      const payload = { ...intake.payload };
+      delete payload.allowedVoteScopes;
+      const voteScope = constitution.policy.voting.defaultScope;
+      current = updateGovernanceIntake(intake.id, {
+        payload: {
+          ...payload,
+          voteScope,
+          electorateLabel: governance.trusted_role_id
+            ? (guild.roles?.cache?.get?.(governance.trusted_role_id)?.name ?? '特別有権者')
+            : '特別有権者'
+        }
+      });
+    }
+    const channel = await guild.channels.fetch(current.channel_id).catch(() => null);
+    if (!channel?.isTextBased?.()) continue;
+    const message = await channel.messages.fetch(current.response_message_id).catch(() => null);
+    if (!message) continue;
+    await message.edit({
+      content: renderIntake(current),
+      components: intakeButtons(current),
+      allowedMentions: NO_MENTIONS
+    });
+    updatedCount += 1;
+  }
+  return updatedCount;
 }
 
 async function createPreview(message, branch, action, payload) {

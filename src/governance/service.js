@@ -1850,6 +1850,7 @@ let schedulerRunning = false;
 let lastPruneAt = 0;
 const verifiedStatuteGuilds = new Set();
 const verifiedRecordUiGuilds = new Set();
+const verifiedIntakeUiGuilds = new Set();
 
 function finalizeElapsedSummarySanctions(guildId, now) {
   for (const caseRecord of listCases(guildId, { statuses: ['summary_active'], limit: 100 })) {
@@ -1935,6 +1936,11 @@ export async function runGovernanceScheduler(client) {
         if (!verifiedRecordUiGuilds.has(guild.id)) {
           await syncGovernanceRecordUi(guild, currentGovernance);
           verifiedRecordUiGuilds.add(guild.id);
+        }
+        if (!verifiedIntakeUiGuilds.has(guild.id)) {
+          const { syncPendingIntakeMessages } = await import('./intake.js');
+          await syncPendingIntakeMessages(guild);
+          verifiedIntakeUiGuilds.add(guild.id);
         }
       } catch (error) {
         console.error(`Failed to sync governance UX in ${guild.id}:`, error);

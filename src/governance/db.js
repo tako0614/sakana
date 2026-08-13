@@ -874,6 +874,14 @@ export function findGovernanceIntakeByResult(guildId, resultType, resultId) {
   `).get(String(guildId), String(resultType), String(resultId)));
 }
 
+export function listPendingGovernanceIntakes(guildId, now = Date.now()) {
+  return db.prepare(`
+    SELECT * FROM governance_intakes
+    WHERE guild_id = ? AND status = 'pending' AND expires_at > ?
+    ORDER BY id
+  `).all(String(guildId), Number(now)).map(hydrateIntake);
+}
+
 export function updateGovernanceIntake(id, patch) {
   const allowed = new Set([
     'response_message_id', 'payload_json', 'status', 'expires_at', 'result_type',

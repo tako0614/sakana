@@ -172,6 +172,7 @@ const {
   governanceMentionBranch,
   handleGovernanceIntakeComponent,
   handleGovernanceMention,
+  syncPendingIntakeMessages,
   updateRetriedIntakeMessage
 } = await import('../src/governance/intake.js');
 const mentionMessage = (ids) => ({
@@ -187,13 +188,35 @@ assert.equal(governanceMentionBranch(mentionMessage([])), null);
 let intake = governanceDb.createGovernanceIntake({
   guildId: 'g1', branch: 'legislature', action: 'petition', requesterId: 'u1',
   channelId: 'public', sourceMessageId: 'intake-source-1',
-  payload: { title: '自然文請願', voteScope: 'all' }, expiresAt: Date.now() + 60_000
+  payload: { title: '自然文請願', voteScope: 'trusted', allowedVoteScopes: ['all', 'trusted'] },
+  expiresAt: Date.now() + 60_000
 });
 assert.equal(intake.payload.title, '自然文請願');
+intake = governanceDb.updateGovernanceIntake(intake.id, { response_message_id: 'intake-preview-legacy' });
+let migratedIntakeEdit = null;
+assert.equal(await syncPendingIntakeMessages({
+  id: 'g1',
+  roles: { cache: { get: () => ({ name: '特別有権者' }) } },
+  channels: {
+    fetch: async () => ({
+      isTextBased: () => true,
+      messages: { fetch: async () => ({ edit: async (payload) => { migratedIntakeEdit = payload; } }) }
+    })
+  }
+}), 1);
+intake = governanceDb.getGovernanceIntake(intake.id);
+assert.equal(intake.payload.voteScope, policy.voting.defaultScope,
+  '既存の受付も現行policyの投票範囲へ移行する');
+assert.equal('allowedVoteScopes' in intake.payload, false,
+  '既存受付から個別scope選択肢を除く');
+assert.deepEqual(
+  migratedIntakeEdit.components[0].toJSON().components.map((button) => button.label),
+  ['審議に進める', '取り消す'],
+  '既存受付も2択UIへ更新する'
+);
 intake = governanceDb.updateGovernanceIntake(intake.id, {
-  payload: { ...intake.payload, voteScope: 'trusted' }
+  payload: { ...intake.payload, voteScope: policy.voting.defaultScope }
 });
-assert.equal(intake.payload.voteScope, 'trusted');
 assert.equal(governanceDb.claimGovernanceIntake(intake.id, 'other-user'), null, '発議者以外は受付を確定できない');
 assert.equal(governanceDb.claimGovernanceIntake(intake.id, 'u1').status, 'processing');
 assert.equal(governanceDb.claimGovernanceIntake(intake.id, 'u1'), null, '確認ボタンの二重実行を拒否する');
