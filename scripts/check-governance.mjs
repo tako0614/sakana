@@ -2608,6 +2608,8 @@ assert.match(liveE2eSource, /entry\.source === sourceKey/,
   '公開題名ではなく非公開のsource keyからE2E案件を片付ける');
 assert.match(liveE2eSource, /force: true/, '特別有権者ロールはDiscord APIから強制readbackする');
 assert.match(liveE2eSource, /setTrustedMember/, 'owner専用の正規経路で特別有権者を操作する');
+assert.match(liveE2eSource, /onTrustedRoleChange\(oldMember, refreshed\)/,
+  'bot本体を止めたE2Eでもtrusted変更の監査handlerを実測する');
 assert.match(liveE2eSource, /--provision-trusted-role/, '未設定の特別有権者roleは明示フラグなしに作らない');
 assert.match(liveE2eSource, /permissions: \[\]/, 'E2Eで作る特別有権者roleにDiscord権限を付けない');
 assert.match(liveE2eSource, /unauthorizedChangeReverted: true/, '正規経路外の特別有権者変更を差し戻す');

@@ -189,14 +189,18 @@ async function publishCase(guild, governance, caseRecord, state, text, component
 }
 
 async function setTrustedAndAudit(guild, member, desired) {
+  const roleId = getGovernanceGuild(guild.id).trusted_role_id;
+  const before = member.roles.cache.has(roleId);
+  const oldMember = memberRoleSnapshot(member, roleId, before);
   const changed = await setTrustedMember(guild, guild.ownerId, member, desired);
   const refreshed = await fetchMemberRoleState(
     guild,
     member.id,
-    getGovernanceGuild(guild.id).trusted_role_id,
+    roleId,
     desired
   );
   if (changed) {
+    await onTrustedRoleChange(oldMember, refreshed);
     await waitForTrustedAudit(
       guild.id,
       member.id,
@@ -204,6 +208,17 @@ async function setTrustedAndAudit(guild, member, desired) {
     );
   }
   return refreshed;
+}
+
+function memberRoleSnapshot(member, roleId, trusted) {
+  return {
+    id: member.id,
+    guild: member.guild,
+    user: member.user,
+    roles: {
+      cache: { has: (id) => id === roleId ? trusted : member.roles.cache.has(id) }
+    }
+  };
 }
 
 async function fetchMemberRoleState(guild, userId, roleId, expected) {
@@ -423,7 +438,12 @@ async function seed(guild, actorId, runId) {
     if (initialTrusted) currentOwner = await setTrustedAndAudit(guild, currentOwner, false);
     currentOwner = await setTrustedAndAudit(guild, currentOwner, true);
     assert.equal(currentOwner.roles.cache.has(governance.trusted_role_id), true);
+    const beforeUnauthorized = memberRoleSnapshot(currentOwner, governance.trusted_role_id, true);
     await currentOwner.roles.remove(governance.trusted_role_id, 'E2E unauthorized trusted role change probe');
+    const unauthorizedState = await fetchMemberRoleState(
+      guild, currentOwner.id, governance.trusted_role_id, false
+    );
+    await onTrustedRoleChange(beforeUnauthorized, unauthorizedState);
     currentOwner = await fetchMemberRoleState(guild, currentOwner.id, governance.trusted_role_id, true);
     await waitForTrustedAudit(guild.id, currentOwner.id, 'trusted.unauthorized_change_reverted');
     assert.equal(currentOwner.roles.cache.has(governance.trusted_role_id), true, '正規経路外の特別有権者変更が差し戻されませんでした。');
@@ -1044,6 +1064,7 @@ const [{
   appealCase,
   approveCase,
   castAndPublishVote,
+  onTrustedRoleChange,
   processGovernanceOutbox,
   reserveGovernanceAgentAttempt,
   setTrustedMember
