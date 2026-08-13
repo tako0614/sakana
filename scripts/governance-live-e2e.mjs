@@ -310,7 +310,7 @@ async function runAiProbes({ guild, constitution, law, caseRecord, mark }) {
       errors: judicialErrors
     };
   } else {
-    results.judicial.rejectedBySchema = false;
+    results.judicial.rejectedBySchema = results.judicial.failedSeats > 0;
     results.judicial.retryErrors = judicialErrors;
   }
   const amendment = await probe('amendment', () => draftAmendment({
@@ -344,11 +344,17 @@ async function runAiProbes({ guild, constitution, law, caseRecord, mark }) {
       || (results.constitutionalRejectedBySchema && results.failures.constitutional.length === 2),
     '違憲審査は3席成功するか、2回ともschemaでfail closedしなければなりません。'
   );
-  assert.ok(
-    results.judicial.outputs.length === constitution.policy.judiciary.panelSeats
-      || (results.judicial.rejectedBySchema && results.judicial.errors.length === 2),
-    '司法パネルは3席成功するか、2回ともschemaでfail closedしなければなりません。'
+  const judicialSeats = constitution.policy.judiciary.panelSeats;
+  assert.equal(
+    results.judicial.outputs.length + (results.judicial.failedSeats ?? 0),
+    judicialSeats,
+    '司法パネルは成功席とschema拒否席を合わせて全席を完了しなければなりません。'
   );
+  if ((results.judicial.failedSeats ?? 0) > 0
+    && results.judicial.outputs.length < constitution.policy.judiciary.guiltyVotesRequired) {
+    assert.equal(results.judicial.verdict, 'not_responsible', '有効票が可決数未満なら無処分へfail closedしなければなりません。');
+    assert.equal(results.judicial.sanction, null, 'fail closed時に処分を生成してはいけません。');
+  }
   assert.equal(results.amendment.policy.schemaVersion, constitution.policy.schemaVersion);
   return results;
 }
