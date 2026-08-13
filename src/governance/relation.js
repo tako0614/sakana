@@ -2,10 +2,14 @@ import { normalizeActivityContent } from './policy.js';
 
 const TERMINAL_PROPOSAL_STATUSES = new Set(['enacted', 'rejected', 'remanded']);
 
-function activeProposal(proposal) {
+export function openProposal(proposal) {
   return proposal.workflow_handler
     ? proposal.workflow_handler !== 'terminal'
     : !TERMINAL_PROPOSAL_STATUSES.has(proposal.status);
+}
+
+export function activeProposal(proposal) {
+  return openProposal(proposal) && proposal.workflow_status !== 'queued';
 }
 
 function tokens(value) {
@@ -33,7 +37,7 @@ function proposalCandidate(proposal) {
     kind: proposal.kind,
     title: proposal.title,
     summary: proposal.summary,
-    status: proposal.status,
+    status: proposal.workflow_status === 'queued' ? 'queued' : proposal.status,
     threadId: proposal.forum_thread_id ?? null,
     operativeContent: proposal.kind === 'amendment'
       ? String(proposal.body?.content ?? '').slice(0, 12_000)
@@ -60,15 +64,25 @@ function lawCandidate(law) {
 export function buildLegislativeCandidates({ request, normalized, proposals, laws, constitution }) {
   const query = `${request}\n${normalized?.title ?? ''}\n${normalized?.summary ?? ''}`;
   const activeProposals = proposals
-    .filter(activeProposal)
-    .map((proposal) => ({ candidate: proposalCandidate(proposal), score: score(query, `${proposal.title}\n${proposal.summary}`) }));
+    .filter(openProposal)
+    .map((proposal) => {
+      const candidate = proposalCandidate(proposal);
+      return { candidate, score: score(query, `${candidate.title}\n${candidate.summary}\n${candidate.operativeContent}`) };
+    });
   const activeLaws = laws
     .filter((law) => law.status === 'active')
-    .map((law) => ({ candidate: lawCandidate(law), score: score(query, `${law.title}\n${law.text}`) }));
-  const selected = [...activeProposals, ...activeLaws]
+    .map((law) => {
+      const candidate = lawCandidate(law);
+      return { candidate, score: score(query, `${candidate.title}\n${candidate.summary}\n${candidate.operativeContent}`) };
+    });
+  // One category must not crowd the other out. Active discussions and enacted
+  // laws are different routing authorities, so retain the strongest six from
+  // each before the relation panel decides.
+  const best = (entries) => entries
     .sort((a, b) => b.score - a.score)
-    .slice(0, 12)
+    .slice(0, 6)
     .map((entry) => entry.candidate);
+  const selected = [...best(activeProposals), ...best(activeLaws)];
   if (normalized?.intent === 'amendment') {
     selected.push({
       type: 'constitution',
@@ -86,6 +100,38 @@ export function buildLegislativeCandidates({ request, normalized, proposals, law
 
 export function exactActiveProposalMatch(title, proposals) {
   const normalized = normalizeActivityContent(title);
-  return proposals.find((proposal) => activeProposal(proposal)
+  return proposals.find((proposal) => openProposal(proposal)
     && normalizeActivityContent(proposal.title) === normalized) ?? null;
+}
+
+export function activeConstitutionalAmendments(proposals, constitutionId = null, { excludeId = null } = {}) {
+  return proposals
+    .filter((proposal) => proposal.kind === 'amendment'
+      && activeProposal(proposal)
+      && Number(proposal.id) !== Number(excludeId)
+      && (constitutionId === null
+        || Number(proposal.target_id ?? proposal.constitution_id) === Number(constitutionId)))
+    .sort((left, right) => Number(left.id) - Number(right.id));
+}
+
+export function activeConstitutionalAmendment(proposals, constitutionId = null, options = {}) {
+  return activeConstitutionalAmendments(proposals, constitutionId, options)[0] ?? null;
+}
+
+function lawRootId(law) {
+  return String(law?.root_law_id ?? law?.id ?? '');
+}
+
+export function activeLawAmendment(proposals, laws, lawId, { excludeId = null } = {}) {
+  const byId = new Map(laws.map((law) => [String(law.id), law]));
+  const target = byId.get(String(lawId));
+  if (!target) return null;
+  const targetRoot = lawRootId(target);
+  return proposals
+    .filter((proposal) => proposal.kind === 'law'
+      && proposal.target_type === 'law'
+      && activeProposal(proposal)
+      && Number(proposal.id) !== Number(excludeId)
+      && lawRootId(byId.get(String(proposal.target_id))) === targetRoot)
+    .sort((left, right) => Number(left.id) - Number(right.id))[0] ?? null;
 }

@@ -434,6 +434,52 @@ assert.equal(relationCandidates.some((candidate) => candidate.type === 'law' && 
   '成立法を類似案件・改正判定の候補へ含める');
 assert.equal(relationModule.exactActiveProposalMatch('test', [proposal]).id, proposal.id,
   '同題名の進行中案件はAIを待たず既存討議へ集約できる');
+const activeAmendmentFixture = {
+  id: 901, kind: 'amendment', title: '進行中の改憲', status: 'discussion',
+  constitution_id: activeConstitution.id, target_id: String(activeConstitution.id),
+  workflow_handler: 'public_discussion'
+};
+assert.equal(
+  relationModule.activeConstitutionalAmendment([
+    { ...activeAmendmentFixture, id: 902, workflow_handler: 'terminal' },
+    activeAmendmentFixture
+  ], activeConstitution.id).id,
+  activeAmendmentFixture.id,
+  '同じ現行憲法を対象にした進行中の改憲案を題名に関係なく検出する'
+);
+assert.deepEqual(
+  relationModule.activeConstitutionalAmendments([
+    { ...activeAmendmentFixture, id: 902 },
+    activeAmendmentFixture
+  ], activeConstitution.id).map((entry) => entry.id),
+  [901, 902],
+  '既存データに複数の改憲案がある間も類似案を正しい討議へ振り分けられる'
+);
+const lawVersionFixtures = [
+  { id: 801, root_law_id: 801 },
+  { id: 802, root_law_id: 801 }
+];
+assert.equal(relationModule.activeLawAmendment([{
+  id: 903, kind: 'law', target_type: 'law', target_id: '801',
+  status: 'discussion', workflow_handler: 'public_discussion'
+}], lawVersionFixtures, 802).id, 903,
+  '同じ法律の別versionを対象にした並行改正も同一案件として検出する');
+const balancedCandidates = relationModule.buildLegislativeCandidates({
+  request: '発言速度の規則を見直したい',
+  normalized: { intent: 'petition', title: '発言速度見直し', summary: '発言速度の規則' },
+  proposals: Array.from({ length: 20 }, (_, index) => ({
+    id: 1000 + index, kind: 'law', title: `発言速度案${index}`, summary: '発言速度の規則を見直す',
+    status: 'discussion', workflow_handler: 'public_discussion', body: { provisions: {} }
+  })),
+  laws: [{
+    id: 888, title: '関連する現行法', text: '別名で定めた投稿頻度の現行規則',
+    status: 'active', provisions: { articles: [{ code: 'A1', text: '投稿頻度を定める' }] },
+    content_hash: 'law-888'
+  }],
+  constitution: activeConstitution
+});
+assert.equal(balancedCandidates.some((candidate) => candidate.type === 'law' && candidate.id === '888'), true,
+  '進行中案件が多くても現行法候補を類似判定から押し出さない');
 
 const versionRoot = governanceDb.enactLaw({
   guildId: 'g1', proposalId: proposal.id, code: 'LAW-VERSION-1', title: '版管理test', text: '旧版',
@@ -605,11 +651,161 @@ const {
   completeProposalDebate,
   completeCaseResponse,
   detectAutomaticEnforcement,
+  fileAmendment,
+  filePetition,
+  reconcileProposalQueues,
+  resumeProposalQueues,
   recordGovernanceMessage,
   recordCourtSubmission,
   recordCourtSubmissionEdit,
   requestSummaryTrial
 } = await import('../src/governance/service.js');
+
+let conflictingAmendment = governanceDb.createProposal({
+  guildId: 'g1', kind: 'amendment', source: 'petition', title: '先行する改憲案',
+  summary: '現行憲法を対象に先に進行している。', proposerId: 'u1',
+  constitutionId: activeConstitution.id, status: compiledConstitution.rules.workflows.constitutionalAmendment.initial,
+  targetType: 'constitution', targetId: activeConstitution.id, targetHash: activeConstitution.content_hash
+});
+conflictingAmendment = governanceDb.updateProposal(conflictingAmendment.id, { forum_thread_id: 'existing-amendment-thread' });
+const parallelExistingAmendment = governanceDb.createProposal({
+  guildId: 'g1', kind: 'amendment', source: 'petition', title: '既存の並行改憲案',
+  summary: '更新前から同時進行していた後発案。', proposerId: 'u2',
+  constitutionId: activeConstitution.id, status: compiledConstitution.rules.workflows.constitutionalAmendment.initial,
+  targetType: 'constitution', targetId: activeConstitution.id, targetHash: activeConstitution.content_hash
+});
+await reconcileProposalQueues({ id: 'g1' });
+assert.equal(governanceDb.getProposal(parallelExistingAmendment.id).workflow_status, 'queued',
+  '更新前から存在する並行改憲も先着以外を自動で待機へ移す');
+let queuedAmendment = await fileAmendment({ id: 'g1' }, { id: 'u2' }, {
+  title: '題名の異なる後発改憲案', summary: '題名が違っても同じ現行憲法を改正する。',
+  attemptReserved: true
+});
+assert.equal(queuedAmendment.workflow_status, 'queued',
+  '正式受付では後発改憲を失わず審議待ちにする');
+assert.equal(queuedAmendment.body, null, '待機中は古い憲法を基礎に草案を作らない');
+const conflictingAmendmentIntake = governanceDb.createGovernanceIntake({
+  guildId: 'g1', branch: 'legislature', action: 'amendment', requesterId: 'u2',
+  channelId: 'public', sourceMessageId: 'parallel-amendment-intake',
+  payload: {
+    title: '後発改憲案', summary: '後発案の論点を先行討議へ追加する。', voteScope: 'all',
+    relation: { relation: 'amend_constitution', materialDifferences: ['後発論点'] }
+  },
+  expiresAt: Date.now() + 60_000
+});
+let appendedAmendmentComment = null;
+let parallelAmendmentReply = null;
+let parallelAmendmentEdit = null;
+await handleGovernanceIntakeComponent({
+  guildId: 'g1', user: { id: 'u2' }, member: { id: 'u2' },
+  guild: {
+    id: 'g1',
+    members: { fetch: async () => ({ id: 'u2' }) },
+    channels: { fetch: async () => ({
+      isTextBased: () => true,
+      send: async (payload) => { appendedAmendmentComment = payload; }
+    }) }
+  },
+  deferReply: async () => {},
+  message: { edit: async (payload) => { parallelAmendmentEdit = payload; } },
+  editReply: async (text) => { parallelAmendmentReply = text; }
+}, conflictingAmendmentIntake.id, 'confirm');
+assert.equal(appendedAmendmentComment, null,
+  '別内容の後発改憲を先行案へ勝手に混ぜない');
+assert.match(parallelAmendmentReply, /審議待ち/);
+assert.match(parallelAmendmentEdit.content, /審議待ちとして受理/,
+  '確認待ち中に先行改憲ができても後発案を待機として明示する');
+const queuedFromIntake = governanceDb.getProposal(governanceDb.getGovernanceIntake(conflictingAmendmentIntake.id).result_id);
+assert.equal(queuedFromIntake.workflow_status, 'queued');
+const exactQueuedCount = governanceDb.listProposals('g1', { limit: 500 }).length;
+const exactQueuedIntake = governanceDb.createGovernanceIntake({
+  guildId: 'g1', branch: 'legislature', action: 'amendment', requesterId: 'u2',
+  channelId: 'public', sourceMessageId: 'exact-queued-amendment-intake',
+  payload: {
+    title: queuedFromIntake.title, summary: '待機中の同じ案を重複して確定しようとした。', voteScope: 'all',
+    relation: { relation: 'amend_constitution', materialDifferences: [] }
+  },
+  expiresAt: Date.now() + 60_000
+});
+let exactQueuedReply = null;
+await handleGovernanceIntakeComponent({
+  guildId: 'g1', user: { id: 'u2' }, member: { id: 'u2' }, guild: { id: 'g1' },
+  deferReply: async () => {}, message: { edit: async () => {} },
+  editReply: async (text) => { exactQueuedReply = text; }
+}, exactQueuedIntake.id, 'confirm');
+assert.match(exactQueuedReply, /審議待ち.*統合/,
+  '確定直前に同名案が待機してもエラーにせず既存案へ統合する');
+assert.equal(governanceDb.getGovernanceIntake(exactQueuedIntake.id).result_type, 'proposal_queue');
+assert.match(
+  governanceDb.getProposal(queuedFromIntake.id).workflow_context.queue.inputs[0].summary,
+  /待機中の同じ案/,
+  '待機案へ統合した意見を再起草用に保存する'
+);
+assert.equal(
+  Number(governanceDb.getGovernanceIntake(exactQueuedIntake.id).result_id),
+  Number(queuedFromIntake.id)
+);
+assert.equal(governanceDb.listProposals('g1', { limit: 500 }).length, exactQueuedCount,
+  '待機中の同名案を重複作成しない');
+conflictingAmendment = governanceDb.updateProposal(conflictingAmendment.id, { status: 'rejected' });
+queuedAmendment = governanceDb.resumeQueuedProposal(queuedAmendment.id, {
+  constitutionId: activeConstitution.id,
+  targetType: 'constitution', targetId: activeConstitution.id, targetHash: activeConstitution.content_hash
+});
+assert.equal(queuedAmendment.workflow_status, 'active', '先行案終了後は待機案件をworkflow先頭へ戻す');
+assert.equal(queuedAmendment.status, compiledConstitution.rules.workflows.constitutionalAmendment.initial);
+governanceDb.updateProposal(queuedAmendment.id, { status: 'remanded' });
+governanceDb.updateProposal(queuedFromIntake.id, { status: 'remanded' });
+governanceDb.updateProposal(parallelExistingAmendment.id, { status: 'remanded' });
+
+let conflictingLawAmendment = governanceDb.createProposal({
+  guildId: 'g1', kind: 'law', source: 'petition', title: '先行する法律改正案',
+  summary: '同じ法律を先に改正している。', proposerId: 'u1',
+  constitutionId: activeConstitution.id, status: compiledConstitution.rules.workflows.law.initial,
+  targetType: 'law', targetId: law.id, targetHash: law.content_hash
+});
+conflictingLawAmendment = governanceDb.updateProposal(conflictingLawAmendment.id, {
+  forum_thread_id: 'existing-law-amendment-thread'
+});
+const queuedLawAmendment = await filePetition({ id: 'g1' }, { id: 'u2' }, {
+  title: '題名の異なる後発法律改正案', summary: '同じ法律の別の条項を変更する。',
+  attemptReserved: true,
+  relation: { relation: 'amend_law', targetType: 'law', targetId: String(law.id), targetHash: law.content_hash }
+});
+assert.equal(queuedLawAmendment.workflow_status, 'queued',
+  '正式受付でも同じ法律に対する後発改正を順番待ちにする');
+const similarLawIntake = governanceDb.createGovernanceIntake({
+  guildId: 'g1', branch: 'legislature', action: 'join_discussion', requesterId: 'u2',
+  channelId: 'public', sourceMessageId: 'similar-law-intake',
+  payload: {
+    title: '類似する法律改正案', summary: '既存案と同じ目的の追加意見。',
+    relation: {
+      relation: 'join_active', targetType: 'proposal', targetId: String(conflictingLawAmendment.id),
+      targetTitle: conflictingLawAmendment.title, threadId: conflictingLawAmendment.forum_thread_id,
+      reasons: ['目的と対象法が同じ。'], materialDifferences: []
+    }
+  },
+  expiresAt: Date.now() + 60_000
+});
+let similarLawComment = null;
+await handleGovernanceIntakeComponent({
+  guildId: 'g1', user: { id: 'u2' }, member: { id: 'u2' },
+  guild: {
+    members: { fetch: async () => ({ id: 'u2' }) },
+    channels: { fetch: async () => ({
+      isTextBased: () => true,
+      send: async (payload) => { similarLawComment = payload; }
+    }) }
+  },
+  deferReply: async () => {},
+  message: { edit: async () => {} },
+  editReply: async () => {}
+}, similarLawIntake.id, 'confirm');
+assert.match(similarLawComment.content, /同じ目的の追加意見/,
+  '似た法律案は新規案件にせず既存討議へ追加する');
+assert.equal(governanceDb.getGovernanceIntake(similarLawIntake.id).result_type, 'proposal_discussion');
+conflictingLawAmendment = governanceDb.updateProposal(conflictingLawAmendment.id, { status: 'rejected' });
+governanceDb.updateProposal(queuedLawAmendment.id, { status: 'remanded' });
 
 assert.equal(recordGovernanceMessage({
   id: 'discussion-live', guildId: 'g1', channelId: 'proposal-discussion',
@@ -1120,6 +1316,56 @@ const safeBill = {
     sanctionDefinitions: []
   }
 };
+const queueBaseConstitution = governanceDb.getActiveConstitution('g2');
+let automaticallyResumed = governanceDb.createProposal({
+  guildId: 'g2', kind: 'amendment', source: 'petition', title: '最新憲法から再起草する案',
+  summary: '審議待ち後に受付時ではなく現行憲法を基礎にする。', proposerId: 'u',
+  constitutionId: queueBaseConstitution.id,
+  status: queueBaseConstitution.rules.workflows.constitutionalAmendment.initial,
+  targetType: 'constitution', targetId: queueBaseConstitution.id, targetHash: queueBaseConstitution.content_hash
+});
+automaticallyResumed = governanceDb.updateProposal(automaticallyResumed.id, {
+  forum_thread_id: 'auto-resume-amendment-thread', forum_message_id: 'auto-resume-amendment-thread'
+});
+automaticallyResumed = governanceDb.queueProposalWorkflow(automaticallyResumed.id, {
+  blockedByProposalId: 999, reason: 'constitution_in_progress'
+});
+automaticallyResumed = governanceDb.appendQueuedProposalInput(automaticallyResumed.id, {
+  intakeId: 'auto-resume-related-input', userId: 'u', summary: '追加意見も再起草に反映する。'
+});
+modelOutput = {
+  title: '最新憲法から再起草した案',
+  summary: '現行憲法に対する完全な置換案。',
+  content: queueBaseConstitution.content,
+  policy: null
+};
+const resumedPosts = [];
+const resumedStarterEdits = [];
+const resumeThread = {
+  id: 'auto-resume-amendment-thread',
+  parent: { availableTags: [{ id: 'draft-tag', name: '草案' }] },
+  isThread: () => true,
+  setAppliedTags: async () => {},
+  fetchStarterMessage: async () => ({ edit: async (payload) => { resumedStarterEdits.push(payload); } }),
+  send: async (payload) => { resumedPosts.push(payload); return payload; }
+};
+const resumedResults = await resumeProposalQueues({
+  id: 'g2', name: 'Test Community',
+  channels: { fetch: async (id) => id === resumeThread.id ? resumeThread : null }
+});
+assert.equal(resumedResults.length, 1);
+automaticallyResumed = governanceDb.getProposal(automaticallyResumed.id);
+assert.equal(automaticallyResumed.workflow_status, 'active');
+assert.equal(automaticallyResumed.constitution_id, queueBaseConstitution.id);
+assert.equal(automaticallyResumed.target_hash, queueBaseConstitution.content_hash,
+  '待機解除時の現行憲法hashへ差し替える');
+assert.ok(automaticallyResumed.body, '待機解除後にAIが再起草する');
+assert.match(capturedRequest.messages[1].content, /追加意見も再起草に反映/,
+  '待機中に統合した意見をAI再起草の入力に含める');
+assert.ok(resumedStarterEdits.length >= 2, '既存討議の表示を待機解除後に更新する');
+assert.ok(resumedPosts.some((payload) => payload.files?.some((file) => file.name === '再起草案全文.md')),
+  '更新前の添付草案ではなく再起草した全文を公開する');
+governanceDb.updateProposal(automaticallyResumed.id, { status: 'remanded' });
 const narrowedBill = {
   ...safeBill,
   title: '限定された一般規則',
@@ -1769,6 +2015,7 @@ const {
   GOVERNANCE_GUIDE_NAME,
   GOVERNANCE_PROCEDURE_NAME,
   governanceProcedureOverwrites,
+  ensureGovernanceParliamentForum,
   readOnlyTextOverwrites,
   retireGovernanceCourtChat,
   syncAppealRoleOverwrites,
@@ -1777,6 +2024,21 @@ const {
 } = await import('../src/governance/discord.js');
 assert.equal(GOVERNANCE_GUIDE_NAME, '案内');
 assert.equal(GOVERNANCE_PROCEDURE_NAME, '進行中');
+let synchronizedParliamentTags = null;
+const parliamentForum = {
+  type: ChannelType.GuildForum,
+  topic: '請願・法案・改憲案。正式案件は1案件1投稿で作成します。',
+  availableTags: [{ id: 'draft-tag', name: '草案', moderated: true, emoji: null }],
+  setTopic: async () => {},
+  setAvailableTags: async (tags) => { synchronizedParliamentTags = tags; }
+};
+await ensureGovernanceParliamentForum({
+  channels: { fetch: async () => parliamentForum }
+}, { parliament_forum_id: 'parliament' });
+assert.ok(synchronizedParliamentTags.some((tag) => tag.name === '待機'),
+  '既存の議会Forumに審議待ちタグを追加する');
+assert.ok(synchronizedParliamentTags.some((tag) => tag.id === 'draft-tag'),
+  'タグ同期で既存の議会タグを消さない');
 assert.deepEqual(courtForumEveryonePermissionState(), {
   ViewChannel: true,
   ReadMessageHistory: true,
@@ -1977,13 +2239,29 @@ const guideText = await renderGovernanceGuide(uxGuild, governanceDb.getGovernanc
 assert.match(guideText, /貴族院/);
 assert.match(guideText, /<@&legislature-role>/);
 assert.doesNotMatch(guideText, /trusted|shadow|policy JSON/i, '参加者案内に内部用語を出さない');
+const uxConstitution = governanceDb.getActiveConstitution('g1');
+let uxQueuedProposal = governanceDb.createProposal({
+  guildId: 'g1', kind: 'amendment', source: 'petition', title: '発言の自由の保障を明確にする案',
+  summary: '先行案の終了後に討議する。', proposerId: 'u',
+  constitutionId: uxConstitution.id,
+  status: uxConstitution.rules.workflows.constitutionalAmendment.initial,
+  targetType: 'constitution', targetId: uxConstitution.id, targetHash: uxConstitution.content_hash
+});
+uxQueuedProposal = governanceDb.queueProposalWorkflow(uxQueuedProposal.id, {
+  blockedByProposalId: 1, reason: 'constitution_in_progress'
+});
 const procedureHub = await renderGovernanceProcedureHub(uxGuild, governanceDb.getGovernanceGuild('g1'));
 assert.match(procedureHub.content, /いま対応できる手続/);
 assert.match(procedureHub.content, /- \[test\]/);
+assert.match(procedureHub.content, /## 審議待ち/);
+assert.match(procedureHub.content, /発言の自由の保障を明確にする案/);
+assert.match(procedureHub.content, /受付順に最新版から起草/);
+assert.doesNotMatch(procedureHub.content, /順番\s*\d+/, '意味の薄い内部順番を公開UIに出さない');
 assert.doesNotMatch(procedureHub.content, /L-1|C-\d+/, '進行中一覧では参照IDを出さない');
 assert.doesNotMatch(procedureHub.content, /Bot権限|AI受付|自律起案|診断・復旧/, '公開手続に技術運用を混ぜない');
 assert.equal(procedureHub.components.length, 2);
 assert.equal(procedureHub.components[1].components[0].data.label, '自分の即時処分を確認');
+governanceDb.updateProposal(uxQueuedProposal.id, { status: 'remanded' });
 const operations = await renderGovernanceOperationsPanel(uxGuild, governanceDb.getGovernanceGuild('g1'));
 assert.match(operations.content, /Bot技術運用/);
 assert.match(operations.content, /記録のみ/);

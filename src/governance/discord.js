@@ -22,7 +22,8 @@ import {
   upsertStatutePublication
 } from './db.js';
 
-const TAGS = ['草案', '違憲審査', '討議', '投票', '成立', '否決', '廃案'];
+const TAGS = ['待機', '草案', '違憲審査', '討議', '投票', '成立', '否決', '廃案'];
+const PARLIAMENT_TOPIC = '請願・法案・改憲案。正式案件は1案件1投稿で作成します。';
 const STATUTE_TAGS = ['現行憲法', '旧憲法', '現行法', '停止', '違憲', '廃止'];
 const STATUTE_TOPIC = '現行憲法と法律の公開正本です。1法令1投稿で、旧法令も状態付きで保存します。';
 const GAZETTE_TOPIC = '成立・改正・判決・執行・運営操作を時系列に残す公開履歴です。現行本文は法令集を参照してください。';
@@ -39,7 +40,7 @@ function proposalHandler(proposal) {
 }
 
 function proposalStateLabel(state, handler = null) {
-  if (['草案', '討議', '違憲審査', '投票', '成立', '否決', '廃案'].includes(state)) return state;
+  if (['待機', '草案', '討議', '違憲審査', '投票', '成立', '否決', '廃案'].includes(state)) return state;
   return ({
     drafting: 'AI起草中',
     draft: '草案',
@@ -87,6 +88,7 @@ function oneLine(value, maximum = 700) {
 }
 
 function proposalDeadline(proposal) {
+  if (proposal.workflow_status === 'queued') return null;
   if (!proposal.stage_ends_at || proposalHandler(proposal) === 'terminal') return null;
   return `<t:${Math.floor(proposal.stage_ends_at / 1000)}:F>`;
 }
@@ -471,7 +473,7 @@ export async function createGovernanceSurfaces(guild, { resources = {}, onProgre
     name: '議会',
     type: ChannelType.GuildForum,
     parent: category.id,
-    topic: '請願・法案・改憲案。正式案件は1案件1投稿で作成します。',
+    topic: PARLIAMENT_TOPIC,
     availableTags: TAGS.map((name) => ({ name, moderated: true })),
     defaultAutoArchiveDuration: 10_080,
     permissionOverwrites: [everyoneForumOverwrite(guild, { discuss: true }), botOverwrite(guild)],
@@ -539,6 +541,28 @@ export async function createGovernanceSurfaces(guild, { resources = {}, onProgre
     adminChannelId: admin.id,
     permissionReport: core
   };
+}
+
+export async function ensureGovernanceParliamentForum(guild, governance) {
+  const forum = await guild.channels.fetch(governance.parliament_forum_id).catch(() => null);
+  if (!forum || forum.type !== ChannelType.GuildForum) throw new Error('議会Forumが見つかりません。');
+  if (forum.topic !== PARLIAMENT_TOPIC) await forum.setTopic(PARLIAMENT_TOPIC, '議会の説明を同期');
+  const known = new Set(forum.availableTags.map((tag) => tag.name));
+  const missing = TAGS.filter((name) => !known.has(name));
+  if (missing.length > 0) {
+    const tags = [
+      ...forum.availableTags.map((tag) => ({
+        id: tag.id,
+        name: tag.name,
+        moderated: tag.moderated,
+        emoji: tag.emoji
+      })),
+      ...missing.map((name) => ({ name, moderated: true }))
+    ];
+    if (tags.length > 20) throw new Error('議会Forumの利用可能タグ上限20件を超えます。');
+    await forum.setAvailableTags(tags, '議会の手続状態タグを同期');
+  }
+  return forum;
 }
 
 export async function ensureGovernanceStatuteForum(guild, governance) {
@@ -938,6 +962,7 @@ export function reviewRequestButtons(guildId, sanctionId, disabled = false) {
 }
 
 function proposalNextAction(proposal) {
+  if (proposal.workflow_status === 'queued') return '先行案件の終了後、最新版を基礎に自動で草案を作成します。';
   const byStatus = ({
     drafting: 'AIが草案を作成しています。',
     draft: '公開草案を確認できます。受付時の手続に従って次の段階へ進みます。',
@@ -965,7 +990,7 @@ function proposalStarterContent(proposal, nextAction = proposalNextAction(propos
     '',
     proposal.summary,
     '',
-    `状態: **${proposalStateLabel(displayState, proposalHandler(proposal))}**`,
+    `状態: **${proposal.workflow_status === 'queued' ? '待機' : proposalStateLabel(displayState, proposalHandler(proposal))}**`,
     proposalDeadline(proposal) ? `期限: ${proposalDeadline(proposal)}` : null,
     `いま必要なこと: ${oneLine(nextAction)}`,
     '草案・調整案・最終案と経過はこの投稿内にあります。'
@@ -1097,6 +1122,7 @@ export async function postCourtUpdate(guild, caseRecord, text, { state = null, c
 }
 
 function proposalForumState(proposal) {
+  if (proposal.workflow_status === 'queued') return '待機';
   const byStatus = ({
     drafting: '草案', draft: '草案', constitutional_review: '違憲審査', debate: '討議', voting: '投票',
     enacted: '成立', rejected: '否決', remanded: '廃案'

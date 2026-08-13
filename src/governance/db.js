@@ -867,15 +867,22 @@ function hydrateConstitution(row) {
 }
 
 const proposalRulesStmt = db.prepare('SELECT rules_json FROM governance_constitutions WHERE id = ?');
+const proposalWorkflowStmt = db.prepare(`
+  SELECT status, context_json FROM governance_workflow_instances
+  WHERE subject_type = 'proposal' AND subject_id = ?
+`);
 
 function hydrateProposal(row) {
   if (!row) return null;
   const rules = parseJson(proposalRulesStmt.get(Number(row.constitution_id))?.rules_json, null);
+  const workflow = proposalWorkflowStmt.get(String(row.id));
   const key = row.kind === 'amendment' ? 'constitutionalAmendment' : 'law';
   return {
     ...row,
     body: parseJson(row.body_json, null),
-    workflow_handler: rules?.workflows?.[key]?.states?.[row.status]?.handler ?? null
+    workflow_handler: rules?.workflows?.[key]?.states?.[row.status]?.handler ?? null,
+    workflow_status: workflow?.status ?? null,
+    workflow_context: parseJson(workflow?.context_json, {})
   };
 }
 
@@ -1496,8 +1503,144 @@ export function createProposal(input) {
     wakeAt: proposal.stage_ends_at
   });
   writeAudit({ guildId: input.guildId, actorType: input.source === 'weekly' ? 'ai' : 'member', actorId: input.proposerId, action: 'proposal.created', targetType: 'proposal', targetId: proposal.id, detail: { kind: proposal.kind, source: proposal.source, voteScope: proposal.vote_scope } });
-  return proposal;
+  return getProposal(proposal.id);
 }
+
+export const queueProposalWorkflow = db.transaction((proposalId, {
+  blockedByProposalId = null, reason = 'same_target_in_progress', actorType = 'system'
+} = {}) => {
+  const proposal = getProposal(proposalId);
+  if (!proposal) throw new Error('待機対象の案件がありません。');
+  const instance = getWorkflowInstance('proposal', proposal.id);
+  if (!instance || instance.status === 'completed') throw new Error('終了済み案件は待機にできません。');
+  if (instance.status === 'queued') return proposal;
+  const now = Date.now();
+  const context = {
+    ...instance.context,
+    queue: {
+      queuedAt: now,
+      blockedByProposalId: blockedByProposalId === null ? null : String(blockedByProposalId),
+      reason,
+      previousState: instance.current_state
+    }
+  };
+  db.prepare(`
+    INSERT INTO governance_workflow_events
+      (workflow_instance_id, event_type, actor_type, actor_id, from_state, to_state,
+       payload_json, idempotency_key, created_at)
+    VALUES (?, 'proposal.queued', ?, NULL, ?, ?, ?, ?, ?)
+  `).run(
+    instance.id, actorType, instance.current_state, instance.current_state,
+    canonicalJson(context.queue), `queued:${now}`, now
+  );
+  db.prepare(`
+    UPDATE governance_workflow_instances
+    SET status = 'queued', wake_at = NULL, context_json = ?, updated_at = ?
+    WHERE id = ?
+  `).run(canonicalJson(context), now, instance.id);
+  writeAudit({
+    guildId: proposal.guild_id,
+    actorType,
+    action: 'proposal.queued',
+    targetType: 'proposal',
+    targetId: proposal.id,
+    detail: context.queue
+  });
+  return getProposal(proposal.id);
+});
+
+export const appendQueuedProposalInput = db.transaction((proposalId, {
+  intakeId, userId, summary
+}) => {
+  const proposal = getProposal(proposalId);
+  if (!proposal) throw new Error('審議待ちの案件がありません。');
+  const instance = getWorkflowInstance('proposal', proposal.id);
+  if (!instance || instance.status !== 'queued') throw new Error('案件は審議待ちではありません。');
+  const queue = { ...(instance.context.queue ?? {}) };
+  const inputs = Array.isArray(queue.inputs) ? [...queue.inputs] : [];
+  if (inputs.some((entry) => String(entry.intakeId) === String(intakeId))) return proposal;
+  const input = {
+    intakeId: String(intakeId),
+    userId: String(userId),
+    summary: String(summary ?? '').trim().slice(0, 1800),
+    createdAt: Date.now()
+  };
+  inputs.push(input);
+  // Keep the queue context bounded. The original intake remains the durable
+  // source record even when more than 20 equivalent requests arrive.
+  queue.inputs = inputs.slice(-20);
+  const context = { ...instance.context, queue };
+  db.prepare(`
+    UPDATE governance_workflow_instances
+    SET context_json = ?, updated_at = ?
+    WHERE id = ?
+  `).run(canonicalJson(context), input.createdAt, instance.id);
+  writeAudit({
+    guildId: proposal.guild_id,
+    actorType: 'member',
+    actorId: userId,
+    action: 'proposal.queue_input_added',
+    targetType: 'proposal',
+    targetId: proposal.id,
+    detail: { intakeId: String(intakeId) }
+  });
+  return getProposal(proposal.id);
+});
+
+export const resumeQueuedProposal = db.transaction((proposalId, {
+  constitutionId, targetType = null, targetId = null, targetHash = null
+}) => {
+  const proposal = getProposal(proposalId);
+  if (!proposal) throw new Error('再開対象の案件がありません。');
+  const instance = getWorkflowInstance('proposal', proposal.id);
+  if (!instance || instance.status !== 'queued') throw new Error('案件は待機中ではありません。');
+  const constitution = getConstitution(constitutionId);
+  const workflowKey = proposal.kind === 'amendment' ? 'constitutionalAmendment' : 'law';
+  const initial = constitution?.rules?.workflows?.[workflowKey]?.initial;
+  if (!initial) throw new Error('再開に使う憲法のworkflowがありません。');
+  const now = Date.now();
+  db.prepare(`
+    UPDATE governance_proposals
+    SET constitution_id = ?, status = ?, body_json = NULL, stage_started_at = ?, stage_ends_at = NULL,
+        revision = 1, debate_extensions = 0, retry_after = NULL, failure_count = 0, last_error = NULL,
+        target_type = ?, target_id = ?, target_hash = ?, updated_at = ?
+    WHERE id = ?
+  `).run(
+    Number(constitutionId), initial, now,
+    targetType, targetId === null ? null : String(targetId), targetHash,
+    now, Number(proposal.id)
+  );
+  db.prepare(`
+    INSERT INTO governance_workflow_events
+      (workflow_instance_id, event_type, actor_type, actor_id, from_state, to_state,
+       payload_json, idempotency_key, created_at)
+    VALUES (?, 'proposal.resumed', 'system', NULL, ?, ?, ?, ?, ?)
+  `).run(
+    instance.id, instance.current_state, initial,
+    canonicalJson({ constitutionId, targetType, targetId, targetHash }),
+    `resumed:${now}`, now
+  );
+  const context = { ...instance.context };
+  delete context.queue;
+  db.prepare(`
+    UPDATE governance_workflow_instances
+    SET constitution_id = ?, workflow_key = ?, current_state = ?, state_entered_at = ?,
+        wake_at = NULL, context_json = ?, status = 'active', updated_at = ?
+    WHERE id = ?
+  `).run(
+    Number(constitutionId), workflowKey, initial, now,
+    canonicalJson(context), now, instance.id
+  );
+  writeAudit({
+    guildId: proposal.guild_id,
+    actorType: 'system',
+    action: 'proposal.resumed',
+    targetType: 'proposal',
+    targetId: proposal.id,
+    detail: { constitutionId, targetType, targetId, targetHash }
+  });
+  return getProposal(proposal.id);
+});
 
 export function getProposal(id) {
   return hydrateProposal(db.prepare('SELECT * FROM governance_proposals WHERE id = ?').get(Number(id)));
@@ -1559,7 +1702,7 @@ export const updateProposal = db.transaction((id, patch) => {
       completed
     });
   }
-  return updated;
+  return getProposal(id);
 });
 
 export function recordProposalDeliberation({ proposalId, revision, outcome, discussion, decision }) {

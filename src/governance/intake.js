@@ -7,6 +7,7 @@ import {
 } from 'discord.js';
 import { parseDiscordRef } from '../agent/format.js';
 import {
+  appendQueuedProposalInput,
   claimGovernanceIntake,
   createGovernanceIntake,
   findGovernanceIntakeByResult,
@@ -23,7 +24,12 @@ import {
   updateGovernanceIntake
 } from './db.js';
 import { interpretJudicialRequest, interpretLegislativeRequest, reviewLegislativeRelation } from './llm.js';
-import { buildLegislativeCandidates, exactActiveProposalMatch } from './relation.js';
+import {
+  activeConstitutionalAmendments,
+  activeLawAmendment,
+  buildLegislativeCandidates,
+  exactActiveProposalMatch
+} from './relation.js';
 import {
   addEvidenceToCase,
   appealCase,
@@ -129,10 +135,13 @@ async function assertEvidenceVisibleTo(guild, evidence, userIds) {
 }
 
 function intakeButtons(intake) {
+  const queuedTarget = intake.payload.relation?.targetStatus === 'queued';
   const buttons = [
     new ButtonBuilder()
       .setCustomId(`gov:intake:${intake.id}:confirm`)
-      .setLabel(intake.action === 'join_discussion' ? '既存討議に加える' : '審議に進める')
+      .setLabel(intake.action === 'join_discussion'
+        ? (queuedTarget ? '待機案に加える' : '既存討議に加える')
+        : '審議に進める')
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId(`gov:intake:${intake.id}:cancel`)
@@ -145,8 +154,11 @@ function intakeButtons(intake) {
 function renderIntake(intake, suffix = '') {
   const payload = intake.payload;
   const pending = intake.status === 'pending' || intake.status === 'processing';
+  const queuedTarget = payload.relation?.targetStatus === 'queued' || intake.result_type === 'proposal_queue';
+  const joinedDiscussion = intake.action === 'join_discussion'
+    || ['proposal_discussion', 'proposal_queue'].includes(intake.result_type);
   const lines = [intake.status === 'completed' ? '## 正式受付済み' : pending ? '## 受付前の確認' : '## 受付結果', ''];
-  if (intake.action === 'petition' || intake.action === 'amendment') {
+  if ((intake.action === 'petition' || intake.action === 'amendment') && !joinedDiscussion) {
     lines.push(
       `種別: ${intake.action === 'amendment' ? '憲法改正案' : '法律の請願'}`,
       `題名: ${payload.title}`,
@@ -158,14 +170,15 @@ function renderIntake(intake, suffix = '') {
     }
     if (payload.relation?.relation === 'amend_constitution') lines.push(`改正対象: ${payload.relation.targetTitle}`);
     if (payload.relation?.relation === 'separate') lines.push('関連案件とは独立して成立できる別案件として扱います。');
+    if (payload.queueBehindTitle) lines.push(`開始時期: 「${payload.queueBehindTitle}」の終了後`);
     if (payload.relation?.reasons?.length) lines.push(`振り分け理由: ${payload.relation.reasons.join(' / ')}`);
-  } else if (intake.action === 'join_discussion') {
+  } else if (joinedDiscussion) {
     lines.push(
-      '種別: 既存討議への意見追加',
-      `討議: ${payload.relation.targetTitle}`,
+      queuedTarget ? '種別: 審議待ち案への意見追加' : '種別: 既存討議への意見追加',
+      payload.relation?.targetTitle ? `対象: ${payload.relation.targetTitle}` : null,
       pending ? `意見・対案: ${payload.summary}` : null,
-      payload.relation.threadId ? linkToThread(intake.guild_id, payload.relation.threadId) : null,
-      payload.relation.reasons?.length ? `振り分け理由: ${payload.relation.reasons.join(' / ')}` : null
+      payload.relation?.threadId ? linkToThread(intake.guild_id, payload.relation.threadId) : null,
+      payload.relation?.reasons?.length ? `振り分け理由: ${payload.relation.reasons.join(' / ')}` : null
     );
   } else if (intake.action === 'criminal_case') {
     const law = getLaw(payload.lawId);
@@ -291,6 +304,77 @@ function reservationMessage(reservation) {
   return `AI受付の24時間回数枠に達しました (${reservation.used}/${reservation.limit})。${retry}`;
 }
 
+async function appendToExistingDiscussion(interaction, intake, proposal, reasons = []) {
+  if (!proposal || proposal.workflow_handler === 'terminal'
+    || (!proposal.workflow_handler && ['enacted', 'rejected', 'remanded'].includes(proposal.status))) {
+    throw new Error('既存討議は終了しています。改めて新規提案してください。');
+  }
+  if (proposal.workflow_status === 'queued') {
+    const decision = {
+      relation: 'join_active',
+      targetType: 'proposal',
+      targetId: String(proposal.id),
+      reasons,
+      materialDifferences: intake.payload.relation?.materialDifferences ?? []
+    };
+    recordInstrumentRelation({
+      guildId: interaction.guildId,
+      sourceType: 'intake',
+      sourceId: intake.id,
+      relationType: 'join_active',
+      targetType: 'proposal',
+      targetId: proposal.id,
+      targetHash: proposal.target_hash,
+      reasons,
+      decision
+    });
+    appendQueuedProposalInput(proposal.id, {
+      intakeId: intake.id,
+      userId: interaction.user.id,
+      summary: intake.payload.summary
+    });
+    return {
+      type: 'proposal_queue',
+      id: proposal.id,
+      text: `新しい案件にはせず、審議待ちの「${proposal.title}」に統合しました。先行案件の終了後に討議が始まります。`
+    };
+  }
+  if (!proposal.forum_thread_id) throw new Error('既存案件は草案作成中です。公開後、その討議へ意見を追加してください。');
+  const thread = await interaction.guild.channels.fetch(proposal.forum_thread_id).catch(() => null);
+  if (!thread?.isTextBased?.()) throw new Error('既存討議を読めません。');
+  await thread.send({
+    content: [
+      `<@${interaction.user.id}> からの意見・対案`,
+      intake.payload.summary,
+      `元の発言: https://discord.com/channels/${interaction.guildId}/${intake.channel_id}/${intake.source_message_id}`
+    ].join('\n\n'),
+    allowedMentions: { parse: [] }
+  });
+  const decision = {
+    relation: 'join_active',
+    targetType: 'proposal',
+    targetId: String(proposal.id),
+    reasons,
+    materialDifferences: intake.payload.relation?.materialDifferences ?? []
+  };
+  recordInstrumentRelation({
+    guildId: interaction.guildId,
+    sourceType: 'intake',
+    sourceId: intake.id,
+    relationType: 'join_active',
+    targetType: 'proposal',
+    targetId: proposal.id,
+    targetHash: proposal.target_hash,
+    reasons,
+    decision
+  });
+  return {
+    type: 'proposal_discussion',
+    id: proposal.id,
+    text: `新しい案件にはせず、進行中の「${proposal.title}」へ追加しました。\n${linkToThread(interaction.guildId, proposal.forum_thread_id)}`
+  };
+}
+
 async function handleLegislature(message, governance, request) {
   const constitution = getActiveConstitution(message.guildId);
   let output = await interpretLegislativeRequest({
@@ -304,12 +388,15 @@ async function handleLegislature(message, governance, request) {
     return true;
   }
   const proposals = listProposals(message.guildId, { limit: 100 });
+  const currentAmendments = activeConstitutionalAmendments(proposals);
+  const currentAmendment = currentAmendments[0] ?? null;
   const exact = exactActiveProposalMatch(output.title, proposals);
+  const laws = listLaws(message.guildId, { activeOnly: false, limit: 100 });
   const candidates = buildLegislativeCandidates({
     request,
     normalized: output,
     proposals,
-    laws: listLaws(message.guildId, { activeOnly: false, limit: 100 }),
+    laws,
     constitution
   });
   const relation = exact ? {
@@ -326,6 +413,10 @@ async function handleLegislature(message, governance, request) {
     candidates,
     panel: constitution.rules?.panels?.proposalRelation
   });
+  const joinsCurrentAmendment = currentAmendment
+    && relation.relation === 'join_active'
+    && relation.targetType === 'proposal'
+    && currentAmendments.some((proposal) => String(proposal.id) === String(relation.targetId));
   if (relation.relation === 'uncertain') {
     await message.reply({ content: relation.reasons[0], allowedMentions: NO_MENTIONS });
     return true;
@@ -345,6 +436,15 @@ async function handleLegislature(message, governance, request) {
     });
     return true;
   }
+  const isConstitutionalAmendment = output.intent === 'amendment'
+    || relation.relation === 'amend_constitution';
+  let queueConflict = isConstitutionalAmendment && currentAmendment && !joinsCurrentAmendment
+    ? currentAmendment
+    : null;
+  if (relation.relation === 'amend_law' && target) {
+    const currentLawAmendment = activeLawAmendment(proposals, laws, target.id);
+    if (currentLawAmendment) queueConflict = currentLawAmendment;
+  }
   const relationPayload = {
     relation: relation.relation,
     targetType: relation.targetType,
@@ -352,6 +452,7 @@ async function handleLegislature(message, governance, request) {
     targetTitle: target?.title ?? null,
     targetHash: target?.contentHash ?? null,
     targetVersion: target?.version ?? null,
+    targetStatus: target?.status ?? null,
     threadId: target?.threadId ?? null,
     reasons: relation.reasons,
     materialDifferences: relation.materialDifferences,
@@ -379,6 +480,8 @@ async function handleLegislature(message, governance, request) {
     title: output.title,
     summary: output.summary,
     voteScope,
+    queueBehindTitle: queueConflict?.title ?? null,
+    queueBehindProposalId: queueConflict?.id ?? null,
     electorateLabel: governance.trusted_role_id
       ? (message.guild.roles?.cache?.get?.(governance.trusted_role_id)?.name ?? '特別有権者')
       : '特別有権者',
@@ -536,6 +639,15 @@ export async function handleGovernanceMention(message) {
 async function executeIntake(interaction, intake) {
   const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
   const payload = intake.payload;
+  if (['petition', 'amendment'].includes(intake.action)) {
+    const proposals = listProposals(interaction.guildId, { limit: 500 });
+    const exact = exactActiveProposalMatch(payload.title, proposals);
+    if (exact) {
+      return appendToExistingDiscussion(interaction, intake, exact, [
+        '同じ題名の案件がすでに進行中です。'
+      ]);
+    }
+  }
   if (intake.action === 'petition') {
     const result = await filePetition(interaction.guild, member, {
       title: payload.title,
@@ -545,6 +657,9 @@ async function executeIntake(interaction, intake) {
       attemptReserved: true,
       relation: payload.relation
     });
+    if (result.workflow_status === 'queued') {
+      return { type: 'proposal', id: result.id, text: `「${payload.title}」を審議待ちとして受理しました。先行案件の終了後、最新版を基礎に自動で開始します。` };
+    }
     return { type: 'proposal', id: result.id, text: `「${payload.title}」を受理しました。\n${linkToThread(interaction.guildId, result.forum_thread_id)}` };
   }
   if (intake.action === 'amendment') {
@@ -556,36 +671,17 @@ async function executeIntake(interaction, intake) {
       attemptReserved: true,
       relation: payload.relation
     });
+    if (result.workflow_status === 'queued') {
+      return { type: 'proposal', id: result.id, text: `「${payload.title}」を改憲の審議待ちとして受理しました。先行案の終了後、現行憲法を基礎に自動で起草します。` };
+    }
     return { type: 'proposal', id: result.id, text: `「${payload.title}」を改憲案として受理しました。\n${linkToThread(interaction.guildId, result.forum_thread_id)}` };
   }
   if (intake.action === 'join_discussion') {
     const relation = payload.relation;
-    if (relation.targetType !== 'proposal' || !relation.targetId || !relation.threadId) throw new Error('既存討議を特定できません。');
+    if (relation.targetType !== 'proposal' || !relation.targetId) throw new Error('既存案件を特定できません。');
     const proposal = listProposals(interaction.guildId, { limit: 100 })
       .find((entry) => String(entry.id) === String(relation.targetId));
-    if (!proposal || proposal.workflow_handler === 'terminal'
-      || (!proposal.workflow_handler && ['enacted', 'rejected', 'remanded'].includes(proposal.status))) {
-      throw new Error('既存討議は終了しています。改めて新規提案してください。');
-    }
-    const thread = await interaction.guild.channels.fetch(relation.threadId).catch(() => null);
-    if (!thread?.isTextBased?.()) throw new Error('既存討議を読めません。');
-    await thread.send({
-      content: [`<@${interaction.user.id}> からの意見・対案`, payload.summary,
-        `元の発言: https://discord.com/channels/${interaction.guildId}/${intake.channel_id}/${intake.source_message_id}`].join('\n\n'),
-      allowedMentions: { parse: [] }
-    });
-    recordInstrumentRelation({
-      guildId: interaction.guildId,
-      sourceType: 'intake',
-      sourceId: intake.id,
-      relationType: 'join_active',
-      targetType: 'proposal',
-      targetId: proposal.id,
-      targetHash: proposal.target_hash,
-      reasons: relation.reasons,
-      decision: relation
-    });
-    return { type: 'proposal_discussion', id: proposal.id, text: `既存の討議へ追加しました。\n${linkToThread(interaction.guildId, proposal.forum_thread_id)}` };
+    return appendToExistingDiscussion(interaction, intake, proposal, relation.reasons);
   }
   if (intake.action === 'criminal_case') {
     await assertEvidenceVisibleTo(interaction.guild, payload.evidence, [interaction.user.id, payload.accusedId]);

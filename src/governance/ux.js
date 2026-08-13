@@ -57,7 +57,14 @@ function proposalHandler(proposal) {
 }
 
 function activeProposals(guildId, limit = 100) {
-  return listProposals(guildId, { limit }).filter((proposal) => proposalHandler(proposal) !== 'terminal');
+  return listProposals(guildId, { limit }).filter((proposal) => proposal.workflow_status !== 'queued'
+    && proposalHandler(proposal) !== 'terminal');
+}
+
+function queuedProposals(guildId, limit = 100) {
+  return listProposals(guildId, { limit })
+    .filter((proposal) => proposal.workflow_status === 'queued')
+    .sort((left, right) => Number(left.id) - Number(right.id));
 }
 
 function stateLabel(governance) {
@@ -84,6 +91,7 @@ async function electorateLabel(guild, governance) {
 function activeCounts(guildId) {
   return {
     proposals: activeProposals(guildId).length,
+    queued: queuedProposals(guildId).length,
     cases: listCases(guildId, { statuses: ACTIVE_CASE_STATUSES, limit: 100 }).length
   };
 }
@@ -156,7 +164,7 @@ export async function renderGovernanceGuide(guild, governance) {
     governance.enforcement_mode === 'live'
       ? '成立した法律と確定判決に基づく処分が実際に執行されます。'
       : '現在は判決と監査記録だけを作り、Discord上の処分は実行しません。',
-    `進行中: 法案 ${counts.proposals}件 / 事件 ${counts.cases}件`,
+    `進行中: 法案 ${counts.proposals}件 / 審議待ち ${counts.queued}件 / 事件 ${counts.cases}件`,
     `特別有権者: ${electorate}`,
     '',
     '## 参加方法',
@@ -269,6 +277,7 @@ function procedureComponents(governance, supportsImmediateReview) {
 export async function renderGovernanceProcedureHub(guild, governance) {
   const supportsImmediateReview = Boolean(summaryProcedure(getActiveConstitution(guild.id)?.policy));
   const proposals = activeProposals(guild.id, 100);
+  const queued = queuedProposals(guild.id, 100);
   const voting = proposals.filter((proposal) => proposalHandler(proposal) === 'public_vote');
   const approvals = listCases(guild.id, { statuses: ['approval'], limit: 20 });
   const debates = proposals.filter((proposal) => proposalHandler(proposal) === 'public_discussion');
@@ -294,9 +303,13 @@ export async function renderGovernanceProcedureHub(guild, governance) {
       `- ${recordLink(guild.id, proposal.forum_thread_id, `${proposal.title}を討議中`)}${deadline(proposal.stage_ends_at)}`
     )
   ].slice(0, 8);
+  const queuedLines = queued.slice(0, 6).map((proposal) =>
+    `- ${recordLink(guild.id, proposal.forum_thread_id, proposal.title)}`
+  );
   const omitted = Math.max(0, voting.length - votingLines.length)
     + Math.max(0, approvals.length - approvalLines.length)
-    + Math.max(0, appeals.length + defenses.length + debates.length - responseLines.length);
+    + Math.max(0, appeals.length + defenses.length + debates.length - responseLines.length)
+    + Math.max(0, queued.length - queuedLines.length);
   return {
     content: [
       `# ${guild.name} 進行中`,
@@ -311,6 +324,10 @@ export async function renderGovernanceProcedureHub(guild, governance) {
       '',
       '## 裁判・討議',
       ...(responseLines.length ? responseLines : ['いま受付中の案件はありません。']),
+      '',
+      '## 審議待ち',
+      ...(queuedLines.length ? ['同じ憲法・法律の先行案件が終わると、受付順に最新版から起草します。'] : []),
+      ...(queuedLines.length ? queuedLines : ['いま審議待ちはありません。']),
       omitted ? `\nほか ${omitted}件は議会・裁判所から確認できます。` : null,
       ''
     ].filter(Boolean).join('\n').slice(0, 1_900),

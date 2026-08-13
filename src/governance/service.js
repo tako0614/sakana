@@ -59,6 +59,7 @@ import {
   proposalVoteSummary,
   proposalDiscussion,
   pruneGovernance,
+  queueProposalWorkflow,
   recordActivities,
   recordActivity,
   recordProposalDeliberation,
@@ -67,6 +68,7 @@ import {
   recentGovernanceMessages,
   replaceCaseSubmission,
   reserveAgentAttempt,
+  resumeQueuedProposal,
   setCaseApproval,
   setOperationalSetting,
   snapshotProposalVoters,
@@ -86,6 +88,7 @@ import {
   createProposalPost,
   executeDiscordSanction,
   ensureGovernanceGazetteTopic,
+  ensureGovernanceParliamentForum,
   ensureGovernanceStatuteForum,
   postCourtUpdate,
   postCourtRecord,
@@ -122,7 +125,13 @@ import {
   validateRestrictionDefinition
 } from './policy.js';
 import { governanceActionAllowed, reserveRestrictedAgentCall } from './restrictions.js';
-import { buildLegislativeCandidates, exactActiveProposalMatch } from './relation.js';
+import {
+  activeProposal,
+  activeConstitutionalAmendment,
+  activeLawAmendment,
+  buildLegislativeCandidates,
+  exactActiveProposalMatch
+} from './relation.js';
 import { closeGovernanceVote, compileConstitution, durationMilliseconds, workflowFor } from './rules.js';
 
 const RETRY_BASE_MS = 5 * 60_000;
@@ -412,12 +421,15 @@ async function finishDraft(guild, proposal, body) {
   });
 }
 
-async function draftStoredProposal(guild, proposal) {
+async function draftStoredProposal(guild, proposal, { relatedInputs = [] } = {}) {
   const { constitution, policy } = requireGovernance(guild.id);
   if (proposal.body) return finishDraft(guild, proposal, proposal.body);
   const request = {
     title: proposal.title,
-    summary: proposal.summary,
+    summary: [
+      proposal.summary,
+      ...relatedInputs.slice(-8).map((input) => `同一案件として寄せられた意見: ${String(input.summary ?? '').slice(0, 1200)}`)
+    ].join('\n').slice(0, 12_000),
     source: proposal.source
   };
   const targetLaw = proposal.target_type === 'law' ? getLaw(proposal.target_id) : null;
@@ -456,12 +468,18 @@ export async function filePetition(guild, member, {
   if (duplicate) throw new Error('同名の法案が進行中です。議会で討議してください。');
   if (source !== 'weekly' && !attemptReserved) requireGovernanceAiAttempt(member, eventId ?? `petition:${member.id}:${Date.now()}`);
   let targetLaw = null;
+  let targetConflict = null;
   if (relation?.relation === 'amend_law') {
     targetLaw = getCurrentLawVersion(relation.targetId);
     if (!targetLaw || targetLaw.guild_id !== guild.id || targetLaw.status !== 'active') throw new Error('改正対象の法律が現行ではありません。');
     if (relation.targetHash && relation.targetHash !== targetLaw.content_hash) throw new Error('改正対象の法律が更新されました。改めて内容を確認してください。');
+    targetConflict = activeLawAmendment(
+      listProposals(guild.id, { limit: 500 }),
+      listLaws(guild.id, { activeOnly: false, limit: 500 }),
+      targetLaw.id
+    );
   }
-  const proposal = createProposal({
+  let proposal = createProposal({
     guildId: guild.id,
     kind: 'law',
     source,
@@ -487,6 +505,12 @@ export async function filePetition(guild, member, {
     reasons: relation.reasons,
     decision: relation
   });
+  if (targetConflict) {
+    return queueProposalWorkflow(proposal.id, {
+      blockedByProposalId: targetConflict.id,
+      reason: 'same_law_in_progress'
+    });
+  }
   try {
     return await draftStoredProposal(guild, proposal);
   } catch (error) {
@@ -508,10 +532,13 @@ export async function fileAmendment(guild, member, {
   if (!policy.voting.allowedScopes.includes(scope)) throw new Error('許可されていない投票scopeです。');
   if (scope === 'trusted' && !governance.trusted_role_id) throw new Error('特別有権者のみの投票には、対象ロールの設定が必要です。');
   if (!governanceActionAllowed(guild.id, member.id, 'petition')) throw new Error('改憲提案が制裁により停止されています。');
+  const conflict = activeConstitutionalAmendment(
+    listProposals(guild.id, { limit: 500 })
+  );
   const duplicate = findActiveProposalByNormalizedTitle(guild.id, title);
   if (duplicate) throw new Error('同名の改憲案が進行中です。議会で討議してください。');
   if (!attemptReserved) requireGovernanceAiAttempt(member, eventId ?? `amendment:${member.id}:${Date.now()}`);
-  const proposal = createProposal({
+  let proposal = createProposal({
     guildId: guild.id,
     kind: 'amendment',
     source: 'petition',
@@ -537,6 +564,12 @@ export async function fileAmendment(guild, member, {
     reasons: relation.reasons,
     decision: relation
   });
+  if (conflict) {
+    return queueProposalWorkflow(proposal.id, {
+      blockedByProposalId: conflict.id,
+      reason: 'constitution_in_progress'
+    });
+  }
   try {
     return await draftStoredProposal(guild, proposal);
   } catch (error) {
@@ -2110,6 +2143,7 @@ async function ensureAppealRestriction(guild, sanctionId) {
 }
 
 async function advanceProposal(guild, proposal, now) {
+  if (proposal.workflow_status === 'queued') return proposal;
   if (proposal.retry_after && proposal.retry_after > now) return proposal;
   const runtime = proposalRuntime(proposal);
   if (!runtime || runtime.state.handler === 'terminal') return proposal;
@@ -2138,6 +2172,129 @@ async function advanceProposal(guild, proposal, now) {
     return closeProposalVote(guild, proposal);
   }
   return proposal;
+}
+
+async function queueProposalBehind(guild, proposal, blocker, reason) {
+  const queued = queueProposalWorkflow(proposal.id, {
+    blockedByProposalId: blocker.id,
+    reason
+  });
+  if (queued.forum_thread_id) {
+    await postProposalUpdate(
+      guild,
+      queued,
+      `先に受理された「${blocker.title}」と同じ対象を更新するため、審議を一時停止しました。先行案件の終了後、最新版を基礎に自動で再開します。`,
+      { state: '待機', components: [] }
+    );
+  }
+  return queued;
+}
+
+export async function reconcileProposalQueues(guild) {
+  const newlyQueued = [];
+  let proposals = listProposals(guild.id, { limit: 500 });
+  const activeAmendments = proposals
+    .filter((proposal) => proposal.kind === 'amendment' && activeProposal(proposal))
+    .sort((left, right) => Number(left.id) - Number(right.id));
+  const firstAmendment = activeAmendments[0] ?? null;
+  for (const proposal of activeAmendments.slice(1)) {
+    newlyQueued.push(await queueProposalBehind(guild, proposal, firstAmendment, 'constitution_in_progress'));
+  }
+
+  proposals = listProposals(guild.id, { limit: 500 });
+  const laws = listLaws(guild.id, { activeOnly: false, limit: 500 });
+  const lawsById = new Map(laws.map((law) => [String(law.id), law]));
+  const firstByRoot = new Map();
+  for (const proposal of proposals
+    .filter((entry) => entry.kind === 'law' && entry.target_type === 'law' && activeProposal(entry))
+    .sort((left, right) => Number(left.id) - Number(right.id))) {
+    const law = lawsById.get(String(proposal.target_id));
+    const root = String(law?.root_law_id ?? law?.id ?? proposal.target_id);
+    const first = firstByRoot.get(root);
+    if (!first) firstByRoot.set(root, proposal);
+    else newlyQueued.push(await queueProposalBehind(guild, proposal, first, 'same_law_in_progress'));
+  }
+  return newlyQueued;
+}
+
+async function resumeQueuedProposalAndDraft(guild, proposal) {
+  const constitution = getActiveConstitution(guild.id);
+  const relatedInputs = Array.isArray(proposal.workflow_context?.queue?.inputs)
+    ? proposal.workflow_context.queue.inputs
+    : [];
+  let targetType = null;
+  let targetId = null;
+  let targetHash = null;
+  if (proposal.kind === 'amendment') {
+    targetType = 'constitution';
+    targetId = constitution.id;
+    targetHash = constitution.content_hash;
+  } else if (proposal.target_type === 'law') {
+    const law = getCurrentLawVersion(proposal.target_id);
+    if (!law || law.guild_id !== guild.id || law.status !== 'active') {
+      const remanded = updateProposal(proposal.id, { status: 'remanded', stage_ends_at: Date.now() });
+      if (remanded.forum_thread_id) {
+        await postProposalUpdate(guild, remanded, '改正対象の法律が現行ではなくなったため、審議待ちを終了して差し戻しました。', { state: '廃案' });
+      }
+      return remanded;
+    }
+    targetType = 'law';
+    targetId = law.id;
+    targetHash = law.content_hash;
+  }
+  let resumed = resumeQueuedProposal(proposal.id, {
+    constitutionId: constitution.id,
+    targetType,
+    targetId,
+    targetHash
+  });
+  if (resumed.forum_thread_id) {
+    await postProposalUpdate(guild, resumed, '先行案件が終了したため、最新版を基礎に草案を作り直します。', { state: '草案', components: [] });
+  }
+  try {
+    resumed = await draftStoredProposal(guild, resumed, { relatedInputs });
+  } catch (error) {
+    updateProposal(resumed.id, retryPatch(resumed, error));
+    throw error;
+  }
+  if (resumed.forum_thread_id) {
+    await postProposalUpdate(
+      guild,
+      resumed,
+      '審議待ちを終了し、最新版を基礎に討議を開始しました。',
+      { files: proposalBodyFiles(resumed.kind, resumed.body, '再起草案') }
+    );
+  }
+  return resumed;
+}
+
+export async function resumeProposalQueues(guild) {
+  const proposals = listProposals(guild.id, { limit: 500 });
+  const active = proposals.filter(activeProposal);
+  const queued = proposals
+    .filter((proposal) => proposal.workflow_status === 'queued')
+    .sort((left, right) => Number(left.id) - Number(right.id));
+  const resumed = [];
+  if (!active.some((proposal) => proposal.kind === 'amendment')) {
+    const next = queued.find((proposal) => proposal.kind === 'amendment');
+    if (next) resumed.push(await resumeQueuedProposalAndDraft(guild, next));
+  }
+  const laws = listLaws(guild.id, { activeOnly: false, limit: 500 });
+  const rootOf = (lawId) => {
+    const law = laws.find((entry) => String(entry.id) === String(lawId));
+    return String(law?.root_law_id ?? law?.id ?? lawId);
+  };
+  const activeRoots = new Set(active
+    .filter((proposal) => proposal.kind === 'law' && proposal.target_type === 'law')
+    .map((proposal) => rootOf(proposal.target_id)));
+  const resumedRoots = new Set();
+  for (const proposal of queued.filter((entry) => entry.kind === 'law' && entry.target_type === 'law')) {
+    const root = rootOf(proposal.target_id);
+    if (activeRoots.has(root) || resumedRoots.has(root)) continue;
+    resumed.push(await resumeQueuedProposalAndDraft(guild, proposal));
+    resumedRoots.add(root);
+  }
+  return resumed;
 }
 
 async function syncRetriedIntake(guild, resultType, result) {
@@ -2415,6 +2572,11 @@ export async function runGovernanceScheduler(client) {
         console.error(`Failed to sync statute book in ${guild.id}:`, error);
       }
       try {
+        await ensureGovernanceParliamentForum(guild, currentGovernance);
+      } catch (error) {
+        console.error(`Failed to sync parliament forum in ${guild.id}:`, error);
+      }
+      try {
         const { ensureGovernanceUx } = await import('./ux.js');
         const ux = await ensureGovernanceUx(guild, currentGovernance);
         currentGovernance = ux.governance;
@@ -2431,14 +2593,34 @@ export async function runGovernanceScheduler(client) {
         console.error(`Failed to sync governance UX in ${guild.id}:`, error);
       }
       if (currentGovernance.status !== 'active') continue;
+      let queueUiChanged = false;
+      try {
+        queueUiChanged = (await reconcileProposalQueues(guild)).length > 0;
+      } catch (error) {
+        console.error(`Failed to reconcile proposal queues in ${guild.id}:`, error);
+      }
       for (const proposal of listProposals(guild.id, { limit: 100 })
-        .filter((entry) => proposalRuntime(entry)?.state?.handler !== 'terminal')) {
+        .filter((entry) => entry.workflow_status !== 'queued'
+          && proposalRuntime(entry)?.state?.handler !== 'terminal')) {
         try {
           const current = await advanceProposal(guild, proposal, now) ?? getProposal(proposal.id);
           if (current?.status !== 'drafting') await syncRetriedIntake(guild, 'proposal', current);
         } catch (error) {
           updateProposal(proposal.id, retryPatch(getProposal(proposal.id), error));
           console.error(`Failed to advance proposal ${proposal.id}:`, error);
+        }
+      }
+      try {
+        queueUiChanged = (await resumeProposalQueues(guild)).length > 0 || queueUiChanged;
+      } catch (error) {
+        console.error(`Failed to resume proposal queue in ${guild.id}:`, error);
+      }
+      if (queueUiChanged) {
+        try {
+          const { ensureGovernanceUx } = await import('./ux.js');
+          currentGovernance = (await ensureGovernanceUx(guild, currentGovernance)).governance;
+        } catch (error) {
+          console.error(`Failed to publish proposal queue state in ${guild.id}:`, error);
         }
       }
       const cases = listCases(guild.id, { statuses: ['filing', 'summary_review', 'defense', 'deliberation', 'appeal_window', 'appeal'], limit: 100 });

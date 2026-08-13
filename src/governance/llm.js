@@ -719,7 +719,7 @@ relation is covered, join_active, amend_law, amend_constitution, separate, new, 
 Use covered only when the requested operative result is already effective.
 Use amend_law when an active law is the operative subject and the request would change its elements, scope, duties, sanctions, definitions, or exceptions.
 Use amend_constitution when the request changes the active constitution or its executable rules.
-Use join_active when an active proposal has substantially the same objective and scope, can absorb the request as discussion, or is a mutually exclusive alternative that should be resolved in the same proceeding.
+Use join_active when an active proposal has substantially the same objective and scope, can absorb the request as discussion, or is a mutually exclusive alternative that should be resolved in the same proceeding. A proposal whose status is queued is already accepted and waiting for the same target to become available; use join_active for a substantially equivalent queued proposal too, so it is not duplicated.
 Use separate only when a related active proposal can be enacted independently and the two operative results do not conflict.
 Use new only when no supplied instrument is materially related. Use uncertain when the request lacks enough substance.
 Select targetType and targetId only from the supplied candidates and only for covered, join_active, amend_law, or amend_constitution. Otherwise both must be null.
