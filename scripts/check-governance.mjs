@@ -1425,6 +1425,10 @@ assert.doesNotMatch(discordSource, /name: '裁判当事者用'/, '新規導入�
 assert.match(discordSource, /発言状態:/, '事件投稿に裁判中の発言状態を表示する');
 assert.match(discordSource, /いま必要なこと:/, '事件投稿の説明を次の行動へ絞る');
 assert.doesNotMatch(discordSource, /参照番号:|法律ID:/, '通常の公開投稿に内部IDを表示しない');
+assert.match(discordSource, /export async function syncGovernanceRecordUi/,
+  '既存の議会・裁判所・官報も番号なし表示へ移行する');
+assert.match(discordSource, /withoutLegacyPublicIds\(message\.content\)/,
+  '既存官報のrole IDも公開本文から除去する');
 const intakeSource = readFileSync(new URL('../src/governance/intake.js', import.meta.url), 'utf8');
 assert.doesNotMatch(intakeSource, /参照番号:|適用法: #|違憲審査対象: \$\{caseRecord\.challenged_type\}:\$\{caseRecord\.challenged_id\}/,
   'メンション受付の応答にも内部IDを表示しない');

@@ -90,6 +90,7 @@ import {
   reviewRequestButtons,
   syncAppealRoleOverwrites,
   ensureGovernanceMentionRoles,
+  syncGovernanceRecordUi,
   syncStatuteBook,
   voteButtons
 } from './discord.js';
@@ -1834,6 +1835,7 @@ async function runWeeklyReview(guild, governance, now) {
 let schedulerRunning = false;
 let lastPruneAt = 0;
 const verifiedStatuteGuilds = new Set();
+const verifiedRecordUiGuilds = new Set();
 
 function finalizeElapsedSummarySanctions(guildId, now) {
   for (const caseRecord of listCases(guildId, { statuses: ['summary_active'], limit: 100 })) {
@@ -1916,6 +1918,10 @@ export async function runGovernanceScheduler(client) {
         const { ensureGovernanceUx } = await import('./ux.js');
         const ux = await ensureGovernanceUx(guild, currentGovernance);
         currentGovernance = ux.governance;
+        if (!verifiedRecordUiGuilds.has(guild.id)) {
+          await syncGovernanceRecordUi(guild, currentGovernance);
+          verifiedRecordUiGuilds.add(guild.id);
+        }
       } catch (error) {
         console.error(`Failed to sync governance UX in ${guild.id}:`, error);
       }

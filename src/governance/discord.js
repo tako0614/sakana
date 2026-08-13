@@ -13,8 +13,10 @@ import {
   getGovernanceGuild,
   getLaw,
   getStatutePublication,
+  listCases,
   listConstitutions,
   listLaws,
+  listProposals,
   upsertStatutePublication
 } from './db.js';
 
@@ -912,6 +914,72 @@ export function reviewRequestButtons(guildId, sanctionId, disabled = false) {
   )];
 }
 
+function proposalNextAction(proposal) {
+  return ({
+    drafting: 'AIが草案を作成しています。',
+    draft: '内容を読み、必要なら討議に備えます。',
+    constitutional_review: 'AIが憲法との整合を審査しています。',
+    debate: '内容についてこの投稿で討議します。',
+    voting: '下のボタンから投票します。',
+    enacted: '成立済みです。現行本文は法令集で確認できます。',
+    rejected: '否決され、手続は終了しました。',
+    remanded: '差し戻され、手続は終了しました。'
+  })[proposal.status] ?? '経過はこの投稿で確認できます。';
+}
+
+function proposalStarterContent(proposal, nextAction = proposalNextAction(proposal), displayState = proposal.status) {
+  return [
+    `# ${proposal.title}`,
+    '',
+    proposal.summary,
+    '',
+    `状態: **${proposalStateLabel(displayState)}**`,
+    proposalDeadline(proposal) ? `期限: ${proposalDeadline(proposal)}` : null,
+    `いま必要なこと: ${oneLine(nextAction)}`,
+    '草案全文は添付、経過はこの投稿内にあります。'
+  ].filter(Boolean).join('\n').slice(0, 2_000);
+}
+
+function courtNextAction(caseRecord) {
+  return ({
+    filing: '裁判の準備中です。',
+    summary_review: 'AIが成立法に照らして判定しています。',
+    summary_active: '被処分者は「裁判を求める」から争えます。',
+    defense: '当事者は下のボタンから回答します。',
+    deliberation: '回答を締め切り、AIが判定しています。',
+    approval: '特別有権者の公開承認を待っています。',
+    appeal_window: '被申立人は下のボタンから上訴できます。',
+    appeal: '上訴審の回答または判定を待っています。',
+    execution: '確定した処分を処理しています。',
+    final: '判決は確定しました。',
+    overturned: '処分は取り消されました。',
+    acquitted: '責任なしで終了しました。',
+    dismissed: '申立ては棄却されました。',
+    constitutional_uncertain: '違憲判断は成立しませんでした。',
+    unenforceable: '処分を執行できないまま終了しました。'
+  })[caseRecord.status] ?? '経過はこの投稿で確認できます。';
+}
+
+function courtThreadName(caseRecord) {
+  return `${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反'}: ${caseRecord.summary}`.slice(0, 100);
+}
+
+function courtStarterContent(caseRecord, nextAction = courtNextAction(caseRecord), displayState = caseRecord.status) {
+  return [
+    `# ${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
+    caseRecord.accused_id ? `被申立人: <@${caseRecord.accused_id}>` : null,
+    caseLawDescription(caseRecord),
+    '',
+    caseRecord.summary,
+    '',
+    `状態: **${caseStateLabel(displayState)}**`,
+    `発言状態: ${courtAccessState(caseRecord)}`,
+    courtDeadline(caseRecord) ? `期限: <t:${Math.floor(courtDeadline(caseRecord) / 1000)}:F>` : null,
+    `いま必要なこと: ${oneLine(nextAction)}`,
+    '答弁・証拠・判断・承認・上訴はこの投稿にまとまります。'
+  ].filter(Boolean).join('\n').slice(0, 2_000);
+}
+
 export async function createProposalPost(guild, governance, proposal) {
   const forum = await guild.channels.fetch(governance.parliament_forum_id);
   if (!forum?.threads) throw new Error('議会Forumが見つかりません。');
@@ -927,17 +995,7 @@ export async function createProposalPost(guild, governance, proposal) {
     appliedTags: draftTag ? [draftTag] : [],
     autoArchiveDuration: 10_080,
     message: {
-      content: [
-        `# ${proposal.title}`,
-        '',
-        proposal.summary,
-        '',
-        `状態: ${proposalStateLabel(proposal.status)}`,
-        proposalDeadline(proposal) ? `期限: ${proposalDeadline(proposal)}` : null,
-        '次にすること: 内容を読み、この投稿で討議します。',
-        '草案全文は添付にあります。',
-        ''
-      ].filter(Boolean).join('\n').slice(0, 2000),
+      content: proposalStarterContent(proposal),
       files: [
         { attachment: Buffer.from(fullDraft), name: '草案全文.md' },
         {
@@ -960,17 +1018,7 @@ export async function postProposalUpdate(guild, proposal, text, { state = null, 
   const starter = await thread.fetchStarterMessage().catch(() => null);
   if (starter) {
     await starter.edit({
-      content: [
-        `# ${proposal.title}`,
-        '',
-        proposal.summary,
-        '',
-        `状態: **${proposalStateLabel(state ?? proposal.status)}**`,
-        proposalDeadline(proposal) ? `期限: ${proposalDeadline(proposal)}` : null,
-        `いま必要なこと: ${oneLine(text)}`,
-        '全文は添付、経過はこの投稿内にあります。',
-        ''
-      ].filter(Boolean).join('\n').slice(0, 2_000),
+      content: proposalStarterContent(proposal, text, state ?? proposal.status),
       allowedMentions: { parse: [] }
     }).catch(() => {});
   }
@@ -984,24 +1032,11 @@ export async function createCourtCaseThread(guild, governance, caseRecord, { onP
   const publicThread = caseRecord.public_thread_id
     ? await guild.channels.fetch(caseRecord.public_thread_id)
     : await forum.threads.create({
-    name: `${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反'}: ${caseRecord.summary}`.slice(0, 100),
+    name: courtThreadName(caseRecord),
     appliedTags: answerTag ? [answerTag] : [],
     autoArchiveDuration: 10_080,
     message: {
-      content: [
-        `# ${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
-        caseRecord.accused_id ? `被告: <@${caseRecord.accused_id}>` : null,
-        caseLawDescription(caseRecord),
-        '',
-        caseRecord.summary,
-        '',
-        `状態: ${caseStateLabel(caseRecord.status)}`,
-        `発言状態: ${courtAccessState(caseRecord)}`,
-        `期限: ${caseRecord.defense_until ? `<t:${Math.floor(caseRecord.defense_until / 1000)}:F>` : '審査準備中'}`,
-        '',
-        '次にすること: 当事者は下のボタンから回答します。',
-        ''
-      ].filter(Boolean).join('\n').slice(0, 2000),
+      content: courtStarterContent(caseRecord),
       components: courtActionButtons(caseRecord),
       allowedMentions: { parse: [] }
     },
@@ -1018,24 +1053,102 @@ export async function postCourtUpdate(guild, caseRecord, text, { state = null, c
   const starter = await thread.fetchStarterMessage().catch(() => null);
   if (starter) {
     await starter.edit({
-      content: [
-        `# ${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
-        caseRecord.accused_id ? `被申立人: <@${caseRecord.accused_id}>` : null,
-        '',
-        caseRecord.summary,
-        '',
-        `状態: **${caseStateLabel(state ?? caseRecord.status)}**`,
-        `発言状態: ${courtAccessState(caseRecord)}`,
-        courtDeadline(caseRecord) ? `期限: <t:${Math.floor(courtDeadline(caseRecord) / 1000)}:F>` : null,
-        `いま必要なこと: ${oneLine(text)}`,
-        '答弁・証拠・判断・承認・上訴はこの投稿にまとまります。',
-        ''
-      ].filter(Boolean).join('\n').slice(0, 2_000),
+      content: courtStarterContent(caseRecord, text, state ?? caseRecord.status),
       components: courtActionButtons(caseRecord),
       allowedMentions: { parse: [] }
     }).catch(() => {});
   }
   return thread.send({ content: text.slice(0, 2000), components, files, allowedMentions: { parse: [] } });
+}
+
+function proposalForumState(status) {
+  return ({
+    drafting: '草案', draft: '草案', constitutional_review: '違憲審査', debate: '討議', voting: '投票',
+    enacted: '成立', rejected: '否決', remanded: '廃案'
+  })[status] ?? null;
+}
+
+function courtForumState(status) {
+  if (['filing', 'defense'].includes(status)) return '答弁';
+  if (['summary_review', 'deliberation'].includes(status)) return '審理';
+  if (status === 'approval') return '承認待ち';
+  if (['appeal_window', 'appeal'].includes(status)) return '上訴';
+  return '確定';
+}
+
+async function syncRecordThread(thread, { name, content, components, state }) {
+  const wasArchived = Boolean(thread.archived);
+  if (wasArchived) await thread.setArchived(false, '公開表示を同期');
+  if (thread.name !== name) await thread.setName(name, '内部番号を使わない表示へ同期');
+  const starter = await thread.fetchStarterMessage().catch(() => null);
+  if (starter) await starter.edit({ content, components, allowedMentions: { parse: [] } });
+  if (state) await setForumState(thread, state);
+  if (wasArchived) await thread.setArchived(true, '公開表示の同期完了');
+}
+
+function withoutLegacyPublicIds(content) {
+  return String(content ?? '')
+    .replace(/^\s*(?:参照番号|法律ID|ロールID):[^\n]*\n?/gim, '')
+    .replace(/(^#{1,6}\s+[^\n]*?)\s+(?:L|C|A)-\d+\s*$/gim, '$1')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+export async function syncGovernanceRecordUi(guild, governance) {
+  let changed = 0;
+  const failures = [];
+  for (const proposal of listProposals(guild.id, { limit: 500 })) {
+    if (!proposal.forum_thread_id || proposal.title.startsWith('[E2E:')) continue;
+    const thread = await guild.channels.fetch(proposal.forum_thread_id).catch(() => null);
+    if (!thread?.isThread?.() || thread.parentId !== governance.parliament_forum_id) continue;
+    try {
+      await syncRecordThread(thread, {
+        name: proposal.title.slice(0, 100),
+        content: proposalStarterContent(proposal),
+        components: proposal.status === 'voting' ? voteButtons(proposal.id) : [],
+        state: proposalForumState(proposal.status)
+      });
+      changed += 1;
+    } catch (error) {
+      failures.push(`proposal ${proposal.id}: ${error?.message ?? error}`);
+    }
+  }
+  for (const caseRecord of listCases(guild.id, { limit: 500 })) {
+    if (!caseRecord.public_thread_id || caseRecord.summary.startsWith('[E2E:')) continue;
+    const thread = await guild.channels.fetch(caseRecord.public_thread_id).catch(() => null);
+    if (!thread?.isThread?.() || thread.parentId !== governance.court_forum_id) continue;
+    try {
+      await syncRecordThread(thread, {
+        name: courtThreadName(caseRecord),
+        content: courtStarterContent(caseRecord),
+        components: caseRecord.status === 'approval' ? approvalButtons(caseRecord.id) : courtActionButtons(caseRecord),
+        state: courtForumState(caseRecord.status)
+      });
+      changed += 1;
+    } catch (error) {
+      failures.push(`case ${caseRecord.id}: ${error?.message ?? error}`);
+    }
+  }
+  const gazette = await guild.channels.fetch(governance.gazette_channel_id).catch(() => null);
+  if (gazette?.isTextBased?.()) {
+    let before;
+    for (let page = 0; page < 10; page += 1) {
+      const batch = await gazette.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+      if (batch.size === 0) break;
+      for (const message of batch.values()) {
+        if (message.author.id !== guild.client.user.id) continue;
+        const content = withoutLegacyPublicIds(message.content);
+        if (content !== message.content) {
+          await message.edit({ content });
+          changed += 1;
+        }
+      }
+      before = batch.last()?.id;
+      if (batch.size < 100 || !before) break;
+    }
+  }
+  if (failures.length > 0) throw new Error(`公開表示を${failures.length}件同期できません: ${failures.slice(0, 3).join(' / ')}`);
+  return changed;
 }
 
 export function courtActionButtons(caseRecord) {
