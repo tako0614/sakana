@@ -917,9 +917,9 @@ export function reviewRequestButtons(guildId, sanctionId, disabled = false) {
 function proposalNextAction(proposal) {
   return ({
     drafting: 'AIが草案を作成しています。',
-    draft: '内容を読み、必要なら討議に備えます。',
-    constitutional_review: 'AIが憲法との整合を審査しています。',
-    debate: '内容についてこの投稿で討議します。',
+    draft: '草案を公開討議へ移行しています。',
+    constitutional_review: '最終案を固定し、AIが憲法との整合を審査しています。',
+    debate: '草案または調整案を読み、意見をこの投稿へ書きます。',
     voting: '下のボタンから投票します。',
     enacted: '成立済みです。現行本文は法令集で確認できます。',
     rejected: '否決され、手続は終了しました。',
@@ -936,7 +936,7 @@ function proposalStarterContent(proposal, nextAction = proposalNextAction(propos
     `状態: **${proposalStateLabel(displayState)}**`,
     proposalDeadline(proposal) ? `期限: ${proposalDeadline(proposal)}` : null,
     `いま必要なこと: ${oneLine(nextAction)}`,
-    '草案全文は添付、経過はこの投稿内にあります。'
+    '草案・調整案・最終案と経過はこの投稿内にあります。'
   ].filter(Boolean).join('\n').slice(0, 2_000);
 }
 
@@ -983,7 +983,7 @@ function courtStarterContent(caseRecord, nextAction = courtNextAction(caseRecord
 export async function createProposalPost(guild, governance, proposal) {
   const forum = await guild.channels.fetch(governance.parliament_forum_id);
   if (!forum?.threads) throw new Error('議会Forumが見つかりません。');
-  const draftTag = tagId(forum, '草案');
+  const debateTag = tagId(forum, '討議');
   const body = proposal.body;
   const fullDraft = proposal.kind === 'amendment'
     ? `# ${body.title}\n\n${body.content}\n\n## Policy\n\n\`\`\`json\n${JSON.stringify(body.policy, null, 2)}\n\`\`\``
@@ -992,7 +992,7 @@ export async function createProposalPost(guild, governance, proposal) {
   const structuredName = proposal.kind === 'amendment' ? 'policy' : 'provisions';
   const thread = await forum.threads.create({
     name: proposal.title.slice(0, 100),
-    appliedTags: draftTag ? [draftTag] : [],
+    appliedTags: debateTag ? [debateTag] : [],
     autoArchiveDuration: 10_080,
     message: {
       content: proposalStarterContent(proposal),
@@ -1013,7 +1013,7 @@ export async function createProposalPost(guild, governance, proposal) {
 
 export async function postProposalUpdate(guild, proposal, text, { state = null, components = [], files = [] } = {}) {
   const thread = await guild.channels.fetch(proposal.forum_thread_id).catch(() => null);
-  if (!thread?.isThread?.()) return null;
+  if (!thread?.isThread?.()) throw new Error('議会の案件投稿が見つかりません。公開記録なしでは手続を進められません。');
   if (state) await setForumState(thread, state).catch(() => {});
   const starter = await thread.fetchStarterMessage().catch(() => null);
   if (starter) {

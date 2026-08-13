@@ -648,6 +648,27 @@ db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied
 }
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (12, ?)').run(Date.now());
 
+{
+  const existing = new Set(db.pragma('table_info(governance_proposals)').map((row) => row.name));
+  if (!existing.has('debate_extensions')) {
+    db.exec('ALTER TABLE governance_proposals ADD COLUMN debate_extensions INTEGER NOT NULL DEFAULT 0');
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS governance_proposal_deliberations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      proposal_id INTEGER NOT NULL,
+      revision INTEGER NOT NULL,
+      outcome TEXT NOT NULL,
+      discussion_json TEXT NOT NULL,
+      decision_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_gov_proposal_deliberations
+      ON governance_proposal_deliberations(proposal_id, revision, id);
+  `);
+}
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (13, ?)').run(Date.now());
+
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
 db.prepare("UPDATE governance_outbox SET status = 'error', last_error = 'interrupted before completion' WHERE status = 'running'").run();
@@ -1086,6 +1107,23 @@ export function recentGovernanceMessages(guildId, since, channelIds, limit = 300
   }).reverse();
 }
 
+export function proposalDiscussion(proposalId, since, until, limit = 300) {
+  const proposal = getProposal(proposalId);
+  if (!proposal?.forum_thread_id) return [];
+  return db.prepare(`
+    SELECT message_id, user_id, content, created_at
+    FROM governance_activity
+    WHERE guild_id = ? AND channel_id = ? AND created_at >= ? AND created_at <= ? AND content <> ''
+    ORDER BY created_at, message_id LIMIT ?
+  `).all(
+    String(proposal.guild_id),
+    String(proposal.forum_thread_id),
+    Number(since),
+    Number(until),
+    Number(limit)
+  );
+}
+
 export function recentUserActivity(guildId, userId, channelId, since, until = Date.now(), limit = 100) {
   return db.prepare(`
     SELECT message_id, channel_id, parent_id, content_hash, content, created_at
@@ -1130,6 +1168,10 @@ export function getProposal(id) {
   return hydrateProposal(db.prepare('SELECT * FROM governance_proposals WHERE id = ?').get(Number(id)));
 }
 
+export function getProposalByForumThread(threadId) {
+  return hydrateProposal(db.prepare('SELECT * FROM governance_proposals WHERE forum_thread_id = ?').get(String(threadId)));
+}
+
 export function findActiveProposalByNormalizedTitle(guildId, normalizedTitle) {
   return hydrateProposal(db.prepare(`
     SELECT * FROM governance_proposals
@@ -1152,7 +1194,8 @@ export function listProposals(guildId, { statuses = null, limit = 25 } = {}) {
 export function updateProposal(id, patch) {
   const allowed = new Set([
     'title', 'summary', 'body_json', 'status', 'forum_thread_id', 'forum_message_id',
-    'stage_started_at', 'stage_ends_at', 'revision', 'retry_after', 'failure_count', 'last_error'
+    'stage_started_at', 'stage_ends_at', 'revision', 'debate_extensions',
+    'retry_after', 'failure_count', 'last_error'
   ]);
   const normalized = { ...patch };
   if ('body' in normalized) {
@@ -1165,6 +1208,32 @@ export function updateProposal(id, patch) {
   db.prepare(`UPDATE governance_proposals SET ${sql}, updated_at = @updated_at WHERE id = @id`)
     .run({ id: Number(id), updated_at: Date.now(), ...Object.fromEntries(entries) });
   return getProposal(id);
+}
+
+export function recordProposalDeliberation({ proposalId, revision, outcome, discussion, decision }) {
+  const result = db.prepare(`
+    INSERT INTO governance_proposal_deliberations
+      (proposal_id, revision, outcome, discussion_json, decision_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    Number(proposalId),
+    Number(revision),
+    String(outcome),
+    canonicalJson(discussion ?? []),
+    canonicalJson(decision ?? {}),
+    Date.now()
+  );
+  return Number(result.lastInsertRowid);
+}
+
+export function listProposalDeliberations(proposalId) {
+  return db.prepare(`
+    SELECT * FROM governance_proposal_deliberations WHERE proposal_id = ? ORDER BY id
+  `).all(Number(proposalId)).map((row) => ({
+    ...row,
+    discussion: parseJson(row.discussion_json, []),
+    decision: parseJson(row.decision_json, {})
+  }));
 }
 
 export const snapshotProposalVoters = db.transaction((proposalId, rows) => {
