@@ -313,6 +313,44 @@ try {
   if (plainText('<:neko:12345> かわいい') !== ':neko: かわいい') fail('絵文字が :name: になっていない');
   if (channelLabel('nonexistent') !== '#other') fail('知らないチャンネルが #other にならない');
 
+  // --- bot は自分の役で喋る ---
+  //
+  // `nextRole()` で毎回「次の空き役」にしていたので、bot 自身の過去の返答を文脈に
+  // 入れる修正を入れた時点で整合が壊れた。実際に流れていたプロンプト:
+  //   だこ: @A 日本の首都どこにゃ   ← @A 宛て = bot 宛て
+  //   B:                          ← ここを書かせていた
+  // モデルから見れば「A に聞かれたのに B が喋る番」なので答えないのが正しい。
+  {
+    const { buildMimicPrompt } = await import('../src/mimic/respond.js');
+    const SELF = 'check-self-bot';
+    const turns = [
+      { authorId: 'check-user-1', content: 'これ動かんのやけど', isReply: false },
+      { authorId: SELF, content: 'どこで止まってる？', isReply: false },
+      { authorId: 'check-user-1', content: '日本の首都どこ', isReply: true }
+    ];
+
+    const withSelf = await buildMimicPrompt(turns, { engine: 'evex-ft', selfId: SELF });
+    const first = withSelf.prompt.split('\n').find((line) => line.startsWith('B: '))
+      ?? withSelf.prompt.split('\n')[2];
+    if (!withSelf.prompt.endsWith(`\n${withSelf.trailing}:`)) {
+      fail('末尾が役で終わっていない');
+    }
+    // bot が既に喋っているので、その役で続けないといけない
+    const spoken = withSelf.prompt.split('\n')
+      .filter((line) => line.includes('どこで止まってる？'))
+      .map((line) => line.slice(0, line.indexOf(':')))[0];
+    if (!spoken) fail('bot 自身の発言が文脈に入っていない');
+    if (withSelf.trailing !== spoken) {
+      fail(`bot が自分の役で喋っていない (文脈では ${spoken} / 末尾は ${withSelf.trailing})`);
+    }
+
+    // selfId が無いときは従来どおり次の空き役 (初めて喋る場合と同じ)
+    const without = await buildMimicPrompt(turns, { engine: 'evex-ft' });
+    if (without.trailing === spoken) fail('selfId 無しで自分の役を引いてはいけない');
+
+    console.log(`self-role ok (bot は自分の役 ${spoken} で続ける / 未参加なら ${without.trailing})`);
+  }
+
   console.log(
     `mimic plain ok (${speakers.length} ラベル / 本人の連投4発言まで / 他人で切る / 正規化)`
   );

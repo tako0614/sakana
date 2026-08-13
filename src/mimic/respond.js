@@ -67,9 +67,9 @@ const MAX_TRIES = Number(process.env.MIMIC_MAX_TRIES ?? 3);
 
 /**
  * 独自トークン形式 (evex-1 / evex-2)。会話に出てくる人に役を振って、
- * bot は次の空いている役 — または /as で選ばれた人の話者トークン — で喋る。
+ * bot は**自分が既に持っている役** — または /as で選ばれた人の話者トークン — で喋る。
  */
-async function tokenRequest(messages, { wanted, engine }) {
+async function tokenRequest(messages, { wanted, engine, selfId }) {
   const scheme = await roleScheme(engine);
   const roles = assignRoles(messages.map((entry) => entry.authorId), scheme);
   const turns = messages.map((entry) => ({
@@ -81,7 +81,9 @@ async function tokenRequest(messages, { wanted, engine }) {
   // 申告に無いトークンは渡さない
   const token = wanted ? tokenFor(wanted) : null;
   const as = token && scheme?.speakers?.includes(token) ? token : null;
-  const trailing = as ?? nextRole(roles, scheme);
+  // 自分が既に喋っているならその役で続ける (下の plainRequest と同じ理由)
+  const mine = selfId ? roles.get(selfId) ?? null : null;
+  const trailing = as ?? mine ?? nextRole(roles, scheme);
 
   return {
     prompt: buildPrompt(turns, trailing),
@@ -97,7 +99,7 @@ async function tokenRequest(messages, { wanted, engine }) {
  * **学習側 (build-sft.mjs) と同じ規則でないと形がずれる** — 名前持ちに役を配ると
  * 「たこ」と「B」が同一人物という、学習中に一度も無かった形になる。
  */
-function plainRequest(messages, { wanted, channelId }) {
+function plainRequest(messages, { wanted, channelId, selfId }) {
   const ids = messages.map((entry) => entry.authorId);
   const roles = assignPlainRoles(ids.filter((id) => !labelFor(id)));
   const labelOf = (id) => labelFor(id) ?? roles.get(id) ?? null;
@@ -108,7 +110,21 @@ function plainRequest(messages, { wanted, channelId }) {
   })).filter((turn) => turn.role && turn.content);
 
   const as = wanted ? labelFor(wanted) : null;
-  const trailing = as ?? nextRole(roles, PLAIN_SCHEME);
+
+  // **自分が既に喋っているならその役で続ける。**
+  //
+  // `nextRole()` で毎回「次の空き役」にしていたので、bot 自身の過去の返答を文脈に
+  // 入れる修正を入れた時点で整合が壊れていた。実際に流れていたプロンプトがこれ:
+  //
+  //   だこ: @A あ
+  //   A: 確かにVPS提供する側としては悪いことしてにゃいぞ   ← bot 自身 (役 A)
+  //   だこ: @A 日本の首都どこにゃ                        ← @A 宛て = bot 宛て
+  //   B:                                              ← ここを書かせていた
+  //
+  // モデルから見ると「だこが A に質問した。さて B が喋る番」なので、
+  // **答えないのが正しい振る舞い**になる。噛み合わないのは当然だった。
+  const mine = selfId ? roles.get(selfId) ?? null : null;
+  const trailing = as ?? mine ?? nextRole(roles, PLAIN_SCHEME);
 
   return {
     prompt: buildPlainPrompt(turns, { channelId, trailingRole: trailing }),
@@ -132,10 +148,12 @@ function plainRequest(messages, { wanted, channelId }) {
  * as が null なら人格は乗っていない
  * (その世代がその人を知らない = 渡すと未学習のラベルになるので落としている)。
  */
-export async function buildMimicPrompt(messages, { wanted = null, engine = 'evex', channelId = null } = {}) {
+export async function buildMimicPrompt(
+  messages, { wanted = null, engine = 'evex', channelId = null, selfId = null } = {}
+) {
   return await mimicFormat(engine) === 'plain'
-    ? plainRequest(messages, { wanted, channelId })
-    : tokenRequest(messages, { wanted, engine });
+    ? plainRequest(messages, { wanted, channelId, selfId })
+    : tokenRequest(messages, { wanted, engine, selfId });
 }
 
 // 自分の返答に付けている `-# evex-1 / たこ として` を落とす。
@@ -226,7 +244,7 @@ export async function handleMimicRequest(
     // 載っている世代で形式が違う。取り違えるとモデルが一度も見ていない入力を
     // 受け取り、例外を出さずに静かに崩れる (evex-1 に <|a|> を渡して実際に壊した)
     const built = await buildMimicPrompt(messages, {
-      wanted, engine, channelId: message.channelId
+      wanted, engine, channelId: message.channelId, selfId
     });
 
     // **一番長い候補を残す。** 以前は毎回 body を上書きしていたので、1 回目が
