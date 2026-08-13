@@ -13,6 +13,7 @@ const E2E_STARTED_AT = Date.now();
 const SCENARIOS = Object.freeze([
   '公開討議・全員投票・特別有権者限定投票',
   '特別有権者ロールのowner操作、監査、原状復帰',
+  '投票・承認mentionの対象固定、通知上限、定期同期での重複防止',
   '一般／特別有権者のAI利用上限とprompt injection防御',
   '特別有権者の拒否権（分母はyes+noの有効票）',
   '発言数、リンク、添付、mention、reaction、thread、voice、AI、請願、投票の制限定義',
@@ -413,8 +414,17 @@ async function seed(guild, actorId, runId) {
     laws: [],
     results: {}
   };
+  const notificationKeys = [
+    'notification_everyone_daily_limit',
+    'notification_trusted_daily_limit',
+    'notification_user_daily_limit'
+  ];
+  const initialNotificationSettings = Object.fromEntries(
+    notificationKeys.map((key) => [key, getOperationalSetting(guild.id, key)])
+  );
 
   try {
+    for (const key of notificationKeys) setOperationalSetting(guild.id, key, 0, actorId);
     if (initialTrusted) currentOwner = await setTrustedAndAudit(guild, currentOwner, false);
     currentOwner = await setTrustedAndAudit(guild, currentOwner, true);
     assert.equal(currentOwner.roles.cache.has(governance.trusted_role_id), true);
@@ -794,6 +804,7 @@ async function seed(guild, actorId, runId) {
     await postCourtUpdate(guild, appealedCase, '上訴受付・上訴記録・shadow制限経路を確認し、実処分なしでE2E完了しました。', { state: '確定' });
     manifest.cases.push({ id: appealedCase.id, kind: 'appeal-exercised', status: appealedCase.status, threadId: appealedCase.public_thread_id });
 
+    const notificationStatsBefore = governanceNotificationStats(guild.id);
     await ensureGovernanceUx(guild, governance);
     const procedureChannel = await guild.channels.fetch(governance.admin_channel_id);
     const procedureMessages = await procedureChannel.messages.fetch({ limit: 100 });
@@ -804,6 +815,14 @@ async function seed(guild, actorId, runId) {
       '特別有権者投票の操作は進行中に表示する');
     assert.ok(procedureCustomIds.some((id) => id.startsWith(`gov:approve:${kickCase.id}:`)),
       '未完了の執行承認は進行中に表示する');
+    const actionMessageFor = (kind, id) => [...procedureMessages.values()].find((message) =>
+      messageCustomIds(message).some((customId) => customId.startsWith(`gov:${kind}:${id}:`)));
+    assert.match(actionMessageFor('vote', allVote.id)?.content ?? '', /^@everyone\n/,
+      '全員投票カードは全員への通知対象を明示する');
+    assert.match(actionMessageFor('vote', trustedVote.id)?.content ?? '', new RegExp(`^<@&${governance.trusted_role_id}>\\n`),
+      '限定投票カードは特別有権者ロールだけを通知対象にする');
+    assert.match(actionMessageFor('approve', kickCase.id)?.content ?? '', new RegExp(`^<@&${governance.trusted_role_id}>\\n`),
+      '執行承認カードは特別有権者ロールだけを通知対象にする');
     for (const [record, action] of [[allVote, 'vote'], [trustedVote, 'vote'], [kickCase, 'approve']]) {
       const threadId = record.forum_thread_id ?? record.public_thread_id;
       const thread = await guild.channels.fetch(threadId);
@@ -817,6 +836,22 @@ async function seed(guild, actorId, runId) {
       approvalCards: 1,
       recordThreadsContainDecisionButtons: false,
       completedRecordsLockedAndArchived: true
+    };
+    const notificationStatsAfterFirstSync = governanceNotificationStats(guild.id);
+    await ensureGovernanceUx(guild, governance);
+    const notificationStatsAfterSecondSync = governanceNotificationStats(guild.id);
+    assert.equal(notificationStatsAfterFirstSync.delivered, notificationStatsBefore.delivered,
+      'E2Eでは通知上限0により実在memberへ通知しない');
+    assert.ok(notificationStatsAfterFirstSync.suppressed - notificationStatsBefore.suppressed >= 3,
+      '全員投票・限定投票・執行承認の通知抑制を記録する');
+    assert.deepEqual(notificationStatsAfterSecondSync, notificationStatsAfterFirstSync,
+      '定期同期で通知記録を重複作成しない');
+    manifest.results.notifications = {
+      liveMentionsSent: 0,
+      suppressed: notificationStatsAfterFirstSync.suppressed - notificationStatsBefore.suppressed,
+      audiences: ['everyone', 'trusted_role'],
+      duplicateFree: true,
+      settingsRestored: false
     };
     const links = [
       `[進行中](${link(guild.id, governance.admin_channel_id)})`,
@@ -856,6 +891,10 @@ async function seed(guild, actorId, runId) {
     manifest.completedAt = new Date().toISOString();
     return manifest;
   } finally {
+    for (const [key, value] of Object.entries(initialNotificationSettings)) {
+      setOperationalSetting(guild.id, key, value, actorId);
+    }
+    if (manifest.results.notifications) manifest.results.notifications.settingsRestored = true;
     currentOwner = await guild.members.fetch({ user: actorId, force: true }).catch(() => currentOwner);
     const currentTrusted = currentOwner.roles.cache.has(governance.trusted_role_id);
     if (currentTrusted !== initialTrusted) {
@@ -1000,6 +1039,7 @@ const [{
   getCaseSanction,
   getGovernanceGuild,
   getOperationalSetting,
+  governanceNotificationStats,
   getStatutePublication,
   listCaseEvidence,
   listCaseApprovals,
@@ -1013,6 +1053,7 @@ const [{
   proposalVoteSummary,
   recordActivity,
   snapshotProposalVoters,
+  setOperationalSetting,
   updateAppeal,
   updateCase,
   updateGovernanceGuild,
