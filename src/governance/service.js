@@ -83,7 +83,6 @@ import {
 } from './db.js';
 import {
   applyAppealRestriction,
-  approvalButtons,
   createCourtCaseThread,
   createProposalPost,
   executeDiscordSanction,
@@ -100,8 +99,7 @@ import {
   syncAppealRoleOverwrites,
   ensureGovernanceMentionRoles,
   syncGovernanceRecordUi,
-  syncStatuteBook,
-  voteButtons
+  syncStatuteBook
 } from './discord.js';
 import {
   discoverWeeklyIssues,
@@ -980,7 +978,7 @@ async function openProposalVote(guild, proposal, suppliedTransition = null) {
     `投票範囲: ${proposal.vote_scope === 'all' ? '全員' : `${electorate}のみ`} / 有権者: ${eligible}人 / ${electorate}: ${trusted}人`,
     `定足数: ${Math.max(procedurePolicy.voting.minimumBallots, Math.ceil(eligible * procedurePolicy.voting.quorumRatio))}票`,
     `成立条件: 投票範囲内の賛否で${Math.round(voteRule.yesRatio * 100)}%${voteRule.comparison === 'gte' ? '以上' : 'を超える'}賛成${proposal.vote_scope === voteRule.trustedVeto.enabledForScope ? `、かつ${electorate}の有効票（賛否）中の反対が${Math.round(voteRule.trustedVeto.noRatio * 100)}%未満` : ''}`
-  ].join('\n'), { state: '投票', components: voteButtons(proposal.id) });
+  ].join('\n'), { state: '投票' });
   return updateProposal(proposal.id, {
     status: transition.targetName,
     stage_started_at: now,
@@ -1633,10 +1631,7 @@ async function beginCaseApproval(guild, caseRecord, sanction, text) {
   }
   updateSanction(sanction.id, { status: 'pending_approval' });
   updateCase(caseRecord.id, { status: 'approval' });
-  await postCourtUpdate(guild, getCase(caseRecord.id), text, {
-    state: '承認待ち',
-    components: approvalButtons(caseRecord.id)
-  });
+  await postCourtUpdate(guild, getCase(caseRecord.id), text, { state: '承認待ち' });
   return true;
 }
 
@@ -1787,7 +1782,7 @@ async function adjudicateCriminalCase(guild, caseRecord, phase = 'initial') {
       return;
     }
     updateCase(caseRecord.id, { status: 'approval' });
-    await postCourtUpdate(guild, getCase(caseRecord.id), `責任あり ${policy.judiciary.guiltyVotesRequired}/${policy.judiciary.panelSeats}以上。刑: ${panel.sanction.type}${panel.sanction.durationSeconds ? ` ${panel.sanction.durationSeconds}秒` : ''}。「${electorate}」${approvals}人の執行承認が必要です。`, { state: '承認待ち', components: approvalButtons(caseRecord.id) });
+    await postCourtUpdate(guild, getCase(caseRecord.id), `責任あり ${policy.judiciary.guiltyVotesRequired}/${policy.judiciary.panelSeats}以上。刑: ${panel.sanction.type}${panel.sanction.durationSeconds ? ` ${panel.sanction.durationSeconds}秒` : ''}。「${electorate}」${approvals}人の執行承認が必要です。`, { state: '承認待ち' });
   } else if (appealable) {
     await beginAppealWindow(guild, caseRecord, sanction);
   } else {

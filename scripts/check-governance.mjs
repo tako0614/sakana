@@ -2228,9 +2228,11 @@ const {
   legacyStatuteTechnicalCandidates,
   reconcileRequiredPermissionOverwrites,
   renderGovernanceGuide,
+  renderGovernanceActionCards,
   renderGovernanceOperationsPanel,
   renderGovernanceProcedureHub,
-  requiredPermissionOverwritesMatch
+  requiredPermissionOverwritesMatch,
+  syncGovernanceActionCards
 } = await import('../src/governance/ux.js');
 const expectedPublicAcl = readOnlyTextOverwrites(aclGuild);
 const existingPublicAcl = new Map(expectedPublicAcl.map((entry) => [entry.id, {
@@ -2294,6 +2296,62 @@ assert.doesNotMatch(procedureHub.content, /L-1|C-\d+/, '進行中一覧では参
 assert.doesNotMatch(procedureHub.content, /Bot権限|AI受付|自律起案|診断・復旧/, '公開手続に技術運用を混ぜない');
 assert.equal(procedureHub.components.length, 2);
 assert.equal(procedureHub.components[1].components[0].data.label, '自分の即時処分を確認');
+let uxVoteProposal = governanceDb.createProposal({
+  guildId: 'g1', kind: 'law', source: 'petition', title: '進行中カードで投票する法案',
+  summary: '議論と投票操作を分離する。', proposerId: 'u', constitutionId: uxConstitution.id,
+  status: 'voting', voteScope: 'all', stageEndsAt: Date.now() + 86_400_000
+});
+uxVoteProposal = governanceDb.updateProposal(uxVoteProposal.id, { forum_thread_id: 'vote-thread' });
+let uxApprovalCase = governanceDb.createCase({
+  guildId: 'g1', reporterId: 'reporter', accusedId: 'synthetic-user',
+  summary: '進行中カードで執行承認する事件', status: 'approval'
+});
+uxApprovalCase = governanceDb.updateCase(uxApprovalCase.id, { public_thread_id: 'approval-thread' });
+governanceDb.createSanction({
+  caseId: uxApprovalCase.id, guildId: 'g1', userId: 'synthetic-user', type: 'timeout',
+  durationSeconds: 172_800, status: 'pending_approval', requiredApprovals: 1, appealable: false
+});
+const actionCards = renderGovernanceActionCards(uxGuild);
+const voteCard = actionCards.find((card) => card.key === `vote:${uxVoteProposal.id}`);
+const approvalCard = actionCards.find((card) => card.key === `approve:${uxApprovalCase.id}`);
+assert.deepEqual(voteCard.components[0].components.map((button) => button.data.label),
+  ['賛成', '反対', '棄権', '本文・議論']);
+assert.match(voteCard.content, /現在: 賛成 0 \/ 反対 0 \/ 棄権 0/);
+assert.deepEqual(approvalCard.components[0].components.map((button) => button.data.label),
+  ['執行承認', '承認しない', '判決記録']);
+assert.match(approvalCard.content, /タイムアウト 2日 \/ 承認 0\/1人/);
+assert.match(approvalCard.content, /表示対象のアカウント/);
+assert.doesNotMatch(actionCards.map((card) => card.content).join('\n'),
+  /(?:法案|事件|参照番号|ID)\s*[:#A-]*\d+/i, '進行中カード本文に内部IDを出さない');
+const actionMessages = new Map();
+let actionSequence = 0;
+const actionChannel = {
+  messages: { fetch: async () => actionMessages },
+  send: async (payload) => {
+    const id = `action-${++actionSequence}`;
+    const message = {
+      id,
+      author: { id: 'bot' },
+      content: payload.content,
+      components: payload.components,
+      edit: async (next) => Object.assign(message, next),
+      delete: async () => actionMessages.delete(id)
+    };
+    actionMessages.set(id, message);
+    return message;
+  }
+};
+assert.equal(await syncGovernanceActionCards(uxGuild, actionChannel), actionCards.length);
+assert.equal(actionMessages.size, actionCards.length, '進行中に投票と承認を別カードとして作る');
+governanceDb.updateProposal(uxVoteProposal.id, { status: 'rejected' });
+governanceDb.updateCase(uxApprovalCase.id, { status: 'dismissed' });
+const remainingActionCards = renderGovernanceActionCards(uxGuild);
+assert.equal(await syncGovernanceActionCards(uxGuild, actionChannel), remainingActionCards.length);
+assert.equal(actionMessages.size, remainingActionCards.length, '終了した案件の操作カードを進行中から除去する');
+assert.ok(![...actionMessages.values()].flatMap((message) => message.components[0].components)
+  .some((button) => String(button.data.custom_id ?? '').includes(`:${uxVoteProposal.id}:`)
+    || String(button.data.custom_id ?? '').includes(`:${uxApprovalCase.id}:`)),
+  '終了した案件の操作ボタンを残さない');
 governanceDb.updateProposal(uxQueuedProposal.id, { status: 'remanded' });
 const operations = await renderGovernanceOperationsPanel(uxGuild, governanceDb.getGovernanceGuild('g1'));
 assert.match(operations.content, /Bot技術運用/);
@@ -2309,6 +2367,8 @@ assert.match(discordSource, /いま必要なこと:/, '事件投稿の説明を�
 assert.doesNotMatch(discordSource, /参照番号:|法律ID:/, '通常の公開投稿に内部IDを表示しない');
 assert.match(discordSource, /export async function syncGovernanceRecordUi/,
   '既存の議会・裁判所・官報も番号なし表示へ移行する');
+assert.match(discordSource, /removeOldDecisionRows/,
+  '既存の議会・裁判所投稿に残る投票・承認ボタンも移行時に除去する');
 assert.match(discordSource, /withoutLegacyPublicIds\(message\.content\)/,
   '既存官報のrole IDも公開本文から除去する');
 const intakeSource = readFileSync(new URL('../src/governance/intake.js', import.meta.url), 'utf8');
@@ -2329,6 +2389,8 @@ assert.match(serviceSource, /createProposalPost\(guild, governance, displayPropo
   '起草完了後に公開する投稿は草案状態と期限を表示する');
 assert.doesNotMatch(serviceSource, /`(?:法案|改憲案) L-\$\{proposal\.id\}|`事件 C-\$\{caseRecord\.id\}|ロールID:/,
   '公開する再試行案内と特別有権者履歴から内部IDを外す');
+assert.doesNotMatch(serviceSource, /components:\s*(?:voteButtons|approvalButtons)/,
+  '議会・裁判所の記録投稿へ投票・承認ボタンを戻さない');
 const legacyMessages = [
   { id: 'before', createdTimestamp: 1, author: { id: 'user' }, content: '普通の投稿', attachments: [] },
   { id: 'start', createdTimestamp: 2, author: { id: 'bot' }, content: '# 初期憲法 v1\n本文', attachments: [] },

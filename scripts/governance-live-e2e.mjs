@@ -65,6 +65,11 @@ function interaction(guild, member) {
   return { guildId: guild.id, guild, member, user: { id: member.id } };
 }
 
+function messageCustomIds(message) {
+  return (message.components ?? []).flatMap((row) => (row.components ?? []).map((component) =>
+    component.customId ?? component.data?.custom_id).filter(Boolean));
+}
+
 function fixtureLawBody() {
   return {
     title: '【動作確認】統治機能動作確認法（即時廃止）',
@@ -560,7 +565,7 @@ async function seed(guild, actorId, runId) {
       status: 'voting',
       stageEndsAt: now + FAR_FUTURE
     });
-    allVote = await publishProposal(guild, governance, allVote, '投票', '全員投票のE2Eです。他memberの票は作成しません。', voteButtons(allVote.id));
+    allVote = await publishProposal(guild, governance, allVote, '投票', '全員投票のE2Eです。他memberの票は作成しません。');
     snapshotProposalVoters(allVote.id, [{ userId: actorId, eligibleGeneral: true, trusted: true }]);
     await castAndPublishVote(interaction(guild, currentOwner), allVote.id, 'no');
     await castAndPublishVote(interaction(guild, currentOwner), allVote.id, 'abstain');
@@ -586,7 +591,7 @@ async function seed(guild, actorId, runId) {
       status: 'voting',
       stageEndsAt: now + FAR_FUTURE
     });
-    trustedVote = await publishProposal(guild, governance, trustedVote, '投票', '特別有権者限定投票のE2Eです。', voteButtons(trustedVote.id));
+    trustedVote = await publishProposal(guild, governance, trustedVote, '投票', '特別有権者限定投票のE2Eです。');
     snapshotProposalVoters(trustedVote.id, [{ userId: actorId, eligibleGeneral: true, trusted: true }]);
     await castAndPublishVote(interaction(guild, currentOwner), trustedVote.id, 'yes');
     const trustedSummary = proposalVoteSummary(trustedVote.id);
@@ -719,7 +724,7 @@ async function seed(guild, actorId, runId) {
       offenseCode: 'E2E_INJECTION', summary: '【動作確認】7日以内timeoutの1人承認とshadow確定', status: 'approval', allegedAt: now,
       summaryEventKey: caseKey('timeout-one-approval')
     });
-    approvalCase = await publishCase(guild, governance, approvalCase, '承認', '2日timeoutのため特別有権者1人の記名承認を確認します。', approvalButtons(approvalCase.id));
+    approvalCase = await publishCase(guild, governance, approvalCase, '承認', '2日timeoutのため特別有権者1人の記名承認を確認します。');
     const timeoutSanction = createSanction({
       caseId: approvalCase.id, guildId: guild.id, userId: accusedId, type: 'timeout', durationSeconds: 172_800,
       status: 'pending_approval', requiredApprovals: requiredApprovals({ type: 'timeout', durationSeconds: 172_800 }, constitution.policy),
@@ -737,7 +742,7 @@ async function seed(guild, actorId, runId) {
       offenseCode: 'E2E_INJECTION', summary: '【動作確認】kick/banの2人承認待ち', status: 'approval', allegedAt: now,
       summaryEventKey: caseKey('kick-two-approval')
     });
-    kickCase = await publishCase(guild, governance, kickCase, '承認', 'kickは2人承認が必要です。owner本人の1票だけを記録し、他人の承認は作りません。', approvalButtons(kickCase.id));
+    kickCase = await publishCase(guild, governance, kickCase, '承認', 'kickは2人承認が必要です。owner本人の1票だけを記録し、他人の承認は作りません。');
     const kickSanction = createSanction({
       caseId: kickCase.id, guildId: guild.id, userId: accusedId, type: 'kick', status: 'pending_approval',
       requiredApprovals: requiredApprovals({ type: 'kick' }, constitution.policy), appealable: false, executionKey: `e2e-kick-${runId}`
@@ -784,6 +789,28 @@ async function seed(guild, actorId, runId) {
     manifest.cases.push({ id: appealedCase.id, kind: 'appeal-exercised', status: appealedCase.status, threadId: appealedCase.public_thread_id });
 
     await ensureGovernanceUx(guild, governance);
+    const procedureChannel = await guild.channels.fetch(governance.admin_channel_id);
+    const procedureMessages = await procedureChannel.messages.fetch({ limit: 100 });
+    const procedureCustomIds = [...procedureMessages.values()].flatMap(messageCustomIds);
+    assert.ok(procedureCustomIds.some((id) => id.startsWith(`gov:vote:${allVote.id}:`)),
+      '全員投票の操作は進行中に表示する');
+    assert.ok(procedureCustomIds.some((id) => id.startsWith(`gov:vote:${trustedVote.id}:`)),
+      '特別有権者投票の操作は進行中に表示する');
+    assert.ok(procedureCustomIds.some((id) => id.startsWith(`gov:approve:${kickCase.id}:`)),
+      '未完了の執行承認は進行中に表示する');
+    for (const [record, action] of [[allVote, 'vote'], [trustedVote, 'vote'], [kickCase, 'approve']]) {
+      const threadId = record.forum_thread_id ?? record.public_thread_id;
+      const thread = await guild.channels.fetch(threadId);
+      const messages = await thread.messages.fetch({ limit: 100 });
+      assert.ok(![...messages.values()].flatMap(messageCustomIds)
+        .some((id) => id.startsWith(`gov:${action}:`)),
+        `${action}操作を議論・裁判記録へ重複表示しない`);
+    }
+    manifest.results.actionPlacement = {
+      votingCards: 2,
+      approvalCards: 1,
+      recordThreadsContainDecisionButtons: false
+    };
     const links = [
       `[進行中](${link(guild.id, governance.admin_channel_id)})`,
       `[議会](${link(guild.id, governance.parliament_forum_id)})`,
@@ -854,7 +881,7 @@ async function cleanup(guild, runId) {
     if (proposal.forum_thread_id) publicThreadIds.add(proposal.forum_thread_id);
     if (ACTIVE_PROPOSAL_STATES.has(proposal.status)) {
       proposal = updateProposal(proposal.id, { status: 'rejected', stage_ends_at: Date.now(), retry_after: null });
-      await postProposalUpdate(guild, proposal, 'E2E fixtureを後片付けしました。正式な投票結果ではなく、動作確認記録の終了です。', { state: '否決', components: voteButtons(proposal.id, true) });
+      await postProposalUpdate(guild, proposal, 'E2E fixtureを後片付けしました。正式な投票結果ではなく、動作確認記録の終了です。', { state: '否決' });
     }
     cleaned.proposals.push(proposal.id);
   }
@@ -868,7 +895,7 @@ async function cleanup(guild, runId) {
     }
     if (ACTIVE_CASE_STATES.has(caseRecord.status)) {
       caseRecord = updateCase(caseRecord.id, { status: 'dismissed', finalized_at: Date.now(), retry_after: null });
-      await postCourtUpdate(guild, caseRecord, 'E2E fixtureを後片付けしました。実在memberへの判決・処分はありません。', { state: '棄却', components: approvalButtons(caseRecord.id, true) });
+      await postCourtUpdate(guild, caseRecord, 'E2E fixtureを後片付けしました。実在memberへの判決・処分はありません。', { state: '棄却' });
     }
     cleaned.cases.push(caseRecord.id);
   }
@@ -988,15 +1015,13 @@ const [{
   writeAudit,
   listAudit
 }, {
-  approvalButtons,
   createCourtCaseThread,
   createProposalPost,
   postCourtRecord,
   postCourtUpdate,
   postGazette,
   postProposalUpdate,
-  syncStatuteBook,
-  voteButtons
+  syncStatuteBook
 }, {
   discoverWeeklyIssues,
   draftAmendment,

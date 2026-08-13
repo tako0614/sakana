@@ -24,6 +24,7 @@ import {
   listCaseApprovals,
   listCases,
   listProposals,
+  proposalVoteSummary,
   markLegacyGovernanceMessageDeleted,
   retryFailedActions,
   setOperationalSetting,
@@ -40,6 +41,7 @@ import {
   governanceProcedureOverwrites,
   governancePermissionReport,
   postGazette,
+  publicMemberLabel,
   readOnlyTextOverwrites,
   retireGovernanceCourtChat
 } from './discord.js';
@@ -274,6 +276,124 @@ function procedureComponents(governance, supportsImmediateReview) {
   ].filter(Boolean);
 }
 
+function actionLink(guildId, channelId, label) {
+  return new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link)
+    .setURL(`https://discord.com/channels/${guildId}/${channelId}`);
+}
+
+function voteActionComponents(guildId, proposal) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`gov:vote:${proposal.id}:yes`).setLabel('賛成').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`gov:vote:${proposal.id}:no`).setLabel('反対').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`gov:vote:${proposal.id}:abstain`).setLabel('棄権').setStyle(ButtonStyle.Secondary),
+    actionLink(guildId, proposal.forum_thread_id, '本文・議論')
+  )];
+}
+
+function approvalActionComponents(guildId, caseRecord) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`gov:approve:${caseRecord.id}:approve`).setLabel('執行承認').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`gov:approve:${caseRecord.id}:reject`).setLabel('承認しない').setStyle(ButtonStyle.Danger),
+    actionLink(guildId, caseRecord.public_thread_id, '判決記録')
+  )];
+}
+
+function sanctionName(sanction) {
+  const name = ({
+    warning: '警告', restriction: '機能制限', timeout: 'タイムアウト', kick: 'キック', ban: 'BAN'
+  })[sanction?.type] ?? '処分';
+  if (!sanction?.duration_seconds) return name;
+  const seconds = Number(sanction.duration_seconds);
+  if (seconds % 86_400 === 0) return `${name} ${seconds / 86_400}日`;
+  if (seconds % 3_600 === 0) return `${name} ${seconds / 3_600}時間`;
+  return `${name} ${Math.ceil(seconds / 60)}分`;
+}
+
+export function renderProposalVoteAction(guild, proposal) {
+  const summary = proposalVoteSummary(proposal.id);
+  return {
+    key: `vote:${proposal.id}`,
+    content: [
+      '# 投票',
+      `**${safeLabel(proposal.title, 180)}**`,
+      `対象: ${proposal.vote_scope === 'all' ? '全員' : '特別有権者'}${deadline(proposal.stage_ends_at)}`,
+      `現在: 賛成 ${summary.yes} / 反対 ${summary.no} / 棄権 ${summary.abstain}`,
+      '下のボタンから記名投票できます。選び直すと票が更新されます。'
+    ].join('\n').slice(0, 1_900),
+    components: voteActionComponents(guild.id, proposal),
+    allowedMentions: { parse: [] }
+  };
+}
+
+export function renderCaseApprovalAction(guild, caseRecord) {
+  const sanction = getCaseSanction(caseRecord.id);
+  const approved = listCaseApprovals(caseRecord.id).filter((entry) => entry.decision === 'approve').length;
+  return {
+    key: `approve:${caseRecord.id}`,
+    content: [
+      '# 執行承認',
+      `**${safeLabel(caseRecord.summary, 180)}**`,
+      caseRecord.accused_id ? `対象: ${publicMemberLabel(caseRecord.accused_id)}` : null,
+      `処分: ${sanctionName(sanction)} / 承認 ${approved}/${sanction?.required_approvals ?? '?'}人`,
+      '特別有権者は下のボタンから記名で判断します。被申立人と申立人は承認できません。'
+    ].filter(Boolean).join('\n').slice(0, 1_900),
+    components: approvalActionComponents(guild.id, caseRecord),
+    allowedMentions: { parse: [] }
+  };
+}
+
+export function renderGovernanceActionCards(guild) {
+  const proposals = activeProposals(guild.id, 100)
+    .filter((proposal) => proposalHandler(proposal) === 'public_vote' && proposal.forum_thread_id);
+  const approvals = listCases(guild.id, { statuses: ['approval'], limit: 100 })
+    .filter((caseRecord) => caseRecord.public_thread_id && getCaseSanction(caseRecord.id));
+  return [
+    ...proposals.map((proposal) => renderProposalVoteAction(guild, proposal)),
+    ...approvals.map((caseRecord) => renderCaseApprovalAction(guild, caseRecord))
+  ];
+}
+
+function actionCardKey(message) {
+  for (const row of message.components ?? []) {
+    for (const component of row.components ?? []) {
+      const customId = component.customId ?? component.data?.custom_id;
+      const match = String(customId ?? '').match(/^gov:(vote|approve):(\d+):/);
+      if (match) return `${match[1]}:${match[2]}`;
+    }
+  }
+  return null;
+}
+
+export async function syncGovernanceActionCards(guild, channel) {
+  const expected = renderGovernanceActionCards(guild);
+  const activeKeys = new Set(expected.map((card) => card.key));
+  const recent = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+  const existing = new Map();
+  for (const message of recent?.values?.() ?? []) {
+    if (message.author.id !== guild.client.user.id) continue;
+    const key = actionCardKey(message);
+    if (!key) continue;
+    if (!existing.has(key)) existing.set(key, []);
+    existing.get(key).push(message);
+  }
+  for (const card of expected) {
+    const messages = existing.get(card.key) ?? [];
+    const message = messages.shift() ?? null;
+    const { key: _key, ...payload } = card;
+    if (!message) await channel.send(payload);
+    else if (message.content !== payload.content || !componentsMatch(message, payload.components)) {
+      await message.edit(payload);
+    }
+    for (const duplicate of messages) await duplicate.delete().catch(() => {});
+    existing.delete(card.key);
+  }
+  for (const [key, messages] of existing) {
+    if (activeKeys.has(key)) continue;
+    for (const message of messages) await message.delete().catch(() => {});
+  }
+  return expected.length;
+}
+
 export async function renderGovernanceProcedureHub(guild, governance) {
   const supportsImmediateReview = Boolean(summaryProcedure(getActiveConstitution(guild.id)?.policy));
   const proposals = activeProposals(guild.id, 100);
@@ -314,7 +434,8 @@ export async function renderGovernanceProcedureHub(guild, governance) {
     content: [
       `# ${guild.name} 進行中`,
       '',
-      'いま対応できる手続です。詳しい説明と操作はリンク先にあります。',
+      'いま対応できる手続です。投票と執行承認は、このチャンネルの案件カードから行います。',
+      '議会・裁判所のリンクは、本文・議論・判決記録を読むためのものです。',
       '',
       '## 投票',
       ...(votingLines.length ? votingLines : ['いま投票はありません。']),
@@ -400,6 +521,7 @@ export async function ensureGovernanceUx(guild, governance = getGovernanceGuild(
   else if (adminMessage.content !== dashboard.content || !componentsMatch(adminMessage, dashboard.components)) {
     await adminMessage.edit(dashboard);
   }
+  await syncGovernanceActionCards(guild, admin);
 
   if (guideMessage.id !== current.guide_message_id || adminMessage.id !== current.admin_dashboard_message_id) {
     current = updateGovernanceGuild(guild.id, {

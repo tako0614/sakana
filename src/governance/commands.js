@@ -376,12 +376,14 @@ export async function handleGovernanceComponent(interaction) {
     await interaction.deferReply({ flags: EPHEMERAL });
     if (action === 'vote') {
       await castAndPublishVote(interaction, id, value);
+      await ensureGovernanceUx(interaction.guild, getGovernanceGuild(interaction.guildId));
       const label = { yes: '賛成', no: '反対', abstain: '棄権' }[value] ?? value;
       await interaction.editReply(`「${label}」で記名投票しました。`);
       return true;
     }
     if (action === 'approve') {
       const result = await approveCase(interaction, id, value);
+      await ensureGovernanceUx(interaction.guild, getGovernanceGuild(interaction.guildId));
       const label = value === 'approve' ? '執行を承認' : '承認しない';
       await interaction.editReply(`「${label}」を記録しました（承認 ${result.approvals}/${result.required}）。`);
       return true;
