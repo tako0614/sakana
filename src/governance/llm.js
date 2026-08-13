@@ -50,7 +50,11 @@ function texts(value, name, maxItems = 20, maxLength = 2000) {
 }
 
 function integer(value, name, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
-  if (!Number.isInteger(value) || value < min || value > max) throw new Error(`${name} must be an integer`);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    const error = new Error(`${name} must be an integer`);
+    error.governanceRetryHint = `${name} must be an integer from ${min} through ${max}.`;
+    throw error;
+  }
   return value;
 }
 
@@ -424,9 +428,9 @@ Each article has code and text. Each offense has code, title, elements, sanction
 ${summaryProcedure(policy)
     ? 'A narrowly defined spam-like offense may declare automaticTrigger {type:"message_burst", minimumMessages:5-30, windowSeconds:10-300}. It only starts the constitutional 3-seat summary review; it never proves guilt by itself. Omit it unless an objective burst trigger is necessary.'
     : 'A narrowly defined spam-like offense may also declare interimProtection with trigger {type:"message_burst", minimumMessages:5-30, windowSeconds:10-300} and durationSeconds:60-900. This is a short, non-punitive court-only safeguard before judgment; omit it unless an objective burst trigger is necessary.'}
-A sanction type is warning, restriction, timeout, kick, or ban. timeout has maximumSeconds.
-restriction refers to a sanctionDefinitions code and has maximumSeconds.
-A sanctionDefinition has code matching 3-40 uppercase letters/numbers/underscore, title, maximumDurationSeconds, and 1-12 rules.
+A sanction type is warning, restriction, timeout, kick, or ban. warning, kick, and ban have only type. timeout has type and maximumSeconds, an integer from 1 through ${policy.judiciary.maximumTimeoutSeconds}.
+restriction has type, definitionCode referring to a sanctionDefinitions code, and maximumSeconds, an integer from 60 through that definition's maximumDurationSeconds.
+A sanctionDefinition has code matching 3-40 uppercase letters/numbers/underscore, title, maximumDurationSeconds (an integer from 60 through ${policy.judiciary.maximumRestrictionSeconds}), and 1-12 rules.
 Count-rule primitives allowed by the current constitution: ${countRestrictionPrimitives.join(', ') || '(none)'}. A count rule has exactly primitive, maximum (integer 0-10000), and windowSeconds (integer 60-2592000).
 Boolean-rule primitives allowed by the current constitution: ${booleanRestrictionPrimitives.join(', ') || '(none)'}. A boolean rule has exactly primitive and enabled:true.
 Never invent another primitive or add fields to these rule shapes.
