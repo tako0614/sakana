@@ -2287,7 +2287,11 @@ uxQueuedProposal = governanceDb.queueProposalWorkflow(uxQueuedProposal.id, {
 });
 const procedureHub = await renderGovernanceProcedureHub(uxGuild, governanceDb.getGovernanceGuild('g1'));
 assert.match(procedureHub.content, /いま対応できる手続/);
-assert.match(procedureHub.content, /- \[test\]/);
+assert.match(procedureHub.content, /## 投票・承認/);
+assert.doesNotMatch(procedureHub.content, /- \[test\]/,
+  '操作カードがある投票案件を上部一覧へ重複表示しない');
+assert.doesNotMatch(procedureHub.content, /## 投票\n[\s\S]*## 承認/,
+  '上部メッセージで操作カードと同じ投票・承認一覧を重複表示しない');
 assert.match(procedureHub.content, /## 審議待ち/);
 assert.match(procedureHub.content, /発言の自由の保障を明確にする案/);
 assert.match(procedureHub.content, /受付順に最新版から起草/);
@@ -2316,9 +2320,11 @@ const voteCard = actionCards.find((card) => card.key === `vote:${uxVoteProposal.
 const approvalCard = actionCards.find((card) => card.key === `approve:${uxApprovalCase.id}`);
 assert.deepEqual(voteCard.components[0].components.map((button) => button.data.label),
   ['賛成', '反対', '棄権', '本文・議論']);
+assert.doesNotMatch(voteCard.content, /^#\s*投票/m, '各投票カードに同じ見出しを繰り返さない');
 assert.match(voteCard.content, /現在: 賛成 0 \/ 反対 0 \/ 棄権 0/);
 assert.deepEqual(approvalCard.components[0].components.map((button) => button.data.label),
   ['執行承認', '承認しない', '判決記録']);
+assert.doesNotMatch(approvalCard.content, /^#\s*執行承認/m, '各承認カードに同じ見出しを繰り返さない');
 assert.match(approvalCard.content, /タイムアウト 2日 \/ 承認 0\/1人/);
 assert.match(approvalCard.content, /表示対象のアカウント/);
 assert.doesNotMatch(actionCards.map((card) => card.content).join('\n'),
@@ -2369,6 +2375,8 @@ assert.match(discordSource, /export async function syncGovernanceRecordUi/,
   '既存の議会・裁判所・官報も番号なし表示へ移行する');
 assert.match(discordSource, /removeOldDecisionRows/,
   '既存の議会・裁判所投稿に残る投票・承認ボタンも移行時に除去する');
+assert.match(discordSource, /await closeRecordThread\(thread\)/,
+  '結果を記録した完了済みの議会・裁判所投稿はロックしてアーカイブする');
 assert.match(discordSource, /withoutLegacyPublicIds\(message\.content\)/,
   '既存官報のrole IDも公開本文から除去する');
 const intakeSource = readFileSync(new URL('../src/governance/intake.js', import.meta.url), 'utf8');

@@ -520,6 +520,9 @@ async function seed(guild, actorId, runId) {
       '直近30秒の公開ログ5件と成立法の定義が一致する場合だけ一時保全候補になることを確認しました。実制限なしで終了しました。',
       { state: '確定' }
     );
+    const closedCourtThread = await guild.channels.fetch(interimCase.public_thread_id, { force: true });
+    assert.equal(closedCourtThread.locked, true, '完了した裁判記録をロックする');
+    assert.equal(closedCourtThread.archived, true, '完了した裁判記録をアーカイブする');
     manifest.cases.push({
       id: interimCase.id,
       kind: 'interim-protection-log-trigger',
@@ -532,6 +535,9 @@ async function seed(guild, actorId, runId) {
     updateLaw(law.id, { status: 'repealed', ended_at: Date.now() });
     lawProposal = updateProposal(lawProposal.id, { status: 'rejected', stage_ends_at: Date.now() });
     await postProposalUpdate(guild, lawProposal, '刑罰schemaを登録・検証し、通常の法適用に入る前に廃止しました。', { state: '廃止' });
+    const closedProposalThread = await guild.channels.fetch(lawProposal.forum_thread_id, { force: true });
+    assert.equal(closedProposalThread.locked, true, '完了した議会記録をロックする');
+    assert.equal(closedProposalThread.archived, true, '完了した議会記録をアーカイブする');
     await syncStatuteBook(guild, governance, { verifyExisting: true });
     manifest.proposals.push({ id: lawProposal.id, kind: 'fixture-law', status: lawProposal.status, threadId: lawProposal.forum_thread_id });
     manifest.laws.push({ id: law.id, code: law.code, status: 'repealed' });
@@ -809,7 +815,8 @@ async function seed(guild, actorId, runId) {
     manifest.results.actionPlacement = {
       votingCards: 2,
       approvalCards: 1,
-      recordThreadsContainDecisionButtons: false
+      recordThreadsContainDecisionButtons: false,
+      completedRecordsLockedAndArchived: true
     };
     const links = [
       `[進行中](${link(guild.id, governance.admin_channel_id)})`,

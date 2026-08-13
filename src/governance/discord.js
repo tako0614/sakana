@@ -1093,12 +1093,14 @@ export async function postProposalUpdate(guild, proposal, text, { state = null, 
       allowedMentions: { parse: [] }
     }).catch(() => {});
   }
-  return thread.send({
+  const message = await thread.send({
     content: text.slice(0, 2000),
     components: withoutDecisionRows(components, ['vote']),
     files,
     allowedMentions: { parse: [] }
   });
+  if (proposalClosed(proposal)) await closeRecordThread(thread);
+  return message;
 }
 
 export async function createCourtCaseThread(guild, governance, caseRecord, { onPartial = null } = {}) {
@@ -1134,12 +1136,14 @@ export async function postCourtUpdate(guild, caseRecord, text, { state = null, c
       allowedMentions: { parse: [] }
     }).catch(() => {});
   }
-  return thread.send({
+  const message = await thread.send({
     content: text.slice(0, 2000),
     components: withoutDecisionRows(components, ['approve']),
     files,
     allowedMentions: { parse: [] }
   });
+  if (caseClosed(caseRecord)) await closeRecordThread(thread);
+  return message;
 }
 
 function proposalForumState(proposal) {
@@ -1163,6 +1167,21 @@ function courtForumState(status) {
   return '確定';
 }
 
+function proposalClosed(proposal) {
+  return proposalHandler(proposal) === 'terminal'
+    || ['enacted', 'rejected', 'remanded'].includes(proposal.status);
+}
+
+function caseClosed(caseRecord) {
+  return ['final', 'overturned', 'acquitted', 'dismissed', 'constitutional_uncertain', 'unenforceable']
+    .includes(caseRecord.status);
+}
+
+async function closeRecordThread(thread) {
+  if (!thread.locked) await thread.setLocked(true, '統治手続が完了したため記録を確定');
+  if (!thread.archived) await thread.setArchived(true, '統治手続が完了したため記録を保管');
+}
+
 async function removeOldDecisionRows(thread, actions) {
   let before;
   for (let page = 0; page < 5; page += 1) {
@@ -1178,7 +1197,7 @@ async function removeOldDecisionRows(thread, actions) {
   }
 }
 
-async function syncRecordThread(thread, { name, content, components, state, removeActions = [] }) {
+async function syncRecordThread(thread, { name, content, components, state, removeActions = [], closed = false }) {
   const wasArchived = Boolean(thread.archived);
   if (wasArchived) await thread.setArchived(false, '公開表示を同期');
   if (thread.name !== name) await thread.setName(name, '内部番号を使わない表示へ同期');
@@ -1186,7 +1205,8 @@ async function syncRecordThread(thread, { name, content, components, state, remo
   if (starter) await starter.edit({ content, components, allowedMentions: { parse: [] } });
   if (removeActions.length) await removeOldDecisionRows(thread, removeActions);
   if (state) await setForumState(thread, state);
-  if (wasArchived) await thread.setArchived(true, '公開表示の同期完了');
+  if (closed) await closeRecordThread(thread);
+  else if (wasArchived) await thread.setArchived(true, '公開表示の同期完了');
 }
 
 export function withoutLegacyPublicIds(content) {
@@ -1238,7 +1258,8 @@ export async function syncGovernanceRecordUi(guild, governance) {
         content: proposalStarterContent(proposal),
         components: [],
         state: proposalForumState(proposal),
-        removeActions: ['vote']
+        removeActions: ['vote'],
+        closed: proposalClosed(proposal)
       });
       changed += 1;
     } catch (error) {
@@ -1255,7 +1276,8 @@ export async function syncGovernanceRecordUi(guild, governance) {
         content: courtStarterContent(caseRecord),
         components: caseRecord.status === 'approval' ? [] : courtActionButtons(caseRecord),
         state: courtForumState(caseRecord.status),
-        removeActions: ['approve']
+        removeActions: ['approve'],
+        closed: caseClosed(caseRecord)
       });
       changed += 1;
     } catch (error) {

@@ -314,7 +314,6 @@ export function renderProposalVoteAction(guild, proposal) {
   return {
     key: `vote:${proposal.id}`,
     content: [
-      '# 投票',
       `**${safeLabel(proposal.title, 180)}**`,
       `対象: ${proposal.vote_scope === 'all' ? '全員' : '特別有権者'}${deadline(proposal.stage_ends_at)}`,
       `現在: 賛成 ${summary.yes} / 反対 ${summary.no} / 棄権 ${summary.abstain}`,
@@ -331,7 +330,6 @@ export function renderCaseApprovalAction(guild, caseRecord) {
   return {
     key: `approve:${caseRecord.id}`,
     content: [
-      '# 執行承認',
       `**${safeLabel(caseRecord.summary, 180)}**`,
       caseRecord.accused_id ? `対象: ${publicMemberLabel(caseRecord.accused_id)}` : null,
       `処分: ${sanctionName(sanction)} / 承認 ${approved}/${sanction?.required_approvals ?? '?'}人`,
@@ -403,14 +401,6 @@ export async function renderGovernanceProcedureHub(guild, governance) {
   const debates = proposals.filter((proposal) => proposalHandler(proposal) === 'public_discussion');
   const defenses = listCases(guild.id, { statuses: ['defense'], limit: 20 });
   const appeals = listCases(guild.id, { statuses: ['appeal_window'], limit: 20 });
-  const votingLines = voting.slice(0, 6).map((proposal) =>
-    `- ${recordLink(guild.id, proposal.forum_thread_id, proposal.title)} / ${proposal.vote_scope === 'all' ? '全員' : '特別有権者'}${deadline(proposal.stage_ends_at)}`
-  );
-  const approvalLines = approvals.slice(0, 6).map((caseRecord) => {
-    const sanction = getCaseSanction(caseRecord.id);
-    const approved = listCaseApprovals(caseRecord.id).filter((entry) => entry.decision === 'approve').length;
-    return `- ${recordLink(guild.id, caseRecord.public_thread_id, `処分の承認: ${caseRecord.summary}`)} / ${approved}/${sanction?.required_approvals ?? '?'}人`;
-  });
   const responseLines = [
     ...appeals.map((caseRecord) => {
       const sanction = getCaseSanction(caseRecord.id);
@@ -426,9 +416,7 @@ export async function renderGovernanceProcedureHub(guild, governance) {
   const queuedLines = queued.slice(0, 6).map((proposal) =>
     `- ${recordLink(guild.id, proposal.forum_thread_id, proposal.title)}`
   );
-  const omitted = Math.max(0, voting.length - votingLines.length)
-    + Math.max(0, approvals.length - approvalLines.length)
-    + Math.max(0, appeals.length + defenses.length + debates.length - responseLines.length)
+  const omitted = Math.max(0, appeals.length + defenses.length + debates.length - responseLines.length)
     + Math.max(0, queued.length - queuedLines.length);
   return {
     content: [
@@ -437,11 +425,10 @@ export async function renderGovernanceProcedureHub(guild, governance) {
       'いま対応できる手続です。投票と執行承認は、このチャンネルの案件カードから行います。',
       '議会・裁判所のリンクは、本文・議論・判決記録を読むためのものです。',
       '',
-      '## 投票',
-      ...(votingLines.length ? votingLines : ['いま投票はありません。']),
-      '',
-      '## 承認',
-      ...(approvalLines.length ? approvalLines : ['いま承認待ちはありません。']),
+      '## 投票・承認',
+      voting.length || approvals.length
+        ? `下の案件カードから操作できます（投票 ${voting.length}件 / 承認 ${approvals.length}件）。`
+        : 'いま投票・承認待ちはありません。',
       '',
       '## 裁判・討議',
       ...(responseLines.length ? responseLines : ['いま受付中の案件はありません。']),
