@@ -94,6 +94,7 @@ import {
   postCourtRecord,
   postGazette,
   postProposalUpdate,
+  publicMemberLabel,
   releaseAppealRestriction,
   reviewRequestButtons,
   syncAppealRoleOverwrites,
@@ -187,6 +188,28 @@ function publicLawDetails(law, offenseCode) {
     law ? `適用法: ${law.title}` : '適用法: 裁判記録に記載',
     offense?.title ? `対象となる違反: ${offense.title}` : null
   ].filter(Boolean);
+}
+
+export function publicPanelOutputs(outputs, evidenceOrder = new Map()) {
+  return outputs.map((output) => {
+    const {
+      evidenceIds = [],
+      elementFindings = [],
+      lawId: _lawId,
+      offenseCode: _offenseCode,
+      ...publicOutput
+    } = output;
+    return {
+      ...publicOutput,
+      evidence: evidenceIds.map((id) => `証拠 ${evidenceOrder.get(id) ?? '?'}`),
+      ...(elementFindings.length > 0 ? {
+        elementFindings: elementFindings.map(({ evidenceIds: findingEvidence = [], ...finding }) => ({
+          ...finding,
+          evidence: findingEvidence.map((id) => `証拠 ${evidenceOrder.get(id) ?? '?'}`)
+        }))
+      } : {})
+    };
+  });
 }
 const CASE_EVIDENCE_LIMIT = 20;
 const CASE_SUBMISSION_LIMIT_PER_PHASE = 40;
@@ -650,7 +673,7 @@ async function reviseProposal(guild, proposal, reviews) {
 
 function proposalBodyFiles(kind, body, label) {
   const fullText = kind === 'amendment'
-    ? `# ${body.title}\n\n${body.content}\n\nrules hash: ${body.rulesHash ?? '-'}`
+    ? `# ${body.title}\n\n${body.content}`
     : `# ${body.title}\n\n${body.text}\n\n## Provisions\n\n\`\`\`json\n${JSON.stringify(body.provisions, null, 2)}\n\`\`\``;
   return [
     { attachment: Buffer.from(fullText), name: `${label}全文.md` },
@@ -889,11 +912,9 @@ async function constitutionalReviewProposal(guild, proposal) {
   await postProposalUpdate(guild, proposal, '事前違憲審査の理由と憲法条文参照を公開します。', {
     files: [{
       attachment: Buffer.from(`${JSON.stringify({
-        proposalId: proposal.id,
         revision: proposal.revision,
-        panelId: panel.panelId,
         phase: 'pre',
-        outputs: panel.outputs
+        outputs: publicPanelOutputs(panel.outputs)
       }, null, 2)}\n`),
       name: '違憲審査.json'
     }]
@@ -1008,7 +1029,7 @@ async function closeProposalVote(guild, proposal) {
     const transition = proposalTransition(proposal, 'passed');
     proposal = updateProposal(proposal.id, { status: transition.targetName, stage_ends_at: Date.now() });
     await postProposalUpdate(guild, proposal, `改憲が成立しました。憲法 v${next.version} が有効です。`, { state: '成立' });
-    await postGazette(guild, governance, `憲法 v${next.version}`, `${next.content}\n\nrules hash: ${next.rules_hash}\ncontent hash: ${next.content_hash}`);
+    await postGazette(guild, governance, `憲法 v${next.version}`, next.content);
     await syncStatuteBook(guild, getGovernanceGuild(guild.id)).catch((error) => {
       console.error(`Failed to publish constitution v${next.version} in statute book:`, error);
     });
@@ -1055,7 +1076,7 @@ async function closeProposalVote(guild, proposal) {
   await postProposalUpdate(guild, proposal, proposal.target_type === 'law'
     ? `可決・成立しました。「${law.title}」v${law.version} が有効です。旧版は履歴として保存します。`
     : `可決・成立しました。「${law.title}」はこの時点から有効です。`, { state: '成立' });
-  await postGazette(guild, governance, `${law.title} v${law.version}`, `${law.text}\n\n## Provisions\n\n\`\`\`json\n${JSON.stringify(law.provisions, null, 2)}\n\`\`\`\n\ncontent hash: ${law.content_hash}${law.supersedes_law_id ? `\nsupersedes: ${law.supersedes_law_id}` : ''}`);
+  await postGazette(guild, governance, `${law.title} v${law.version}`, `${law.text}\n\n## Provisions\n\n\`\`\`json\n${JSON.stringify(law.provisions, null, 2)}\n\`\`\`${law.supersedes_law_id ? '\n\n旧版を置き換えました。' : ''}`);
   await syncStatuteBook(guild, getGovernanceGuild(guild.id)).catch((error) => {
     console.error(`Failed to publish law ${law.id} in statute book:`, error);
   });
@@ -1069,7 +1090,7 @@ export async function castAndPublishVote(interaction, proposalId, choice) {
   const proposal = result.proposal;
   const label = { yes: '賛成', no: '反対', abstain: '棄権' }[choice];
   const oldLabel = { yes: '賛成', no: '反対', abstain: '棄権' }[result.oldChoice] ?? result.oldChoice;
-  await postProposalUpdate(interaction.guild, proposal, `<@${interaction.user.id}> が ${label} に投票しました${oldLabel ? ` (変更前: ${oldLabel})` : ''}。`);
+  await postProposalUpdate(interaction.guild, proposal, `${publicMemberLabel(interaction.user.id)} が ${label} に投票しました${oldLabel ? ` (変更前: ${oldLabel})` : ''}。`);
   writeAudit({ guildId: interaction.guildId, actorType: 'member', actorId: interaction.user.id, action: 'vote.cast', targetType: 'proposal', targetId: proposalId, detail: { oldChoice: result.oldChoice, choice, public: true } });
   return { proposal, governance, choice };
 }
@@ -1202,7 +1223,7 @@ async function finishSummaryReview(guild, caseRecord) {
     verdict: { phase: 'summary', verdict: panel.verdict, sanction: panel.sanction, panelId: panel.panelId }
   });
   const summaryAudit = [
-    `対象: <@${current.accused_id}>`,
+    `対象: ${publicMemberLabel(current.accused_id, '動作確認用アカウント')}`,
     `申立内容: ${current.summary}`,
     ...publicLawDetails(law, current.offense_code),
     `有効な違反認定: ${panel.outputs.filter((entry) => entry.verdict === 'responsible').length}/${procedure.panelSeats}`,
@@ -1210,10 +1231,7 @@ async function finishSummaryReview(guild, caseRecord) {
     '',
     '```json',
     JSON.stringify({
-      caseId: current.id,
-      panelId: panel.panelId,
-      evidenceHashes: Object.fromEntries(evidence.map((entry) => [`E-${entry.id}`, entry.content_hash])),
-      outputs: panel.outputs
+      outputs: publicPanelOutputs(panel.outputs, new Map(evidence.map((entry, index) => [entry.id, index + 1])))
     }, null, 2),
     '```'
   ].join('\n');
@@ -1227,7 +1245,7 @@ async function finishSummaryReview(guild, caseRecord) {
   const profile = profileForSanction(law, panel.sanction, policy);
   const trialFirst = procedure.trialFirstSanctions.includes(panel.sanction.type);
   await postGazette(guild, governance, 'AI取締り判定', summaryAudit, {
-    summary: `成立法に照らした${procedure.panelSeats}席のAI判定により、${panel.sanction.type}を選びました。判定理由と証拠hashは添付で公開します。`
+    summary: `成立法に照らした${procedure.panelSeats}席のAI判定により、${panel.sanction.type}を選びました。判定理由と採用した証拠は添付で公開します。`
   });
   const sanction = createSanction({
     caseId: current.id,
@@ -1368,11 +1386,11 @@ export async function addEvidenceToCase(guild, member, caseId, evidence) {
 
 function evidenceDisclosure(entry, ordinal) {
   const source = entry.message_id && entry.channel_id
-    ? `https://discord.com/channels/${entry.guild_id ?? '@me'}/${entry.channel_id}/${entry.message_id}`
+    ? `[元の投稿を開く](https://discord.com/channels/${entry.guild_id ?? '@me'}/${entry.channel_id}/${entry.message_id})`
     : '保存された提出';
   return [
     `## 証拠 ${ordinal}`,
-    `提出者: <@${entry.submitted_by}> / 原投稿者: ${entry.author_id ? `<@${entry.author_id}>` : '-'}`,
+    `提出者: ${publicMemberLabel(entry.submitted_by, '動作確認用提出者')} / 原投稿者: ${entry.author_id ? publicMemberLabel(entry.author_id, '動作確認用投稿者') : '-'}`,
     `行為時刻: ${entry.occurred_at ? `<t:${Math.floor(entry.occurred_at / 1000)}:F>` : '-'}`,
     `出典: ${source}`,
     '',
@@ -1410,14 +1428,11 @@ async function publishDecisionRecord(guild, caseRecord, phase, panel) {
   await postCourtRecord(guild, caseRecord, '構成要件ごとの判断・理由・採用証拠を添付します。', {
     files: [{
       attachment: Buffer.from(`${JSON.stringify({
-        caseId: caseRecord.id,
         phase,
-        panelId: panel.panelId,
-        lawId: caseRecord.law_id,
-        offenseCode: caseRecord.offense_code,
-        allegedAt: caseRecord.alleged_at,
-        evidenceHashes: Object.fromEntries(evidence.map((entry) => [`E-${entry.id}`, entry.content_hash])),
-        outputs: panel.outputs
+        law: law?.title ?? '裁判記録に記載',
+        offense: law?.provisions?.offenses?.find((entry) => entry.code === caseRecord.offense_code)?.title ?? '裁判記録に記載',
+        allegedAt: caseRecord.alleged_at ? new Date(caseRecord.alleged_at).toISOString() : null,
+        outputs: publicPanelOutputs(panel.outputs, evidenceOrder)
       }, null, 2)}\n`),
       name: `${phaseLabel}-判決記録.json`
     }]
@@ -1554,7 +1569,7 @@ export async function recordCourtSubmissionEdit(message) {
   if (!existing) return false;
   if (!['defense', 'appeal'].includes(caseRecord.status) || existing.kind !== caseRecord.status) {
     await message.channel.send({
-      content: `<@${message.author.id}> が締切後に正式主張を編集しました。この編集は判決資料へ反映しません。`,
+      content: `${publicMemberLabel(message.author.id)} が締切後に正式主張を編集しました。この編集は判決資料へ反映しません。`,
       allowedMentions: { parse: [] }
     }).catch(() => {});
     return false;
@@ -1569,9 +1584,7 @@ export async function recordCourtSubmissionEdit(message) {
   if (!changed || changed.unchanged) return false;
   await message.channel.send({
     content: [
-      `<@${message.author.id}> が正式主張を編集しました。`,
-      `変更前: \`${changed.previous.content_hash}\``,
-      `変更後: \`${changed.current.content_hash}\``,
+      `${publicMemberLabel(message.author.id)} が正式主張を編集しました。`,
       '変更前の内容も監査履歴に残し、判決には変更後の正本だけを使用します。'
     ].join('\n'),
     allowedMentions: { parse: [] }
@@ -1817,11 +1830,8 @@ async function adjudicateConstitutionalCase(guild, caseRecord) {
   await postCourtRecord(guild, caseRecord, '違憲審査パネルの理由と憲法条文参照を添付します。', {
     files: [{
       attachment: Buffer.from(`${JSON.stringify({
-        caseId: caseRecord.id,
-        panelId: panel.panelId,
-        targetType: caseRecord.challenged_type,
-        targetId: caseRecord.challenged_id,
-        outputs: panel.outputs
+        target: ({ law: '法律', case: '判決', sanction: '処分', administrative_act: '行政行為' })[caseRecord.challenged_type] ?? '統治行為',
+        outputs: publicPanelOutputs(panel.outputs)
       }, null, 2)}\n`),
       name: '違憲審査記録.json'
     }]
@@ -1933,7 +1943,7 @@ async function reverseAdministrativeAct(guild, act) {
       });
     }
   } else {
-    throw new Error(`行政行為 A-${act.id} は自動取消方法を持ちません。`);
+    throw new Error('この行政行為は自動で取り消せません。');
   }
   updateAdministrativeAct(act.id, { status: 'reversed', reversed_at: Date.now() });
   writeAudit({ guildId: guild.id, actorType: 'system', action: 'administrative_act.reversed', targetType: 'administrative_act', targetId: act.id, detail: { operation } });
@@ -1956,7 +1966,7 @@ export async function approveCase(interaction, caseId, decision) {
   await postCourtUpdate(
     interaction.guild,
     caseRecord,
-    `<@${member.id}> が執行を${decision === 'approve' ? '承認' : '拒否'}しました${oldLabel ? ` (変更前: ${oldLabel})` : ''}。承認 ${approvals}/${sanction.required_approvals}`
+    `${publicMemberLabel(member.id)} が執行を${decision === 'approve' ? '承認' : '拒否'}しました${oldLabel ? ` (変更前: ${oldLabel})` : ''}。承認 ${approvals}/${sanction.required_approvals}`
   );
   if (decision === 'approve' && approvals >= sanction.required_approvals) {
     const procedure = summaryProcedure(policy);
@@ -1989,7 +1999,7 @@ export async function appealCase(guild, member, caseId, grounds) {
     payload: { sanctionId: sanction.id },
     idempotencyKey: `appeal-restrict:${sanction.id}`
   });
-  await postCourtUpdate(guild, getCase(caseId), `<@${member.id}> が上訴しました。<t:${Math.floor(submissionsUntil / 1000)}:F>までこの事件投稿で追加主張を受け付け、その後に別の${policy.judiciary.panelSeats}席パネルで再審します。`, { state: '上訴' });
+  await postCourtUpdate(guild, getCase(caseId), `${publicMemberLabel(member.id, '動作確認用アカウント')} が上訴しました。<t:${Math.floor(submissionsUntil / 1000)}:F>までこの事件投稿で追加主張を受け付け、その後に別の${policy.judiciary.panelSeats}席パネルで再審します。`, { state: '上訴' });
   // live modeではAI再審へ渡す前に発言先を自分の上訴事件投稿へ限定する。
   await ensureAppealRestriction(guild, sanction.id);
   return getCase(caseId);
@@ -2033,7 +2043,7 @@ export async function requestSummaryTrial(guild, member, sanctionId) {
     await processGovernanceOutbox(guild.client);
   }
   current = await finishCaseFiling(guild, current);
-  await postCourtUpdate(guild, current, `<@${member.id}> が裁判を求めました。回答完了ボタンを押せばすぐ判定し、押さなくても<t:${Math.floor(current.defense_until / 1000)}:F>までに判定します。`, {
+  await postCourtUpdate(guild, current, `${publicMemberLabel(member.id)} が裁判を求めました。回答完了ボタンを押せばすぐ判定し、押さなくても<t:${Math.floor(current.defense_until / 1000)}:F>までに判定します。`, {
     state: '答弁'
   });
   return current;
@@ -2099,7 +2109,7 @@ export async function completeCaseResponse(guild, member, caseId) {
     decision_due_at: now,
     retry_after: null
   });
-  await postCourtUpdate(guild, current, `<@${member.id}> が回答を完了しました。判定を開始します。`, { state: '審理' });
+  await postCourtUpdate(guild, current, `${publicMemberLabel(member.id)} が回答を完了しました。判定を開始します。`, { state: '審理' });
   await advanceCase(guild, current, now);
   await processGovernanceOutbox(guild.client);
   return getCase(caseId);
@@ -2117,7 +2127,7 @@ export async function submitCaseAnswer(guild, member, caseId, content) {
   const count = listCurrentCaseSubmissions(caseRecord.id).filter((entry) => entry.kind === caseRecord.status).length;
   if (count >= CASE_SUBMISSION_LIMIT_PER_PHASE) throw new Error('この審級の回答件数上限に達しました。');
   const id = addCaseSubmission(caseRecord.id, member.id, caseRecord.status, normalized);
-  await postCourtRecord(guild, caseRecord, `<@${member.id}> が回答を提出しました。`);
+  await postCourtRecord(guild, caseRecord, `${publicMemberLabel(member.id)} が回答を提出しました。`);
   return id;
 }
 
@@ -2407,7 +2417,7 @@ async function runWeeklyReview(guild, governance, now) {
     const sourceLinks = issue.evidenceMessageIds
       .map((id) => sourceById.get(String(id)))
       .filter(Boolean)
-      .map((message) => `https://discord.com/channels/${guild.id}/${message.channelId}/${message.id}`);
+      .map((message, index) => `[根拠投稿 ${index + 1}](https://discord.com/channels/${guild.id}/${message.channelId}/${message.id})`);
     const summary = sourceLinks.length > 0
       ? `${issue.summary}\n\n週次検出の根拠:\n${sourceLinks.join('\n')}`
       : issue.summary;
@@ -2794,7 +2804,7 @@ export async function processGovernanceOutbox(client) {
           guild,
           governance,
           reviewable ? '即時処分を記録' : '判決の処理確定',
-          `対象: <@${sanction.user_id}>\n刑: ${sanction.type}${sanction.duration_seconds ? ` ${sanction.duration_seconds}秒` : ''}\n処理: ${executionLabel}`,
+          `対象: ${publicMemberLabel(sanction.user_id)}\n刑: ${sanction.type}${sanction.duration_seconds ? ` ${sanction.duration_seconds}秒` : ''}\n処理: ${executionLabel}`,
           { summary: reviewable
             ? `成立法と${v2Procedure.panelSeats}席中${v2Procedure.votesRequired}席以上の判定に基づく即時処分を「${executionLabel}」として記録しました。本人は裁判を求められます。`
             : `裁判で確定した刑を「${executionLabel}」として処理しました。` }
@@ -2830,7 +2840,7 @@ export async function onTrustedRoleChange(oldMember, newMember) {
   if (authorized) {
     const electorate = specialElectorateName(newMember.guild, governance);
     writeAudit({ guildId: newMember.guild.id, actorType: 'operator', actorId: authorized.authorized_by, action: after ? 'trusted.added' : 'trusted.removed', targetType: 'member', targetId: newMember.id, detail: { roleId: governance.trusted_role_id } });
-    await postGazette(newMember.guild, governance, after ? `「${electorate}」に追加` : `「${electorate}」から削除`, `対象: <@${newMember.id}>\n運営者: <@${authorized.authorized_by}>`);
+    await postGazette(newMember.guild, governance, after ? `「${electorate}」に追加` : `「${electorate}」から削除`, `対象: ${publicMemberLabel(newMember.id)}\n運営者: ${publicMemberLabel(authorized.authorized_by)}`);
     return;
   }
 

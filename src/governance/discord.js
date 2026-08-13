@@ -14,6 +14,7 @@ import {
   getConstitution,
   getGovernanceGuild,
   getLaw,
+  getProposal,
   getStatutePublication,
   listCases,
   listConstitutions,
@@ -85,6 +86,11 @@ function caseStateLabel(state) {
 
 function oneLine(value, maximum = 700) {
   return String(value ?? '').replace(/[#*_`\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, maximum);
+}
+
+export function publicMemberLabel(userId, fallback = '表示対象のアカウント') {
+  const value = String(userId ?? '');
+  return /^\d{17,20}$/.test(value) ? `<@${value}>` : fallback;
 }
 
 function proposalDeadline(proposal) {
@@ -706,16 +712,7 @@ function statuteDocument(instrumentType, instrument) {
       ].join('\n'),
       files: [
         { attachment: Buffer.from(instrument.content), name: `constitution-v${instrument.version}.md` },
-        { attachment: Buffer.from(`${JSON.stringify(instrument.rules ?? instrument.policy, null, 2)}\n`), name: `constitution-rules-v${instrument.version}.json` },
-        {
-          attachment: Buffer.from(`${JSON.stringify({
-            constitutionHash: instrument.content_hash,
-            rulesHash: instrument.rules_hash,
-            compilerVersion: instrument.compiler_version,
-            sourceFormat: instrument.source_format
-          }, null, 2)}\n`),
-          name: `constitution-hashes-v${instrument.version}.json`
-        }
+        { attachment: Buffer.from(`${JSON.stringify(instrument.rules ?? instrument.policy, null, 2)}\n`), name: `constitution-rules-v${instrument.version}.json` }
       ]
     };
   }
@@ -729,9 +726,7 @@ function statuteDocument(instrumentType, instrument) {
     '',
     '```json',
     JSON.stringify(instrument.provisions, null, 2),
-    '```',
-    '',
-    `content hash: ${instrument.content_hash}`
+    '```'
   ].join('\n');
   return {
     title: `${instrument.title} v${instrument.version ?? 1}`,
@@ -748,13 +743,7 @@ function statuteDocument(instrumentType, instrument) {
       '全文は、この投稿を開いた先で確認できます。'
     ].join('\n').slice(0, 2_000),
     detailContent: `## ${instrument.title} v${instrument.version ?? 1} 詳細\n全文を添付します。`,
-    files: [
-      { attachment: Buffer.from(full), name: '法律全文.md' },
-      {
-        attachment: Buffer.from(`${JSON.stringify({ contentHash: instrument.content_hash }, null, 2)}\n`),
-        name: '検証情報.json'
-      }
-    ]
+    files: [{ attachment: Buffer.from(full), name: '法律全文.md' }]
   };
 }
 
@@ -806,7 +795,11 @@ export async function syncStatuteBook(guild, governance, { verifyExisting = fals
   const instruments = [
     ...listConstitutions(guild.id, { limit: 100 }).map((instrument) => ({ instrumentType: 'constitution', instrument })),
     ...listLaws(guild.id, { activeOnly: false, limit: 500 }).map((instrument) => ({ instrumentType: 'law', instrument }))
-  ].filter(({ instrument }) => !String(instrument.title ?? '').startsWith('[E2E:'));
+  ].filter(({ instrumentType, instrument }) => {
+    if (String(instrument.title ?? '').startsWith('[E2E:')) return false;
+    if (instrumentType !== 'law' || instrument.status !== 'repealed') return true;
+    return !String(getProposal(instrument.proposal_id)?.source ?? '').startsWith('live_e2e:');
+  });
   let changed = 0;
   for (const { instrumentType, instrument } of instruments) {
     const document = statuteDocument(instrumentType, instrument);
@@ -1024,7 +1017,7 @@ function courtThreadName(caseRecord) {
 function courtStarterContent(caseRecord, nextAction = courtNextAction(caseRecord), displayState = caseRecord.status) {
   return [
     `# ${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
-    caseRecord.accused_id ? `被申立人: <@${caseRecord.accused_id}>` : null,
+    caseRecord.accused_id ? `被申立人: ${publicMemberLabel(caseRecord.accused_id, '動作確認用アカウント')}` : null,
     caseLawDescription(caseRecord),
     '',
     caseRecord.summary,
@@ -1046,7 +1039,7 @@ export async function createProposalPost(guild, governance, proposal) {
   );
   const body = proposal.body;
   const fullDraft = proposal.kind === 'amendment'
-    ? `# ${body.title}\n\n${body.content}\n\nrules hash: ${body.rulesHash ?? '-'}\n\n実行手続: ${body.rules ? governanceRulesSummary(body.rules) : 'legacy policy'}`
+    ? `# ${body.title}\n\n${body.content}\n\n実行手続: ${body.rules ? governanceRulesSummary(body.rules) : 'legacy policy'}`
     : `# ${body.title}\n\n${body.text}\n\n## Provisions\n\n\`\`\`json\n${JSON.stringify(body.provisions, null, 2)}\n\`\`\``;
   const structuredDraft = proposal.kind === 'amendment' ? (body.rules ?? body.policy) : body.provisions;
   const structuredName = proposal.kind === 'amendment' ? 'rules' : 'provisions';
@@ -1260,11 +1253,18 @@ function safeGazetteFilename(heading) {
   return `${base || 'governance-event'}-details.md`.slice(0, 100);
 }
 
+export function maskDiscordUrls(value) {
+  return String(value).replace(
+    /(?<!\]\()https:\/\/discord\.com\/channels\/\d+\/\d+(?:\/\d+)?/g,
+    (url) => `[Discordで開く](${url})`
+  );
+}
+
 export async function postGazette(guild, governance, heading, body, { summary = null, links = [] } = {}) {
   const channel = await guild.channels.fetch(governance.gazette_channel_id).catch(() => null);
   if (!channel?.isTextBased?.()) return null;
-  const full = String(body ?? '');
-  const compact = String(summary ?? gazetteSummary(full));
+  const full = maskDiscordUrls(body ?? '');
+  const compact = maskDiscordUrls(summary ?? gazetteSummary(full));
   const needsAttachment = summary !== null
     ? full.trim() !== compact.trim()
     : full.length > compact.length || full.includes('```');
@@ -1272,7 +1272,7 @@ export async function postGazette(guild, governance, heading, body, { summary = 
     `# ${heading}`,
     '',
     compact,
-    ...links.map((link) => `- ${link}`),
+    ...links.map((link) => `- ${maskDiscordUrls(link)}`),
     needsAttachment ? '\n詳細な監査情報は添付ファイルに保存しています。' : null
   ].filter(Boolean).join('\n').slice(0, 1_900);
   return channel.send({

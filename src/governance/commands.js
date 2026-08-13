@@ -111,20 +111,11 @@ function setupPreviewPayload(interaction, session, documents, report, { resumed 
       `開始状態: **記録のみ**（Discord上の処分は実行しません）`,
       '特別有権者: 未設定（導入後の管理画面で設定可能）',
       `Bot権限不足: ${missing}`,
-      `憲法hash: \`${session.constitution_hash}\``,
-      `policy hash: \`${session.policy_hash}\``,
       blocking.length ? `\n導入を続けるには次の権限が必要です: ${blocking.join('、')}` : ''
     ].filter(Boolean).join('\n').slice(0, 1_900),
     files: [
       { attachment: Buffer.from(documents.constitution), name: 'initial-constitution.md' },
-      { attachment: Buffer.from(`${JSON.stringify(documents.policy, null, 2)}\n`), name: 'initial-constitution-policy.json' },
-      {
-        attachment: Buffer.from(`${JSON.stringify({
-          constitutionHash: session.constitution_hash,
-          policyHash: session.policy_hash
-        }, null, 2)}\n`),
-        name: 'initial-constitution-hashes.json'
-      }
+      { attachment: Buffer.from(`${JSON.stringify(documents.policy, null, 2)}\n`), name: 'initial-constitution-policy.json' }
     ],
     components: blocking.length ? [] : [new ActionRowBuilder().addComponents(
       new ButtonBuilder()
@@ -223,7 +214,7 @@ async function executeSetup(interaction, sessionId) {
         interaction.guild,
         result.guild,
         '初期憲法 v1 公布',
-        `${constitution.content}\n\nrules hash: ${constitution.rules_hash}\ncontent hash: ${constitution.content_hash}`,
+        constitution.content,
         {
           summary: '設定済み運営者の全文確認を経て初期憲法 v1 を公布しました。現行正文は法令集を参照してください。',
           links: [`法令集: https://discord.com/channels/${interaction.guildId}/${result.guild.statute_forum_id}`]
@@ -306,7 +297,7 @@ export async function handleGovernanceComponent(interaction) {
       if (!member) throw new Error('対象サーバーのメンバーではありません。');
       await interaction.deferReply(interaction.inGuild?.() ? { flags: EPHEMERAL } : {});
       const result = await requestSummaryTrial(guild, member, Number(rawSanctionId));
-      await interaction.editReply(`裁判を開始しました。期限: <t:${Math.floor(result.defense_until / 1000)}:F>\nhttps://discord.com/channels/${guild.id}/${result.public_thread_id}`);
+      await interaction.editReply(`裁判を開始しました。期限: <t:${Math.floor(result.defense_until / 1000)}:F>\n[裁判を開く](https://discord.com/channels/${guild.id}/${result.public_thread_id})`);
       return true;
     }
     if (customId.startsWith('gov:court_answer:') && interaction.isModalSubmit()) {

@@ -596,7 +596,7 @@ async function cleanupLegacyGazette(interaction, governance) {
       interaction.guild,
       governance,
       `初期憲法 v${constitution?.version ?? 1} 公布`,
-      `初期憲法を公布しました。\n本文hash: ${constitution?.content_hash ?? '不明'}\nrules hash: ${constitution?.rules_hash ?? '不明'}`,
+      '初期憲法を公布しました。',
       {
         summary: `初期憲法 v${constitution?.version ?? 1} を公布しました。現行正文は法令集を参照してください。`,
         links: [`法令集: https://discord.com/channels/${interaction.guildId}/${governance.statute_forum_id}`]

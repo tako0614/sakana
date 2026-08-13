@@ -985,8 +985,8 @@ await castAndPublishVote({
   user: { id: 't3' },
   guild: { channels: { fetch: async (id) => id === 'public-proposal' ? proposalThread : null } }
 }, proposal.id, 'yes');
-assert.match(publicVoteMessages[0], /<@t3> が 賛成 に投票しました \(変更前: 棄権\)/,
-  '記名投票の選択変更を法案投稿へ公開する');
+assert.match(publicVoteMessages[0], /表示対象のアカウント が 賛成 に投票しました \(変更前: 棄権\)/,
+  '記名投票の選択変更を法案投稿へ公開し、無効な内部IDは表示しない');
 const courtSubmissionCount = governanceDb.listCaseSubmissions(caseWithTime.id).length;
 assert.equal(await recordCourtSubmission({
   id: 'court-submission-1',
@@ -1146,8 +1146,8 @@ const approvalInteraction = {
 };
 await approveCase(approvalInteraction, approvalCase.id, 'approve');
 await approveCase(approvalInteraction, approvalCase.id, 'reject');
-assert.match(publicApprovalMessages[0], /<@approval-voter> が執行を承認しました。承認 1\/2/,
-  '執行承認者と選択を事件投稿へ公開する');
+assert.match(publicApprovalMessages[0], /表示対象のアカウント が執行を承認しました。承認 1\/2/,
+  '執行承認者と選択を事件投稿へ公開し、無効な内部IDは表示しない');
 assert.match(publicApprovalMessages[1], /執行を拒否しました \(変更前: 承認\)。承認 0\/2/,
   '執行承認の選択変更も事件投稿へ公開する');
 governanceDb.updateCase(approvalCase.id, { status: 'closed' });
@@ -1201,9 +1201,10 @@ assert.equal(restrictionModule.governanceActionAllowed('g2', 'a', 'vote', restri
 assert.equal(restrictionModule.reserveRestrictedAgentCall('g2', 'a', 'agent-1', restrictionStart).ok, true);
 assert.equal(restrictionModule.reserveRestrictedAgentCall('g2', 'a', 'agent-2', restrictionStart).ok, false);
 let messageDeleted = false;
+let restrictionNotice = '';
 const blockedMessage = {
   id: 'blocked-message', guildId: 'g2', channelId: 'public',
-  author: { id: 'a', bot: false, send: async () => {} },
+  author: { id: 'a', bot: false, send: async (content) => { restrictionNotice = content; } },
   channel: { isThread: () => false },
   content: 'https://example.com', attachments: { size: 0 },
   mentions: { users: { size: 0 }, roles: { size: 0 }, channels: { size: 0 }, everyone: false },
@@ -1211,6 +1212,7 @@ const blockedMessage = {
 };
 assert.equal(await restrictionModule.enforceMessageRestrictions(blockedMessage), true);
 assert.equal(messageDeleted, true);
+assert.doesNotMatch(restrictionNotice, /制裁\s*#|\b\d+\b/, '制限通知へ内部制裁番号を表示しない');
 assert.equal(governanceDb.getCaseByPublicThread('public-court').id, caseWithTime.id,
   '公開裁判所の事件投稿から事件を特定できる');
 assert.equal(await restrictionModule.enforceMessageRestrictions({
@@ -2020,10 +2022,35 @@ const {
   retireGovernanceCourtChat,
   syncAppealRoleOverwrites,
   statuteForumEveryonePermissionState,
-  statutePublicationState
+  statutePublicationState,
+  publicMemberLabel,
+  maskDiscordUrls
 } = await import('../src/governance/discord.js');
 assert.equal(GOVERNANCE_GUIDE_NAME, '案内');
 assert.equal(GOVERNANCE_PROCEDURE_NAME, '進行中');
+assert.equal(publicMemberLabel('123456789012345678'), '<@123456789012345678>', '実在Discord IDは名前表示用mentionにする');
+assert.equal(publicMemberLabel('e2e-accused', '動作確認用アカウント'), '動作確認用アカウント',
+  '内部fixture識別子を公開mentionへ埋め込まない');
+assert.equal(
+  maskDiscordUrls('法令集: https://discord.com/channels/123456789012345678/223456789012345678'),
+  '法令集: [Discordで開く](https://discord.com/channels/123456789012345678/223456789012345678)',
+  '公開本文のDiscord URLはIDを見せないリンクにする'
+);
+assert.equal(
+  maskDiscordUrls('[法令集](https://discord.com/channels/123456789012345678/223456789012345678)'),
+  '[法令集](https://discord.com/channels/123456789012345678/223456789012345678)',
+  'すでに名前付きのリンクを二重変換しない'
+);
+const { publicPanelOutputs } = await import('../src/governance/service.js');
+const publicDecision = publicPanelOutputs([{
+  verdict: 'responsible', lawId: 9, offenseCode: 'O1', evidenceIds: [41],
+  elementFindings: [{ element: '要件', proved: true, evidenceIds: [41], reason: '確認済み' }],
+  reasons: ['理由'], sanction: { type: 'warning' }
+}], new Map([[41, 1]]));
+assert.doesNotMatch(JSON.stringify(publicDecision), /lawId|offenseCode|evidenceIds|\b41\b/,
+  '公開判決記録から内部の法律・証拠IDを除く');
+assert.deepEqual(publicDecision[0].evidence, ['証拠 1']);
+assert.deepEqual(publicDecision[0].elementFindings[0].evidence, ['証拠 1']);
 let synchronizedParliamentTags = null;
 const parliamentForum = {
   type: ChannelType.GuildForum,
@@ -2364,8 +2391,14 @@ assert.match(liveE2eSource, /pendingActions\(100\)\.length, 0/, '既存outboxを
 assert.match(liveE2eSource, /currentTrusted !== initialTrusted/, '特別有権者ロールを原状復帰する');
 assert.match(liveE2eSource, /thread\.delete\('E2E fixtureを公開一覧から除去'\)/,
   'E2E cleanupはテスト投稿を公開フォーラムに残さない');
-assert.match(liveE2eSource, /message\.author\.id !== guild\.client\.user\.id \|\| !message\.content\.includes\(mark\)/,
-  'E2E cleanupは同じrun markerを持つbot官報だけを除去する');
+assert.match(liveE2eSource, /message\.id !== seededAudit\?\.detail\?\.gazetteMessageId/,
+  'E2E cleanupは内部監査で対応付けたbot官報だけを除去する');
+assert.match(liveE2eSource, /entry\.source === sourceKey/,
+  '公開題名ではなく非公開のsource keyからE2E案件を片付ける');
+assert.doesNotMatch(liveE2eSource, /postGazette\([^\n]+`\$\{mark\}/,
+  'E2E run IDを官報見出しへ表示しない');
+assert.doesNotMatch(liveE2eSource, /postGazette\([^\n]+JSON\.stringify\(manifest/,
+  '内部IDを含むE2E manifestを官報へ添付しない');
 assert.match(liveE2eSource, /force: true/, '特別有権者ロールはDiscord APIから強制readbackする');
 assert.match(liveE2eSource, /setTrustedMember/, 'owner専用の正規経路で特別有権者を操作する');
 assert.match(liveE2eSource, /--provision-trusted-role/, '未設定の特別有権者roleは明示フラグなしに作らない');

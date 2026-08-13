@@ -140,7 +140,7 @@ export async function enforceMessageRestrictions(message) {
       targetId: restriction.sanction_id,
       detail: { userId: message.author.id, messageId: message.id, reason }
     });
-    await message.author.send(`${message.guild?.name ?? 'このコミュニティ'}の制裁 #${restriction.sanction_id} により投稿を削除しました: ${reason}`).catch(() => {});
+    await message.author.send(`${message.guild?.name ?? 'このコミュニティ'}の機能制限により投稿を削除しました: ${reason}\n詳しくは裁判所または通知済みの事件投稿を確認してください。`).catch(() => {});
     return true;
   }
   for (const restriction of restrictions) {

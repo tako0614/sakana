@@ -30,6 +30,7 @@ import {
   buildLegislativeCandidates,
   exactActiveProposalMatch
 } from './relation.js';
+import { publicMemberLabel } from './discord.js';
 import {
   addEvidenceToCase,
   appealCase,
@@ -74,12 +75,12 @@ function safeError(error) {
 }
 
 function linkToThread(guildId, threadId) {
-  return `https://discord.com/channels/${guildId}/${threadId}`;
+  return `[投稿を開く](https://discord.com/channels/${guildId}/${threadId})`;
 }
 
 function sourceLink(guildId, evidence) {
   return evidence?.messageId && evidence?.channelId
-    ? `https://discord.com/channels/${guildId}/${evidence.channelId}/${evidence.messageId}`
+    ? `[証拠の投稿を開く](https://discord.com/channels/${guildId}/${evidence.channelId}/${evidence.messageId})`
     : null;
 }
 
@@ -185,7 +186,7 @@ function renderIntake(intake, suffix = '') {
     const offense = law?.provisions?.offenses?.find((entry) => entry.code === payload.offenseCode);
     lines.push(
       '種別: 法律違反の申立て',
-      `被申立人: <@${payload.accusedId}>`,
+      `被申立人: ${publicMemberLabel(payload.accusedId)}`,
       `適用法候補: ${law?.title ?? '裁判記録に記載'}`,
       offense?.title ? `対象となる違反: ${offense.title}` : null,
       pending ? `申立内容: ${payload.summary}` : null,
@@ -346,7 +347,7 @@ async function appendToExistingDiscussion(interaction, intake, proposal, reasons
     content: [
       `<@${interaction.user.id}> からの意見・対案`,
       intake.payload.summary,
-      `元の発言: https://discord.com/channels/${interaction.guildId}/${intake.channel_id}/${intake.source_message_id}`
+      `元の発言: [投稿を開く](https://discord.com/channels/${interaction.guildId}/${intake.channel_id}/${intake.source_message_id})`
     ].join('\n\n'),
     allowedMentions: { parse: [] }
   });
@@ -507,7 +508,7 @@ function caseStatusText(caseRecord, guildId) {
   return [
     `${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
     `状態: ${status}`,
-    caseRecord.accused_id ? `被申立人: <@${caseRecord.accused_id}>` : null,
+    caseRecord.accused_id ? `被申立人: ${publicMemberLabel(caseRecord.accused_id)}` : null,
     law ? `適用法: ${law.title}` : null,
     offense?.title ? `対象となる違反: ${offense.title}` : null,
     caseRecord.challenged_type ? `違憲審査対象: ${challenged?.title ?? challenged?.summary ?? ({ sanction: '処分', administrative_act: '行政行為' }[caseRecord.challenged_type] ?? '統治行為')}` : null,
