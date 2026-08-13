@@ -1117,6 +1117,31 @@ const automaticBill = await draftBill({
 assert.equal(automaticBill.provisions.offenses[0].automaticTrigger.minimumMessages, 5,
   'v2法案は客観的な自動検知条件だけを宣言できる');
 
+let triggerRetryCalls = 0;
+modelOutput = () => {
+  triggerRetryCalls += 1;
+  if (triggerRetryCalls === 1) {
+    return {
+      ...safeBill,
+      provisions: {
+        ...safeBill.provisions,
+        offenses: [{
+          ...safeBill.provisions.offenses[0],
+          automaticTrigger: { type: 'message_burst', minimumMessages: 5, windowSeconds: '30' }
+        }]
+      }
+    };
+  }
+  return automaticBill;
+};
+await draftBill({
+  guildId: 'g2', petition: injectionPetition,
+  constitution: { version: 1, content: constitution }, activeLaws: [], policy
+});
+assert.equal(triggerRetryCalls, 2, '不正な自動検知条件は理由を添えて再生成する');
+assert.match(capturedRequest.messages[0].content,
+  /automaticTrigger.windowSeconds must be an integer from 10 through 300/);
+
 modelOutput = {
   ...safeBill,
   provisions: {

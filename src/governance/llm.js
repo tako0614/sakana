@@ -115,6 +115,25 @@ function restrictionDefinitionIssue(definition, policy) {
   return null;
 }
 
+function automaticTriggerIssue(trigger) {
+  if (!trigger || typeof trigger !== 'object' || Array.isArray(trigger)) return 'automaticTrigger must be an object';
+  if (Object.keys(trigger).some((key) => !['type', 'minimumMessages', 'windowSeconds'].includes(key))) {
+    return 'automaticTrigger has unsupported fields';
+  }
+  if (trigger.type !== 'message_burst') return 'automaticTrigger.type must be message_burst';
+  if (!Number.isInteger(trigger.minimumMessages)
+    || trigger.minimumMessages < 5
+    || trigger.minimumMessages > 30) {
+    return 'automaticTrigger.minimumMessages must be an integer from 5 through 30';
+  }
+  if (!Number.isInteger(trigger.windowSeconds)
+    || trigger.windowSeconds < 10
+    || trigger.windowSeconds > 300) {
+    return 'automaticTrigger.windowSeconds must be an integer from 10 through 300';
+  }
+  return null;
+}
+
 function validateDraft(raw, policy) {
   const value = assertObject(raw);
   exactKeys(value, ['title', 'summary', 'text', 'provisions'], 'bill');
@@ -201,8 +220,14 @@ function validateDraft(raw, policy) {
     const automaticTrigger = offense.automaticTrigger === undefined
       ? null
       : assertObject(offense.automaticTrigger, 'offense.automaticTrigger');
-    if (automaticTrigger && (!summaryProcedure(policy) || !validateAutomaticTrigger(automaticTrigger))) {
-      throw new Error('invalid automatic enforcement trigger');
+    const triggerIssue = automaticTrigger ? automaticTriggerIssue(automaticTrigger) : null;
+    if (automaticTrigger && (!summaryProcedure(policy) || triggerIssue || !validateAutomaticTrigger(automaticTrigger))) {
+      throw validationError(
+        'invalid automatic enforcement trigger',
+        summaryProcedure(policy)
+          ? `The automatic enforcement trigger is invalid: ${triggerIssue ?? 'follow the declared automaticTrigger schema exactly'}.`
+          : 'Omit automaticTrigger because this constitutional procedure does not allow it.'
+      );
     }
     return {
       code: text(offense.code, 'offense.code', 40),
