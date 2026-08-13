@@ -223,7 +223,7 @@ async function executeSetup(interaction, sessionId) {
         interaction.guild,
         result.guild,
         '初期憲法 v1 公布',
-        `${constitution.content}\n\n## Policy\n\n\`\`\`json\n${JSON.stringify(constitution.policy, null, 2)}\n\`\`\`\n\ncontent hash: ${constitution.content_hash}\npolicy hash: ${constitution.policy_hash}`,
+        `${constitution.content}\n\nrules hash: ${constitution.rules_hash}\ncontent hash: ${constitution.content_hash}`,
         {
           summary: '設定済み運営者の全文確認を経て初期憲法 v1 を公布しました。現行正文は法令集を参照してください。',
           links: [`法令集: https://discord.com/channels/${interaction.guildId}/${result.guild.statute_forum_id}`]
@@ -306,7 +306,7 @@ export async function handleGovernanceComponent(interaction) {
       if (!member) throw new Error('対象サーバーのメンバーではありません。');
       await interaction.deferReply(interaction.inGuild?.() ? { flags: EPHEMERAL } : {});
       const result = await requestSummaryTrial(guild, member, Number(rawSanctionId));
-      await interaction.editReply(`裁判を開始しました。24時間以内に終了します。\nhttps://discord.com/channels/${guild.id}/${result.public_thread_id}`);
+      await interaction.editReply(`裁判を開始しました。期限: <t:${Math.floor(result.defense_until / 1000)}:F>\nhttps://discord.com/channels/${guild.id}/${result.public_thread_id}`);
       return true;
     }
     if (customId.startsWith('gov:court_answer:') && interaction.isModalSubmit()) {

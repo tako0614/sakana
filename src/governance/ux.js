@@ -17,6 +17,7 @@ import {
   createAdministrativeAct,
   getActiveConstitution,
   getCaseSanction,
+  getConstitution,
   getGovernanceGuild,
   getOperationalSetting,
   listActionFailures,
@@ -46,8 +47,18 @@ import { setTrustedMember } from './service.js';
 import { summaryProcedure } from './policy.js';
 
 const EPHEMERAL = MessageFlags.Ephemeral;
-const ACTIVE_PROPOSAL_STATUSES = ['drafting', 'draft', 'constitutional_review', 'debate', 'voting'];
 const ACTIVE_CASE_STATUSES = ['filing', 'summary_review', 'summary_active', 'defense', 'deliberation', 'approval', 'appeal_window', 'appeal', 'execution'];
+
+function proposalHandler(proposal) {
+  if (proposal.workflow_handler) return proposal.workflow_handler;
+  const constitution = getConstitution(proposal.constitution_id);
+  const key = proposal.kind === 'amendment' ? 'constitutionalAmendment' : 'law';
+  return constitution?.rules?.workflows?.[key]?.states?.[proposal.status]?.handler ?? null;
+}
+
+function activeProposals(guildId, limit = 100) {
+  return listProposals(guildId, { limit }).filter((proposal) => proposalHandler(proposal) !== 'terminal');
+}
 
 function stateLabel(governance) {
   return governance.status === 'active' ? '稼働中' : '停止中';
@@ -55,6 +66,12 @@ function stateLabel(governance) {
 
 function enforcementLabel(governance) {
   return governance.enforcement_mode === 'live' ? '実執行' : '記録のみ';
+}
+
+function periodLabel(milliseconds) {
+  if (milliseconds % 86_400_000 === 0) return `${milliseconds / 86_400_000}日`;
+  if (milliseconds % 3_600_000 === 0) return `${milliseconds / 3_600_000}時間`;
+  return `${Math.ceil(milliseconds / 60_000)}分`;
 }
 
 async function electorateLabel(guild, governance) {
@@ -66,14 +83,14 @@ async function electorateLabel(guild, governance) {
 
 function activeCounts(guildId) {
   return {
-    proposals: listProposals(guildId, { statuses: ACTIVE_PROPOSAL_STATUSES, limit: 100 }).length,
+    proposals: activeProposals(guildId).length,
     cases: listCases(guildId, { statuses: ACTIVE_CASE_STATUSES, limit: 100 }).length
   };
 }
 
 function workflowFailures(governance) {
   return [
-    ...listProposals(governance.guild_id, { statuses: ACTIVE_PROPOSAL_STATUSES, limit: 100 })
+    ...activeProposals(governance.guild_id)
       .filter((proposal) => proposal.last_error)
       .map((proposal) => `${proposal.title}: ${proposal.last_error}`),
     ...listCases(governance.guild_id, { statuses: ACTIVE_CASE_STATUSES, limit: 100 })
@@ -151,7 +168,7 @@ export async function renderGovernanceGuide(guild, governance) {
     'AIが整理しただけでは正式案件になりません。表示された受付内容を本人が確認して初めて手続が始まります。',
     '投票と執行承認は記名です。誰がどの選択をしたか、変更した場合の経過も対象の議会・裁判投稿へ公開されます。',
     summary
-      ? '警告・機能制限・タイムアウトは、成立法と3席中2席以上の判定で即時に始まる場合があります。本人は「進行中」または通知から一度だけ裁判を求められ、裁判は24時間以内に終わります。kick・banは裁判前には行いません。'
+      ? `警告・機能制限・タイムアウトは、成立法と${summary.panelSeats}席中${summary.votesRequired}席以上の判定で即時に始まる場合があります。本人は「進行中」または通知から一度だけ裁判を求められ、裁判は${periodLabel(summary.trialMilliseconds)}以内に終わります。kick・banは裁判前には行いません。`
       : '裁判中の発言範囲は事件投稿の「発言状態」に表示されます。一時保全は公開ログと成立法の条件が一致した時だけ短時間行い、自動終了します。',
     '',
     '## 公開記録',
@@ -251,9 +268,10 @@ function procedureComponents(governance, supportsImmediateReview) {
 
 export async function renderGovernanceProcedureHub(guild, governance) {
   const supportsImmediateReview = Boolean(summaryProcedure(getActiveConstitution(guild.id)?.policy));
-  const voting = listProposals(guild.id, { statuses: ['voting'], limit: 20 });
+  const proposals = activeProposals(guild.id, 100);
+  const voting = proposals.filter((proposal) => proposalHandler(proposal) === 'public_vote');
   const approvals = listCases(guild.id, { statuses: ['approval'], limit: 20 });
-  const debates = listProposals(guild.id, { statuses: ['debate'], limit: 20 });
+  const debates = proposals.filter((proposal) => proposalHandler(proposal) === 'public_discussion');
   const defenses = listCases(guild.id, { statuses: ['defense'], limit: 20 });
   const appeals = listCases(guild.id, { statuses: ['appeal_window'], limit: 20 });
   const votingLines = voting.slice(0, 6).map((proposal) =>
@@ -561,7 +579,7 @@ async function cleanupLegacyGazette(interaction, governance) {
       interaction.guild,
       governance,
       `初期憲法 v${constitution?.version ?? 1} 公布`,
-      `初期憲法を公布しました。\n本文hash: ${constitution?.content_hash ?? '不明'}\npolicy hash: ${constitution?.policy_hash ?? '不明'}`,
+      `初期憲法を公布しました。\n本文hash: ${constitution?.content_hash ?? '不明'}\nrules hash: ${constitution?.rules_hash ?? '不明'}`,
       {
         summary: `初期憲法 v${constitution?.version ?? 1} を公布しました。現行正文は法令集を参照してください。`,
         links: [`法令集: https://discord.com/channels/${interaction.guildId}/${governance.statute_forum_id}`]

@@ -7,9 +7,11 @@ import {
   PermissionFlagsBits
 } from 'discord.js';
 import { governanceCategoryName } from './config.js';
+import { governanceRulesSummary } from './rules.js';
 import {
   getCaseInterimProtection,
   getCaseSanction,
+  getConstitution,
   getGovernanceGuild,
   getLaw,
   getStatutePublication,
@@ -29,17 +31,35 @@ export const GOVERNANCE_GUIDE_NAME = '案内';
 export const GOVERNANCE_PROCEDURE_NAME = '進行中';
 export const GOVERNANCE_PROCEDURE_TOPIC = 'いま投票・承認・答弁・上訴できる案件を、全員に公開します。';
 
-function proposalStateLabel(state) {
+function proposalHandler(proposal) {
+  if (proposal.workflow_handler) return proposal.workflow_handler;
+  const constitution = getConstitution(proposal.constitution_id);
+  const workflow = constitution?.rules?.workflows?.[proposal.kind === 'amendment' ? 'constitutionalAmendment' : 'law'];
+  return workflow?.states?.[proposal.status]?.handler ?? null;
+}
+
+function proposalStateLabel(state, handler = null) {
+  if (['草案', '討議', '違憲審査', '投票', '成立', '否決', '廃案'].includes(state)) return state;
   return ({
     drafting: 'AI起草中',
     draft: '草案',
+    discussion: '討議中',
+    revision_discussion: '調整案の討議中',
+    deliberation: 'AI整理中',
     constitutional_review: '違憲審査',
     debate: '討議中',
     voting: '投票中',
     enacted: '成立',
     rejected: '否決',
     remanded: '差戻し'
-  })[state] ?? state;
+  })[state] ?? ({
+    draft: 'AI起草中',
+    public_discussion: '討議中',
+    ai_deliberation: 'AI整理中',
+    constitutional_panel: '違憲審査',
+    public_vote: '投票中',
+    terminal: '終了'
+  })[handler] ?? '進行中';
 }
 
 function caseStateLabel(state) {
@@ -67,7 +87,7 @@ function oneLine(value, maximum = 700) {
 }
 
 function proposalDeadline(proposal) {
-  if (!proposal.stage_ends_at || !['draft', 'debate', 'voting'].includes(proposal.status)) return null;
+  if (!proposal.stage_ends_at || proposalHandler(proposal) === 'terminal') return null;
   return `<t:${Math.floor(proposal.stage_ends_at / 1000)}:F>`;
 }
 
@@ -630,6 +650,7 @@ export function statutePublicationState(instrumentType, status) {
   if (instrumentType === 'constitution') return status === 'active' ? '現行憲法' : '旧憲法';
   return ({
     active: '現行法',
+    superseded: '廃止',
     suspended: '停止',
     unconstitutional: '違憲',
     repealed: '廃止'
@@ -661,11 +682,13 @@ function statuteDocument(instrumentType, instrument) {
       ].join('\n'),
       files: [
         { attachment: Buffer.from(instrument.content), name: `constitution-v${instrument.version}.md` },
-        { attachment: Buffer.from(`${JSON.stringify(instrument.policy, null, 2)}\n`), name: `constitution-policy-v${instrument.version}.json` },
+        { attachment: Buffer.from(`${JSON.stringify(instrument.rules ?? instrument.policy, null, 2)}\n`), name: `constitution-rules-v${instrument.version}.json` },
         {
           attachment: Buffer.from(`${JSON.stringify({
             constitutionHash: instrument.content_hash,
-            policyHash: instrument.policy_hash
+            rulesHash: instrument.rules_hash,
+            compilerVersion: instrument.compiler_version,
+            sourceFormat: instrument.source_format
           }, null, 2)}\n`),
           name: `constitution-hashes-v${instrument.version}.json`
         }
@@ -674,7 +697,7 @@ function statuteDocument(instrumentType, instrument) {
   }
   const state = statutePublicationState(instrumentType, instrument.status);
   const full = [
-    `# ${instrument.title}`,
+    `# ${instrument.title} v${instrument.version ?? 1}`,
     '',
     instrument.text,
     '',
@@ -687,11 +710,11 @@ function statuteDocument(instrumentType, instrument) {
     `content hash: ${instrument.content_hash}`
   ].join('\n');
   return {
-    title: instrument.title,
+    title: `${instrument.title} v${instrument.version ?? 1}`,
     state,
     hash: instrument.content_hash,
     content: [
-      `# ${instrument.title}`,
+      `# ${instrument.title} v${instrument.version ?? 1}`,
       `状態: ${state}`,
       `施行: <t:${Math.floor(instrument.effective_at / 1000)}:F>`,
       '',
@@ -700,7 +723,7 @@ function statuteDocument(instrumentType, instrument) {
       '',
       '全文は、この投稿を開いた先で確認できます。'
     ].join('\n').slice(0, 2_000),
-    detailContent: `## ${instrument.title} 詳細\n全文を添付します。`,
+    detailContent: `## ${instrument.title} v${instrument.version ?? 1} 詳細\n全文を添付します。`,
     files: [
       { attachment: Buffer.from(full), name: '法律全文.md' },
       {
@@ -915,7 +938,7 @@ export function reviewRequestButtons(guildId, sanctionId, disabled = false) {
 }
 
 function proposalNextAction(proposal) {
-  return ({
+  const byStatus = ({
     drafting: 'AIが草案を作成しています。',
     draft: '公開草案を確認できます。受付時の手続に従って次の段階へ進みます。',
     constitutional_review: '最終案を固定し、AIが憲法との整合を審査しています。',
@@ -924,7 +947,16 @@ function proposalNextAction(proposal) {
     enacted: '成立済みです。現行本文は法令集で確認できます。',
     rejected: '否決され、手続は終了しました。',
     remanded: '差し戻され、手続は終了しました。'
-  })[proposal.status] ?? '経過はこの投稿で確認できます。';
+  })[proposal.status];
+  if (byStatus) return byStatus;
+  return ({
+    draft: 'AIが草案を作成しています。',
+    public_discussion: '案を読み、意見をこの投稿へ書きます。',
+    ai_deliberation: '討議内容をAIが整理しています。',
+    constitutional_panel: 'AIが憲法との整合を審査しています。',
+    public_vote: '下のボタンから投票します。',
+    terminal: 'この手続は終了しました。'
+  })[proposalHandler(proposal)] ?? '経過はこの投稿で確認できます。';
 }
 
 function proposalStarterContent(proposal, nextAction = proposalNextAction(proposal), displayState = proposal.status) {
@@ -933,7 +965,7 @@ function proposalStarterContent(proposal, nextAction = proposalNextAction(propos
     '',
     proposal.summary,
     '',
-    `状態: **${proposalStateLabel(displayState)}**`,
+    `状態: **${proposalStateLabel(displayState, proposalHandler(proposal))}**`,
     proposalDeadline(proposal) ? `期限: ${proposalDeadline(proposal)}` : null,
     `いま必要なこと: ${oneLine(nextAction)}`,
     '草案・調整案・最終案と経過はこの投稿内にあります。'
@@ -983,13 +1015,16 @@ function courtStarterContent(caseRecord, nextAction = courtNextAction(caseRecord
 export async function createProposalPost(guild, governance, proposal) {
   const forum = await guild.channels.fetch(governance.parliament_forum_id);
   if (!forum?.threads) throw new Error('議会Forumが見つかりません。');
-  const stageTag = tagId(forum, proposal.status === 'debate' ? '討議' : '草案');
+  const stageTag = tagId(
+    forum,
+    proposalHandler(proposal) === 'public_discussion' ? '討議' : '草案'
+  );
   const body = proposal.body;
   const fullDraft = proposal.kind === 'amendment'
-    ? `# ${body.title}\n\n${body.content}\n\n## Policy\n\n\`\`\`json\n${JSON.stringify(body.policy, null, 2)}\n\`\`\``
+    ? `# ${body.title}\n\n${body.content}\n\nrules hash: ${body.rulesHash ?? '-'}\n\n実行手続: ${body.rules ? governanceRulesSummary(body.rules) : 'legacy policy'}`
     : `# ${body.title}\n\n${body.text}\n\n## Provisions\n\n\`\`\`json\n${JSON.stringify(body.provisions, null, 2)}\n\`\`\``;
-  const structuredDraft = proposal.kind === 'amendment' ? body.policy : body.provisions;
-  const structuredName = proposal.kind === 'amendment' ? 'policy' : 'provisions';
+  const structuredDraft = proposal.kind === 'amendment' ? (body.rules ?? body.policy) : body.provisions;
+  const structuredName = proposal.kind === 'amendment' ? 'rules' : 'provisions';
   const thread = await forum.threads.create({
     name: proposal.title.slice(0, 100),
     appliedTags: stageTag ? [stageTag] : [],
@@ -1000,7 +1035,7 @@ export async function createProposalPost(guild, governance, proposal) {
         { attachment: Buffer.from(fullDraft), name: '草案全文.md' },
         {
           attachment: Buffer.from(`${JSON.stringify(structuredDraft, null, 2)}\n`),
-          name: `${structuredName === 'policy' ? '手続定義' : '執行定義'}.json`
+          name: `${structuredName === 'rules' ? '憲法実行規則' : '執行定義'}.json`
         }
       ],
       allowedMentions: { parse: [] }
@@ -1061,11 +1096,16 @@ export async function postCourtUpdate(guild, caseRecord, text, { state = null, c
   return thread.send({ content: text.slice(0, 2000), components, files, allowedMentions: { parse: [] } });
 }
 
-function proposalForumState(status) {
-  return ({
+function proposalForumState(proposal) {
+  const byStatus = ({
     drafting: '草案', draft: '草案', constitutional_review: '違憲審査', debate: '討議', voting: '投票',
     enacted: '成立', rejected: '否決', remanded: '廃案'
-  })[status] ?? null;
+  })[proposal.status];
+  if (byStatus) return byStatus;
+  return ({
+    draft: '草案', public_discussion: '討議', ai_deliberation: '討議',
+    constitutional_panel: '違憲審査', public_vote: '投票', terminal: '廃案'
+  })[proposalHandler(proposal)] ?? null;
 }
 
 function courtForumState(status) {
@@ -1105,8 +1145,8 @@ export async function syncGovernanceRecordUi(guild, governance) {
       await syncRecordThread(thread, {
         name: proposal.title.slice(0, 100),
         content: proposalStarterContent(proposal),
-        components: proposal.status === 'voting' ? voteButtons(proposal.id) : [],
-        state: proposalForumState(proposal.status)
+        components: proposalHandler(proposal) === 'public_vote' ? voteButtons(proposal.id) : [],
+        state: proposalForumState(proposal)
       });
       changed += 1;
     } catch (error) {

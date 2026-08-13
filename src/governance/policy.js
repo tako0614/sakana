@@ -92,7 +92,7 @@ function finite(value, name, { min = 0, max = Infinity } = {}) {
   if (!Number.isFinite(value) || value < min || value > max) throw new Error(`${name} が不正です。`);
 }
 
-export function validateConstitutionPolicy(policy) {
+export function validateConstitutionPolicy(policy, { technicalOnly = false } = {}) {
   if (!policy || ![1, 2].includes(policy.schemaVersion)) throw new Error('未対応の憲法policyです。');
   const { eligibility, voting, legislation, judiciary } = policy;
   if (!eligibility || !voting || !legislation || !judiciary) throw new Error('憲法policyの必須区分がありません。');
@@ -137,12 +137,12 @@ export function validateConstitutionPolicy(policy) {
     ? modernLegislationKeys.filter((key) => key.endsWith('Milliseconds'))
     : legacyLegislationKeys;
   for (const key of durationKeys) {
-    finite(legislation[key], `legislation.${key}`, { min: 3_600_000 });
+    finite(legislation[key], `legislation.${key}`, { min: technicalOnly ? 60_000 : 3_600_000 });
     if (!Number.isInteger(legislation[key])) throw new Error(`legislation.${key} は整数である必要があります。`);
   }
   if (modernLegislation) {
     for (const key of ['maximumRevisions', 'maximumDebateExtensions']) {
-      finite(legislation[key], `legislation.${key}`, { max: 10 });
+      finite(legislation[key], `legislation.${key}`, { max: technicalOnly ? 20 : 10 });
       if (!Number.isInteger(legislation[key])) throw new Error(`legislation.${key} は整数である必要があります。`);
     }
     if (legislation.extendOnLateMaterialFeedback !== true && legislation.extendOnLateMaterialFeedback !== false) {
@@ -171,7 +171,8 @@ export function validateConstitutionPolicy(policy) {
   if (judiciary.panelSeats < 1 || judiciary.panelSeats > 5 || judiciary.panelSeats % 2 === 0) {
     throw new Error('panelSeatsは1, 3, 5のいずれかです。');
   }
-  if (judiciary.defenseMilliseconds < 3_600_000 || judiciary.appealMilliseconds < 3_600_000) {
+  if (judiciary.defenseMilliseconds < (technicalOnly ? 60_000 : 3_600_000)
+    || judiciary.appealMilliseconds < (technicalOnly ? 60_000 : 3_600_000)) {
     throw new Error('答弁・上訴期間は最低1時間必要です。');
   }
   if (policy.schemaVersion === 2) {
@@ -189,27 +190,41 @@ export function validateConstitutionPolicy(policy) {
     for (const key of ['panelSeats', 'votesRequired', 'trialMilliseconds']) {
       if (!Number.isInteger(procedure[key])) throw new Error(`summaryProcedure.${key}は整数である必要があります。`);
     }
-    if (procedure.panelSeats !== 3 || procedure.votesRequired !== 2) {
-      throw new Error('v2の即時判定は3席中2席で固定です。');
+    if (procedure.panelSeats < 1 || procedure.panelSeats > 5 || procedure.panelSeats % 2 === 0
+      || procedure.votesRequired < 1 || procedure.votesRequired > procedure.panelSeats) {
+      throw new Error('summaryProcedureの席数または必要票が不正です。');
     }
-    if (judiciary.panelSeats !== procedure.panelSeats || judiciary.guiltyVotesRequired !== procedure.votesRequired) {
+    if (!technicalOnly
+      && (judiciary.panelSeats !== procedure.panelSeats || judiciary.guiltyVotesRequired !== procedure.votesRequired)) {
       throw new Error('v2の通常裁判も即時判定と同じ3席中2席である必要があります。');
     }
-    if (procedure.trialMilliseconds !== DAY_MS) {
+    if (!technicalOnly && (procedure.panelSeats !== 3 || procedure.votesRequired !== 2)) {
+      throw new Error('v2の即時判定は3席中2席で固定です。');
+    }
+    if (!technicalOnly && procedure.trialMilliseconds !== DAY_MS) {
       throw new Error('v2の裁判期限は24時間で固定です。');
     }
-    const exactSanctions = (value, expected) => Array.isArray(value)
+    const validSanctionSet = (value) => Array.isArray(value)
+      && new Set(value).size === value.length
+      && value.every((entry) => ['warning', 'restriction', 'timeout', 'kick', 'ban'].includes(entry));
+    const exactSanctions = (value, expected) => validSanctionSet(value)
       && value.length === expected.length
       && value.every((entry, index) => entry === expected[index]);
-    if (!exactSanctions(procedure.immediateSanctions, ['warning', 'restriction', 'timeout'])
-      || !exactSanctions(procedure.trialFirstSanctions, ['kick', 'ban'])) {
+    if ((!technicalOnly && (!exactSanctions(procedure.immediateSanctions, ['warning', 'restriction', 'timeout'])
+      || !exactSanctions(procedure.trialFirstSanctions, ['kick', 'ban'])))
+      || (technicalOnly && (!validSanctionSet(procedure.immediateSanctions)
+        || !validSanctionSet(procedure.trialFirstSanctions)
+        || procedure.immediateSanctions.some((entry) => procedure.trialFirstSanctions.includes(entry))))) {
       throw new Error('v2の即時処分・裁判先行処分の区分が不正です。');
     }
-    if (procedure.unlimitedWarningReview !== true) throw new Error('warningの裁判請求は期限なしである必要があります。');
+    if ((!technicalOnly && procedure.unlimitedWarningReview !== true)
+      || (technicalOnly && typeof procedure.unlimitedWarningReview !== 'boolean')) {
+      throw new Error('warningの裁判請求設定が不正です。');
+    }
   }
   if (judiciary.constitutionalChallengesPerMemberPerDay < 1
-    || judiciary.constitutionalChallengesPerMemberPerDay > 100) {
-    throw new Error('違憲審査申立て枠は1-100回です。');
+    || judiciary.constitutionalChallengesPerMemberPerDay > (technicalOnly ? 1000 : 100)) {
+    throw new Error(`違憲審査申立て枠は1-${technicalOnly ? 1000 : 100}回です。`);
   }
   if (judiciary.guiltyVotesRequired < 1) throw new Error('guiltyVotesRequiredは1以上です。');
   if (judiciary.constitutionalVotesRequired < 1 || judiciary.unconstitutionalVotesRequired < 1) {

@@ -18,9 +18,12 @@ import {
   listPendingGovernanceIntakes,
   listCases,
   listLaws,
+  listProposals,
+  recordInstrumentRelation,
   updateGovernanceIntake
 } from './db.js';
-import { interpretJudicialRequest, interpretLegislativeRequest } from './llm.js';
+import { interpretJudicialRequest, interpretLegislativeRequest, reviewLegislativeRelation } from './llm.js';
+import { buildLegislativeCandidates, exactActiveProposalMatch } from './relation.js';
 import {
   addEvidenceToCase,
   appealCase,
@@ -129,7 +132,7 @@ function intakeButtons(intake) {
   const buttons = [
     new ButtonBuilder()
       .setCustomId(`gov:intake:${intake.id}:confirm`)
-      .setLabel('審議に進める')
+      .setLabel(intake.action === 'join_discussion' ? '既存討議に加える' : '審議に進める')
       .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId(`gov:intake:${intake.id}:cancel`)
@@ -149,6 +152,20 @@ function renderIntake(intake, suffix = '') {
       `題名: ${payload.title}`,
       pending ? `内容: ${payload.summary}` : null,
       `投票範囲: ${payload.voteScope === 'trusted' ? `${payload.electorateLabel ?? '特別有権者'}のみ` : '全員'}`
+    );
+    if (payload.relation?.relation === 'amend_law') {
+      lines.push(`改正対象: ${payload.relation.targetTitle}`, `現在の版: v${payload.relation.targetVersion ?? 1}`);
+    }
+    if (payload.relation?.relation === 'amend_constitution') lines.push(`改正対象: ${payload.relation.targetTitle}`);
+    if (payload.relation?.relation === 'separate') lines.push('関連案件とは独立して成立できる別案件として扱います。');
+    if (payload.relation?.reasons?.length) lines.push(`振り分け理由: ${payload.relation.reasons.join(' / ')}`);
+  } else if (intake.action === 'join_discussion') {
+    lines.push(
+      '種別: 既存討議への意見追加',
+      `討議: ${payload.relation.targetTitle}`,
+      pending ? `意見・対案: ${payload.summary}` : null,
+      payload.relation.threadId ? linkToThread(intake.guild_id, payload.relation.threadId) : null,
+      payload.relation.reasons?.length ? `振り分け理由: ${payload.relation.reasons.join(' / ')}` : null
     );
   } else if (intake.action === 'criminal_case') {
     const law = getLaw(payload.lawId);
@@ -276,7 +293,7 @@ function reservationMessage(reservation) {
 
 async function handleLegislature(message, governance, request) {
   const constitution = getActiveConstitution(message.guildId);
-  const output = await interpretLegislativeRequest({
+  let output = await interpretLegislativeRequest({
     guildId: message.guildId,
     request: { text: request, authorId: message.author.id },
     constitution,
@@ -286,6 +303,74 @@ async function handleLegislature(message, governance, request) {
     await message.reply({ content: output.question, allowedMentions: NO_MENTIONS });
     return true;
   }
+  const proposals = listProposals(message.guildId, { limit: 100 });
+  const exact = exactActiveProposalMatch(output.title, proposals);
+  const candidates = buildLegislativeCandidates({
+    request,
+    normalized: output,
+    proposals,
+    laws: listLaws(message.guildId, { activeOnly: false, limit: 100 }),
+    constitution
+  });
+  const relation = exact ? {
+    relation: 'join_active',
+    targetType: 'proposal',
+    targetId: String(exact.id),
+    reasons: ['同じ題名の案件がすでに進行中です。'],
+    materialDifferences: [],
+    outputs: []
+  } : await reviewLegislativeRelation({
+    guildId: message.guildId,
+    request: { text: request, authorId: message.author.id },
+    normalized: output,
+    candidates,
+    panel: constitution.rules?.panels?.proposalRelation
+  });
+  if (relation.relation === 'uncertain') {
+    await message.reply({ content: relation.reasons[0], allowedMentions: NO_MENTIONS });
+    return true;
+  }
+  const target = relation.targetType && relation.targetId
+    ? candidates.find((candidate) => candidate.type === relation.targetType && String(candidate.id) === String(relation.targetId))
+    : null;
+  if (relation.relation === 'covered') {
+    const link = target?.type === 'proposal' && target.threadId
+      ? linkToThread(message.guildId, target.threadId)
+      : target?.type === 'law' && governance.statute_forum_id
+        ? `法令集: <#${governance.statute_forum_id}>`
+        : '法令集を確認してください。';
+    await message.reply({
+      content: `この内容は「${target?.title ?? '現行制度'}」ですでに実現されています。\n${relation.reasons.join(' / ')}\n${link}`.slice(0, 2000),
+      allowedMentions: NO_MENTIONS
+    });
+    return true;
+  }
+  const relationPayload = {
+    relation: relation.relation,
+    targetType: relation.targetType,
+    targetId: relation.targetId,
+    targetTitle: target?.title ?? null,
+    targetHash: target?.contentHash ?? null,
+    targetVersion: target?.version ?? null,
+    threadId: target?.threadId ?? null,
+    reasons: relation.reasons,
+    materialDifferences: relation.materialDifferences,
+    panelOutputs: relation.outputs
+  };
+  if (relation.relation === 'join_active') {
+    return createPreview(message, 'legislature', 'join_discussion', {
+      title: output.title,
+      summary: output.summary,
+      relation: relationPayload
+    });
+  }
+  if (relation.relation === 'amend_law') output = {
+    ...output,
+    intent: 'petition',
+    title: `${target.title}の改正`.slice(0, 50),
+    summary: `現行の「${target.title}」を次の内容で改正する。${output.summary}`.slice(0, 1800)
+  };
+  if (relation.relation === 'amend_constitution') output = { ...output, intent: 'amendment' };
   const voteScope = constitution.policy.voting.defaultScope;
   if (voteScope === 'trusted' && !governance.trusted_role_id) {
     throw new Error('既定の投票範囲に使う特別有権者ロールが設定されていません。');
@@ -296,7 +381,8 @@ async function handleLegislature(message, governance, request) {
     voteScope,
     electorateLabel: governance.trusted_role_id
       ? (message.guild.roles?.cache?.get?.(governance.trusted_role_id)?.name ?? '特別有権者')
-      : '特別有権者'
+      : '特別有権者',
+    relation: relationPayload
   });
 }
 
@@ -456,7 +542,8 @@ async function executeIntake(interaction, intake) {
       summary: payload.summary,
       voteScope: payload.voteScope,
       eventId: intake.source_message_id,
-      attemptReserved: true
+      attemptReserved: true,
+      relation: payload.relation
     });
     return { type: 'proposal', id: result.id, text: `「${payload.title}」を受理しました。\n${linkToThread(interaction.guildId, result.forum_thread_id)}` };
   }
@@ -466,9 +553,39 @@ async function executeIntake(interaction, intake) {
       summary: payload.summary,
       voteScope: payload.voteScope,
       eventId: intake.source_message_id,
-      attemptReserved: true
+      attemptReserved: true,
+      relation: payload.relation
     });
     return { type: 'proposal', id: result.id, text: `「${payload.title}」を改憲案として受理しました。\n${linkToThread(interaction.guildId, result.forum_thread_id)}` };
+  }
+  if (intake.action === 'join_discussion') {
+    const relation = payload.relation;
+    if (relation.targetType !== 'proposal' || !relation.targetId || !relation.threadId) throw new Error('既存討議を特定できません。');
+    const proposal = listProposals(interaction.guildId, { limit: 100 })
+      .find((entry) => String(entry.id) === String(relation.targetId));
+    if (!proposal || proposal.workflow_handler === 'terminal'
+      || (!proposal.workflow_handler && ['enacted', 'rejected', 'remanded'].includes(proposal.status))) {
+      throw new Error('既存討議は終了しています。改めて新規提案してください。');
+    }
+    const thread = await interaction.guild.channels.fetch(relation.threadId).catch(() => null);
+    if (!thread?.isTextBased?.()) throw new Error('既存討議を読めません。');
+    await thread.send({
+      content: [`<@${interaction.user.id}> からの意見・対案`, payload.summary,
+        `元の発言: https://discord.com/channels/${interaction.guildId}/${intake.channel_id}/${intake.source_message_id}`].join('\n\n'),
+      allowedMentions: { parse: [] }
+    });
+    recordInstrumentRelation({
+      guildId: interaction.guildId,
+      sourceType: 'intake',
+      sourceId: intake.id,
+      relationType: 'join_active',
+      targetType: 'proposal',
+      targetId: proposal.id,
+      targetHash: proposal.target_hash,
+      reasons: relation.reasons,
+      decision: relation
+    });
+    return { type: 'proposal_discussion', id: proposal.id, text: `既存の討議へ追加しました。\n${linkToThread(interaction.guildId, proposal.forum_thread_id)}` };
   }
   if (intake.action === 'criminal_case') {
     await assertEvidenceVisibleTo(interaction.guild, payload.evidence, [interaction.user.id, payload.accusedId]);
