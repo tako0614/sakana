@@ -9,6 +9,7 @@ StartLimitBurst=10
 Type=simple
 WorkingDirectory=/root/sakana
 ExecStart=/usr/bin/node --import tsx src/index.js
+SuccessExitStatus=143
 Restart=always
 RestartSec=5
 TimeoutStopSec=20
