@@ -898,11 +898,21 @@ async function cleanup(guild, runId) {
       const batch = await gazette.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
       if (batch.size === 0) break;
       for (const message of batch.values()) {
-        if (message.author.id !== guild.client.user.id
-          || (message.id !== seededAudit?.detail?.gazetteMessageId
-            && !message.content.includes(mark)
-            && !message.content.includes('表示対象のアカウント')
-            && !message.content.includes('<@e2e-'))) continue;
+        if (message.author.id !== guild.client.user.id) continue;
+        let fixtureAttachment = false;
+        for (const attachment of message.attachments.values()) {
+          if (!/\.(?:md|txt|json)$/i.test(attachment.name ?? '') || attachment.size > 1_000_000) continue;
+          const body = await fetch(attachment.url).then((response) => response.ok ? response.text() : '').catch(() => '');
+          if (body.includes('表示対象のアカウント') || body.includes('<@e2e-') || body.includes(mark)) {
+            fixtureAttachment = true;
+            break;
+          }
+        }
+        if (message.id !== seededAudit?.detail?.gazetteMessageId
+          && !message.content.includes(mark)
+          && !message.content.includes('表示対象のアカウント')
+          && !message.content.includes('<@e2e-')
+          && !fixtureAttachment) continue;
         await message.delete();
         cleaned.gazetteMessages.push(message.id);
       }

@@ -2399,6 +2399,8 @@ assert.match(liveE2eSource, /thread\.delete\('E2E fixtureを公開一覧から�
   'E2E cleanupはテスト投稿を公開フォーラムに残さない');
 assert.match(liveE2eSource, /message\.id !== seededAudit\?\.detail\?\.gazetteMessageId/,
   'E2E cleanupは内部監査で対応付けたbot官報だけを除去する');
+assert.match(liveE2eSource, /body\.includes\('<@e2e-'\)/,
+  '遅延outboxが添付へ残した旧E2E識別子もcleanupする');
 assert.match(liveE2eSource, /entry\.source === sourceKey/,
   '公開題名ではなく非公開のsource keyからE2E案件を片付ける');
 assert.doesNotMatch(liveE2eSource, /postGazette\([^\n]+`\$\{mark\}/,
