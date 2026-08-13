@@ -1434,6 +1434,9 @@ assert.doesNotMatch(intakeSource, /参照番号:|適用法: #|違憲審査対象
   'メンション受付の応答にも内部IDを表示しない');
 assert.doesNotMatch(intakeSource, /正式受付済み: \$\{error\.accepted\.resultType\} \$\{error\.accepted\.resultId\}/,
   '自動再試行中の受付にも内部IDを表示しない');
+const intakeRepairSource = readFileSync(new URL('./repair-governance-intake-ui.mjs', import.meta.url), 'utf8');
+assert.match(intakeRepairSource, /正式受付済み（自動再試行中）/,
+  '既存の受付メッセージも内部IDなし表示へ修復できる');
 const serviceSource = readFileSync(new URL('../src/governance/service.js', import.meta.url), 'utf8');
 assert.doesNotMatch(serviceSource, /`(?:法案|改憲案) L-\$\{proposal\.id\}|`事件 C-\$\{caseRecord\.id\}|ロールID:/,
   '公開する再試行案内と特別有権者履歴から内部IDを外す');
