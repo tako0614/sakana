@@ -422,6 +422,7 @@ export function governancePermissionReport(guild) {
     ['ManageRoles', PermissionFlagsBits.ManageRoles],
     ['ManageThreads', PermissionFlagsBits.ManageThreads],
     ['ManageMessages', PermissionFlagsBits.ManageMessages],
+    ['MentionEveryone', PermissionFlagsBits.MentionEveryone],
     ['CreatePublicThreads', PermissionFlagsBits.CreatePublicThreads],
     ['SendMessages', PermissionFlagsBits.SendMessages],
     ['AttachFiles', PermissionFlagsBits.AttachFiles],

@@ -842,9 +842,35 @@ db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied
 }
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (14, ?)').run(Date.now());
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS governance_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    event_key TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL,
+    audience_kind TEXT NOT NULL,
+    audience_id TEXT,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    channel_id TEXT,
+    message_id TEXT,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    delivered_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_notifications_rate
+    ON governance_notifications(guild_id, audience_kind, audience_id, status, delivered_at);
+  CREATE INDEX IF NOT EXISTS idx_gov_notifications_failed
+    ON governance_notifications(guild_id, status, updated_at);
+`);
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (15, ?)').run(Date.now());
+
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
 db.prepare("UPDATE governance_outbox SET status = 'error', last_error = 'interrupted before completion' WHERE status = 'running'").run();
+db.prepare("UPDATE governance_notifications SET status = 'failed', last_error = 'interrupted before delivery', updated_at = ? WHERE status = 'sending'")
+  .run(Date.now());
 
 function parseJson(value, fallback = null) {
   try {
@@ -2519,6 +2545,148 @@ export function updateAdministrativeAct(id, patch) {
   return getAdministrativeAct(id);
 }
 
+function getGovernanceNotification(eventKey) {
+  return db.prepare('SELECT * FROM governance_notifications WHERE event_key = ?').get(String(eventKey)) ?? null;
+}
+
+const claimNotificationTransaction = db.transaction((input) => {
+  const guildId = String(input.guildId);
+  const eventKey = String(input.eventKey);
+  const eventType = String(input.eventType);
+  const audienceKind = String(input.audienceKind);
+  const audienceId = input.audienceId === null || input.audienceId === undefined
+    ? null
+    : String(input.audienceId);
+  const limit = Math.max(0, Number(input.limit) || 0);
+  const forcedSuppression = input.suppressionReason ? String(input.suppressionReason).slice(0, 500) : null;
+  const now = Number(input.now ?? Date.now());
+  const existing = getGovernanceNotification(eventKey);
+  if (existing) {
+    if (existing.status === 'failed' && existing.attempts < 3) {
+      db.prepare(`
+        UPDATE governance_notifications
+        SET status = 'sending', attempts = attempts + 1, last_error = NULL, updated_at = ?
+        WHERE event_key = ?
+      `).run(now, eventKey);
+      return { action: 'send', notification: getGovernanceNotification(eventKey) };
+    }
+    return { action: 'skip', notification: existing };
+  }
+  const audienceClause = audienceKind === 'user' ? 'AND audience_id = ?' : '';
+  const parameters = audienceKind === 'user'
+    ? [guildId, audienceKind, audienceId, now - DAY_MS]
+    : [guildId, audienceKind, now - DAY_MS];
+  const delivered = db.prepare(`
+    SELECT COUNT(*) AS count FROM governance_notifications
+    WHERE guild_id = ? AND audience_kind = ? ${audienceClause}
+      AND status = 'delivered' AND delivered_at >= ?
+  `).get(...parameters).count;
+  const suppressed = Boolean(forcedSuppression) || limit === 0 || delivered >= limit;
+  db.prepare(`
+    INSERT INTO governance_notifications
+      (guild_id, event_key, event_type, audience_kind, audience_id, status, attempts,
+       last_error, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    guildId,
+    eventKey,
+    eventType,
+    audienceKind,
+    audienceId,
+    suppressed ? 'suppressed' : 'sending',
+    suppressed ? 0 : 1,
+    suppressed
+      ? (forcedSuppression ?? (limit === 0 ? 'notifications disabled by limit' : '24 hour notification limit reached'))
+      : null,
+    now,
+    now
+  );
+  return { action: suppressed ? 'suppressed' : 'send', notification: getGovernanceNotification(eventKey) };
+});
+
+export function claimGovernanceNotification(input) {
+  if (!String(input.eventKey ?? '').startsWith('governance:')) throw new Error('通知キーが不正です。');
+  if (!['everyone', 'trusted_role', 'user'].includes(input.audienceKind)) throw new Error('通知対象が不正です。');
+  return claimNotificationTransaction(input);
+}
+
+export function reconcileGovernanceNotification(input) {
+  const now = Number(input.deliveredAt ?? Date.now());
+  db.prepare(`
+    INSERT INTO governance_notifications
+      (guild_id, event_key, event_type, audience_kind, audience_id, status, attempts,
+       channel_id, message_id, last_error, created_at, updated_at, delivered_at)
+    VALUES (?, ?, ?, ?, ?, 'reconciled', 0, ?, ?, 'existing message found; notification not repeated', ?, ?, NULL)
+    ON CONFLICT(event_key) DO UPDATE SET
+      status = CASE
+        WHEN governance_notifications.status IN ('delivered', 'suppressed', 'reconciled') THEN governance_notifications.status
+        ELSE 'reconciled'
+      END,
+      channel_id = excluded.channel_id,
+      message_id = excluded.message_id,
+      last_error = CASE
+        WHEN governance_notifications.status IN ('delivered', 'suppressed', 'reconciled') THEN governance_notifications.last_error
+        ELSE excluded.last_error
+      END,
+      updated_at = excluded.updated_at
+    WHERE governance_notifications.status IN ('sending', 'failed')
+  `).run(
+    String(input.guildId), String(input.eventKey), String(input.eventType), String(input.audienceKind),
+    input.audienceId === null || input.audienceId === undefined ? null : String(input.audienceId),
+    input.channelId === null || input.channelId === undefined ? null : String(input.channelId),
+    input.messageId === null || input.messageId === undefined ? null : String(input.messageId),
+    now, now
+  );
+  return getGovernanceNotification(input.eventKey);
+}
+
+export function completeGovernanceNotification(eventKey, { channelId = null, messageId = null } = {}) {
+  const now = Date.now();
+  db.prepare(`
+    UPDATE governance_notifications
+    SET status = 'delivered', channel_id = ?, message_id = ?, last_error = NULL,
+      delivered_at = ?, updated_at = ?
+    WHERE event_key = ? AND status = 'sending'
+  `).run(channelId === null ? null : String(channelId), messageId === null ? null : String(messageId), now, now, String(eventKey));
+  return getGovernanceNotification(eventKey);
+}
+
+export function failGovernanceNotification(eventKey, error) {
+  db.prepare(`
+    UPDATE governance_notifications
+    SET status = 'failed', last_error = ?, updated_at = ?
+    WHERE event_key = ? AND status = 'sending'
+  `).run(String(error?.message ?? error).slice(0, 500), Date.now(), String(eventKey));
+  return getGovernanceNotification(eventKey);
+}
+
+export function governanceNotificationStats(guildId, since = Date.now() - DAY_MS) {
+  const rows = db.prepare(`
+    SELECT status, COUNT(*) AS count FROM governance_notifications
+    WHERE guild_id = ? AND updated_at >= ?
+    GROUP BY status
+  `).all(String(guildId), Number(since));
+  const stats = { delivered: 0, suppressed: 0, failed: 0, reconciled: 0 };
+  for (const row of rows) if (row.status in stats) stats[row.status] = Number(row.count);
+  return stats;
+}
+
+export function listNotificationFailures(guildId, limit = 10) {
+  return db.prepare(`
+    SELECT * FROM governance_notifications
+    WHERE guild_id = ? AND status = 'failed'
+    ORDER BY updated_at DESC LIMIT ?
+  `).all(String(guildId), Number(limit));
+}
+
+export function retryFailedNotifications(guildId) {
+  return db.prepare(`
+    UPDATE governance_notifications
+    SET attempts = 0, updated_at = ?
+    WHERE guild_id = ? AND status = 'failed'
+  `).run(Date.now(), String(guildId)).changes;
+}
+
 export function enqueueAction({ guildId, actionType, targetId = null, payload, idempotencyKey }) {
   db.prepare(`
     INSERT OR IGNORE INTO governance_outbox
@@ -2601,6 +2769,7 @@ export function pruneGovernance(keepMs = 90 * 86_400_000) {
   db.prepare('DELETE FROM governance_restriction_usage WHERE created_at < ?').run(cutoff);
   db.prepare("DELETE FROM governance_intakes WHERE status != 'pending' AND updated_at < ?").run(cutoff);
   db.prepare("DELETE FROM governance_setup_sessions WHERE status IN ('completed', 'expired') AND updated_at < ?").run(cutoff);
+  db.prepare("DELETE FROM governance_notifications WHERE status != 'sending' AND updated_at < ?").run(cutoff);
 }
 
 export { db as governanceDatabase };

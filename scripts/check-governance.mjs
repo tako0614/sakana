@@ -8,7 +8,12 @@ process.env.DATABASE_PATH = mainPath;
 process.env.ARCHIVE_DB_PATH = archivePath;
 process.env.GOVERNANCE_API_KEY = 'check';
 
-const { governanceCategoryName, loadBootstrapDocuments, renderBootstrapConstitution } = await import('../src/governance/config.js');
+const {
+  governanceCategoryName,
+  loadBootstrapDocuments,
+  parseOperationalSetting,
+  renderBootstrapConstitution
+} = await import('../src/governance/config.js');
 const policyModule = await import('../src/governance/policy.js');
 const governanceDb = await import('../src/governance/db.js');
 const rulesModule = await import('../src/governance/rules.js');
@@ -42,6 +47,11 @@ assert.match(
 );
 assert.equal(governanceCategoryName('Test Community'), 'Test Community 統治');
 assert.equal(Array.from(governanceCategoryName('x'.repeat(100))).length, 100);
+assert.deepEqual(parseOperationalSetting('notification_everyone_daily_limit', '0'), { ok: true, value: 0 });
+assert.equal(parseOperationalSetting('notification_everyone_daily_limit', '11').ok, false,
+  '全体通知は運営者でも安全上限を超えて設定できない');
+assert.equal(parseOperationalSetting('notification_user_daily_limit', '21').ok, false,
+  '当事者通知は運営者でも安全上限を超えて設定できない');
 policyModule.validateConstitutionPolicy(policy);
 assert.equal(policy.schemaVersion, 2);
 assert.deepEqual(policyModule.summaryProcedure(policy), policy.judiciary.summaryProcedure);
@@ -530,6 +540,32 @@ assert.equal(governanceDb.reserveAgentAttempt('g1', 'general', false, 1, policyM
   '通常agent枠を使い切っても違憲審査申立て枠は独立している');
 assert.equal(governanceDb.reserveAgentAttempt('g1', 'general', false, 1, policyModule.DAY_MS, 'constitutional_challenge').ok, false);
 assert.equal(governanceDb.reserveAgentAttempt('g1', 'disabled', false, 0).ok, false, '0回設定は無制限ではなく停止');
+
+const notificationNow = Date.now();
+const firstNotification = governanceDb.claimGovernanceNotification({
+  guildId: 'notification-test', eventKey: 'governance:test:all:1', eventType: 'proposal_vote_all',
+  audienceKind: 'everyone', limit: 1, now: notificationNow
+});
+assert.equal(firstNotification.action, 'send');
+governanceDb.completeGovernanceNotification('governance:test:all:1', { channelId: 'channel', messageId: 'message' });
+assert.equal(governanceDb.claimGovernanceNotification({
+  guildId: 'notification-test', eventKey: 'governance:test:all:1', eventType: 'proposal_vote_all',
+  audienceKind: 'everyone', limit: 1, now: notificationNow
+}).action, 'skip', '同じ統治イベントは再試行でも二重通知しない');
+assert.equal(governanceDb.claimGovernanceNotification({
+  guildId: 'notification-test', eventKey: 'governance:test:all:2', eventType: 'proposal_vote_all',
+  audienceKind: 'everyone', limit: 1, now: notificationNow
+}).action, 'suppressed', '24時間上限後も手続は止めず通知だけを抑制する');
+assert.deepEqual(
+  (({ delivered, suppressed, failed }) => ({ delivered, suppressed, failed }))(
+    governanceDb.governanceNotificationStats('notification-test')
+  ),
+  { delivered: 1, suppressed: 1, failed: 0 }
+);
+assert.throws(() => governanceDb.claimGovernanceNotification({
+  guildId: 'notification-test', eventKey: 'ai-selected-target', eventType: 'freeform',
+  audienceKind: 'role_from_prompt', limit: 1
+}), /通知キーが不正|通知対象が不正/, '自由入力から任意の通知対象を作れない');
 
 governanceDb.authorizeTrustedMutation({
   guildId: 'g1', userId: 'new-trusted', roleId: 'trusted-role', desired: true, authorizedBy: 'owner'
@@ -2221,7 +2257,7 @@ assert.deepEqual(
 governanceDb.updateGovernanceGuild('g1', {
   guide_channel_id: 'guide',
   admin_channel_id: 'admin',
-  trusted_role_id: 'special-role'
+  trusted_role_id: '123456789012345679'
 });
 const {
   legacyGazetteCandidates,
@@ -2265,8 +2301,8 @@ const uxGuild = {
   ownerId: 'owner',
   client: { user: { id: 'bot' } },
   roles: {
-    cache: new Map([['special-role', { id: 'special-role', name: '貴族院' }]]),
-    fetch: async (id) => id === 'special-role' ? { id, name: '貴族院' } : null
+    cache: new Map([['123456789012345679', { id: '123456789012345679', name: '貴族院', mentionable: false }]]),
+    fetch: async (id) => id === '123456789012345679' ? { id, name: '貴族院', mentionable: false } : null
   },
   members: { me: { permissions: { has: () => true } } }
 };
@@ -2320,10 +2356,13 @@ const voteCard = actionCards.find((card) => card.key === `vote:${uxVoteProposal.
 const approvalCard = actionCards.find((card) => card.key === `approve:${uxApprovalCase.id}`);
 assert.deepEqual(voteCard.components[0].components.map((button) => button.data.label),
   ['賛成', '反対', '棄権', '本文・議論']);
+assert.match(voteCard.content, /^@everyone\n/, '全員投票の開始カードは全員へ一度だけ通知する');
 assert.doesNotMatch(voteCard.content, /^#\s*投票/m, '各投票カードに同じ見出しを繰り返さない');
 assert.match(voteCard.content, /現在: 賛成 0 \/ 反対 0 \/ 棄権 0/);
 assert.deepEqual(approvalCard.components[0].components.map((button) => button.data.label),
   ['執行承認', '承認しない', '判決記録']);
+assert.match(approvalCard.content, /^<@&123456789012345679>\n/,
+  '執行承認カードは特別有権者ロールを明示する');
 assert.doesNotMatch(approvalCard.content, /^#\s*執行承認/m, '各承認カードに同じ見出しを繰り返さない');
 assert.match(approvalCard.content, /タイムアウト 2日 \/ 承認 0\/1人/);
 assert.match(approvalCard.content, /表示対象のアカウント/);
@@ -2337,9 +2376,12 @@ const actionChannel = {
     const id = `action-${++actionSequence}`;
     const message = {
       id,
+      channelId: 'admin',
       author: { id: 'bot' },
       content: payload.content,
       components: payload.components,
+      allowedMentions: payload.allowedMentions,
+      createdTimestamp: Date.now(),
       edit: async (next) => Object.assign(message, next),
       delete: async () => actionMessages.delete(id)
     };
@@ -2349,6 +2391,61 @@ const actionChannel = {
 };
 assert.equal(await syncGovernanceActionCards(uxGuild, actionChannel), actionCards.length);
 assert.equal(actionMessages.size, actionCards.length, '進行中に投票と承認を別カードとして作る');
+const voteMessage = [...actionMessages.values()].find((message) => message.components[0].components
+  .some((button) => String(button.data.custom_id ?? '').startsWith(`gov:vote:${uxVoteProposal.id}:`)));
+const approvalMessage = [...actionMessages.values()].find((message) => message.components[0].components
+  .some((button) => String(button.data.custom_id ?? '').startsWith(`gov:approve:${uxApprovalCase.id}:`)));
+assert.deepEqual(voteMessage.allowedMentions, { parse: ['everyone'], repliedUser: false },
+  '全員通知以外のmention解析をDiscordへ許可しない');
+assert.deepEqual(approvalMessage.allowedMentions, {
+  parse: [], roles: ['123456789012345679'], repliedUser: false
+}, '特別有権者通知は保存済みの1ロールだけを許可する');
+const deliveredBeforeResync = governanceDb.governanceNotificationStats('g1').delivered;
+assert.equal(await syncGovernanceActionCards(uxGuild, actionChannel), actionCards.length);
+assert.equal(actionMessages.size, actionCards.length, '定期同期で案件カードを二重作成しない');
+assert.equal(governanceDb.governanceNotificationStats('g1').delivered, deliveredBeforeResync,
+  '票更新やカード同期では再通知しない');
+const { notifyCaseParty } = await import('../src/governance/notifications.js');
+const partyMessages = [];
+const partyThread = {
+  isTextBased: () => true,
+  messages: {
+    fetch: async () => ({ find: (predicate) => partyMessages.find(predicate) })
+  },
+  send: async (payload) => {
+    const message = {
+      id: `party-${partyMessages.length + 1}`,
+      channelId: 'party-thread',
+      author: { id: 'bot' },
+      content: payload.content,
+      allowedMentions: payload.allowedMentions,
+      createdTimestamp: Date.now()
+    };
+    partyMessages.push(message);
+    return message;
+  }
+};
+const partyGuild = {
+  ...uxGuild,
+  channels: { fetch: async (id) => id === 'party-thread' ? partyThread : null }
+};
+const partyDeadline = Date.now() + 3_600_000;
+const partyCase = {
+  id: 9876,
+  accused_id: '123456789012345680',
+  public_thread_id: 'party-thread',
+  review_count: 1
+};
+assert.equal(await notifyCaseParty(partyGuild, partyCase, 'defense', partyDeadline), true);
+assert.deepEqual(partyMessages[0].allowedMentions, {
+  parse: [], users: ['123456789012345680'], repliedUser: false
+}, '答弁通知は事件DBに固定された被告1人だけをmentionする');
+assert.equal(await notifyCaseParty(partyGuild, partyCase, 'defense', partyDeadline), false);
+assert.equal(partyMessages.length, 1, 'scheduler再試行でも同じ答弁通知を二重送信しない');
+assert.equal(await notifyCaseParty(partyGuild, {
+  ...partyCase, id: 9877, accused_id: '@everyone'
+}, 'defense', partyDeadline), false);
+assert.equal(partyMessages.length, 1, '事件データにDiscord ID以外が混ざってもmentionへ展開しない');
 governanceDb.updateProposal(uxVoteProposal.id, { status: 'rejected' });
 governanceDb.updateCase(uxApprovalCase.id, { status: 'dismissed' });
 const remainingActionCards = renderGovernanceActionCards(uxGuild);

@@ -124,6 +124,7 @@ import {
   validateRestrictionDefinition
 } from './policy.js';
 import { governanceActionAllowed, reserveRestrictedAgentCall } from './restrictions.js';
+import { notifyCaseParty } from './notifications.js';
 import {
   activeProposal,
   activeConstitutionalAmendment,
@@ -1282,6 +1283,7 @@ async function finishCaseFiling(guild, caseRecord) {
   });
   await ensureEvidenceDisclosures(guild, current);
   await postCourtUpdate(guild, current, `答弁期限: <t:${Math.floor(defenseUntil / 1000)}:F>`, { state: '答弁' });
+  await notifyCaseParty(guild, current, 'defense', defenseUntil);
   if (!procedure) await applyInterimProtectionFromLogs(guild, current);
   return current;
 }
@@ -1601,6 +1603,7 @@ async function beginAppealWindow(guild, caseRecord, sanction) {
   });
   caseRecord = updateCase(caseRecord.id, { status: 'appeal_window' });
   await postCourtUpdate(guild, caseRecord, `この刑は上訴対象です。期限: <t:${Math.floor(sanction.appeal_deadline / 1000)}:F>。上訴しなければ自動確定します。`, { state: '上訴' });
+  await notifyCaseParty(guild, caseRecord, 'appeal', sanction.appeal_deadline);
 }
 
 function queueExecution(caseRecord, sanction) {
@@ -2333,6 +2336,7 @@ async function advanceCase(guild, caseRecord, now) {
     return;
   }
   if (caseRecord.status === 'defense') {
+    await notifyCaseParty(guild, caseRecord, 'defense', caseRecord.defense_until);
     await ensureEvidenceDisclosures(guild, caseRecord);
     return;
   }
@@ -2349,6 +2353,10 @@ async function advanceCase(guild, caseRecord, now) {
     return;
   }
   const sanction = getCaseSanction(caseRecord.id);
+  if (caseRecord.status === 'appeal_window' && sanction?.appeal_deadline > now) {
+    await notifyCaseParty(guild, caseRecord, 'appeal', sanction.appeal_deadline);
+    return;
+  }
   if (caseRecord.status === 'appeal_window' && sanction?.appeal_deadline <= now && !getAppeal(caseRecord.id)) {
     if (caseRecord.procedure_version === 2 && sanction.required_approvals > 0) {
       await beginCaseApproval(guild, caseRecord, sanction, `上訴がなかったため判決が確定しました。執行には${sanction.required_approvals}人の公開承認が必要です。`);

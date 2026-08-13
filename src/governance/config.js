@@ -5,6 +5,10 @@ function number(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function boundedInteger(value, fallback, maximum) {
+  return Math.max(0, Math.min(maximum, Math.floor(number(value, fallback))));
+}
+
 function flag(value, fallback) {
   if (value === undefined || value === '') return fallback;
   return !['0', 'false', 'no', 'off'].includes(String(value).toLowerCase());
@@ -50,7 +54,10 @@ export const governanceConfig = {
   weeklyDraftLimit: number(process.env.GOVERNANCE_WEEKLY_DRAFT_LIMIT, 3),
   schedulerIntervalMs: number(process.env.GOVERNANCE_SCHEDULER_INTERVAL_MS, 60_000),
   generalDailyCalls: number(process.env.GOVERNANCE_GENERAL_DAILY_CALLS, 20),
-  trustedDailyCalls: number(process.env.GOVERNANCE_TRUSTED_DAILY_CALLS, 200)
+  trustedDailyCalls: number(process.env.GOVERNANCE_TRUSTED_DAILY_CALLS, 200),
+  notificationEveryoneDailyLimit: boundedInteger(process.env.GOVERNANCE_NOTIFICATION_EVERYONE_DAILY_LIMIT, 3, 10),
+  notificationTrustedDailyLimit: boundedInteger(process.env.GOVERNANCE_NOTIFICATION_TRUSTED_DAILY_LIMIT, 10, 50),
+  notificationUserDailyLimit: boundedInteger(process.env.GOVERNANCE_NOTIFICATION_USER_DAILY_LIMIT, 5, 20)
 };
 
 export function communityDisplayName(value) {
@@ -91,7 +98,10 @@ export const OPERATIONAL_SETTING_DEFAULTS = Object.freeze({
   weekly_scan_enabled: governanceConfig.weeklyScanEnabled ? 1 : 0,
   weekly_draft_limit: governanceConfig.weeklyDraftLimit,
   general_daily_calls: governanceConfig.generalDailyCalls,
-  trusted_daily_calls: governanceConfig.trustedDailyCalls
+  trusted_daily_calls: governanceConfig.trustedDailyCalls,
+  notification_everyone_daily_limit: governanceConfig.notificationEveryoneDailyLimit,
+  notification_trusted_daily_limit: governanceConfig.notificationTrustedDailyLimit,
+  notification_user_daily_limit: governanceConfig.notificationUserDailyLimit
 });
 
 export function parseOperationalSetting(key, raw) {
@@ -103,5 +113,13 @@ export function parseOperationalSetting(key, raw) {
   }
   if (key === 'weekly_draft_limit' && value > 10) return { ok: false, error: '自律起案の週最大件数は10以下です。' };
   if (key.endsWith('_daily_calls') && value > 10_000) return { ok: false, error: 'AI受付回数は10000以下です。' };
+  const notificationMaximums = {
+    notification_everyone_daily_limit: 10,
+    notification_trusted_daily_limit: 50,
+    notification_user_daily_limit: 20
+  };
+  if (key in notificationMaximums && value > notificationMaximums[key]) {
+    return { ok: false, error: `通知上限は${notificationMaximums[key]}以下です。` };
+  }
   return { ok: true, value };
 }

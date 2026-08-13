@@ -20,13 +20,16 @@ import {
   getConstitution,
   getGovernanceGuild,
   getOperationalSetting,
+  governanceNotificationStats,
   listActionFailures,
   listCaseApprovals,
   listCases,
+  listNotificationFailures,
   listProposals,
   proposalVoteSummary,
   markLegacyGovernanceMessageDeleted,
   retryFailedActions,
+  retryFailedNotifications,
   setOperationalSetting,
   updateGovernanceGuild,
   writeAudit
@@ -45,6 +48,14 @@ import {
   readOnlyTextOverwrites,
   retireGovernanceCourtChat
 } from './discord.js';
+import {
+  beginGovernanceNotification,
+  caseApprovalNotification,
+  finishGovernanceNotification,
+  proposalVoteNotification,
+  reconcileGovernanceNotificationMessage,
+  rejectGovernanceNotification
+} from './notifications.js';
 import { setTrustedMember } from './service.js';
 import { summaryProcedure } from './policy.js';
 
@@ -206,6 +217,7 @@ function operationsComponents(governance) {
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('gov:admin:electorate').setLabel('特別有権者を設定').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('gov:admin:notifications').setLabel('通知上限').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('gov:admin:recovery').setLabel('診断・復旧').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setLabel('公開手続を開く').setStyle(ButtonStyle.Link)
         .setURL(`https://discord.com/channels/${governance.guild_id}/${governance.admin_channel_id}`)
@@ -224,6 +236,7 @@ export async function renderGovernanceOperationsPanel(guild, governance) {
     ? (guild.roles.cache.get(governance.trusted_role_id)?.name ?? '特別有権者')
     : '特別有権者';
   const weeklyEnabled = getOperationalSetting(guild.id, 'weekly_scan_enabled') === 1;
+  const notificationStats = governanceNotificationStats(guild.id);
   return {
     content: [
       `# ${guild.name} Bot技術運用`,
@@ -237,6 +250,8 @@ export async function renderGovernanceOperationsPanel(guild, governance) {
       `特別有権者: ${electorate}`,
       `自律起案: ${weeklyEnabled ? '有効' : '無効'} / 週最大 ${getOperationalSetting(guild.id, 'weekly_draft_limit')}件`,
       `AI受付: 一般 ${getOperationalSetting(guild.id, 'general_daily_calls')}回/日 / ${electorateName} ${getOperationalSetting(guild.id, 'trusted_daily_calls')}回/日`,
+      `通知上限: 全体 ${getOperationalSetting(guild.id, 'notification_everyone_daily_limit')}回 / ${electorateName} ${getOperationalSetting(guild.id, 'notification_trusted_daily_limit')}回 / 当事者1人 ${getOperationalSetting(guild.id, 'notification_user_daily_limit')}回（各24時間）`,
+      `通知実績（24時間）: 送信 ${notificationStats.delivered} / 上限・権限で抑制 ${notificationStats.suppressed} / 失敗 ${notificationStats.failed}`,
       '',
       `公開手続: <#${governance.admin_channel_id}> / 参加案内: <#${governance.guide_channel_id}>`,
       'ここで変更できるのはBotの運用値だけです。憲法・投票・司法policyは改憲手続を経なければ変更できません。'
@@ -311,9 +326,12 @@ function sanctionName(sanction) {
 
 export function renderProposalVoteAction(guild, proposal) {
   const summary = proposalVoteSummary(proposal.id);
+  const notification = proposalVoteNotification(guild, proposal);
   return {
     key: `vote:${proposal.id}`,
+    notification,
     content: [
+      notification.mention,
       `**${safeLabel(proposal.title, 180)}**`,
       `対象: ${proposal.vote_scope === 'all' ? '全員' : '特別有権者'}${deadline(proposal.stage_ends_at)}`,
       `現在: 賛成 ${summary.yes} / 反対 ${summary.no} / 棄権 ${summary.abstain}`,
@@ -327,9 +345,12 @@ export function renderProposalVoteAction(guild, proposal) {
 export function renderCaseApprovalAction(guild, caseRecord) {
   const sanction = getCaseSanction(caseRecord.id);
   const approved = listCaseApprovals(caseRecord.id).filter((entry) => entry.decision === 'approve').length;
+  const notification = caseApprovalNotification(guild, caseRecord, sanction);
   return {
     key: `approve:${caseRecord.id}`,
+    notification,
     content: [
+      notification.mention,
       `**${safeLabel(caseRecord.summary, 180)}**`,
       caseRecord.accused_id ? `対象: ${publicMemberLabel(caseRecord.accused_id)}` : null,
       `処分: ${sanctionName(sanction)} / 承認 ${approved}/${sanction?.required_approvals ?? '?'}人`,
@@ -377,10 +398,25 @@ export async function syncGovernanceActionCards(guild, channel) {
   for (const card of expected) {
     const messages = existing.get(card.key) ?? [];
     const message = messages.shift() ?? null;
-    const { key: _key, ...payload } = card;
-    if (!message) await channel.send(payload);
-    else if (message.content !== payload.content || !componentsMatch(message, payload.components)) {
-      await message.edit(payload);
+    const { key: _key, notification, ...payload } = card;
+    if (!message) {
+      const delivery = beginGovernanceNotification(guild, notification);
+      try {
+        const sent = await channel.send({
+          ...payload,
+          allowedMentions: delivery?.allowedMentions ?? { parse: [] }
+        });
+        if (delivery) finishGovernanceNotification(notification, sent);
+      } catch (error) {
+        if (delivery) rejectGovernanceNotification(notification, error);
+        throw error;
+      }
+    } else {
+      reconcileGovernanceNotificationMessage(notification, message);
+      const editPayload = { ...payload, allowedMentions: { parse: [] } };
+      if (message.content !== editPayload.content || !componentsMatch(message, editPayload.components)) {
+        await message.edit(editPayload);
+      }
     }
     for (const duplicate of messages) await duplicate.delete().catch(() => {});
     existing.delete(card.key);
@@ -545,6 +581,19 @@ function settingsModal(guildId) {
       new ActionRowBuilder().addComponents(input('weekly_draft_limit', '自律起案の週最大件数', getOperationalSetting(guildId, 'weekly_draft_limit'))),
       new ActionRowBuilder().addComponents(input('general_daily_calls', '一般参加者のAI受付回数/日', getOperationalSetting(guildId, 'general_daily_calls'))),
       new ActionRowBuilder().addComponents(input('trusted_daily_calls', '特別有権者のAI受付回数/日', getOperationalSetting(guildId, 'trusted_daily_calls')))
+    );
+}
+
+function notificationSettingsModal(guildId) {
+  const input = (id, label, value) => new TextInputBuilder()
+    .setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short).setRequired(true).setValue(String(value));
+  return new ModalBuilder()
+    .setCustomId('gov:admin_modal:notifications')
+    .setTitle('通知上限（24時間）')
+    .addComponents(
+      new ActionRowBuilder().addComponents(input('notification_everyone_daily_limit', '全体通知（0で停止・最大10）', getOperationalSetting(guildId, 'notification_everyone_daily_limit'))),
+      new ActionRowBuilder().addComponents(input('notification_trusted_daily_limit', '特別有権者通知（0で停止・最大50）', getOperationalSetting(guildId, 'notification_trusted_daily_limit'))),
+      new ActionRowBuilder().addComponents(input('notification_user_daily_limit', '当事者1人あたり（0で停止・最大20）', getOperationalSetting(guildId, 'notification_user_daily_limit')))
     );
 }
 
@@ -749,6 +798,30 @@ export async function handleGovernanceUxInteraction(interaction) {
     await refreshDashboard(interaction);
     return true;
   }
+  if (interaction.isModalSubmit() && customId === 'gov:admin_modal:notifications') {
+    const keys = [
+      'notification_everyone_daily_limit',
+      'notification_trusted_daily_limit',
+      'notification_user_daily_limit'
+    ];
+    const updates = [];
+    for (const key of keys) {
+      const parsed = parseOperationalSetting(key, interaction.fields.getTextInputValue(key));
+      if (!parsed.ok) throw new Error(parsed.error);
+      updates.push([key, parsed.value]);
+    }
+    for (const [key, value] of updates) setOperationalSetting(interaction.guildId, key, value, interaction.user.id);
+    createAdministrativeAct({
+      guildId: interaction.guildId,
+      kind: 'notification_settings',
+      actorId: interaction.user.id,
+      summary: '通知上限を変更',
+      detail: Object.fromEntries(updates)
+    });
+    await interaction.reply({ content: '通知上限を更新しました。0にした対象への新しい通知は停止します。', flags: EPHEMERAL });
+    await refreshDashboard(interaction);
+    return true;
+  }
   if (interaction.isModalSubmit() && customId === 'gov:admin_modal:live') {
     if (interaction.fields.getTextInputValue('server_name').trim() !== interaction.guild.name) {
       throw new Error('サーバー名が一致しません。実執行へ切り替えていません。');
@@ -807,6 +880,10 @@ export async function handleGovernanceUxInteraction(interaction) {
   }
   if (customId === 'gov:admin:settings') {
     await interaction.showModal(settingsModal(interaction.guildId));
+    return true;
+  }
+  if (customId === 'gov:admin:notifications') {
+    await interaction.showModal(notificationSettingsModal(interaction.guildId));
     return true;
   }
   if (customId === 'gov:admin:weekly_toggle') {
@@ -882,20 +959,22 @@ export async function handleGovernanceUxInteraction(interaction) {
   }
   if (customId === 'gov:admin:recovery') {
     const failures = listActionFailures(interaction.guildId);
+    const notificationFailures = listNotificationFailures(interaction.guildId);
     const workflows = workflowFailures(governance);
     const details = [
       ...failures.map((failure) => `Discord処理: ${failure.last_error}`),
+      ...notificationFailures.map((failure) => `通知: ${failure.last_error}`),
       ...workflows
     ].slice(0, 5);
     await interaction.reply({
-      content: failures.length || workflows.length
+      content: failures.length || notificationFailures.length || workflows.length
         ? [
-          `Discord処理の失敗 ${failures.length}件 / 自動再試行中の手続き ${workflows.length}件`,
+          `Discord処理の失敗 ${failures.length}件 / 通知の失敗 ${notificationFailures.length}件 / 自動再試行中の手続き ${workflows.length}件`,
           ...details.map((detail) => `- ${String(detail).slice(0, 300)}`),
-          failures.length ? 'Discord処理の再試行は同じ重複防止キーを使います。' : null
+          failures.length || notificationFailures.length ? '再試行しても同じ通知・処理は重複実行しません。' : null
         ].filter(Boolean).join('\n').slice(0, 1_900)
         : '失敗または再試行中の処理はありません。',
-      components: failures.length ? [new ActionRowBuilder().addComponents(
+      components: failures.length || notificationFailures.length ? [new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('gov:admin:retry').setLabel('失敗処理を再試行').setStyle(ButtonStyle.Primary)
       )] : [],
       flags: EPHEMERAL
@@ -903,9 +982,10 @@ export async function handleGovernanceUxInteraction(interaction) {
     return true;
   }
   if (customId === 'gov:admin:retry') {
-    const count = retryFailedActions(interaction.guildId);
-    writeAudit({ guildId: interaction.guildId, actorType: 'operator', actorId: interaction.user.id, action: 'outbox.retry', targetType: 'guild', targetId: interaction.guildId, detail: { count } });
-    await interaction.update({ content: `${count}件を再試行待ちへ戻しました。`, components: [] });
+    const actionCount = retryFailedActions(interaction.guildId);
+    const notificationCount = retryFailedNotifications(interaction.guildId);
+    writeAudit({ guildId: interaction.guildId, actorType: 'operator', actorId: interaction.user.id, action: 'outbox.retry', targetType: 'guild', targetId: interaction.guildId, detail: { actionCount, notificationCount } });
+    await interaction.update({ content: `${actionCount + notificationCount}件を再試行待ちへ戻しました。`, components: [] });
     await refreshDashboard(interaction);
     return true;
   }
