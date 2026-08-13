@@ -329,6 +329,7 @@ export async function buildElectorateSnapshot(guild, proposalId) {
 async function finishDraft(guild, proposal, body) {
   const { policy, governance } = requireGovernance(guild.id);
   const now = Date.now();
+  const stageEndsAt = now + policy.legislation.draftMilliseconds;
   // Forum作成が成功するまではdraftingのままにする。bodyは保存済みなので、
   // Discord障害からの再試行でAIをもう一度呼ぶ必要はない。
   proposal = updateProposal(proposal.id, {
@@ -339,13 +340,19 @@ async function finishDraft(guild, proposal, body) {
     failure_count: 0,
     last_error: null
   });
+  const displayProposal = {
+    ...proposal,
+    status: 'draft',
+    stage_started_at: now,
+    stage_ends_at: stageEndsAt
+  };
   const post = proposal.forum_thread_id
     ? { threadId: proposal.forum_thread_id, messageId: proposal.forum_message_id }
-    : await createProposalPost(guild, governance, proposal);
+    : await createProposalPost(guild, governance, displayProposal);
   return updateProposal(proposal.id, {
     status: 'draft',
     stage_started_at: now,
-    stage_ends_at: now + policy.legislation.draftMilliseconds,
+    stage_ends_at: stageEndsAt,
     forum_thread_id: post.threadId,
     forum_message_id: post.messageId
   });

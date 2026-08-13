@@ -1443,6 +1443,8 @@ assert.match(governanceLlmSource, /thinking: \{ type: thinking \}/,
 assert.match(governanceLlmSource, /previous response was empty or invalid/,
   '空または不正なJSONの再試行では指示を変える');
 const serviceSource = readFileSync(new URL('../src/governance/service.js', import.meta.url), 'utf8');
+assert.match(serviceSource, /createProposalPost\(guild, governance, displayProposal\)/,
+  '起草完了後に公開する投稿は草案状態と期限を表示する');
 assert.doesNotMatch(serviceSource, /`(?:法案|改憲案) L-\$\{proposal\.id\}|`事件 C-\$\{caseRecord\.id\}|ロールID:/,
   '公開する再試行案内と特別有権者履歴から内部IDを外す');
 const legacyMessages = [
