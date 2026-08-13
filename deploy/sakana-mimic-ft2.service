@@ -1,0 +1,33 @@
+[Unit]
+Description=Sakana mimic-ft2 (evex-ft-2 / sft-v5 の推論)
+# ft-1 (8766) と**同時に立てる**。置き換えないのは読み比べたいから —
+# 「話を受けて返すようになったか」と「evex のままか」は数字だけでは決まらない。
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/sakana
+# --int8 を付ける。実測 (0.6B / 6スレッド): fp32 11.2 tok/s / 2.38GB に対して
+# int8 は 27.2 tok/s / 0.62GB で、口調も崩れなかった。ft-1 と2本立てても
+# RAM は増えないし、CPU 推論が 2.4 倍速くなる。
+ExecStart=/root/sakana/.venv-llm/bin/python -u src/mimic/server-ft.py \
+  --model /root/sakana/ft2/epoch-2 \
+  --label evex-ft-2 \
+  --port 8768 \
+  --threads 6 \
+  --int8
+
+Restart=on-failure
+RestartSec=5
+
+# int8 なので実体は 0.62GB。読み込み時だけ fp32 の 2.4GB を経由する
+# (from_pretrained → quantize_dynamic の順) ので、上限はそこに合わせる。
+MemoryMax=5G
+CPUWeight=40
+Nice=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

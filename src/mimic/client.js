@@ -57,6 +57,21 @@ export const ENDPOINTS = {
     maxNewTokens: number(process.env.MIMIC_FT_MAX_NEW_TOKENS, 160),
     label: process.env.MIMIC_FT_LABEL ?? 'evex-ft-1',
     format: process.env.MIMIC_FT_FORMAT ?? 'plain'
+  },
+  // ft-1 と同じ base・同じ形式で、コーパスだけ違う (sft-v5)。
+  //
+  // ft-1 は口調は移ったが話を受けて返さない — 疑問に20字以上で答えた組が全発言の
+  // 1.1% しか無かったので、確率がフィラーに寄っていた (`まじ？` `うーん`)。
+  // v5 でそこを 10.0% にし、片方を匿名の役に付け替えて bot の既定経路にも通した。
+  //
+  // **置き換えず並走させる。** int8 で 0.62GB / 27 tok/s (実測) なので両方立てられる。
+  // 「会話できるようになったか」と「evex のままか」は読み比べないと分からない
+  'evex-ft-2': {
+    url: process.env.MIMIC_FT2_URL ?? 'http://127.0.0.1:8768',
+    timeoutMs: number(process.env.MIMIC_FT2_TIMEOUT_MS, 120_000),
+    maxNewTokens: number(process.env.MIMIC_FT2_MAX_NEW_TOKENS, 160),
+    label: process.env.MIMIC_FT2_LABEL ?? 'evex-ft-2',
+    format: process.env.MIMIC_FT2_FORMAT ?? 'plain'
   }
 };
 

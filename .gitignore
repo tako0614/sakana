@@ -22,14 +22,16 @@ corpus-v1/
 # **世代付きも塞ぐ** — sft-v3/ sft-v4/ corpus-v3/ が漏れていて、追跡されない前提で
 # 実発言と Discord の user ID を置いていた
 sft/
-sft-v*/
-corpus-v*/
+/sft-v*/
+/corpus-v*/
 
 # 追加学習に混ぜる公開データ (llm-jp/oasst1-21k-ja など)。HF から落とせるので持たない
-mix/
+/mix/
 
-# 推論サーバーに置く重みと対応表 (mimic-ft / ft1 は 2.3GB)
-mimic/
-mimic-ft/
-ft1/
-ft2/
+# 推論サーバーに置く重みと対応表 (mimic-ft / ft1 は 2.3GB)。
+# **先頭の / を外すと `src/mimic/` まで無視される** — 実際にやって
+# ソースが git add できなくなった。ここは全部リポジトリ直下に固定する
+/mimic/
+/mimic-ft/
+/ft1/
+/ft2/
