@@ -1011,6 +1011,8 @@ assert.match(capturedRequest.messages[0].content, /windowSeconds \(integer 60-25
   '法案AIへ制限primitiveの機械的な境界を明示する');
 assert.match(capturedRequest.messages[0].content, new RegExp(`maximumDurationSeconds \\(an integer from 60 through ${policy.judiciary.maximumRestrictionSeconds}\\)`),
   '法案AIへ機能制限期間の上限を明示する');
+assert.match(capturedRequest.messages[0].content, /elements and sanctions must always be arrays/,
+  '法案AIへ構成要件と制裁が配列であることを明示する');
 
 let restrictionRetryCalls = 0;
 const validRestrictionBill = {
@@ -1076,6 +1078,27 @@ await draftBill({
 assert.equal(durationRetryCalls, 2, '文字列になった制限期間も理由を添えて再生成する');
 assert.match(capturedRequest.messages[0].content,
   new RegExp(`definition.maximumDurationSeconds must be an integer from 60 through ${policy.judiciary.maximumRestrictionSeconds}`));
+
+let elementsRetryCalls = 0;
+modelOutput = () => {
+  elementsRetryCalls += 1;
+  if (elementsRetryCalls === 1) {
+    return {
+      ...validRestrictionBill,
+      provisions: {
+        ...validRestrictionBill.provisions,
+        offenses: [{ ...validRestrictionBill.provisions.offenses[0], elements: '短時間に多数投稿したこと' }]
+      }
+    };
+  }
+  return validRestrictionBill;
+};
+await draftBill({
+  guildId: 'g2', petition: injectionPetition,
+  constitution: { version: 1, content: constitution }, activeLaws: [], policy
+});
+assert.equal(elementsRetryCalls, 2, '配列でない構成要件も理由を添えて再生成する');
+assert.match(capturedRequest.messages[0].content, /offense.elements must be an array of at most 12 strings/);
 
 modelOutput = {
   ...safeBill,
