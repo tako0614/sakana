@@ -1424,6 +1424,13 @@ const discordSource = readFileSync(new URL('../src/governance/discord.js', impor
 assert.doesNotMatch(discordSource, /name: '裁判当事者用'/, '新規導入では裁判当事者用channelを作らない');
 assert.match(discordSource, /発言状態:/, '事件投稿に裁判中の発言状態を表示する');
 assert.match(discordSource, /いま必要なこと:/, '事件投稿の説明を次の行動へ絞る');
+assert.doesNotMatch(discordSource, /参照番号:|法律ID:/, '通常の公開投稿に内部IDを表示しない');
+const intakeSource = readFileSync(new URL('../src/governance/intake.js', import.meta.url), 'utf8');
+assert.doesNotMatch(intakeSource, /参照番号:|適用法: #|違憲審査対象: \$\{caseRecord\.challenged_type\}:\$\{caseRecord\.challenged_id\}/,
+  'メンション受付の応答にも内部IDを表示しない');
+const serviceSource = readFileSync(new URL('../src/governance/service.js', import.meta.url), 'utf8');
+assert.doesNotMatch(serviceSource, /`(?:法案|改憲案) L-\$\{proposal\.id\}|`事件 C-\$\{caseRecord\.id\}|ロールID:/,
+  '公開する再試行案内と特別有権者履歴から内部IDを外す');
 const legacyMessages = [
   { id: 'before', createdTimestamp: 1, author: { id: 'user' }, content: '普通の投稿', attachments: [] },
   { id: 'start', createdTimestamp: 2, author: { id: 'bot' }, content: '# 初期憲法 v1\n本文', attachments: [] },
@@ -1469,8 +1476,10 @@ const visibleGovernanceContext = {
     }
   }
 };
-assert.match(runGovernanceInfo(visibleGovernanceContext, { action: 'law', id: law.id }), /LAW-TEST/,
+assert.match(runGovernanceInfo(visibleGovernanceContext, { action: 'law', title: law.title }), /制裁profile test/,
   '@Evex公式から現行法の正本を読める');
+assert.doesNotMatch(runGovernanceInfo(visibleGovernanceContext, { action: 'laws' }), /#\d+|LAW-TEST/,
+  '@Evex公式の一覧も人が読む名前を優先し内部IDを出さない');
 assert.match(runGovernanceInfo(visibleGovernanceContext, { action: 'constitution' }), /公開場所: 法令集 <#statutes>/,
   '@Evex公式から人が読む法令集channelも案内する');
 assert.throws(

@@ -123,6 +123,14 @@ function specialElectorateName(guild, governance) {
     ? (guild.roles.cache.get(governance.trusted_role_id)?.name ?? '特別有権者')
     : '特別有権者';
 }
+
+function publicLawDetails(law, offenseCode) {
+  const offense = law?.provisions?.offenses?.find((entry) => entry.code === offenseCode);
+  return [
+    law ? `適用法: ${law.title}` : '適用法: 裁判記録に記載',
+    offense?.title ? `対象となる違反: ${offense.title}` : null
+  ].filter(Boolean);
+}
 const CASE_EVIDENCE_LIMIT = 20;
 const CASE_SUBMISSION_LIMIT_PER_PHASE = 40;
 
@@ -369,7 +377,7 @@ export async function filePetition(guild, member, { title, summary, source = 'pe
   if (scope === 'trusted' && !governance.trusted_role_id) throw new Error('特別有権者のみの投票には、対象ロールの設定が必要です。');
   if (!governanceActionAllowed(guild.id, member.id, 'petition')) throw new Error('請願提出が制裁により停止されています。');
   const duplicate = findActiveProposalByNormalizedTitle(guild.id, title);
-  if (duplicate) throw new Error(`同名の法案 L-${duplicate.id} が進行中です。議会Forumで討議してください。`);
+  if (duplicate) throw new Error('同名の法案が進行中です。議会で討議してください。');
   if (source !== 'weekly' && !attemptReserved) requireGovernanceAiAttempt(member, eventId ?? `petition:${member.id}:${Date.now()}`);
   const proposal = createProposal({
     guildId: guild.id,
@@ -388,7 +396,7 @@ export async function filePetition(guild, member, { title, summary, source = 'pe
     updateProposal(proposal.id, retryPatch(proposal, error));
     console.error(`Initial draft failed for proposal ${proposal.id}:`, error);
     throw acceptedWorkflowError(
-      `法案 L-${proposal.id} は受理しました。AIまたはDiscordが一時失敗したため自動再試行します。`,
+      '法案は受理しました。AIまたはDiscordが一時失敗したため自動再試行します。',
       'proposal',
       proposal.id
     );
@@ -402,7 +410,7 @@ export async function fileAmendment(guild, member, { title, summary, eventId = n
   if (scope === 'trusted' && !governance.trusted_role_id) throw new Error('特別有権者のみの投票には、対象ロールの設定が必要です。');
   if (!governanceActionAllowed(guild.id, member.id, 'petition')) throw new Error('改憲提案が制裁により停止されています。');
   const duplicate = findActiveProposalByNormalizedTitle(guild.id, title);
-  if (duplicate) throw new Error(`同名の法案 L-${duplicate.id} が進行中です。議会Forumで討議してください。`);
+  if (duplicate) throw new Error('同名の改憲案が進行中です。議会で討議してください。');
   if (!attemptReserved) requireGovernanceAiAttempt(member, eventId ?? `amendment:${member.id}:${Date.now()}`);
   const proposal = createProposal({
     guildId: guild.id,
@@ -421,7 +429,7 @@ export async function fileAmendment(guild, member, { title, summary, eventId = n
     updateProposal(proposal.id, retryPatch(proposal, error));
     console.error(`Initial draft failed for amendment ${proposal.id}:`, error);
     throw acceptedWorkflowError(
-      `改憲案 L-${proposal.id} は受理しました。AIまたはDiscordが一時失敗したため自動再試行します。`,
+      '改憲案は受理しました。AIまたはDiscordが一時失敗したため自動再試行します。',
       'proposal',
       proposal.id
     );
@@ -462,10 +470,10 @@ async function reviseProposal(guild, proposal, reviews) {
     proposal,
     `違憲審査の指摘を反映して改訂${nextRevision}を公開しました。草案期間をやり直します。`,
     { files: [
-      { attachment: Buffer.from(fullDraft), name: `proposal-${proposal.id}-r${nextRevision}.md` },
+      { attachment: Buffer.from(fullDraft), name: '改訂草案全文.md' },
       {
         attachment: Buffer.from(`${JSON.stringify(proposal.kind === 'amendment' ? body.policy : body.provisions, null, 2)}\n`),
-        name: `proposal-${proposal.id}-r${nextRevision}-${proposal.kind === 'amendment' ? 'policy' : 'provisions'}.json`
+        name: proposal.kind === 'amendment' ? '手続定義.json' : '執行定義.json'
       }
     ] }
   );
@@ -511,7 +519,7 @@ async function constitutionalReviewProposal(guild, proposal) {
         phase: 'pre',
         outputs: panel.outputs
       }, null, 2)}\n`),
-      name: `proposal-${proposal.id}-constitutional-review-r${proposal.revision}.json`
+      name: '違憲審査.json'
     }]
   });
   const constitutional = panel.outputs.filter((output) => output.verdict === 'constitutional').length;
@@ -607,8 +615,8 @@ async function closeProposalVote(guild, proposal) {
     effectiveAt: Date.now()
   });
   proposal = updateProposal(proposal.id, { status: 'enacted', stage_ends_at: Date.now() });
-  await postProposalUpdate(guild, proposal, `可決・成立しました。法律 ${law.code} はこの時点から有効です。`, { state: '成立' });
-  await postGazette(guild, governance, `${law.code} ${law.title}`, `${law.text}\n\n## Provisions\n\n\`\`\`json\n${JSON.stringify(law.provisions, null, 2)}\n\`\`\`\n\ncontent hash: ${law.content_hash}`);
+  await postProposalUpdate(guild, proposal, `可決・成立しました。「${law.title}」はこの時点から有効です。`, { state: '成立' });
+  await postGazette(guild, governance, law.title, `${law.text}\n\n## Provisions\n\n\`\`\`json\n${JSON.stringify(law.provisions, null, 2)}\n\`\`\`\n\ncontent hash: ${law.content_hash}`);
   await syncStatuteBook(guild, getGovernanceGuild(guild.id)).catch((error) => {
     console.error(`Failed to publish law ${law.id} in statute book:`, error);
   });
@@ -664,7 +672,7 @@ export async function fileCriminalCase(guild, reporter, input) {
     updateCase(caseRecord.id, retryPatch(getCase(caseRecord.id), error));
     console.error(`Initial court setup failed for case ${caseRecord.id}:`, error);
     throw acceptedWorkflowError(
-      `事件 C-${caseRecord.id} は受理しました。裁判所の作成を自動再試行します。答弁期間は作成完了後に開始します。`,
+      '申立ては受理しました。裁判所の作成を自動再試行します。答弁期間は作成完了後に開始します。',
       'case',
       caseRecord.id
     );
@@ -757,7 +765,7 @@ async function finishSummaryReview(guild, caseRecord) {
   const summaryAudit = [
     `対象: <@${current.accused_id}>`,
     `申立内容: ${current.summary}`,
-    `適用法: 法律 #${current.law_id} / 構成要件: ${current.offense_code}`,
+    ...publicLawDetails(law, current.offense_code),
     `有効な違反認定: ${panel.outputs.filter((entry) => entry.verdict === 'responsible').length}/${procedure.panelSeats}`,
     `無効・失敗席: ${panel.failedSeats}`,
     '',
@@ -919,17 +927,15 @@ export async function addEvidenceToCase(guild, member, caseId, evidence) {
   return id;
 }
 
-function evidenceDisclosure(entry) {
+function evidenceDisclosure(entry, ordinal) {
   const source = entry.message_id && entry.channel_id
     ? `https://discord.com/channels/${entry.guild_id ?? '@me'}/${entry.channel_id}/${entry.message_id}`
     : '保存された提出';
   return [
-    '## 証拠',
-    `証拠番号: E-${entry.id}`,
+    `## 証拠 ${ordinal}`,
     `提出者: <@${entry.submitted_by}> / 原投稿者: ${entry.author_id ? `<@${entry.author_id}>` : '-'}`,
     `行為時刻: ${entry.occurred_at ? `<t:${Math.floor(entry.occurred_at / 1000)}:F>` : '-'}`,
-    `hash: \`${entry.content_hash}\``,
-    `source: ${source}`,
+    `出典: ${source}`,
     '',
     String(entry.content).slice(0, 1500)
   ].join('\n');
@@ -937,24 +943,28 @@ function evidenceDisclosure(entry) {
 
 async function ensureEvidenceDisclosures(guild, caseRecord) {
   if (!caseRecord?.public_thread_id) return;
-  for (const entry of listCaseEvidence(caseRecord.id).filter((row) => !row.disclosed_at)) {
+  const evidence = listCaseEvidence(caseRecord.id);
+  for (const [index, entry] of evidence.entries()) {
+    if (entry.disclosed_at) continue;
     const withGuild = { ...entry, guild_id: guild.id };
-    await postCourtRecord(guild, caseRecord, evidenceDisclosure(withGuild));
+    await postCourtRecord(guild, caseRecord, evidenceDisclosure(withGuild, index + 1));
     markEvidenceDisclosed(entry.id);
   }
 }
 
 async function publishDecisionRecord(guild, caseRecord, phase, panel) {
   const evidence = listCaseEvidence(caseRecord.id);
+  const evidenceOrder = new Map(evidence.map((entry, index) => [entry.id, index + 1]));
+  const law = getLaw(caseRecord.law_id);
   const phaseLabel = phase === 'appeal' ? '上訴審' : '第一審';
   const publicLines = panel.outputs.map((output, index) => [
     `席 ${index + 1}: ${{ responsible: '責任あり', not_responsible: '責任なし', insufficient: '立証不十分' }[output.verdict] ?? output.verdict}`,
-    `採用証拠: ${(output.evidenceIds ?? []).map((id) => `E-${id}`).join(', ') || '-'}`,
+    `採用証拠: ${(output.evidenceIds ?? []).map((id) => `証拠 ${evidenceOrder.get(id) ?? '?'}`).join('、') || 'なし'}`,
     `処分: ${output.sanction ? `${output.sanction.type}${output.sanction.durationSeconds ? ` ${output.sanction.durationSeconds}秒` : ''}` : '-'}`
   ].join(' / '));
   await postCourtUpdate(guild, caseRecord, [
     `判決記録（${phaseLabel}）`,
-    `適用法: 法律 #${caseRecord.law_id} / 構成要件: ${caseRecord.offense_code}`,
+    ...publicLawDetails(law, caseRecord.offense_code),
     ...publicLines
   ].join('\n'));
 
@@ -970,7 +980,7 @@ async function publishDecisionRecord(guild, caseRecord, phase, panel) {
         evidenceHashes: Object.fromEntries(evidence.map((entry) => [`E-${entry.id}`, entry.content_hash])),
         outputs: panel.outputs
       }, null, 2)}\n`),
-      name: `case-${caseRecord.id}-${phase}-decision.json`
+      name: `${phaseLabel}-判決記録.json`
     }]
   });
 }
@@ -984,7 +994,7 @@ export async function fileConstitutionalChallenge(guild, reporter, input) {
   else if (input.targetType === 'administrative_act') target = getAdministrativeAct(input.targetId);
   if (!target || target.guild_id !== guild.id) throw new Error('審査対象が見つかりません。');
   const existing = findOpenConstitutionalCase(guild.id, input.targetType, input.targetId);
-  if (existing) throw new Error(`同じ対象の違憲審査 C-${existing.id} が進行中です。`);
+  if (existing) throw new Error('同じ対象の違憲審査が進行中です。裁判所で確認してください。');
   if (!input.system && !input.attemptReserved) {
     const attempt = reserveAgentAttempt(
       guild.id,
@@ -1015,7 +1025,7 @@ export async function fileConstitutionalChallenge(guild, reporter, input) {
     updateCase(caseRecord.id, retryPatch(getCase(caseRecord.id), error));
     console.error(`Initial court setup failed for constitutional case ${caseRecord.id}:`, error);
     throw acceptedWorkflowError(
-      `違憲審査 C-${caseRecord.id} は受理しました。裁判所の作成を自動再試行します。答弁期間は作成完了後に開始します。`,
+      '違憲審査は受理しました。裁判所の作成を自動再試行します。答弁期間は作成完了後に開始します。',
       'case',
       caseRecord.id
     );
@@ -1105,7 +1115,7 @@ export async function recordCourtSubmissionEdit(message) {
   if (!existing) return false;
   if (!['defense', 'appeal'].includes(caseRecord.status) || existing.kind !== caseRecord.status) {
     await message.channel.send({
-      content: `<@${message.author.id}> が締切後に正式主張を編集しました。この編集は判決資料へ反映しません。保存済みhash: \`${existing.content_hash}\``,
+      content: `<@${message.author.id}> が締切後に正式主張を編集しました。この編集は判決資料へ反映しません。`,
       allowedMentions: { parse: [] }
     }).catch(() => {});
     return false;
@@ -1374,7 +1384,7 @@ async function adjudicateConstitutionalCase(guild, caseRecord) {
         targetId: caseRecord.challenged_id,
         outputs: panel.outputs
       }, null, 2)}\n`),
-      name: `constitutional-case-${caseRecord.id}.json`
+      name: '違憲審査記録.json'
     }]
   });
   if (constitutional >= constitution.policy.judiciary.constitutionalVotesRequired) {
@@ -1668,7 +1678,7 @@ export async function submitCaseAnswer(guild, member, caseId, content) {
   const count = listCurrentCaseSubmissions(caseRecord.id).filter((entry) => entry.kind === caseRecord.status).length;
   if (count >= CASE_SUBMISSION_LIMIT_PER_PHASE) throw new Error('この審級の回答件数上限に達しました。');
   const id = addCaseSubmission(caseRecord.id, member.id, caseRecord.status, normalized);
-  await postCourtRecord(guild, caseRecord, `<@${member.id}> が回答を提出しました。内容hash: \`${sha256(normalized)}\``);
+  await postCourtRecord(guild, caseRecord, `<@${member.id}> が回答を提出しました。`);
   return id;
 }
 
@@ -2121,7 +2131,7 @@ export async function onTrustedRoleChange(oldMember, newMember) {
   if (authorized) {
     const electorate = specialElectorateName(newMember.guild, governance);
     writeAudit({ guildId: newMember.guild.id, actorType: 'operator', actorId: authorized.authorized_by, action: after ? 'trusted.added' : 'trusted.removed', targetType: 'member', targetId: newMember.id, detail: { roleId: governance.trusted_role_id } });
-    await postGazette(newMember.guild, governance, after ? `「${electorate}」に追加` : `「${electorate}」から削除`, `対象: <@${newMember.id}>\nロールID: ${governance.trusted_role_id}\n運営者: <@${authorized.authorized_by}>`);
+    await postGazette(newMember.guild, governance, after ? `「${electorate}」に追加` : `「${electorate}」から削除`, `対象: <@${newMember.id}>\n運営者: <@${authorized.authorized_by}>`);
     return;
   }
 
@@ -2165,7 +2175,7 @@ export async function onGuildRoleDelete(role) {
   if (governance.trusted_role_id === role.id) {
     updateGovernanceGuild(role.guild.id, { trusted_role_id: '' });
     writeAudit({ guildId: role.guild.id, actorType: 'system', action: 'trusted.role_deleted', targetType: 'role', targetId: role.id, detail: { trustedDisabled: true } });
-    await postGazette(role.guild, governance, '特別有権者機能を自動無効化', `対象ロール ${role.id} が削除されたため拒否権と執行承認を無効化しました。統治手続き自体は停止していません。`);
+    await postGazette(role.guild, governance, '特別有権者機能を自動無効化', `設定されていたロールが削除されたため拒否権と重い処分の承認を無効化しました。統治手続き自体は停止していません。`);
   }
   const patch = {};
   if (governance.legislature_role_id === role.id) patch.legislature_role_id = '';

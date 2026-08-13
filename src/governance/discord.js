@@ -11,6 +11,7 @@ import {
   getCaseInterimProtection,
   getCaseSanction,
   getGovernanceGuild,
+  getLaw,
   getStatutePublication,
   listConstitutions,
   listLaws,
@@ -97,6 +98,17 @@ function courtAccessState(caseRecord) {
   if (protection?.status === 'active' && protection.ends_at > Date.now()) return '通常（実執行停止中）';
   if (protection?.status === 'simulated') return '通常（一時保全の条件はshadowで確認済み・実制限なし）';
   return '通常（正式な主張として記録するのは当事者だけ）';
+}
+
+function caseLawDescription(caseRecord) {
+  if (!caseRecord.law_id) return null;
+  const law = getLaw(caseRecord.law_id);
+  if (!law) return '適用法: 裁判記録に記載';
+  const offense = law.provisions?.offenses?.find((entry) => entry.code === caseRecord.offense_code);
+  return [
+    `適用法: ${law.title}`,
+    offense?.title ? `対象となる違反: ${offense.title}` : null
+  ].filter(Boolean).join('\n');
 }
 
 const APPEAL_DENY = {
@@ -639,13 +651,11 @@ function statuteDocument(instrumentType, instrument) {
         '',
         headings.length > 0 ? `主な構成: ${headings.join(' / ')}` : 'コミュニティの最高規範です。',
         '',
-        '全文・policy・検証用hashは、この投稿を開いた先の詳細から確認できます。'
+        '全文は、この投稿を開いた先で確認できます。'
       ].join('\n').slice(0, 2_000),
       detailContent: [
         `## 憲法 v${instrument.version} 詳細`,
-        `本文hash: \`${instrument.content_hash}\``,
-        `policy hash: \`${instrument.policy_hash}\``,
-        '全文とpolicyを添付します。'
+        '全文を添付します。'
       ].join('\n'),
       files: [
         { attachment: Buffer.from(instrument.content), name: `constitution-v${instrument.version}.md` },
@@ -662,7 +672,7 @@ function statuteDocument(instrumentType, instrument) {
   }
   const state = statutePublicationState(instrumentType, instrument.status);
   const full = [
-    `# ${instrument.code} ${instrument.title}`,
+    `# ${instrument.title}`,
     '',
     instrument.text,
     '',
@@ -675,26 +685,25 @@ function statuteDocument(instrumentType, instrument) {
     `content hash: ${instrument.content_hash}`
   ].join('\n');
   return {
-    title: `${instrument.code} ${instrument.title}`,
+    title: instrument.title,
     state,
     hash: instrument.content_hash,
     content: [
-      `# ${instrument.code} ${instrument.title}`,
-      `法律ID: #${instrument.id}`,
+      `# ${instrument.title}`,
       `状態: ${state}`,
       `施行: <t:${Math.floor(instrument.effective_at / 1000)}:F>`,
       '',
       instrument.text.split(/\n+/).find((line) => line.trim() && !line.trim().startsWith('#'))?.slice(0, 500)
         ?? '成立した法律です。',
       '',
-      '全文・処分定義・検証用hashは、この投稿を開いた先の詳細から確認できます。'
+      '全文は、この投稿を開いた先で確認できます。'
     ].join('\n').slice(0, 2_000),
-    detailContent: `## ${instrument.code} 詳細\n本文hash: \`${instrument.content_hash}\`\n全文と処分定義を添付します。`,
+    detailContent: `## ${instrument.title} 詳細\n全文を添付します。`,
     files: [
-      { attachment: Buffer.from(full), name: `law-${instrument.id}.md` },
+      { attachment: Buffer.from(full), name: '法律全文.md' },
       {
         attachment: Buffer.from(`${JSON.stringify({ contentHash: instrument.content_hash }, null, 2)}\n`),
-        name: `law-${instrument.id}-hash.json`
+        name: '検証情報.json'
       }
     ]
   };
@@ -770,10 +779,33 @@ export async function syncStatuteBook(guild, governance, { verifyExisting = fals
       : null;
     if (verifyExisting) {
       const starter = await thread.fetchStarterMessage().catch(() => null);
-      if (starter?.content !== document.content || starter?.attachments?.size > 0) {
+      const attachmentNames = [...(detail?.attachments?.values?.() ?? [])].map((attachment) => attachment.name);
+      const expectedNames = document.files.map((file) => file.name);
+      const displayTitle = document.title.slice(0, 100);
+      const rename = thread.name !== displayTitle;
+      const refreshStarter = starter?.content !== document.content || starter?.attachments?.size > 0;
+      const refreshDetail = detail && (detail.content !== document.detailContent
+        || JSON.stringify(attachmentNames) !== JSON.stringify(expectedNames));
+      const reopen = Boolean(thread.archived && (rename || refreshStarter || refreshDetail));
+      if (reopen) await thread.setArchived(false, '法令表示の同期');
+      if (rename) {
+        await thread.setName(displayTitle, '法令名の表示を同期');
+        changed += 1;
+      }
+      if (refreshStarter) {
         await starter?.edit({ content: document.content, attachments: [], allowedMentions: { parse: [] } });
         changed += 1;
       }
+      if (refreshDetail) {
+        await detail.edit({
+          content: document.detailContent,
+          attachments: [],
+          files: document.files,
+          allowedMentions: { parse: [] }
+        });
+        changed += 1;
+      }
+      if (reopen) await thread.setArchived(true, '法令表示の同期完了');
     }
     if (!detail) {
       const wasArchived = Boolean(thread.archived);
@@ -903,15 +935,14 @@ export async function createProposalPost(guild, governance, proposal) {
         `状態: ${proposalStateLabel(proposal.status)}`,
         proposalDeadline(proposal) ? `期限: ${proposalDeadline(proposal)}` : null,
         '次にすること: 内容を読み、この投稿で討議します。',
-        '全文と構造化定義は添付にあります。',
-        '',
-        `参照番号: L-${proposal.id}`
+        '草案全文は添付にあります。',
+        ''
       ].filter(Boolean).join('\n').slice(0, 2000),
       files: [
-        { attachment: Buffer.from(fullDraft), name: `proposal-${proposal.id}-r${proposal.revision}.md` },
+        { attachment: Buffer.from(fullDraft), name: '草案全文.md' },
         {
           attachment: Buffer.from(`${JSON.stringify(structuredDraft, null, 2)}\n`),
-          name: `proposal-${proposal.id}-r${proposal.revision}-${structuredName}.json`
+          name: `${structuredName === 'policy' ? '手続定義' : '執行定義'}.json`
         }
       ],
       allowedMentions: { parse: [] }
@@ -938,8 +969,7 @@ export async function postProposalUpdate(guild, proposal, text, { state = null, 
         proposalDeadline(proposal) ? `期限: ${proposalDeadline(proposal)}` : null,
         `いま必要なこと: ${oneLine(text)}`,
         '全文は添付、経過はこの投稿内にあります。',
-        '',
-        `参照番号: L-${proposal.id}`
+        ''
       ].filter(Boolean).join('\n').slice(0, 2_000),
       allowedMentions: { parse: [] }
     }).catch(() => {});
@@ -961,7 +991,7 @@ export async function createCourtCaseThread(guild, governance, caseRecord, { onP
       content: [
         `# ${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
         caseRecord.accused_id ? `被告: <@${caseRecord.accused_id}>` : null,
-        caseRecord.law_id ? `適用法候補: #${caseRecord.law_id} / ${caseRecord.offense_code}` : null,
+        caseLawDescription(caseRecord),
         '',
         caseRecord.summary,
         '',
@@ -970,8 +1000,7 @@ export async function createCourtCaseThread(guild, governance, caseRecord, { onP
         `期限: ${caseRecord.defense_until ? `<t:${Math.floor(caseRecord.defense_until / 1000)}:F>` : '審査準備中'}`,
         '',
         '次にすること: 当事者は下のボタンから回答します。',
-        '',
-        `参照番号: C-${caseRecord.id}`
+        ''
       ].filter(Boolean).join('\n').slice(0, 2000),
       components: courtActionButtons(caseRecord),
       allowedMentions: { parse: [] }
@@ -1000,8 +1029,7 @@ export async function postCourtUpdate(guild, caseRecord, text, { state = null, c
         courtDeadline(caseRecord) ? `期限: <t:${Math.floor(courtDeadline(caseRecord) / 1000)}:F>` : null,
         `いま必要なこと: ${oneLine(text)}`,
         '答弁・証拠・判断・承認・上訴はこの投稿にまとまります。',
-        '',
-        `参照番号: C-${caseRecord.id}`
+        ''
       ].filter(Boolean).join('\n').slice(0, 2_000),
       components: courtActionButtons(caseRecord),
       allowedMentions: { parse: [] }

@@ -75,10 +75,10 @@ function workflowFailures(governance) {
   return [
     ...listProposals(governance.guild_id, { statuses: ACTIVE_PROPOSAL_STATUSES, limit: 100 })
       .filter((proposal) => proposal.last_error)
-      .map((proposal) => `L-${proposal.id}: ${proposal.last_error}`),
+      .map((proposal) => `${proposal.title}: ${proposal.last_error}`),
     ...listCases(governance.guild_id, { statuses: ACTIVE_CASE_STATUSES, limit: 100 })
       .filter((caseRecord) => caseRecord.last_error)
-      .map((caseRecord) => `C-${caseRecord.id}: ${caseRecord.last_error}`),
+      .map((caseRecord) => `${caseRecord.summary}: ${caseRecord.last_error}`),
     ...(governance.weekly_last_error ? [`自律起案: ${governance.weekly_last_error}`] : [])
   ];
 }
@@ -628,7 +628,7 @@ export async function handleGovernanceUxInteraction(interaction) {
     updateGovernanceGuild(interaction.guildId, { trusted_role_id: role.id });
     createAdministrativeAct({ guildId: interaction.guildId, kind: 'trusted_role', actorId: interaction.user.id, summary: `特別有権者ロールを${role.name}に変更`, detail: { before: governance.trusted_role_id, after: role.id } });
     writeAudit({ guildId: interaction.guildId, actorType: 'operator', actorId: interaction.user.id, action: 'trusted.role_changed', targetType: 'role', targetId: role.id, detail: { before: governance.trusted_role_id } });
-    await postGazette(interaction.guild, governance, '特別有権者ロール変更', `変更後: ${role.name} (${role.id})\n運営者: <@${interaction.user.id}>`, { summary: `特別有権者ロールを「${role.name}」へ変更しました。` });
+    await postGazette(interaction.guild, governance, '特別有権者ロール変更', `変更後: ${role.name}\n運営者: <@${interaction.user.id}>`, { summary: `特別有権者ロールを「${role.name}」へ変更しました。` });
     await interaction.reply({ content: `特別有権者ロールを「${role.name}」に変更しました。`, flags: EPHEMERAL });
     await refreshDashboard(interaction);
     return true;
@@ -740,7 +740,7 @@ export async function handleGovernanceUxInteraction(interaction) {
     const failures = listActionFailures(interaction.guildId);
     const workflows = workflowFailures(governance);
     const details = [
-      ...failures.map((failure) => `Discord処理 #${failure.id}: ${failure.last_error}`),
+      ...failures.map((failure) => `Discord処理: ${failure.last_error}`),
       ...workflows
     ].slice(0, 5);
     await interaction.reply({

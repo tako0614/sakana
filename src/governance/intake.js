@@ -170,17 +170,24 @@ function renderIntake(intake, suffix = '') {
     );
   } else if (intake.action === 'criminal_case') {
     const law = getLaw(payload.lawId);
+    const offense = law?.provisions?.offenses?.find((entry) => entry.code === payload.offenseCode);
     lines.push(
       '種別: 法律違反の申立て',
       `被申立人: <@${payload.accusedId}>`,
-      `適用法候補: #${payload.lawId} ${law?.code ?? ''} / ${payload.offenseCode}`,
+      `適用法候補: ${law?.title ?? '裁判記録に記載'}`,
+      offense?.title ? `対象となる違反: ${offense.title}` : null,
       `申立内容: ${payload.summary}`,
       `証拠: ${sourceLink(intake.guild_id, payload.evidence)}`
     );
   } else if (intake.action === 'constitutional_challenge') {
+    const target = payload.targetType === 'law'
+      ? getLaw(payload.targetId)?.title
+      : payload.targetType === 'case'
+        ? getCase(payload.targetId)?.summary
+        : ({ sanction: '処分', administrative_act: '行政行為' }[payload.targetType] ?? '統治行為');
     lines.push(
       '種別: 違憲審査',
-      `対象: ${payload.targetType}:${payload.targetId}`,
+      `対象: ${target ?? '指定した統治行為'}`,
       `申立理由: ${payload.summary}`
     );
   } else if (intake.action === 'evidence') {
@@ -255,14 +262,21 @@ function caseStatusText(caseRecord, guildId) {
     overturned: '取消', acquitted: '責任なし', dismissed: '棄却',
     constitutional_uncertain: '違憲判断不能', unenforceable: '執行不能'
   })[caseRecord.status] ?? caseRecord.status;
+  const law = caseRecord.law_id ? getLaw(caseRecord.law_id) : null;
+  const offense = law?.provisions?.offenses?.find((entry) => entry.code === caseRecord.offense_code);
+  const challenged = caseRecord.challenged_type === 'law'
+    ? getLaw(caseRecord.challenged_id)
+    : caseRecord.challenged_type === 'case'
+      ? getCase(caseRecord.challenged_id)
+      : null;
   return [
     `${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
     `状態: ${status}`,
     caseRecord.accused_id ? `被申立人: <@${caseRecord.accused_id}>` : null,
-    caseRecord.law_id ? `適用法: #${caseRecord.law_id} / ${caseRecord.offense_code}` : null,
-    caseRecord.challenged_type ? `違憲審査対象: ${caseRecord.challenged_type}:${caseRecord.challenged_id}` : null,
-    caseRecord.public_thread_id ? linkToThread(guildId, caseRecord.public_thread_id) : null,
-    `参照番号: C-${caseRecord.id}`
+    law ? `適用法: ${law.title}` : null,
+    offense?.title ? `対象となる違反: ${offense.title}` : null,
+    caseRecord.challenged_type ? `違憲審査対象: ${challenged?.title ?? challenged?.summary ?? ({ sanction: '処分', administrative_act: '行政行為' }[caseRecord.challenged_type] ?? '統治行為')}` : null,
+    caseRecord.public_thread_id ? linkToThread(guildId, caseRecord.public_thread_id) : null
   ].filter(Boolean).join('\n');
 }
 
@@ -441,11 +455,11 @@ async function executeIntake(interaction, intake) {
     if (!caseRecord || caseRecord.guild_id !== interaction.guildId) throw new Error('事件が見つかりません。');
     await assertEvidenceVisibleTo(interaction.guild, payload.evidence, [caseRecord.reporter_id, caseRecord.accused_id]);
     const id = await addEvidenceToCase(interaction.guild, member, payload.caseId, payload.evidence);
-    return { type: 'evidence', id, text: `証拠 E-${id} を事件 C-${payload.caseId} に追加しました。` };
+    return { type: 'evidence', id, text: '証拠を裁判記録へ追加しました。' };
   }
   if (intake.action === 'appeal') {
     const result = await appealCase(interaction.guild, member, payload.caseId, payload.summary);
-    return { type: 'appeal', id: result.id, text: `事件 C-${result.id} の上訴を受理しました。` };
+    return { type: 'appeal', id: result.id, text: '上訴を受理しました。' };
   }
   throw new Error('未対応の受付種別です。');
 }
