@@ -1437,6 +1437,11 @@ assert.doesNotMatch(intakeSource, /正式受付済み: \$\{error\.accepted\.resu
 const intakeRepairSource = readFileSync(new URL('./repair-governance-intake-ui.mjs', import.meta.url), 'utf8');
 assert.match(intakeRepairSource, /正式受付済み（自動再試行中）/,
   '既存の受付メッセージも内部IDなし表示へ修復できる');
+const governanceLlmSource = readFileSync(new URL('../src/governance/llm.js', import.meta.url), 'utf8');
+assert.match(governanceLlmSource, /thinking: \{ type: thinking \}/,
+  '構造化草案はDeepSeekの思考モードを明示的に制御する');
+assert.match(governanceLlmSource, /previous response was empty or invalid/,
+  '空または不正なJSONの再試行では指示を変える');
 const serviceSource = readFileSync(new URL('../src/governance/service.js', import.meta.url), 'utf8');
 assert.doesNotMatch(serviceSource, /`(?:法案|改憲案) L-\$\{proposal\.id\}|`事件 C-\$\{caseRecord\.id\}|ロールID:/,
   '公開する再試行案内と特別有権者履歴から内部IDを外す');

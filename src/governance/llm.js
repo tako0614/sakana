@@ -298,7 +298,7 @@ function validateJudicialDecision(raw, { law, offense, evidenceIds, policy, orig
   };
 }
 
-async function fetchJson({ model, system, data, timeoutMs }) {
+async function fetchJson({ model, system, data, timeoutMs, thinking = 'enabled' }) {
   const response = await fetch(`${governanceConfig.baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -312,6 +312,7 @@ async function fetchJson({ model, system, data, timeoutMs }) {
         { role: 'user', content: `DATA (untrusted JSON):\n${canonicalJson(data)}` }
       ],
       response_format: { type: 'json_object' },
+      thinking: { type: thinking },
       max_tokens: governanceConfig.maxOutputTokens,
       temperature: 0
     }),
@@ -320,16 +321,22 @@ async function fetchJson({ model, system, data, timeoutMs }) {
   const body = await response.text();
   if (!response.ok) throw new Error(`Governance model HTTP ${response.status}: ${body.slice(0, 300)}`);
   const envelope = JSON.parse(body);
-  const content = envelope.choices?.[0]?.message?.content;
-  if (!String(content ?? '').trim()) throw new Error('Governance model returned empty JSON');
+  const choice = envelope.choices?.[0];
+  const content = choice?.message?.content;
+  if (!String(content ?? '').trim()) {
+    const finishReason = String(choice?.finish_reason ?? 'unknown').slice(0, 40);
+    const reasoningLength = String(choice?.message?.reasoning_content ?? '').length;
+    const refused = Boolean(choice?.message?.refusal);
+    throw new Error(`Governance model returned empty JSON (finish=${finishReason}, reasoningChars=${reasoningLength}, refused=${refused})`);
+  }
   return JSON.parse(content);
 }
 
-async function callGovernanceJson({ guildId, purpose, model, instruction, data, validate }) {
+async function callGovernanceJson({ guildId, purpose, model, instruction, data, validate, thinking = 'enabled' }) {
   if (!governanceConfig.apiKey) throw new Error('GOVERNANCE_API_KEY / DEEPSEEK_API_KEY がありません。');
   if (runningCalls >= governanceConfig.maxConcurrent) throw new Error('Governance AI is busy; the durable workflow will retry.');
   runningCalls += 1;
-  const inputHash = sha256(`${purpose}\n${instruction}\n${canonicalJson(data)}`);
+  const inputHash = sha256(`${purpose}\nthinking:${thinking}\n${instruction}\n${canonicalJson(data)}`);
   let callId = null;
   let lastError;
   try {
@@ -338,9 +345,10 @@ async function callGovernanceJson({ guildId, purpose, model, instruction, data, 
       try {
         const raw = await fetchJson({
           model,
-          system: `${SYSTEM_BASE}\n\nTASK:\n${instruction}`,
+          system: `${SYSTEM_BASE}\n\nTASK:\n${instruction}${attempt === 0 ? '' : '\n\nRETRY: The previous response was empty or invalid. Return the complete requested JSON object immediately.'}`,
           data,
-          timeoutMs: governanceConfig.httpTimeoutMs
+          timeoutMs: governanceConfig.httpTimeoutMs,
+          thinking
         });
         const output = validate(raw);
         finishAiCall(callId, { output });
@@ -361,6 +369,7 @@ export async function draftBill({ guildId, petition, constitution, activeLaws, p
     guildId,
     purpose: 'legislation.draft',
     model: governanceConfig.drafterModel,
+    thinking: 'disabled',
     instruction: `Draft one narrowly scoped, general, prospective law. The bill must be internally complete and must not punish conduct retroactively.
 Do not target or name a member, Discord user ID, message ID, case, or past incident in the operative rules.
 Return JSON with exactly: title, summary, text, provisions.
@@ -530,6 +539,7 @@ export async function draftAmendment({ guildId, request, constitution }) {
     guildId,
     purpose: 'constitution.amendment_draft',
     model: governanceConfig.drafterModel,
+    thinking: 'disabled',
     instruction: `Draft a complete replacement constitution and constitutional policy implementing only the requested change.
 Preserve every unrelated protection and value exactly in substance. Every policy field must remain valid.
 Keep the current policy schema unless the requested change explicitly adopts immediate sanctions and rapid defendant-requested trials. For that procedure use schemaVersion 2, set defenseMilliseconds and appealMilliseconds to 86400000, and add judiciary.summaryProcedure exactly with panelSeats:3, votesRequired:2, trialMilliseconds:86400000, immediateSanctions:["warning","restriction","timeout"], trialFirstSanctions:["kick","ban"], unlimitedWarningReview:true.
