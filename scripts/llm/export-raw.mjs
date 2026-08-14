@@ -8,7 +8,8 @@
 //
 // 出力:
 //   raw.jsonl.gz   1行1メッセージ。
-//                  [ch, author, created_at, is_bot, is_reply, content, extra, reply_author]
+//                  [ch, author, created_at, is_bot, is_reply, content, extra,
+//                   reply_author, reaction_count]
 //                  キー名を省いて配列にしてある (94万行あるとキー名だけで数十MB になる)
 //   authors.json   author の番号 → id / 表示名 / 件数 / 文字数 / bot 判定
 //   channels.json  channel の番号 → id / 件数
@@ -55,7 +56,7 @@ const db = new Database(dbPath, { readonly: true, fileMustExist: true });
 // p は主キー参照なので、94万行でも結合は効く。
 const rows = db.prepare(`
   SELECT m.channel_id, m.author_id, m.author_name, m.is_bot, m.content, m.extra,
-         m.created_at, m.reply_to,
+         m.created_at, m.reply_to, m.reaction_count,
          p.author_id AS reply_author_id, p.author_name AS reply_author_name,
          p.is_bot AS reply_is_bot
   FROM messages m
@@ -122,7 +123,12 @@ async function* lines() {
       row.reply_to ? 1 : 0,
       content,
       row.extra ?? '',
-      replyAuthor
+      replyAuthor,
+      // **サーバーが実際に反応した発言**という直接の信号。人間の発言 591,470 のうち
+      // 22,667 件 (3.8%) に付いている。`長い` や `噛み合った` のような間接的な代理より
+      // evex らしさに近いので、切り出しの重み付けに使う。
+      // 列を足しても古い読み手は壊れない (build-corpus.mjs は分割代入で読んでいる)
+      row.reaction_count ?? 0
     ])}\n`;
   }
 }
