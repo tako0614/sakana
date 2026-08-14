@@ -74,6 +74,21 @@ parser.add_argument("--wd-mode", default="all", choices=["all", "matrices"])
 # 正規化が作った記号 (<file> <url> <mention> <channel> <time>) を損失から外す。
 # 文脈には残るので流れは学べるが、自分では書かなくなる
 parser.add_argument("--mask-tokens", action=argparse.BooleanOptionalAction, default=True)
+# 話者ごとの学習率の倍率の上限。1.0 で無効。
+#
+# 147 人の発言数は **最多 55,964 / 最少 203 で 276 倍**の開きがあり、下位50人の
+# 合計は全体の 2.7% しかない。話者トークンは「その人が喋ったときにしか勾配が
+# 来ない」ので、少ない人ほど更新回数が足りず、`/as` でその人を指名しても
+# 実質学習されていない。
+#
+# **基準は幾何平均にする。**素朴に `sqrt(最多件数 / その人の件数)` にすると
+# 上限 ×4 で 147 人中 116 人が上限に張り付き、「補正」ではなく
+# 「話者だけ一律 4 倍」になる (実測)。幾何平均 (1,187 件) を基準にすると
+# 多い人は下げ・少ない人は上げる形になり、埋め込み全体の学習率は動かない:
+#
+#   最多 55,964 件 → ×0.33     50位 1,816 件 → ×0.81
+#   100位   415 件 → ×1.69     最少   203 件 → ×2.42     (上限 3.0)
+parser.add_argument("--speaker-lr-cap", type=float, default=1.0)
 args = parser.parse_args()
 
 corpus = Path(args.corpus)
@@ -279,6 +294,52 @@ def param_groups():
 opt = torch.optim.AdamW(param_groups(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
 
 
+def speaker_grad_scale():
+    """話者トークンの行にだけ勾配の倍率を掛ける。
+
+    埋め込み表の一部だけ学習率を変えるには行単位のスケールが要るので、
+    optimizer の param_group ではなく**勾配のフック**で掛ける。
+
+    **head と embed は tying している**ので、この倍率は「その人を表す向き」
+    だけでなく「その人が次に喋る確率」の学習にも掛かる。発言の少ない人の
+    logit が振れやすくなるということなので、上限 (--speaker-lr-cap) を
+    置いて効き過ぎないようにする。既定は 1.0 = 無効で、振りの軸にする。
+    """
+    if args.speaker_lr_cap <= 1.0:
+        return None
+
+    speakers_json = corpus / "speakers.json"
+    if not speakers_json.exists():
+        print("speakers.json が無いので話者の学習率補正は掛けない")
+        return None
+
+    rows = json.loads(speakers_json.read_text(encoding="utf8"))
+    counts = [max(1, row["count"]) for row in rows]
+    # 幾何平均。件数が 276 倍も開いているので算術平均だと上位に引っぱられる
+    ref = math.exp(sum(math.log(c) for c in counts) / len(counts))
+    cap = args.speaker_lr_cap
+
+    scale = torch.ones(cfg.vocab_size)
+    for row, count in zip(rows, counts):
+        piece = sp.piece_to_id(row["token"])
+        # 語彙に無い = 世代がずれている。**黙って進めない** (学習していない
+        # トークンを推論で渡す形になる)
+        if piece <= 0:
+            raise SystemExit(f"{row['token']} が tokenizer に無い。世代が対になっていない")
+        scale[piece] = min(cap, max(1.0 / cap, math.sqrt(ref / count)))
+
+    touched = scale[scale != 1.0]
+    print(f"話者の学習率補正: {len(rows)} 人 / 基準 {ref:,.0f} 件 / "
+          f"範囲 ×{touched.min():.2f}〜×{touched.max():.2f} (上限 ×{cap})")
+
+    scale = scale.to(device).unsqueeze(1)
+    model.embed.weight.register_hook(lambda grad: grad * scale)
+    return scale
+
+
+speaker_scale = speaker_grad_scale()
+
+
 def lr_at(step):
     if step < warmup_steps:
         return args.lr * (step + 1) / warmup_steps
@@ -325,13 +386,19 @@ def piece(*candidates):
 
 
 ME, YOU, ANON = piece("<|s0|>"), piece("<|s3|>", "<|s0|>"), piece("<|a|>", "<|other|>")
+
+# チャンネル (evex-4 以降)。**学習データは 100% がこれで始まる**ので、
+# 付けずに引くとサンプルだけ分布の外になる。持たない世代では空文字になる
+CH = piece("<|c0|>", "")
+CH2 = piece("<|c2|>", "<|c0|>", "")
+
 SAMPLE_PROMPTS = [
-    f"<|conv|>{YOU}Cloudflare Containers ってどうなん{ME}",
-    f"<|conv|>{ME}rebase 疲れた{YOU}",
-    f"<|conv|>{ANON}これバグってる？{ANON}",
+    f"{CH2}<|conv|>{YOU}Cloudflare Containers ってどうなん{ME}",
+    f"{CH2}<|conv|>{ME}rebase 疲れた{YOU}",
+    f"{CH}<|conv|>{ANON}これバグってる？{ANON}",
     # 返信先まで置く形 (evex-3 以降)。学習と同じ並びを見せる
-    f"<|conv|>{ANON}日本の首都どこ{ME}<|re|>{ANON}",
-    "<|conv|>",
+    f"{CH}<|conv|>{ANON}日本の首都どこ{ME}<|re|>{ANON}",
+    f"{CH}<|conv|>",
 ]
 
 
