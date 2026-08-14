@@ -84,6 +84,13 @@ REPLY_MARK = re.compile(r"^<\|re\|>(?:<\|s\d+\|>|<\|other\|>|<\|[a-hz]\|>)?")
 WORD = re.compile(r"[一-龥ァ-ヶー]{2,}|[A-Za-z][A-Za-z0-9_.-]{2,}")
 POLITE = re.compile(r"(です|ます|ください|ましょう|でしょう)[。！？\s]*$")
 MARKDOWN = re.compile(r"^[-*#>]|\*\*")
+# なりきり掲示板の地の文 (`（微笑み` `（首こてん`)。evex-3.5 で外部データを
+# 混ぜたので、その口調が漏れていないかを見る。
+#
+# **元のデータでは本文の 74% が括弧の中**だった。ビルド時に落としてはいるが、
+# register 自体は残るので、生成側で地の値と比べる。
+# 顔文字 `(´・ω・｀)` は evex にも普通に出るので、**中身が日本語の語**のものだけ数える
+STAGE = re.compile(r"[(（][^)）\n]*[ぁ-んァ-ヶ一-龥]{2,}[^)）\n]*[)）]?")
 
 
 def plain(text):
@@ -141,6 +148,8 @@ def score(texts):
         "long": sum(1 for t in texts if len(t) >= 20) / len(texts),
         "polite": sum(1 for t in texts if POLITE.search(t)) / len(texts),
         "markdown": sum(1 for t in texts if MARKDOWN.search(t)) / len(texts),
+        # なりきり掲示板の地の文が漏れていないか (evex-3.5 で外部を混ぜたため)
+        "stage": sum(1 for t in texts if STAGE.search(t)) / len(texts),
         "oov": (sum(1 for w in words if w not in vocab) / len(words)) if words else 0.0,
         # 学習データの発言と完全一致。「その人が言いそうなこと」ではなく
         # 「実際に言ったこと」を出していたら、それは覚えただけ
@@ -302,6 +311,7 @@ print(f"{'20字以上':<12} {pct(got['long']):>10} {pct(base_line['long']):>12}"
 print(f"{'噛み合い':<12} {pct(overlap):>10} {'—':>12}")
 print(f"{'敬体':<12} {pct(got['polite']):>10} {pct(base_line['polite']):>12}")
 print(f"{'markdown':<12} {pct(got['markdown']):>10} {pct(base_line['markdown']):>12}")
+print(f"{'地の文の括弧':<12} {pct(got['stage']):>10} {pct(base_line['stage']):>12}")
 print(f"{'未知語':<12} {pct(got['oov']):>10} {pct(base_line['oov']):>12}")
 print(f"{'逐語コピー':<12} {pct(got['verbatim']):>10} {'—':>12}")
 print(f"{'平均の長さ':<12} {got['chars']:9.0f}字 {base_line['chars']:11.0f}字")
@@ -313,5 +323,6 @@ if judged:
           + ("崩れている (別モデルから見て当てにくい)" if ratio > 1.5
              else "本物と同じ手触り" if ratio > 0.5
              else "無難すぎる (本物より当てやすい = evex の手触りが薄い)"))
-print("\n未知語が地の値より大きく上なら Qwen の地が出ている。"
+print("\n地の文の括弧が地の値より大きく上なら、なりきり掲示板の口調が漏れている。"
+      "\n未知語が地の値より大きく上なら Qwen の地が出ている。"
       "\n敬体と markdown が上なら instruct の口調が漏れている。")

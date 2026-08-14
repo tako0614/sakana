@@ -103,6 +103,22 @@ export const ENDPOINTS = {
     maxNewTokens: number(process.env.MIMIC_V3_MAX_NEW_TOKENS, 200),
     label: process.env.MIMIC_V3_LABEL ?? 'evex-3',
     format: process.env.MIMIC_V3_FORMAT ?? 'auto'
+  },
+  // evex-3 と**語彙が別物** (4096 → 12288)。専用ディレクトリで起動する。
+  //
+  // 変えたのは 2 つだけ:
+  //   語彙 12288  日本語 1.56 → 2.06 字/token / 英字 1.94 → 2.62 (英字トークン 641 → 3,058)
+  //   二段学習    なりきり掲示板で土台を作ってから evex だけで仕上げる
+  // 大きさは 15.74M → 18.9M だが、増えたのは埋め込み表だけで transformer 側は同じ。
+  //
+  // **evex-3 を置き換えず並走させる。**tokenizer もコーパスも違うので val で
+  // 比べられない。読み比べないと「良くなったか」が決まらない
+  'evex-3.5': {
+    url: process.env.MIMIC_V35_URL ?? 'http://127.0.0.1:8771',
+    timeoutMs: number(process.env.MIMIC_V35_TIMEOUT_MS, 60_000),
+    maxNewTokens: number(process.env.MIMIC_V35_MAX_NEW_TOKENS, 200),
+    label: process.env.MIMIC_V35_LABEL ?? 'evex-3.5',
+    format: process.env.MIMIC_V35_FORMAT ?? 'auto'
   }
 };
 

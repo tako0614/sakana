@@ -355,12 +355,20 @@ await writeFile(path.join(dst, 'val.txt'), `${val.map((c) => c.text).join('\n')}
 // 混合比だけで evex 率を守ろうとすると、外部が数倍あるぶん永久に薄まる。
 // 最後が evex なら分布は evex に戻り、土台の恩恵だけ取れる。
 //
+// **段1 の evex 側は素の会話 (base.txt) を使う。**
+// 最初は切り出しまで足した train.txt を入れていたが、それだと土台作りの段から
+// 同じ発言を 2.08 回見せることになり、**段2 用の水増しを前借りする**形だった。
+// 素の会話にすると外部比率も 40% → 約 76% になって「土台」らしくなる。
+//
 // 段1 にも evex を入れるのは、**147 個の話者トークンをここで動かしておく**ため。
 // 外部には役しか出てこないので、入れないと `<|sN|>` の埋め込みが段2 で
 // 初期値から始まることになる。
 //
 // val は段1 でも evex のものを使う (train.py が {corpus}/val.txt を読む)。
 // 「外部を混ぜている最中に evex の val がどう動くか」が見たい値そのもの。
+
+const baseLines = trainBase.map((c) => c.text);
+await writeFile(path.join(dst, 'base.txt'), `${baseLines.join('\n')}\n`);
 
 let pretrainStats = null;
 const externalPath = process.env.LLM_EXTERNAL ?? null;
@@ -376,21 +384,20 @@ if (externalPath) {
     throw new Error(`外部データに話者トークンが ${leaked} 行ある。build-external.mjs を直す`);
   }
 
-  const pretrain = [...externalLines, ...train.map((c) => c.text)];
+  const pretrain = [...externalLines, ...baseLines];
   await writeFile(path.join(dst, 'pretrain.txt'), `${pretrain.join('\n')}\n`);
 
-  const externalChars = externalLines.reduce((sum, l) => sum + l.length, 0);
+  const chars = (list) => list.reduce((sum, l) => sum + l.length, 0);
+  const externalChars = chars(externalLines);
   pretrainStats = {
     external_file: externalPath,
     external_conversations: externalLines.length,
     external_chars: externalChars,
+    base_conversations_train: baseLines.length,
+    base_chars: chars(baseLines),
     pretrain_conversations: pretrain.length,
-    pretrain_chars: externalChars + trainCharsOf(train)
+    pretrain_chars: externalChars + chars(baseLines)
   };
-}
-
-function trainCharsOf(list) {
-  return list.reduce((sum, c) => sum + c.text.length, 0);
 }
 
 // **userId と表示名が入っている。HF にはこのファイルを上げない。**
@@ -479,9 +486,12 @@ if (pretrainStats) {
   console.log(`段1 (事前学習)   ${fmt(p.pretrain_conversations)} 会話 / ${fmt(p.pretrain_chars)} 字`);
   console.log(`  うち外部       ${fmt(p.external_conversations)} 会話 / ${fmt(p.external_chars)} 字 `
     + `(${(p.external_chars / p.pretrain_chars * 100).toFixed(0)}%)  ${p.external_file}`);
+  console.log(`  うち evex      ${fmt(p.base_conversations_train)} 会話 / ${fmt(p.base_chars)} 字 `
+    + `(素の会話。水増しも切り出しもしない)`);
   console.log(`  話者トークンの混入 0 (確認済み)`);
 }
+console.log(`段2 (仕上げ)     ${fmt(train.length)} 会話 / ${fmt(trainChars)} 字 (evex だけ)`);
 
-console.log(`\n出力 ${dst}/ (train.txt / val.txt${pretrainStats ? ' / pretrain.txt' : ''}`
-  + ` / speakers.json / stats.json)`);
+console.log(`\n出力 ${dst}/ (train.txt / base.txt / val.txt`
+  + `${pretrainStats ? ' / pretrain.txt' : ''} / speakers.json / stats.json)`);
 console.log('speakers.json には userId と表示名が入っている。**HF には上げない**');

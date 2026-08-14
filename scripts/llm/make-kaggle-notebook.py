@@ -207,8 +207,8 @@ TOKEN = os.environ["HF_TOKEN"]
 
 # 実トークン数 (train-tokenizer.py が測った値)。持ち時間から epoch を逆算する。
 # コーパスを作り直したら stats.json から取り直す
-PRETRAIN_TOKENS = 37_319_281        # 段1: 外部 + evex (外部が 48%)
-TRAIN_TOKENS = 19_280_662           # 段2: evex だけ
+PRETRAIN_TOKENS = 23_267_670        # 段1: 外部 + 素の evex (外部が 78%)
+TRAIN_TOKENS = 19_280_662           # 段2: evex だけ (水増しと切り出し込み)
 
 # 本体は 2 ファイル。ここに丸ごと埋め込んである (写しを手で持たないため)
 Path("model.py").write_text(MODEL_PY, encoding="utf8")
@@ -310,25 +310,37 @@ def push(out, prefix):
 SIZE = (384, 8, 6, 1024)    # evex-3.5  約 18.9M (語彙 12288 で埋め込みが 4.72M)
 
 # 持ち時間 (分)。Kaggle の週枠に合わせて配る
-PRE_MINUTES = float(os.environ.get("EVEX_PRE_MIN", 45))
-FT_MINUTES = float(os.environ.get("EVEX_FT_MIN", 25))
+PRE_MINUTES = float(os.environ.get("EVEX_PRE_MIN", 30))
+FT_MINUTES = float(os.environ.get("EVEX_FT_MIN", 22))
 
-# **段1: 外部の会話 + evex で土台を作る。**
 rate = bench(SIZE)
+
+# **段1: 外部の会話 + 素の evex で土台を作る。**
 pre_epochs = epochs_for(rate, PRE_MINUTES, tokens=PRETRAIN_TOKENS, hi=3)
 print(f"\\n段1 {{rate:,.0f}} tok/s → {{PRE_MINUTES:.0f}} 分で {{pre_epochs}} epoch", flush=True)
 stage1 = run(SIZE, pre_epochs, lr="1e-3", train_name="pretrain", tag="-pre")
 push(stage1, "pretrain")
 
-# **段2: evex だけで仕上げる。**ここで分布が evex に戻る。
-# lr は段1 の 1/3 から。同じ 1e-3 で回すと土台を壊す
 init = last_ckpt(stage1)
 if init is None:
     raise SystemExit("段1 のチェックポイントが無いので段2 に進めない")
 
 ft_epochs = epochs_for(rate, FT_MINUTES, tokens=TRAIN_TOKENS, hi=4)
-print(f"\\n段2 {{FT_MINUTES:.0f}} 分で {{ft_epochs}} epoch / 初期値 {{init}}", flush=True)
+
+# **段2 A: 段1 から続ける (本命)。**ここで分布が evex に戻る。
+# lr は段1 の 1/3 から。同じ 1e-3 で回すと土台を壊す
+print(f"\\n段2 A (段1 から) {{FT_MINUTES:.0f}} 分で {{ft_epochs}} epoch / 初期値 {{init}}", flush=True)
 push(run(SIZE, ft_epochs, lr="3e-4", init=init, tag="-ft"), "evex35")
+
+# **段2 B: ゼロから (対照)。**
+#
+# これが無いと「外部データが効いたか」を永久に知らないまま出すことになる。
+# サイズのときと同じ失敗 — あのときは対照を回したから「効いていない」と分かった。
+# **A が B に勝っていなければ外部データは捨てて evex-3 の路線に戻す。**
+# 段2 は短いので対照込みでも +22 分で済む。
+if os.environ.get("EVEX_CONTROL", "1") == "1":
+    print(f"\\n段2 B (ゼロから / 対照) {{ft_epochs}} epoch", flush=True)
+    push(run(SIZE, ft_epochs, lr="1e-3", tag="-scratch"), "control")
 
 print("\\n完了", flush=True)
 '''
