@@ -63,6 +63,11 @@ parser.add_argument("--show", type=int, default=8, help="出力を何本見せ�
 # 測って**、そこを地の値にする (未知語率と同じ考え方)。
 parser.add_argument("--judge", default=None, help="流暢さを採点させる別モデルのディレクトリ")
 parser.add_argument("--judge-sample", type=int, default=200, help="地の値に使う val の発言数")
+# 話者の弁別性。**`/as` の価値そのものなのに一度も測っていない。**
+# 0 で無効 (既定)。生成量が 人数 × 質問 × seed で増えるので、既定は切っておく
+parser.add_argument("--distinct", type=int, default=0,
+                    help="弁別性を測る人数 (上位N人と下位N人。0 で無効)")
+parser.add_argument("--distinct-questions", type=int, default=5)
 args = parser.parse_args()
 
 if bool(args.model) == bool(args.evex):
@@ -230,8 +235,12 @@ if EVEX:
     model.eval()
     END_ID = sp.piece_to_id("<|end|>")
 
-    def ask(question, seed):
-        prompt = f"<|conv|><|a|>{question}{label}"
+    # チャンネル (evex-4 以降)。**学習データは 100% がこれで始まる**ので、
+    # 付けずに測ると推論だけ分布の外になる。持たない世代では空文字
+    CHANNEL = "<|c0|>" if sp.piece_to_id("<|c0|>") != sp.unk_id() else ""
+
+    def ask(question, seed, who=None):
+        prompt = f"{CHANNEL}<|conv|><|a|>{question}{who or label}"
         ids = torch.tensor([sp.encode(prompt, out_type=int)], dtype=torch.long)
         torch.manual_seed(1000 + seed)
         out = model.generate(ids, max_new_tokens=args.max_new, temperature=0.9,
@@ -244,8 +253,8 @@ else:
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32)
     model.eval()
 
-    def ask(question, seed):
-        prompt = f"#ch2\nA: {question}\n{label}:"
+    def ask(question, seed, who=None):
+        prompt = f"#ch2\nA: {question}\n{who or label}:"
         ids = tok(prompt, return_tensors="pt")
         torch.manual_seed(1000 + seed)
         out = model.generate(
@@ -275,6 +284,74 @@ for question in QUESTIONS:
 
 got = score(replies)
 overlap = sum(overlaps) / len(overlaps) if overlaps else 0.0
+
+# --- 話者の弁別性 ---
+#
+# **本当に人によって書き分けているか。**`/as` の価値そのものなのに一度も
+# 測っていなかった。同じ質問を N 人に振って、**返答どうしの内容語の重なり**を見る。
+#
+# 見るのは絶対値ではなく **同じ人を 2 回引いたときの重なりとの差**。
+# 同じ人でも seed が変われば言うことは変わるので、その揺れが下限になる。
+# 全員が同じような返答なら 差が 0 に近づき、話者トークンは飾りでしかない。
+#
+# **発言数の多い人と少ない人で分ける。**下位50人は全体の 2.7% しか学習して
+# いないので、そこが機能しているかが 147人にした意味を決める。
+def jaccard(a, b):
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def distinctiveness(who_list):
+    """[(名前, 返答の語集合の列)] から 同一人物内 / 他人との 重なりを出す。"""
+    same, cross = [], []
+    for i, (_, mine) in enumerate(who_list):
+        for a in range(len(mine)):
+            for b in range(a + 1, len(mine)):
+                same.append(jaccard(mine[a], mine[b]))         # 同じ人・別の seed
+            for j in range(i + 1, len(who_list)):
+                for other in who_list[j][1]:
+                    cross.append(jaccard(mine[a], other))      # 別の人
+    mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")  # noqa: E731
+    return mean(same), mean(cross)
+
+
+distinct = None
+if args.distinct:
+    if EVEX:
+        rows = json.loads((corpus / "speakers.json").read_text(encoding="utf8"))
+        rows.sort(key=lambda r: -r["count"])
+        key = "token"
+    else:
+        rows = json.loads((corpus / "labels.json").read_text(encoding="utf8"))
+        rows.sort(key=lambda r: -r.get("count", 0))
+        key = "label"
+
+    n = min(args.distinct, len(rows) // 2)
+    groups = {"発言の多い上位": rows[:n], "発言の少ない下位": rows[-n:]}
+    distinct = {}
+
+    for group, picked in groups.items():
+        collected = []
+        for row in picked:
+            answers = []
+            for question in QUESTIONS[: args.distinct_questions]:
+                for seed in range(args.seeds):
+                    reply, _ = ask(question, seed, who=row[key])
+                    words = {w.lower() for w in WORD.findall(reply)} if reply else set()
+                    # **内容語が無い返答は数えない。**空集合どうしの Jaccard は 0 に
+                    # なるので、崩れたモデルが「弁別性が高い」ように見えてしまう
+                    if words:
+                        answers.append(words)
+            if len(answers) >= 2:
+                collected.append((row[key], answers))
+
+        same, cross = distinctiveness(collected)
+        distinct[group] = {
+            "n": len(collected), "same": same, "cross": cross,
+            "median_count": sorted(r["count"] for r in picked)[len(picked) // 2],
+        }
+
 
 # --- 文章として成り立っているか ---
 #
@@ -333,6 +410,16 @@ if judged:
           + ("崩れている (別モデルから見て当てにくい)" if ratio > 1.5
              else "本物と同じ手触り" if ratio > 0.5
              else "無難すぎる (本物より当てやすい = evex の手触りが薄い)"))
+if distinct:
+    print(f"\n{'話者の弁別性':<16} {'人数':>4} {'中位の件数':>10} {'同じ人':>8} {'他人':>8} {'差':>8}")
+    for group, d in distinct.items():
+        gap = d["same"] - d["cross"]
+        print(f"{group:<16} {d['n']:>4} {d['median_count']:>10,} "
+              f"{pct(d['same']):>8} {pct(d['cross']):>8} {pct(gap):>8}")
+    print("  差が 0 に近いなら、話者トークンを変えても同じことを言っている "
+          "= `/as` は飾り。下位の差が上位より大幅に小さいなら、"
+          "発言の少ない人が学習できていない")
+
 print("\n地の文の括弧が地の値より大きく上なら、なりきり掲示板の口調が漏れている。"
       "\n未知語が地の値より大きく上なら Qwen の地が出ている。"
       "\n敬体と markdown が上なら instruct の口調が漏れている。")
