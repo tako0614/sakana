@@ -203,6 +203,7 @@ CUDA が同梱されているので、それでそのまま GPU が使える。
          repo_type="dataset", token=os.environ["HF_TOKEN"])).read())
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -217,8 +218,9 @@ TOKEN = os.environ["HF_TOKEN"]
 
 # 実トークン数 (train-tokenizer.py が測った値)。持ち時間から epoch を逆算する。
 # コーパスを作り直したら stats.json から取り直す
-PRETRAIN_TOKENS = 23_267_670        # 段1: 外部 + 素の evex (外部が 78%)
-TRAIN_TOKENS = 19_280_662           # 段2: evex だけ (水増しと切り出し込み)
+PRETRAIN_TOKENS = 179_002_073       # 段1: 外部 158.1M + evex 20.9M (evex が 11.7%)
+TRAIN_TOKENS = 31_455_563           # 段2: evex だけ (水増しと切り出し込み)
+REACTED_TOKENS = 692_050            # 段3: リアクションの付いた切り出しだけ
 
 # 本体は 2 ファイル。ここに丸ごと埋め込んである (写しを手で持たないため)
 Path("model.py").write_text(MODEL_PY, encoding="utf8")
@@ -286,7 +288,8 @@ def epochs_for(rate, minutes, tokens=TRAIN_TOKENS, hi=6):
     return max(1, min(hi, fits))
 
 
-def run(size, epochs, batch=24, lr="1e-3", train_name="train", init=None, tag=""):
+def run(size, epochs, batch=24, lr="1e-3", train_name="train", init=None, tag="",
+        max_tokens=0):
     """学習して出力ディレクトリを返す。
 
     **落ちても例外にしない。**train.py は epoch ごとにチェックポイントを書くので、
@@ -300,6 +303,14 @@ def run(size, epochs, batch=24, lr="1e-3", train_name="train", init=None, tag=""
            "--train-name", train_name]
     if init:
         cmd += ["--init", init]
+    # 等計算量で振るときの上限 (実測 tok/s × 分)
+    if max_tokens:
+        cmd += ["--max-tokens", str(max_tokens)]
+    # 振りの軸。環境変数で渡してここで train.py の引数に直す
+    if os.environ.get("EVEX_WD"):
+        cmd += ["--wd-mode", os.environ["EVEX_WD"]]
+    if os.environ.get("EVEX_SPEAKER_LR"):
+        cmd += ["--speaker-lr-cap", os.environ["EVEX_SPEAKER_LR"]]
 
     print("\\n$ " + " ".join(cmd), flush=True)
     done = subprocess.run(cmd, env=env_for(size), check=False)
@@ -329,17 +340,65 @@ def push(out, prefix):
     print(f"pushed {{prefix}} ({{len(found)}} epoch) → https://huggingface.co/{{PUSH}}", flush=True)
 
 
-SIZE = (384, 8, 6, 1024)    # evex-3.5  約 18.9M (語彙 12288 で埋め込みが 4.72M)
+# 形。**振りの候補**でもある (d_model, layers, heads, context)。
+SHAPES = {{
+    "19M": (384, 8, 6, 1024),      # evex-3.5 と同じ (語彙 12288 で埋め込みが 4.72M)
+    "30M": (448, 10, 7, 1024),
+    "45M": (512, 12, 8, 1024),
+    "19M-c2048": (384, 8, 6, 2048),
+}}
+SIZE = SHAPES[os.environ.get("EVEX_SHAPE", "19M")]
 
 # **既に押してある重みから続ける。**段1 をやり直さないための経路。
 #   EVEX_RESUME=evex35   … evex-3.5/evex35 の最終 epoch から段2 を延長する
 RESUME = os.environ.get("EVEX_RESUME")
 
-PRE_MINUTES = float(os.environ.get("EVEX_PRE_MIN", 30))
-FT_MINUTES = float(os.environ.get("EVEX_FT_MIN", 22))
+# 持ち時間 (分)。**トークン数ではなく分で配る。**段1 のデータが 7.7 倍になっても、
+# 分で配れば段1 の epoch が減るだけで evex に使う割合は動かない。
+# 実測: 段1 ×1 + 段2 ×6 で evex に触れる計算量が 57%
+PRE_MINUTES = float(os.environ.get("EVEX_PRE_MIN", 56))
+FT_MINUTES = float(os.environ.get("EVEX_FT_MIN", 58))
+
+# --- 形を振る ---
+#
+# **同じ持ち時間で回す。**等トークン数で比べると大きい模型が不利に出るので、
+# 実測 tok/s × 分 を --max-tokens に入れて「同じ計算量」を揃える。
+#
+# **val だけで判定してはいけない。**容量を増やせば val はほぼ必ず下がるので、
+# それだけ見ると毎回「大きい方が良い」になる。evex-3 のときも val は 15.74M の
+# 方が低かったが、生成を見たら噛み合いの差は +3.4pt しか無かった。
+# ここで出すのは段1 の val だけ。生成側の判定は段2 まで通してから。
+if os.environ.get("EVEX_SWEEP"):
+    minutes = float(os.environ.get("EVEX_SWEEP_MIN", 15))
+    names = os.environ.get("EVEX_SWEEP_SHAPES", "19M,30M,45M").split(",")
+    results = []
+
+    for name in [x.strip() for x in names if x.strip()]:
+        size = SHAPES[name]
+        rate = bench(size)
+        budget = int(rate * minutes * 60)
+        print(f"\\n振り {{name}} {{size}} — {{rate:,.0f}} tok/s × {{minutes:.0f}} 分 "
+              f"= {{budget:,}} トークン", flush=True)
+        out = run(size, 1, lr="1e-3", train_name="pretrain", tag=f"-sw-{{name}}",
+                  max_tokens=budget)
+        push(out, f"sweep-{{name}}")
+
+        history = Path(out, "history.json")
+        val = None
+        if history.exists():
+            rows = json.loads(history.read_text(encoding="utf8"))
+            val = rows[-1].get("val_loss") if rows else None
+        results.append((name, size, rate, budget, val))
+
+    print("\\n=== 振りの結果 (段1 の val だけ。生成側は段2 まで通してから) ===", flush=True)
+    for name, size, rate, budget, val in results:
+        shown = f"{{val:.4f}}" if val is not None else "—"
+        print(f"  {{name:<10}} d{{size[0]}}x{{size[1]}} ctx{{size[3]}}  "
+              f"{{rate:>7,.0f}} tok/s  {{budget:>12,}} tok  val {{shown}}", flush=True)
+    raise SystemExit(0)
 
 rate = bench(SIZE)
-ft_epochs = epochs_for(rate, FT_MINUTES, tokens=TRAIN_TOKENS, hi=4)
+ft_epochs = epochs_for(rate, FT_MINUTES, tokens=TRAIN_TOKENS, hi=8)
 
 if RESUME:
     # 押してある重みを落として初期値にする。lr は段2 の続きなので低めから
@@ -369,7 +428,24 @@ else:
 
     # **段2 A: 段1 から続ける (本命)。**lr は段1 の 1/3 から
     print(f"\\n段2 A (段1 から) {{FT_MINUTES:.0f}} 分で {{ft_epochs}} epoch / 初期値 {{init}}", flush=True)
-    push(run(SIZE, ft_epochs, lr="3e-4", init=init, tag="-ft"), "evex35")
+    stage2 = run(SIZE, ft_epochs, lr="3e-4", init=init, tag="-ft")
+    push(stage2, "evex4-s2")
+
+    # **段3: リアクションの付いた切り出しだけ。**サーバーが実際に反応した発言で
+    # 仕上げる。0.69M トークンしか無いので**過学習しやすい** — lr を段2 の 1/3 に
+    # 落として 2 epoch。**逐語コピー (20字以上) で必ず確かめる**。上がるなら捨てる。
+    #
+    # 段2 の重みは別名 (evex4-s2) で押してあるので、段3 が悪ければそちらに戻せる
+    if os.environ.get("EVEX_STAGE3", "1") == "1":
+        init2 = last_ckpt(stage2)
+        if init2 is None:
+            print("⚠ 段2 のチェックポイントが無いので段3 は飛ばす", flush=True)
+        else:
+            s3_epochs = int(os.environ.get("EVEX_S3_EPOCHS", 2))
+            print(f"\\n段3 (リアクション {{REACTED_TOKENS:,}} tok) {{s3_epochs}} epoch / "
+                  f"初期値 {{init2}}", flush=True)
+            push(run(SIZE, s3_epochs, lr="1e-4", train_name="reacted", init=init2,
+                     tag="-re"), "evex4")
 
     # **段2 B: ゼロから (対照)。**これが無いと外部データが効いたか分からない
     if os.environ.get("EVEX_CONTROL", "1") == "1":

@@ -89,6 +89,13 @@ parser.add_argument("--mask-tokens", action=argparse.BooleanOptionalAction, defa
 #   最多 55,964 件 → ×0.33     50位 1,816 件 → ×0.81
 #   100位   415 件 → ×1.69     最少   203 件 → ×2.42     (上限 3.0)
 parser.add_argument("--speaker-lr-cap", type=float, default=1.0)
+# 学習に使うトークン数の上限。0 で無制限 (既定)。
+#
+# **形を振るときの等計算量比較に使う。**段1 は 179M トークンあるので、
+# 15 分の振りでは 1 epoch も回らない。同じ「見るトークン数」で切れば、
+# 大きい模型ほど不利という等トークン比較にならず、同じ持ち時間の比較になる
+# (実測の tok/s × 分 をここに入れる)。
+parser.add_argument("--max-tokens", type=int, default=0)
 args = parser.parse_args()
 
 corpus = Path(args.corpus)
@@ -121,6 +128,21 @@ def load(name):
 
 train_ids = load(args.train_name)
 val_ids = load("val")
+
+if args.max_tokens and len(train_ids) > args.max_tokens:
+    # **先頭から切る。**コーパスは build-corpus.mjs が時系列に並べているので、
+    # 先頭を取ると古い会話だけになる…が、pretrain.txt は外部が先で evex が後ろ
+    # なので先頭切りだと evex が丸ごと落ちる。等間隔で間引く
+    step = max(1, len(train_ids) // args.max_tokens)
+    if step > 1:
+        # 連続した並びを保ちたいので、間引くのではなく**塊で拾う**。
+        # 1 塊 = context の 64 倍にしておけば、窓の中で文脈が切れない
+        block = 64 * cfg.context
+        kept = [train_ids[i:i + block] for i in range(0, len(train_ids), block * step)]
+        train_ids = np.concatenate(kept)[: args.max_tokens]
+    else:
+        train_ids = train_ids[: args.max_tokens]
+    print(f"上限 {args.max_tokens:,} トークンに絞った ({step} 塊に 1 塊)")
 
 print(f"train {len(train_ids):,} トークン ({args.train_name}.txt) / val {len(val_ids):,} トークン")
 print(f"vocab {cfg.vocab_size} / layers {cfg.n_layers} / d_model {cfg.d_model} "
