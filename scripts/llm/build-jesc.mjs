@@ -33,6 +33,8 @@ process.env.ARCHIVE_DB_PATH = path.join(os.tmpdir(), 'sakana-jesc-scratch.sqlite
 const { ROLE_TOKENS, buildPrompt, messageText } =
   await import('../../src/mimic/serialize.js');
 
+import { discordify } from './discordify.mjs';
+
 const src = process.env.LLM_JESC_DIR ?? 'external/jesc';
 const out = process.argv[2] ?? 'corpus-v7/jesc.txt';
 
@@ -87,11 +89,16 @@ let buffer = [];
 
 async function flush() {
   if (buffer.length < 4) { buffer = []; return; }   // 4 行未満は交代を教えない
-  const turns = buffer.map((content, i) => ({
+  const posts = buffer.map((content, i) => ({
     token: ROLE_TOKENS[i % 2],                       // <|a|> と <|b|> を交互に
     content
   }));
-  const text = `${buildPrompt(turns)}<|end|>`;
+  // 字幕は 1 行が短いので割れることは少ないが、**返信の印は付く** —
+  // 字幕の次の行は直前の行に答えている。
+  //
+  // ただし字幕は**必ず話者が交代する** (a/b を交互に振っているので境目が
+  // 100%)。既定の 3 だと 31.9% になって evex の 20.1% を超えるので 5 にする
+  const text = `${buildPrompt(discordify(posts, stats.windows, { replyEvery: 5 }))}<|end|>`;
   stats.windows += 1;
   stats.chars += text.length;
   await write(text);

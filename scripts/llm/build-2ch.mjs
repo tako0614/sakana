@@ -47,6 +47,9 @@ process.env.ARCHIVE_DB_PATH = path.join(os.tmpdir(), 'sakana-2ch-scratch.sqlite'
 const { ROLE_TOKENS, buildPrompt, messageText } =
   await import('../../src/mimic/serialize.js');
 
+// 長い投稿を連投に割り、直前の相手への返信に印を付ける。**3 つの builder で共通**
+import { discordify } from './discordify.mjs';
+
 const src = process.env.LLM_2CH_FILE ?? 'external/open2ch/open2ch.jsonl';
 const out = process.argv[2] ?? 'corpus-v7/open2ch.txt';
 
@@ -133,7 +136,8 @@ async function flush(board) {
   const buffer = buffers.get(board);
   if (!buffer || buffer.posts.length < 2) { buffers.delete(board); return; }
 
-  const text = `${buildPrompt(buffer.posts)}<|end|>`;
+  // Discord の粒度に直してから並べる (連投 / `<|re|>` / 1発言の長さ)
+  const text = `${buildPrompt(discordify(buffer.posts, buffer.seed))}<|end|>`;
   buffers.delete(board);
 
   // 同じ 2 発話の対話が何度も出るので、窓ごと重複を落とす
@@ -163,7 +167,9 @@ for await (const line of lines(src)) {
   stats.dialogues += 1;
   stat.dialogues += 1;
 
-  if (!buffers.has(board)) buffers.set(board, { posts: [], chars: 0, roleAt: 0 });
+  if (!buffers.has(board)) {
+    buffers.set(board, { posts: [], chars: 0, roleAt: 0, seed: stats.windows });
+  }
   const buffer = buffers.get(board);
 
   // 対話ごとに役を 2 つ進める。話者番号は 1/2 なので、そのまま添え字にする

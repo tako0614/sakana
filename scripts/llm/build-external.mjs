@@ -38,6 +38,8 @@ const { splitIntoChunks } = await import('../../src/archive/chunks.js');
 const { ROLE_TOKENS, ROLE_OVERFLOW, assignRoles, buildPrompt, messageText } =
   await import('../../src/mimic/serialize.js');
 
+import { discordify } from './discordify.mjs';
+
 const src = process.env.LLM_EXTERNAL_DIR ?? 'external';
 const out = process.argv[2] ?? 'corpus-v5/external.txt';
 
@@ -174,8 +176,13 @@ for await (const line of lines(path.join(src, file))) {
     if (chunk.length < 2) continue;                  // 1 投稿だけでは交代を教えない
     // **役だけを配る。**名前も固有トークンも与えない
     const roles = assignRoles(chunk.map((row) => row.author));
-    const turns = chunk.map((row) => ({ token: roles.get(row.author), content: row.content }));
-    const text = `${buildPrompt(turns)}<|end|>`;
+    const posts = chunk.map((row) => ({ token: roles.get(row.author), content: row.content }));
+    // **なりきりはここが一番効く。**1 投稿の中位が 99 字 (evex は 20 字) で
+    // `<nl>` が 1 発言に 1.25 個あるので、割ると Discord の粒度にかなり近づく。
+    //
+    // splitEvery は実測で決めた: 既定の 5 (5本に4本を割る) だと連投が 47.7% に
+    // なって evex の 32.2% を大きく超える。3 にすると 40% 前後で収まる
+    const text = `${buildPrompt(discordify(posts, stats.conversations, { splitEvery: 3 }))}<|end|>`;
     stats.conversations += 1;
     stats.chars += text.length;
     await write(text);
