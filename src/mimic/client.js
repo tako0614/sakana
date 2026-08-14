@@ -240,7 +240,15 @@ export async function roleScheme(engine = null) {
 
   // speakers は実在の人物に紐づくトークン。持っているのは evex-1 だけ。
   // 申告に無いものを渡さないために、bot 側はここだけを見る
-  const found = { roles: info.roles, overflow: info.overflow, speakers: info.speakers ?? [] };
+  const found = {
+    roles: info.roles,
+    overflow: info.overflow,
+    speakers: info.speakers ?? [],
+    // チャンネルトークン (evex-4 以降)。**申告が空の世代には何も渡さない** —
+    // 語彙に無い `<|c0|>` を渡すとバイトに分解されて先頭から形が崩れる
+    channels: info.channels ?? [],
+    channelOverflow: info.channel_overflow ?? null
+  };
   schemes.set(key, found);
   return found;
 }

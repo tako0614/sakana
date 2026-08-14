@@ -77,7 +77,9 @@ function loadChannelRanks() {
       const rows = JSON.parse(readFileSync(path.resolve(file), 'utf8'));
       if (!Array.isArray(rows) || !rows.length) continue;
       const ranked = [...rows].sort((a, b) => b.count - a.count);
-      return new Map(ranked.slice(0, NAMED_CHANNELS).map((c, rank) => [String(c.id), `#ch${rank}`]));
+      // **順位だけを持つ。**表示の仕方 (`#ch3` / `<|c3|>`) は使う側が決める —
+      // ft 系と evex 系で形が違うだけで、順位表は同じものでなければならない
+      return new Map(ranked.map((c, rank) => [String(c.id), rank]));
     } catch {
       // 無くても #other で動く。話題の手がかりが1つ減るだけ
     }
@@ -87,9 +89,22 @@ function loadChannelRanks() {
 
 const channelRanks = loadChannelRanks();
 
-/** そのチャンネルの学習時のラベル。上位16の外は #other。 */
+/**
+ * そのチャンネルの順位。上位から漏れていれば null。
+ *
+ * **順位表は世代と対にする。**channels.json を作り直すと発言数の増分で順位が
+ * 入れ替わるので、載せているモデルを学習したときの channels.json を
+ * mimic/ に置くこと ([[labels-follow-corpus]] と同じ罠)。
+ */
+export function channelRankOf(channelId, top = NAMED_CHANNELS) {
+  const rank = channelRanks.get(String(channelId));
+  return rank != null && rank < top ? rank : null;
+}
+
+/** そのチャンネルの学習時のラベル (ft 系 / 平文)。上位16の外は #other。 */
 export function channelLabel(channelId) {
-  return channelRanks.get(String(channelId)) ?? '#other';
+  const rank = channelRankOf(channelId);
+  return rank == null ? '#other' : `#ch${rank}`;
 }
 
 function shorten(url) {

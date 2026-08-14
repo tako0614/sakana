@@ -78,6 +78,17 @@ SPEAKERS = []
 while has_piece(f"<|s{len(SPEAKERS)}|>"):
     SPEAKERS.append(f"<|s{len(SPEAKERS)}|>")
 
+# チャンネルトークン (evex-4 以降)。窓の先頭に置いて話題の手がかりにする。
+# ft 系には最初からあったのに evex 系は evex-3.5 まで一度も入っていなかった。
+#
+# **話者と同じで上限を決め打ちにしない。**欠けたところで止めれば数がそのまま出る。
+# 溢れ (`<|cx|>`) は上位から漏れたチャンネル用。これが空の世代 (evex-3.5 以前) では
+# bot 側が何も渡さないので、古い世代の推論は変わらない。
+CHANNELS = []
+while has_piece(f"<|c{len(CHANNELS)}|>"):
+    CHANNELS.append(f"<|c{len(CHANNELS)}|>")
+CHANNEL_OVERFLOW = "<|cx|>" if CHANNELS and has_piece("<|cx|>") else None
+
 blob = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 saved = blob["config"]
 cfg = Config(
@@ -92,6 +103,8 @@ INFO = {
     "roles": ROLES,
     "overflow": OVERFLOW,
     "speakers": SPEAKERS,
+    "channels": CHANNELS,
+    "channel_overflow": CHANNEL_OVERFLOW,
     "epoch": blob.get("epoch"),
     "val_loss": blob.get("val_loss"),
     "train_loss": blob.get("train_loss"),

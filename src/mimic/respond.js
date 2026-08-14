@@ -27,8 +27,8 @@ import { ENDPOINTS, continuationOf, endpointFor, generate, roleScheme } from './
 import { mimicFormat } from './impersonate.js';
 import { personaFor } from './persona.js';
 import {
-  PLAIN_SCHEME, assignPlainRoles, buildPlainPrompt, isUnusableReply, labelFor,
-  labelledSpeakers, plainOwnTurns, plainText
+  PLAIN_SCHEME, assignPlainRoles, buildPlainPrompt, channelRankOf, isUnusableReply,
+  labelFor, labelledSpeakers, plainOwnTurns, plainText
 } from './plain.js';
 import { assignRoles, buildPrompt, messageText, nextRole, ownTurns } from './serialize.js';
 import { hasOptedOut, learnedSpeakers, tokenFor } from './speakers.js';
@@ -69,7 +69,7 @@ const MAX_TRIES = Number(process.env.MIMIC_MAX_TRIES ?? 3);
  * 独自トークン形式 (evex-1 / evex-2)。会話に出てくる人に役を振って、
  * bot は**自分が既に持っている役** — または /as で選ばれた人の話者トークン — で喋る。
  */
-async function tokenRequest(messages, { wanted, engine, selfId }) {
+async function tokenRequest(messages, { wanted, engine, channelId, selfId }) {
   const scheme = await roleScheme(engine);
 
   // **学習と同じ振り方にする。**名前を持つ人は固有トークン、それ以外だけに役を配る。
@@ -141,13 +141,38 @@ async function tokenRequest(messages, { wanted, engine, selfId }) {
   const mine = selfId ? tokenOf(selfId) : null;
   const trailing = as ?? mine ?? nextRole(roles, scheme);
 
+  // **チャンネルを窓の先頭に置く (evex-4 以降)。**
+  //
+  // 学習側は `<|c2|><|conv|>...` の形で組んである。ここで渡さないと、
+  // モデルが学習中ずっと持っていた話題の手がかりが推論だけ常に欠けた形になる。
+  // ft 系には最初からあったのに evex 系は evex-3.5 まで無かった。
+  //
+  // **申告が空の世代には何も置かない。**語彙に `<|c0|>` が無い evex-3.5 以前に
+  // 渡すとバイトに分解されて、窓の先頭から形が崩れる。
+  const channel = channelTokenOf(channelId, scheme);
+
   return {
-    prompt: buildPrompt(turns, trailing),
+    prompt: `${channel ?? ''}${buildPrompt(turns, trailing)}`,
     // 末尾に置いたトークンを渡す。同じ人の連投は残し、他人が喋り出したら切る
     cut: (text) => ownTurns(text, trailing),
     trailing,
     as
   };
+}
+
+/**
+ * チャンネル ID をその世代のチャンネルトークンに直す。
+ *
+ * 順位表 (channels.json) は ft 系の `#chN` と**同じもの**を使う。何個まで名前を
+ * 持つかは**モデルの申告**に従う — 順位表だけ増やしても、語彙に無いトークンは
+ * 渡せない。
+ */
+function channelTokenOf(channelId, scheme) {
+  const tokens = scheme?.channels ?? [];
+  if (!tokens.length || !channelId) return null;
+
+  const rank = channelRankOf(channelId, tokens.length);
+  return rank == null ? scheme.channelOverflow ?? null : tokens[rank];
 }
 
 /**
@@ -215,7 +240,7 @@ export async function buildMimicPrompt(
 ) {
   return await mimicFormat(engine) === 'plain'
     ? plainRequest(messages, { wanted, channelId, selfId })
-    : tokenRequest(messages, { wanted, engine, selfId });
+    : tokenRequest(messages, { wanted, engine, channelId, selfId });
 }
 
 // 自分の返答に付けている `-# evex-1 / たこ として` を落とす。
