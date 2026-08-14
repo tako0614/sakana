@@ -242,7 +242,16 @@ def env_for(size):
             "LLM_HEADS": str(heads), "LLM_CONTEXT": str(context)}}
 
 
-def bench(size, batch=24, compile_on=False, strict=True):
+# batch と compile。**実測で決めた既定** (t4-small / 18.88M):
+#   batch 24            56,194 tok/s
+#   batch 48            OOM (語彙ヘッドの logits が 2.25 GiB)
+#   batch 48 + compile  74,140 tok/s  ← compile は速いだけでなくメモリも減る
+#   batch 96 + compile  OOM
+BATCH = int(os.environ.get("EVEX_BATCH", 48))
+COMPILE = os.environ.get("EVEX_COMPILE", "1") == "1"
+
+
+def bench(size, batch=BATCH, compile_on=COMPILE, strict=True):
     """実測の tok/s を返す。**本番の前に必ず通す。**
 
     Kaggle の週枠は 30 時間で、残りが 1 時間ということが普通にある。
@@ -293,7 +302,7 @@ def epochs_for(rate, minutes, tokens=TRAIN_TOKENS, hi=6):
     return max(1, min(hi, fits))
 
 
-def run(size, epochs, batch=24, lr="1e-3", train_name="train", init=None, tag="",
+def run(size, epochs, batch=BATCH, lr="1e-3", train_name="train", init=None, tag="",
         max_tokens=0):
     """学習して出力ディレクトリを返す。
 
@@ -316,7 +325,7 @@ def run(size, epochs, batch=24, lr="1e-3", train_name="train", init=None, tag=""
         cmd += ["--wd-mode", os.environ["EVEX_WD"]]
     if os.environ.get("EVEX_SPEAKER_LR"):
         cmd += ["--speaker-lr-cap", os.environ["EVEX_SPEAKER_LR"]]
-    if os.environ.get("EVEX_COMPILE") == "1":
+    if COMPILE:
         cmd += ["--compile"]
 
     print("\\n$ " + " ".join(cmd), flush=True)
@@ -365,6 +374,14 @@ RESUME = os.environ.get("EVEX_RESUME")
 # 実測: 段1 ×1 + 段2 ×6 で evex に触れる計算量が 57%
 PRE_MINUTES = float(os.environ.get("EVEX_PRE_MIN", 56))
 FT_MINUTES = float(os.environ.get("EVEX_FT_MIN", 58))
+
+# 学習率。**batch を上げたら合わせて上げる。**batch 24 → 48 で 1 step あたりの
+# トークンが倍になるぶん、同じトークン数での更新回数が半分になる。
+# 教科書どおり sqrt(2) 倍にしておく (線形だと上げ過ぎで崩れやすい)。
+# 既定は batch 48 前提の値。batch 24 で回すなら 1e-3 / 3e-4 / 1e-4 に戻す
+PRE_LR = os.environ.get("EVEX_PRE_LR", "1.4e-3")
+FT_LR = os.environ.get("EVEX_FT_LR", "4.2e-4")
+S3_LR = os.environ.get("EVEX_S3_LR", "1.4e-4")
 
 # --- 速度を振る ---
 #
@@ -467,7 +484,7 @@ else:
     # **段1: 外部の会話 + 素の evex で土台を作る。**
     pre_epochs = epochs_for(rate, PRE_MINUTES, tokens=PRETRAIN_TOKENS, hi=3)
     print(f"\\n段1 {{rate:,.0f}} tok/s → {{PRE_MINUTES:.0f}} 分で {{pre_epochs}} epoch", flush=True)
-    stage1 = run(SIZE, pre_epochs, lr="1e-3", train_name="pretrain", tag="-pre")
+    stage1 = run(SIZE, pre_epochs, lr=PRE_LR, train_name="pretrain", tag="-pre")
     push(stage1, "pretrain")
 
     init = last_ckpt(stage1)
@@ -476,7 +493,7 @@ else:
 
     # **段2 A: 段1 から続ける (本命)。**lr は段1 の 1/3 から
     print(f"\\n段2 A (段1 から) {{FT_MINUTES:.0f}} 分で {{ft_epochs}} epoch / 初期値 {{init}}", flush=True)
-    stage2 = run(SIZE, ft_epochs, lr="3e-4", init=init, tag="-ft")
+    stage2 = run(SIZE, ft_epochs, lr=FT_LR, init=init, tag="-ft")
     push(stage2, "evex4-s2")
 
     # **段3: リアクションの付いた切り出しだけ。**サーバーが実際に反応した発言で
@@ -492,13 +509,13 @@ else:
             s3_epochs = int(os.environ.get("EVEX_S3_EPOCHS", 2))
             print(f"\\n段3 (リアクション {{REACTED_TOKENS:,}} tok) {{s3_epochs}} epoch / "
                   f"初期値 {{init2}}", flush=True)
-            push(run(SIZE, s3_epochs, lr="1e-4", train_name="reacted", init=init2,
+            push(run(SIZE, s3_epochs, lr=S3_LR, train_name="reacted", init=init2,
                      tag="-re"), "evex4")
 
     # **段2 B: ゼロから (対照)。**これが無いと外部データが効いたか分からない
     if os.environ.get("EVEX_CONTROL", "1") == "1":
         print(f"\\n段2 B (ゼロから / 対照) {{ft_epochs}} epoch", flush=True)
-        push(run(SIZE, ft_epochs, lr="1e-3", tag="-scratch"), "control")
+        push(run(SIZE, ft_epochs, lr=PRE_LR, tag="-scratch"), "control")
 
 print("\\n完了", flush=True)
 '''
