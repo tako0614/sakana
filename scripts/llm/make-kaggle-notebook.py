@@ -66,8 +66,8 @@ os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
 
 # --- ゼロから学習 (evex-3) ---
 
-EVEX_PUSH = "tako080614/evex-3"
-CORPUS_DIR = "corpus-v4"
+EVEX_PUSH = "tako080614/evex-3.5"
+CORPUS_DIR = "corpus-v5"
 
 EVEX_INTRO = f"""# evex-3 — このサーバーのログだけで一から学習する
 
@@ -180,7 +180,17 @@ print("pushed {prefix} → https://huggingface.co/{EVEX_PUSH} (private)", flush=
 # データセットに置いて、ノートブック側は 6 行だけにする。**
 # 貼るのが 6 行なら手でもすぐ直せるし、中身を直すのは HF に上げ直すだけで済む。
 
-RUNNER = f'''"""evex-3 を GPU で回す。Kaggle でも HF Jobs でも同じものが動く。
+RUNNER = f'''# /// script
+# requires-python = ">=3.10"
+# dependencies = ["torch", "numpy", "sentencepiece", "huggingface_hub"]
+# ///
+"""evex-3.5 を GPU で回す。Kaggle でも HF Jobs でも同じものが動く。
+
+HF Jobs:
+    hf jobs uv run --flavor l4x1 --secrets HF_TOKEN --timeout 2h dist/evex-3-run.py
+
+上の PEP 723 ヘッダを uv が読んで依存を入れる。torch は既定の wheel に
+CUDA が同梱されているので、それでそのまま GPU が使える。
 
 ノートブック側はこれだけ:
 
@@ -202,7 +212,7 @@ from huggingface_hub import HfApi, snapshot_download
 
 DATASET = "{DATASET}"
 PUSH = "{EVEX_PUSH}"
-CORPUS = "{CORPUS_DIR}"
+CORPUS = os.environ.get("EVEX_CORPUS", "{CORPUS_DIR}")
 TOKEN = os.environ["HF_TOKEN"]
 
 # 実トークン数 (train-tokenizer.py が測った値)。持ち時間から epoch を逆算する。
@@ -238,14 +248,26 @@ def bench(size, batch=24):
     """
     cmd = [sys.executable, "train.py", "--corpus", CORPUS, "--batch", str(batch), "--bench"]
     print("\\n$ " + " ".join(cmd), flush=True)
-    done = subprocess.run(cmd, env=env_for(size), check=True,
-                          capture_output=True, text=True)
-    print(done.stdout[-2000:], flush=True)
 
-    for line in done.stdout.splitlines():
+    # **握りつぶさずに流す。**capture_output にしていたら、l4x1 で
+    # 「cuda を使わない」と出ていたのが見えないまま CPU で 24 分回り続けた。
+    # 1 行ずつ出しながら、必要な行だけ拾う
+    rate = None
+    proc = subprocess.Popen(cmd, env=env_for(size), stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+    for line in proc.stdout:
+        print(line.rstrip(), flush=True)
         if line.startswith("実測"):
-            return float(line.split()[1].replace(",", "").replace("tok/s", ""))
-    raise RuntimeError("bench の tok/s を読めなかった")
+            rate = float(line.split()[1].replace(",", "").replace("tok/s", ""))
+    proc.wait()
+    if rate is None:
+        raise RuntimeError("bench の tok/s を読めなかった")
+
+    # **GPU に乗らなかったら止める。**CPU で回すと 1 本 10 時間コースで、
+    # 課金だけ進んで何も残らない
+    if rate < 20_000:
+        raise SystemExit(f"{{rate:,.0f}} tok/s しか出ていない。GPU に乗っていない可能性が高いので止める")
+    return rate
 
 
 def epochs_for(rate, minutes, tokens=TRAIN_TOKENS, hi=6):
@@ -309,38 +331,50 @@ def push(out, prefix):
 
 SIZE = (384, 8, 6, 1024)    # evex-3.5  約 18.9M (語彙 12288 で埋め込みが 4.72M)
 
-# 持ち時間 (分)。Kaggle の週枠に合わせて配る
+# **既に押してある重みから続ける。**段1 をやり直さないための経路。
+#   EVEX_RESUME=evex35   … evex-3.5/evex35 の最終 epoch から段2 を延長する
+RESUME = os.environ.get("EVEX_RESUME")
+
 PRE_MINUTES = float(os.environ.get("EVEX_PRE_MIN", 30))
 FT_MINUTES = float(os.environ.get("EVEX_FT_MIN", 22))
 
 rate = bench(SIZE)
-
-# **段1: 外部の会話 + 素の evex で土台を作る。**
-pre_epochs = epochs_for(rate, PRE_MINUTES, tokens=PRETRAIN_TOKENS, hi=3)
-print(f"\\n段1 {{rate:,.0f}} tok/s → {{PRE_MINUTES:.0f}} 分で {{pre_epochs}} epoch", flush=True)
-stage1 = run(SIZE, pre_epochs, lr="1e-3", train_name="pretrain", tag="-pre")
-push(stage1, "pretrain")
-
-init = last_ckpt(stage1)
-if init is None:
-    raise SystemExit("段1 のチェックポイントが無いので段2 に進めない")
-
 ft_epochs = epochs_for(rate, FT_MINUTES, tokens=TRAIN_TOKENS, hi=4)
 
-# **段2 A: 段1 から続ける (本命)。**ここで分布が evex に戻る。
-# lr は段1 の 1/3 から。同じ 1e-3 で回すと土台を壊す
-print(f"\\n段2 A (段1 から) {{FT_MINUTES:.0f}} 分で {{ft_epochs}} epoch / 初期値 {{init}}", flush=True)
-push(run(SIZE, ft_epochs, lr="3e-4", init=init, tag="-ft"), "evex35")
+if RESUME:
+    # 押してある重みを落として初期値にする。lr は段2 の続きなので低めから
+    got = snapshot_download(repo_id=PUSH, local_dir="resume",
+                            allow_patterns=[RESUME + "/*"], token=TOKEN)
+    found = sorted(Path(got, RESUME).glob("ckpt-e*.pt"),
+                   key=lambda p: int(p.stem.removeprefix("ckpt-e")))
+    if not found:
+        raise SystemExit(f"{{RESUME}} にチェックポイントが無い")
+    # EVEX_TAG で押し先を分ける。段2 の延長なら "-long"、段3 なら "-anon" など
+    tag = os.environ.get("EVEX_TAG", "long")
+    lr = os.environ.get("EVEX_LR", "1.5e-4")
+    print(f"\\n{{RESUME}} の続き {{ft_epochs}} epoch / lr {{lr}} / 初期値 {{found[-1]}} / "
+          f"corpus {{CORPUS}}", flush=True)
+    push(run(SIZE, ft_epochs, lr=lr, init=str(found[-1]), tag="-" + tag), RESUME + "-" + tag)
 
-# **段2 B: ゼロから (対照)。**
-#
-# これが無いと「外部データが効いたか」を永久に知らないまま出すことになる。
-# サイズのときと同じ失敗 — あのときは対照を回したから「効いていない」と分かった。
-# **A が B に勝っていなければ外部データは捨てて evex-3 の路線に戻す。**
-# 段2 は短いので対照込みでも +22 分で済む。
-if os.environ.get("EVEX_CONTROL", "1") == "1":
-    print(f"\\n段2 B (ゼロから / 対照) {{ft_epochs}} epoch", flush=True)
-    push(run(SIZE, ft_epochs, lr="1e-3", tag="-scratch"), "control")
+else:
+    # **段1: 外部の会話 + 素の evex で土台を作る。**
+    pre_epochs = epochs_for(rate, PRE_MINUTES, tokens=PRETRAIN_TOKENS, hi=3)
+    print(f"\\n段1 {{rate:,.0f}} tok/s → {{PRE_MINUTES:.0f}} 分で {{pre_epochs}} epoch", flush=True)
+    stage1 = run(SIZE, pre_epochs, lr="1e-3", train_name="pretrain", tag="-pre")
+    push(stage1, "pretrain")
+
+    init = last_ckpt(stage1)
+    if init is None:
+        raise SystemExit("段1 のチェックポイントが無いので段2 に進めない")
+
+    # **段2 A: 段1 から続ける (本命)。**lr は段1 の 1/3 から
+    print(f"\\n段2 A (段1 から) {{FT_MINUTES:.0f}} 分で {{ft_epochs}} epoch / 初期値 {{init}}", flush=True)
+    push(run(SIZE, ft_epochs, lr="3e-4", init=init, tag="-ft"), "evex35")
+
+    # **段2 B: ゼロから (対照)。**これが無いと外部データが効いたか分からない
+    if os.environ.get("EVEX_CONTROL", "1") == "1":
+        print(f"\\n段2 B (ゼロから / 対照) {{ft_epochs}} epoch", flush=True)
+        push(run(SIZE, ft_epochs, lr="1e-3", tag="-scratch"), "control")
 
 print("\\n完了", flush=True)
 '''
@@ -361,8 +395,16 @@ def embed(name):
 
 
 if MODE == "runner":
+    # **PEP 723 は必ずファイルの先頭。**uv はここしか読まない。
+    # 埋め込んだ本体より前に置かないと、依存が入らないまま起動して落ちる
+    header = (
+        "# /// script\n"
+        '# requires-python = ">=3.10"\n'
+        '# dependencies = ["torch", "numpy", "sentencepiece", "huggingface_hub"]\n'
+        "# ///\n\n"
+    )
     # 本体を文字列として先頭に置く。書き出す側と書き出される側を 1 ファイルにする
-    body = "".join(
+    body = header + "".join(
         f"{name.removesuffix('.py').upper()}_PY = r'''"
         + (LLM / name).read_text(encoding="utf8").replace("'''", "\\x27\\x27\\x27")
         + "'''\n\n"

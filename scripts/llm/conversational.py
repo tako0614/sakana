@@ -84,6 +84,8 @@ REPLY_MARK = re.compile(r"^<\|re\|>(?:<\|s\d+\|>|<\|other\|>|<\|[a-hz]\|>)?")
 WORD = re.compile(r"[一-龥ァ-ヶー]{2,}|[A-Za-z][A-Za-z0-9_.-]{2,}")
 POLITE = re.compile(r"(です|ます|ください|ましょう|でしょう)[。！？\s]*$")
 MARKDOWN = re.compile(r"^[-*#>]|\*\*")
+# 逐語コピーとみなす最短。これ未満は相槌なので数えない (上の説明を見ること)
+VERBATIM_MIN = 20
 # なりきり掲示板の地の文 (`（微笑み` `（首こてん`)。evex-3.5 で外部データを
 # 混ぜたので、その口調が漏れていないかを見る。
 #
@@ -152,8 +154,16 @@ def score(texts):
         "stage": sum(1 for t in texts if STAGE.search(t)) / len(texts),
         "oov": (sum(1 for w in words if w not in vocab) / len(words)) if words else 0.0,
         # 学習データの発言と完全一致。「その人が言いそうなこと」ではなく
-        # 「実際に言ったこと」を出していたら、それは覚えただけ
-        "verbatim": sum(1 for t in texts if t in train_set) / len(texts),
+        # 「実際に言ったこと」を出していたら、それは覚えただけ。
+        #
+        # **短い相槌を数えてはいけない。**閾値なしで測ったとき evex-3.5 の
+        # なりきりが 25.3% と出たが、中身は 14 件すべてが 10 字以下で
+        # `あ` (学習に1877回) `それはそ` (114回) `多分だけど` (18回) だった。
+        # 21字以上の一致は 0 件。**誰でも言う短文が偶然一致していただけ**で、
+        # 「実在の人の発言を丸写しした」ではない。
+        # なりきりの方が高く出るのも、短い相槌を返しやすいからにすぎなかった。
+        "verbatim": (sum(1 for t in texts if len(t) >= VERBATIM_MIN and t in train_set)
+                     / len(texts)),
         "chars": sum(len(t) for t in texts) / len(texts),
     }
 

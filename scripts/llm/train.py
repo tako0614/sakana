@@ -137,20 +137,28 @@ def cuda_usable():
     """torch.cuda.is_available() だけでは足りない。
 
     GTX 960 (sm_52) では is_available() が True を返すのに、カーネルを起動すると
-    「no kernel image is available」で落ちる。PyTorch 2.13+cu130 が持っているのは
-    sm_75 以上で、Maxwell 世代は含まれていない。実際に対応表と突き合わせる。
+    「no kernel image is available」で落ちる。
+
+    **対応表との突き合わせではなく、実際にカーネルを起動して確かめる。**
+    以前は `get_device_capability()` が `get_arch_list()` に**完全一致**するかを
+    見ていたが、それだと L4 (sm_89) を弾いた — wheel が sm_80/86/90 を積んでいて
+    sm_89 が一覧に無くても、PTX から JIT されて普通に動く。
+    HF Jobs の l4x1 で静かに CPU に落ち、200 step の bench が 24 分たっても
+    終わらなかった (しかも bench は出力を握っていたので理由が見えなかった)。
     """
     if not torch.cuda.is_available():
         return False
 
-    have = torch.cuda.get_device_capability(0)
-    supported = {tuple(int(c) for c in a.removeprefix("sm_")) for a in torch.cuda.get_arch_list()}
-    if have in supported:
+    try:
+        probe = torch.zeros(64, 64, device="cuda")
+        (probe @ probe).sum().item()          # 同期させて実際に起動を確かめる
         return True
-
-    print(f"cuda を使わない: この GPU は sm_{have[0]}{have[1]} だが "
-          f"PyTorch が持っているのは {sorted(torch.cuda.get_arch_list())}")
-    return False
+    except Exception as error:                # noqa: BLE001
+        have = torch.cuda.get_device_capability(0)
+        print(f"cuda を使わない: sm_{have[0]}{have[1]} でカーネルが起動しない "
+              f"({type(error).__name__}: {error})。"
+              f"PyTorch が持っているのは {sorted(torch.cuda.get_arch_list())}")
+        return False
 
 
 picked = args.device

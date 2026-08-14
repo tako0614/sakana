@@ -306,7 +306,10 @@ let longChars = 0;
 // 名前持ちと役が交互になる
 for (let round = 0; round < QA_ROUNDS; round += 1) {
   qaExcerpts.forEach((turns, i) => {
-    const used = (i + round) % EXCERPT.qaAnonEvery === 1 ? anonymise(turns) : turns;
+    // **1 は「全部」。**素朴に `% 1 === 1` と書くと 1 本も匿名化されない
+    // (x % 1 は常に 0)。段3 で切り出しだけ全匿名にするのに 1 を使う
+    const anon = EXCERPT.qaAnonEvery <= 1 || (i + round) % EXCERPT.qaAnonEvery === 1;
+    const used = anon ? anonymise(turns) : turns;
     const text = wrap(used);
     qaChars += text.length;
     train.push({ at: cutoff - 1, turns: used, text });
@@ -316,7 +319,8 @@ for (let round = 0; round < QA_ROUNDS; round += 1) {
 // 長い発言は 4 本に 1 本だけ (残りは名前持ちのまま = なりきりの材料)
 for (let round = 0; round < LONG_ROUNDS; round += 1) {
   longExcerpts.forEach((turns, i) => {
-    const used = (i + round) % EXCERPT.longAnonEvery === 0 ? anonymise(turns) : turns;
+    const anon = EXCERPT.longAnonEvery <= 1 || (i + round) % EXCERPT.longAnonEvery === 0;
+    const used = anon ? anonymise(turns) : turns;
     const text = wrap(used);
     longChars += text.length;
     train.push({ at: cutoff - 1, turns: used, text });
