@@ -34,7 +34,13 @@ export const EXCERPT = {
   longAnonEvery: Number(process.env.LLM_LONG_ANON_EVERY ?? 4),
   // 噛み合いを匿名の役に移す割合 (2本に1本)。bot は既定で匿名の役で喋るのに、
   // 噛み合いの信号の 88.1% が名前持ちだったので、半分をそちらに寄せる
-  qaAnonEvery: Number(process.env.LLM_QA_ANON_EVERY ?? 2)
+  qaAnonEvery: Number(process.env.LLM_QA_ANON_EVERY ?? 2),
+  // リアクションが何個付いていたら「サーバーが反応した」とみなすか。
+  // 1 個以上で 22,667 件 (人間の発言の 3.8%)、3 個以上だと 2,728 件しか無い
+  reactedMin: Number(process.env.LLM_REACTED_MIN ?? 1),
+  // リアクションの切り出しを匿名の役に移す割合 (4本に1本)。長い発言と同じ扱い —
+  // 「サーバーが反応した発言」は個人の声そのものなので、なりきりの材料として残す
+  reactedAnonEvery: Number(process.env.LLM_REACTED_ANON_EVERY ?? 4)
 };
 
 const ENDS_WITH_QUESTION = /[?？][\s　]*$/;
@@ -88,6 +94,31 @@ export function longExcerptRanges(turns, opts = EXCERPT) {
 
   for (let i = 0; i < turns.length; i += 1) {
     if (turns[i].raw.length < longMin) continue;
+    const from = Math.max(0, i - qaContext);
+    if (i === from) continue;          // 会話の頭なら文脈が無いので使わない
+    ranges.push([from, i]);
+  }
+
+  return ranges;
+}
+
+/**
+ * **サーバーが実際に反応した発言**の索引を返す。
+ *
+ * 人間の発言 591,643 のうち 22,667 件 (3.8%) にリアクションが付いている。
+ * `長い` や `噛み合った` は「良い発言だろう」という**こちらの推測**だが、
+ * これは**サーバー自身が良いと示した**という直接の信号なので、
+ * evex らしさに近い。アーカイブには最初から入っていたのに、
+ * `export-raw.mjs` が書き出していなくて evex-1 から一度も使えていなかった。
+ *
+ * turn に `reactions`（数）が入っている必要がある。
+ */
+export function reactedExcerptRanges(turns, opts = EXCERPT) {
+  const { reactedMin, qaContext } = { ...EXCERPT, ...opts };
+  const ranges = [];
+
+  for (let i = 0; i < turns.length; i += 1) {
+    if ((turns[i].reactions ?? 0) < reactedMin) continue;
     const from = Math.max(0, i - qaContext);
     if (i === from) continue;          // 会話の頭なら文脈が無いので使わない
     ranges.push([from, i]);

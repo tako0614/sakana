@@ -84,9 +84,27 @@ const write = (line) => new Promise((resolve) => {
 });
 
 const stats = {
-  threads: 0, posts: 0, dropped_ooc: 0, dropped_explicit: 0, dropped_empty: 0,
-  truncated: 0, conversations: 0, chars: 0
+  threads: 0, skipped_threads: 0, posts: 0, dropped_ooc: 0, dropped_explicit: 0,
+  dropped_empty: 0, truncated: 0, conversations: 0, chars: 0
 };
+
+// **どのファイルを読むか。**Filtered (317MB) と Original (616MB) がある。
+//
+// Filtered は構造条件で絞った版で、落としているのは
+//   - 話者が 1 人以下 / 投稿が 10 件以下
+//   - 上位2人が全体の 90% 未満 / 一方が 60% を超える
+//   - 上位2人以外の投稿
+// つまり「きれいな 1 対 1 のなりきり」だけを残している。
+//
+// **Original を自分で緩く絞れば約2倍取れる。**同じデータセット・同じ Apache-2.0
+// なのでライセンスの追加リスクは無い。段1 は会話の土台を作るのが目的なので、
+// 3人以上の会話も 短いスレッドも材料として使える。
+const SOURCES = (process.env.LLM_RP_FILES
+  ?? 'Japanese-Roleplay-Dialogues-Filtered.jsonl').split(',').map((s) => s.trim());
+
+// Original を読むときの最低条件。Filtered の 10 件より緩くする
+const MIN_POSTS = Number(process.env.LLM_RP_MIN_POSTS ?? 4);
+const MIN_POSTERS = Number(process.env.LLM_RP_MIN_POSTERS ?? 2);
 
 /**
  * `\n` **だけ**で切って 1 行ずつ流す。
@@ -106,13 +124,32 @@ async function* lines(file) {
   if (rest) yield rest;
 }
 
-for await (const line of lines(path.join(src, 'Japanese-Roleplay-Dialogues-Filtered.jsonl'))) {
+const seenThreads = new Set();
+
+for (const file of SOURCES) {
+for await (const line of lines(path.join(src, file))) {
   if (!line.trim()) continue;
-  stats.threads += 1;
 
   const thread = JSON.parse(line);
+
+  // Filtered と Original は**同じスレッドを含む**ので、id で重複を落とす
+  if (thread.id != null) {
+    if (seenThreads.has(thread.id)) { stats.skipped_threads += 1; continue; }
+    seenThreads.add(thread.id);
+  }
+
+  // Original は絞っていないので、ここで最低条件を掛ける。
+  // 会話の交代を教えるのが目的なので「2人以上・4投稿以上」で足りる
+  const posts = thread.posts ?? [];
+  const posters = new Set(posts.map((x) => x.poster));
+  if (posts.length < MIN_POSTS || posters.size < MIN_POSTERS) {
+    stats.skipped_threads += 1;
+    continue;
+  }
+
+  stats.threads += 1;
   const rows = [];
-  for (const post of thread.posts ?? []) {
+  for (const post of posts) {
     stats.posts += 1;
     const raw = String(post.post_content ?? '').trim();
     if (OOC.test(raw)) { stats.dropped_ooc += 1; continue; }
@@ -144,11 +181,13 @@ for await (const line of lines(path.join(src, 'Japanese-Roleplay-Dialogues-Filte
     await write(text);
   }
 }
+}
 
 await new Promise((resolve) => sink.end(resolve));
 
 const fmt = (n) => n.toLocaleString();
-console.log(`スレッド        ${fmt(stats.threads)}`);
+console.log(`読んだ file     ${SOURCES.join(', ')}`);
+console.log(`スレッド        ${fmt(stats.threads)} (重複や条件外で飛ばした ${fmt(stats.skipped_threads)})`);
 console.log(`投稿            ${fmt(stats.posts)}`);
 console.log(`  OOC を除外    ${fmt(stats.dropped_ooc)}`);
 console.log(`  露骨を除外    ${fmt(stats.dropped_explicit)}`);

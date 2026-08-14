@@ -48,7 +48,20 @@ SPEAKERS = (
     if speakers_json.exists() else []
 )
 
-SYMBOLS = CONTROL + SPEAKERS + ROLES
+# チャンネルトークン。**evex 系は evex-1 から一度も入れていなかった** —
+# ft 系は窓の先頭に `#ch0..#ch15` を置いていて話題の手がかりになっていたのに、
+# evex 側は技術雑談か雑談かゲームかを知らずに書いていた。
+#
+# 人数と同じで**数はコーパスが決める**。stats.json の named_channels を読み、
+# 無ければ既定の 16。手で書くと閾値を変えたときに静かにずれる
+stats_json = CORPUS / "stats.json"
+NAMED_CHANNELS = (
+    json.loads(stats_json.read_text(encoding="utf8")).get("named_channels", 16)
+    if stats_json.exists() else 16
+)
+CHANNELS = [f"<|c{i}|>" for i in range(NAMED_CHANNELS)] + ["<|cx|>"]
+
+SYMBOLS = CONTROL + SPEAKERS + ROLES + CHANNELS
 
 train_txt = CORPUS / "train.txt"
 prefix = str(CORPUS / "tok")
@@ -62,21 +75,62 @@ prefix = str(CORPUS / "tok")
 # 既定の 3 倍だと evex 54.7M 字 ×3 = 164M 対 外部 36M で 82 対 18 になる
 # (段1 の混合比 60 対 40 とは別物。こちらは語彙の取り合いの話)。
 EVEX_WEIGHT = int(os.environ.get("LLM_TOK_EVEX_WEIGHT", 3))
-EXTRA = os.environ.get("LLM_TOK_EXTRA")          # 例: corpus-v5/external.txt
+EXTRA = os.environ.get("LLM_TOK_EXTRA")   # 複数可: "a.txt,b.txt,c.txt"
+
+# 外部が語彙の学習テキストに占める割合の上限。
+#
+# **全部入れてはいけない。**v7 の外部は 333M 字あって、evex を 3 倍にしても
+# 45 対 55 で外部の方が多くなる (v5 は 82 対 18 だった)。語彙の枠は有限なので、
+# merges がなんJ弁や字幕の言い回しに持っていかれる。配信先は evex なので、
+# 外部は「日本語の土台に要る分だけ」あれば良い。
+#
+# 足りない分を捨てるときは**先頭から切らずに等間隔で間引く** — 先頭から
+# 20M 字だけ取ると、なりきり掲示板なら最初のスレッド群だけになる
+EXTERNAL_SHARE = float(os.environ.get("LLM_TOK_EXTERNAL_SHARE", 0.18))
 
 tok_input = train_txt
 scratch = None
 if EXTRA:
+    files = [x.strip() for x in EXTRA.split(",") if x.strip()]
     scratch = CORPUS / "tok-input.txt"
+    evex_chars = 0
+    picked = []
+
     with scratch.open("w", encoding="utf8") as sink:
         evex = train_txt.read_text(encoding="utf8")
         for _ in range(max(1, EVEX_WEIGHT)):
             sink.write(evex)
+            evex_chars += len(evex)
         del evex
-        sink.write(Path(EXTRA).read_text(encoding="utf8"))
+
+        # 目標割合 p のとき外部に許す字数は  evex × p / (1 - p)
+        budget = int(evex_chars * EXTERNAL_SHARE / (1 - EXTERNAL_SHARE)) // len(files)
+
+        for name in files:
+            path = Path(name)
+            # バイト長から字数を見積もる (日本語はほぼ 3 バイト/字)。
+            # 正確に数えるには全部読む必要があり、333M 字では割に合わない
+            approx = max(1, path.stat().st_size // 3)
+            stride = max(1, -(-approx // budget))     # 切り上げ除算
+            wrote = 0
+            with path.open(encoding="utf8") as source:
+                for i, line in enumerate(source):
+                    if i % stride:
+                        continue
+                    sink.write(line)
+                    wrote += len(line)
+                    if wrote >= budget:
+                        break
+            picked.append((name, wrote, stride))
+
     tok_input = scratch
-    print(f"語彙の学習テキスト: {train_txt} ×{EVEX_WEIGHT} + {EXTRA} "
-          f"= {scratch.stat().st_size / 1e6:.0f} MB")
+    total_external = sum(w for _, w, _ in picked)
+    print(f"語彙の学習テキスト: {train_txt} ×{EVEX_WEIGHT} = {evex_chars:,} 字")
+    for name, wrote, stride in picked:
+        print(f"  + {name:28} {wrote:>12,} 字 ({stride} 行に 1 行)")
+    print(f"  evex 対 外部 = {evex_chars / (evex_chars + total_external) * 100:.0f}"
+          f" 対 {total_external / (evex_chars + total_external) * 100:.0f}"
+          f" / 合計 {scratch.stat().st_size / 1e6:.0f} MB")
 
 spm.SentencePieceTrainer.train(
     input=str(tok_input),
@@ -178,7 +232,8 @@ stats_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2))
 
 print()
 print(f"vocab            {sp.get_piece_size()} cov={COVERAGE} "
-      f"(固定 {reserved} = 制御 {len(CONTROL)} + 話者 {len(SPEAKERS)} + 役 {len(ROLES)} + バイト等 259 / "
+      f"(固定 {reserved} = 制御 {len(CONTROL)} + 話者 {len(SPEAKERS)} + 役 {len(ROLES)}"
+      f" + ch {len(CHANNELS)} + バイト等 259 / "
       f"出現100回未満 {thin} / 未使用 {unused})")
 print(f"圧縮率           {ratio:.2f} 文字/トークン")
 print(f"train            {train['tokens']:,} トークン ({train['lines']:,} 会話)")

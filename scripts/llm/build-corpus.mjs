@@ -31,12 +31,15 @@
 // train.py が損失から外せる (--mask-tokens)。
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { createReadStream, createWriteStream } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { gunzipSync } from 'node:zlib';
 
 // 「どこを拾うか」は build-sft.mjs (Qwen 用) と同じ規則。条件を2箇所に持つとずれる
-import { EXCERPT, longExcerptRanges, responseExcerptRanges } from './excerpts.mjs';
+import {
+  EXCERPT, longExcerptRanges, reactedExcerptRanges, responseExcerptRanges
+} from './excerpts.mjs';
 
 // 会話の切り方は意味検索と同じ `splitIntoChunks` を使う。定義を2箇所に持つと必ず
 // ずれるので、ここでは実装せず import する。ただしあのモジュールは読み込み時に
@@ -70,6 +73,9 @@ const CHUNK = {
 // 3〜4 行の短い会話ばかりになり、元の長い会話が学べなくなる
 const QA_SHARE = Number(process.env.LLM_QA_SHARE ?? 0.123);
 const LONG_SHARE = Number(process.env.LLM_LONG_SHARE ?? 0.256);
+// リアクション切り出しの目標。噛み合いの半分にしておく — 件数が 22,667 と
+// 少ないので、周回数を上げすぎると同じ 2.4M 字を何度も見せることになる
+const REACTED_SHARE = Number(process.env.LLM_REACTED_SHARE ?? 0.06);
 
 // 窓の切り方を変えて増やす。**train だけに掛ける** —
 // val に掛けると中身が重複して loss の意味が変わる。
@@ -85,12 +91,20 @@ const LONG_SHARE = Number(process.env.LLM_LONG_SHARE ?? 0.256);
 //
 // 効くのは境界だけではない。`assignRoles` は会話ごとなので、まとまりが変われば
 // **名前を持たない人に付く役も変わる**。同じ発言が <|a|> でも <|c|> でも出る。
+//
+// **v7 で 3 → 5 通りに増やした。**外部が 23.3M → 167M トークンになったので、
+// 段1 の中の evex 比率も段2 に配る計算量の割合も薄まる。対処として素朴に
+// epoch を増やすと**同じ本文を見る回数が増えて丸暗記に寄る**。切り方を増やせば、
+// 増えるのは「同じ発言を違う位置・違う文脈長・違う役で見る回数」なので、
+// 逐語コピーを上げずに evex 側の材料を増やせる。
 const MINUTE = 60_000;
 const TILINGS = [
   { gapMs: 60 * MINUTE, maxMessages: 60, maxChars: 3600 },
   { gapMs: 30 * MINUTE, maxMessages: 60, maxChars: 2400 },
-  { gapMs: 120 * MINUTE, maxMessages: 60, maxChars: 5400 }
-].slice(0, Number(process.env.LLM_TILINGS ?? 3));
+  { gapMs: 120 * MINUTE, maxMessages: 60, maxChars: 5400 },
+  { gapMs: 15 * MINUTE, maxMessages: 60, maxChars: 1500 },
+  { gapMs: 180 * MINUTE, maxMessages: 60, maxChars: 7200 }
+].slice(0, Number(process.env.LLM_TILINGS ?? 5));
 
 // val は「最後の N 日ぶんの会話」。ランダム分割にしない —
 // 「草」「www」のような完全一致が 23% あるので、時間で切らないと val が嘘になる
@@ -126,7 +140,9 @@ for (const line of raw.split('\n')) {
   read += 1;
 
   // 列が 6 個の古い書き出しも読める。extra と reply_author は後から足した
-  const [ch, author, createdAt, isBot, isReply, content, , replyAuthor] = JSON.parse(line);
+  // 列が 8 個までの古い書き出しも読める。reaction_count は後から足した
+  const [ch, author, createdAt, isBot, isReply, content, , replyAuthor, reactions] =
+    JSON.parse(line);
   if (isBot) { bots += 1; continue; }
 
   const text = messageText(content);
@@ -137,6 +153,7 @@ for (const line of raw.split('\n')) {
     created_at: createdAt,
     reply: isReply,
     reply_author: replyAuthor ?? null,
+    reactions: reactions ?? 0,
     content: text,
     char_count: text.length
   });
@@ -167,6 +184,8 @@ function toTurns(chunk) {
       reply: Boolean(row.reply),
       replyTo: target,
       content: row.content,
+      // **サーバーが実際に反応した発言**の印。切り出しの判定に使う
+      reactions: row.reactions ?? 0,
       // excerpts.mjs の判定に渡す形。宛先は別に持っているので raw と body は同じ
       key: self,
       raw: row.content,
@@ -176,16 +195,39 @@ function toTurns(chunk) {
   });
 }
 
-const wrap = (turns) => `${buildPrompt(turns)}<|end|>`;
+// --- チャンネルトークン ---
+//
+// **evex 系は evex-1 から一度も入れていなかった。**ft 系は窓の先頭に
+// `#ch0..#ch15` を置いていて（上位16chで全体の97%）、話題の手がかりになっている。
+// 技術雑談か雑談かゲームかで口調も語彙も変わるのに、モデルはそれを知らずに書いていた。
+//
+// 件数の多い順に 16 個だけ名前を持ち、それ以外は `<|cx|>` に潰す。
+// **推論側も同じ順位表を使う**必要がある (channels.json の順位がそのまま対応表)。
+const NAMED_CHANNELS = Number(process.env.LLM_NAMED_CHANNELS ?? 16);
+const channels = JSON.parse(await readFile(path.join(src, 'channels.json'), 'utf8'));
+const channelRank = new Map(
+  [...channels].sort((a, b) => b.count - a.count)
+    .slice(0, NAMED_CHANNELS)
+    .map((c, rank) => [c.idx, `<|c${rank}|>`])
+);
+const CHANNEL_OVERFLOW = '<|cx|>';
+const channelToken = (ch) => channelRank.get(ch) ?? CHANNEL_OVERFLOW;
+
+// 会話の先頭にチャンネルを置く。`<|conv|>` より前に出すのは、
+// 「どのチャンネルの会話が始まる」という順序にするため
+// **`ch != null` で見る。**索引 0 は falsy なので、`ch ?` と書くと
+// 番号 0 のチャンネルだけ無タグになる (実測で train 1 行が漏れた)
+const wrap = (turns, ch = null) =>
+  `${ch != null ? channelToken(ch) : ''}${buildPrompt(turns)}<|end|>`;
 
 // 基準の切り方。val と切り出しはここからしか作らない
 const base = [];
 
-for (const rows of byChannel.values()) {
+for (const [ch, rows] of byChannel) {
   for (const chunk of splitIntoChunks(rows, CHUNK)) {
     if (chunk.length < 2) continue;              // 1 発言だけの「会話」は交代を教えない
     const turns = toTurns(chunk);
-    base.push({ at: chunk[chunk.length - 1].created_at, turns, text: wrap(turns) });
+    base.push({ at: chunk[chunk.length - 1].created_at, ch, turns, text: wrap(turns, ch) });
   }
 }
 
@@ -216,13 +258,84 @@ for (const conv of trainBase) push(conv);
 
 // 基準以外の切り方。同じ本文になった窓は落とす
 for (const cfg of TILINGS.slice(1)) {
-  for (const rows of byChannel.values()) {
+  for (const [ch, rows] of byChannel) {
     for (const chunk of splitIntoChunks(rows, cfg)) {
       if (chunk.length < 2) continue;
       const at = chunk[chunk.length - 1].created_at;
       if (at >= cutoff) continue;                // val の期間には掛けない
       const turns = toTurns(chunk);
-      push({ at, turns, text: wrap(turns) });
+      push({ at, ch, turns, text: wrap(turns, ch) });
+    }
+  }
+}
+
+// --- 返信の鎖で窓を作る ---
+//
+// ここまでの窓は**時間の輪切り**だけ。Discord は複数の話題が同時に流れるので、
+// ひとつの窓に無関係なやり取りが混ざる。返信が 113,001 件あるので、
+// **鎖をたどってスレッド単位の窓**も作る。時間の窓とは違う塊になるので、
+// 「同じ発言を違う文脈で見せる」という水増しの狙いがそのまま働く。
+//
+// **親は「返信先の本人の直近の発言」で近似する。**export-raw.mjs は message_id では
+// なく相手の author 番号だけを書き出しているので、正確な親は引けない。Discord の
+// 返信はほぼ直近の発言に付くので実害は小さく、取り違えても「その 2 人のやり取り」
+// にはなるため、話題ごとにまとめるという狙いは保てる。
+//
+// **戻って引き直すことはしない。**正確な親が要るなら export-raw.mjs に列を足して
+// アーカイブを取り直す必要があり、それは bot サーバ側の作業になる。
+const REPLY_MAX_GAP_MS = Number(process.env.LLM_REPLY_GAP_MS ?? 6 * 60 * 60 * 1000);
+const REPLY_MIN_MESSAGES = Number(process.env.LLM_REPLY_MIN ?? 3);
+
+let chainCandidates = 0;
+let chainWindows = 0;
+
+if (Number(process.env.LLM_REPLY_CHAINS ?? 1)) {
+  for (const [ch, rows] of byChannel) {
+    const lastByAuthor = new Map();
+    const parent = new Int32Array(rows.length).fill(-1);
+    const children = new Map();
+
+    rows.forEach((row, i) => {
+      if (row.reply && row.reply_author != null && row.reply_author !== row.author) {
+        const at = lastByAuthor.get(row.reply_author);
+        if (at != null && row.created_at - rows[at].created_at <= REPLY_MAX_GAP_MS) {
+          parent[i] = at;
+          if (!children.has(at)) children.set(at, []);
+          children.get(at).push(i);
+        }
+      }
+      lastByAuthor.set(row.author, i);
+    });
+
+    // 根 = 親を持たず子を持つ発言。そこから木を丸ごと集める。
+    // 枝分かれは畳んで時系列に並べ直す — 読む側は 1 本の会話しか知らない
+    for (let root = 0; root < rows.length; root += 1) {
+      if (parent[root] !== -1 || !children.has(root)) continue;
+
+      const tree = [];
+      const stack = [root];
+      while (stack.length) {
+        const i = stack.pop();
+        tree.push(i);
+        for (const c of children.get(i) ?? []) stack.push(c);
+      }
+      if (tree.length < REPLY_MIN_MESSAGES) continue;
+      chainCandidates += 1;
+
+      tree.sort((a, b) => a - b);            // rows は時系列なので索引順 = 時系列
+      const picked = tree.map((i) => rows[i]);
+
+      // 長い鎖は件数と字数だけで割る。**沈黙では切らない** (Infinity) —
+      // 返信で繋がっている以上、間が空いていても同じ話題
+      for (const chunk of splitIntoChunks(picked, { ...CHUNK, gapMs: Infinity })) {
+        if (chunk.length < REPLY_MIN_MESSAGES) continue;
+        const at = chunk[chunk.length - 1].created_at;
+        if (at >= cutoff) continue;          // val の期間には掛けない
+        const turns = toTurns(chunk);
+        const before = train.length;
+        push({ at, ch, turns, text: wrap(turns, ch) });
+        if (train.length > before) chainWindows += 1;
+      }
     }
   }
 }
@@ -267,16 +380,23 @@ function anonymise(turns) {
   }));
 }
 
-const slice = (turns, [from, to]) => turns.slice(from, to + 1);
+// 切り出しは**元の会話のチャンネルを引き継ぐ**。落とすと `<|cx|>` 扱いになって、
+// せっかく足したチャンネルの信号が切り出しのぶんだけ薄まる
+const slice = (conv, [from, to]) => ({ turns: conv.turns.slice(from, to + 1), ch: conv.ch });
 
 const qaExcerpts = trainBase.flatMap((conv) =>
-  responseExcerptRanges(conv.turns).map((range) => slice(conv.turns, range)));
+  responseExcerptRanges(conv.turns).map((range) => slice(conv, range)));
 const longExcerpts = trainBase.flatMap((conv) =>
-  longExcerptRanges(conv.turns).map((range) => slice(conv.turns, range)));
+  longExcerptRanges(conv.turns).map((range) => slice(conv, range)));
+// **サーバーが実際に反応した発言。**`長い` や `噛み合った` はこちらの推測だが、
+// これはサーバー自身が良いと示した直接の信号
+const reactedExcerpts = trainBase.flatMap((conv) =>
+  reactedExcerptRanges(conv.turns).map((range) => slice(conv, range)));
 
-const sizeOf = (list) => list.reduce((sum, turns) => sum + wrap(turns).length, 0);
+const sizeOf = (list) => list.reduce((sum, x) => sum + wrap(x.turns, x.ch).length, 0);
 const qaPerRound = sizeOf(qaExcerpts);
 const longPerRound = sizeOf(longExcerpts);
+const reactedPerRound = sizeOf(reactedExcerpts);
 
 /**
  * 目標の割合に一番近い周回数の組を選ぶ。
@@ -288,42 +408,62 @@ function pickRounds() {
   let best = null;
   for (let nQa = 1; nQa <= 3; nQa += 1) {
     for (let nLong = 1; nLong <= 3; nLong += 1) {
-      const total = tiledChars + nQa * qaPerRound + nLong * longPerRound;
-      const error = ((nQa * qaPerRound / total) - QA_SHARE) ** 2
-        + ((nLong * longPerRound / total) - LONG_SHARE) ** 2;
-      if (!best || error < best.error) best = { nQa, nLong, error };
+      for (let nRe = 1; nRe <= 3; nRe += 1) {
+        const total = tiledChars + nQa * qaPerRound + nLong * longPerRound
+          + nRe * reactedPerRound;
+        const error = ((nQa * qaPerRound / total) - QA_SHARE) ** 2
+          + ((nLong * longPerRound / total) - LONG_SHARE) ** 2
+          + ((nRe * reactedPerRound / total) - REACTED_SHARE) ** 2;
+        if (!best || error < best.error) best = { nQa, nLong, nRe, error };
+      }
     }
   }
   return best;
 }
 
-const { nQa: QA_ROUNDS, nLong: LONG_ROUNDS } = pickRounds();
+const { nQa: QA_ROUNDS, nLong: LONG_ROUNDS, nRe: REACTED_ROUNDS } = pickRounds();
 
 let qaChars = 0;
 let longChars = 0;
+let reactedChars = 0;
 
 // 噛み合いは 2 本に 1 本を匿名化。周ごとにずらすので、同じ切り出しの複製は
 // 名前持ちと役が交互になる
 for (let round = 0; round < QA_ROUNDS; round += 1) {
-  qaExcerpts.forEach((turns, i) => {
+  qaExcerpts.forEach((x, i) => {
     // **1 は「全部」。**素朴に `% 1 === 1` と書くと 1 本も匿名化されない
-    // (x % 1 は常に 0)。段3 で切り出しだけ全匿名にするのに 1 を使う
+    // (x % 1 は常に 0)。切り出しだけ全匿名にするのに 1 を使う
     const anon = EXCERPT.qaAnonEvery <= 1 || (i + round) % EXCERPT.qaAnonEvery === 1;
-    const used = anon ? anonymise(turns) : turns;
-    const text = wrap(used);
+    const used = anon ? anonymise(x.turns) : x.turns;
+    const text = wrap(used, x.ch);
     qaChars += text.length;
-    train.push({ at: cutoff - 1, turns: used, text });
+    train.push({ at: cutoff - 1, ch: x.ch, turns: used, text });
   });
 }
 
 // 長い発言は 4 本に 1 本だけ (残りは名前持ちのまま = なりきりの材料)
 for (let round = 0; round < LONG_ROUNDS; round += 1) {
-  longExcerpts.forEach((turns, i) => {
+  longExcerpts.forEach((x, i) => {
     const anon = EXCERPT.longAnonEvery <= 1 || (i + round) % EXCERPT.longAnonEvery === 0;
-    const used = anon ? anonymise(turns) : turns;
-    const text = wrap(used);
+    const used = anon ? anonymise(x.turns) : x.turns;
+    const text = wrap(used, x.ch);
     longChars += text.length;
-    train.push({ at: cutoff - 1, turns: used, text });
+    train.push({ at: cutoff - 1, ch: x.ch, turns: used, text });
+  });
+}
+
+// **リアクションの付いた発言。**段3 でここだけを流すので、
+// train に混ぜるぶんとは別に `reacted` にも溜めておく
+const reacted = [];
+for (let round = 0; round < REACTED_ROUNDS; round += 1) {
+  reactedExcerpts.forEach((x, i) => {
+    const anon = EXCERPT.reactedAnonEvery <= 1
+      || (i + round) % EXCERPT.reactedAnonEvery === 0;
+    const used = anon ? anonymise(x.turns) : x.turns;
+    const text = wrap(used, x.ch);
+    reactedChars += text.length;
+    train.push({ at: cutoff - 1, ch: x.ch, turns: used, text });
+    if (round === 0) reacted.push(text);
   });
 }
 
@@ -374,35 +514,109 @@ await writeFile(path.join(dst, 'val.txt'), `${val.map((c) => c.text).join('\n')}
 const baseLines = trainBase.map((c) => c.text);
 await writeFile(path.join(dst, 'base.txt'), `${baseLines.join('\n')}\n`);
 
+// **段1 の中の evex 比率を目標で固定する。**
+//
+// 外部を増やすほど段1 の evex が薄まる。v5 は 5.2M / 23.3M = 22% だったが、
+// v7 は外部が 3 倍になるので素のままだと 6.7% で、**147 個の話者トークンが
+// 段1 で 1 周しか勾配を受けない**。段2 で戻すとはいえ、初期値に近いまま
+// 段2 に渡すのは損。
+//
+// 足りない分は**同じ本文を繰り返さず、別の切り方と返信の鎖から足す**
+// (train の先頭 tiledCount 件 = 切り出しを除いた窓の水増し全部)。
+// 同じ発言が違う位置・違う文脈長・違う役で出るので、素朴な複製より効く。
+// プールを使い切ったら初めて先頭から巡回する。
+const BASE_SHARE = Number(process.env.LLM_BASE_SHARE ?? 0.15);
+
+const evexPool = train.slice(0, tiledCount).map((c) => c.text);
+const poolChars = evexPool.reduce((sum, l) => sum + l.length, 0);
+
 let pretrainStats = null;
-const externalPath = process.env.LLM_EXTERNAL ?? null;
 
-if (externalPath) {
-  const externalText = await readFile(externalPath, 'utf8');
-  const externalLines = externalText.split('\n').filter(Boolean);
+// **複数受ける。**v7 では なりきり掲示板 と JESC 字幕 の 2 本を混ぜる。
+// 1 本しか受けない作りのままだと、混ぜるのに事前の cat が要って手順が増える
+const externalPaths = (process.env.LLM_EXTERNAL ?? '')
+  .split(',').map((x) => x.trim()).filter(Boolean);
 
-  // **外部に話者トークンが混ざっていないこと。**破れると <|s0|> が
-  // なりきり掲示板の口調を覚える。ここで止める
-  const leaked = externalLines.reduce((n, line) => n + (/<\|s\d+\|>/.test(line) ? 1 : 0), 0);
-  if (leaked > 0) {
-    throw new Error(`外部データに話者トークンが ${leaked} 行ある。build-external.mjs を直す`);
+if (externalPaths.length) {
+  // **流しながら書く。**外部は 200M 字を超えるので、全部を配列に持つと
+  // 文字列だけで GB 級になる (最初 `push(...lines)` で call stack も溢れた)。
+  const sink = createWriteStream(path.join(dst, 'pretrain.txt'), { encoding: 'utf8' });
+  const emit = (line) => new Promise((resolve) => {
+    if (sink.write(`${line}\n`)) resolve();
+    else sink.once('drain', resolve);
+  });
+
+  const perFile = [];
+  let externalConversations = 0;
+  let externalChars = 0;
+
+  for (const file of externalPaths) {
+    let conversations = 0;
+    let fileChars = 0;
+    let leaked = 0;
+    let rest = '';
+
+    // `\n` だけで切る。readline は U+2028 / U+2029 / U+0085 も行終端にする
+    for await (const chunk of createReadStream(file, { encoding: 'utf8' })) {
+      const parts = (rest + chunk).split('\n');
+      rest = parts.pop();
+      for (const line of parts) {
+        if (!line) continue;
+        // **外部に話者トークンが混ざっていないこと。**破れると <|s0|> が
+        // なりきり掲示板や字幕やなんJ の口調を覚える
+        if (/<\|s\d+\|>/.test(line)) { leaked += 1; continue; }
+        conversations += 1;
+        fileChars += line.length;
+        await emit(line);
+      }
+    }
+    if (rest) {
+      if (/<\|s\d+\|>/.test(rest)) leaked += 1;
+      else { conversations += 1; fileChars += rest.length; await emit(rest); }
+    }
+
+    if (leaked > 0) {
+      throw new Error(`${file} に話者トークンが ${leaked} 行ある。作り手のスクリプトを直す`);
+    }
+
+    perFile.push({ file, conversations, chars: fileChars });
+    externalConversations += conversations;
+    externalChars += fileChars;
   }
 
-  const pretrain = [...externalLines, ...baseLines];
-  await writeFile(path.join(dst, 'pretrain.txt'), `${pretrain.join('\n')}\n`);
+  // 目標比率 p のとき evex 側に要る字数は  外部 × p / (1 - p)
+  const wantChars = externalChars * BASE_SHARE / (1 - BASE_SHARE);
+  let evexConversations = 0;
+  let evexChars = 0;
+  for (let i = 0; evexChars < wantChars && evexPool.length; i += 1) {
+    const line = evexPool[i % evexPool.length];
+    evexConversations += 1;
+    evexChars += line.length;
+    await emit(line);
+  }
 
-  const chars = (list) => list.reduce((sum, l) => sum + l.length, 0);
-  const externalChars = chars(externalLines);
+  await new Promise((resolve) => sink.end(resolve));
+
   pretrainStats = {
-    external_file: externalPath,
-    external_conversations: externalLines.length,
+    external_files: perFile,
+    external_conversations: externalConversations,
     external_chars: externalChars,
-    base_conversations_train: baseLines.length,
-    base_chars: chars(baseLines),
-    pretrain_conversations: pretrain.length,
-    pretrain_chars: externalChars + chars(baseLines)
+    base_share_target: BASE_SHARE,
+    base_conversations_train: evexConversations,
+    base_chars: evexChars,
+    base_pool_conversations: evexPool.length,
+    base_pool_chars: poolChars,
+    base_passes: Number((evexChars / poolChars).toFixed(2)),
+    pretrain_conversations: externalConversations + evexConversations,
+    pretrain_chars: externalChars + evexChars
   };
 }
+
+// --- 段3 (evex度の仕上げ) ---
+//
+// **リアクションの付いた発言の切り出しだけ**を流す。量が小さい (見込み 2.4M 字)
+// ので過学習しやすい。lr を落として 1〜2 epoch にし、逐語コピーで見る。
+await writeFile(path.join(dst, 'reacted.txt'), `${reacted.join('\n')}\n`);
 
 // **userId と表示名が入っている。HF にはこのファイルを上げない。**
 // 公開するのは rank と件数だけ (evex-1 / evex-2 と同じ扱い)
@@ -417,6 +631,18 @@ await writeFile(path.join(dst, 'speakers.json'), JSON.stringify(
 const chars = (list) => list.reduce((sum, c) => sum + c.text.length, 0);
 const trainChars = chars(train);
 const fmt = (n) => n.toLocaleString();
+
+// リアクションの付いた人間の発言。切り出しの分母
+let reactedMessages = 0;
+for (const rows of byChannel.values()) {
+  for (const row of rows) if ((row.reactions ?? 0) >= EXCERPT.reactedMin) reactedMessages += 1;
+}
+
+// 固有トークンを持つチャンネルが発言全体のどれだけを覆うか。ft 系は上位16chで 97%
+const channelTotal = channels.reduce((sum, c) => sum + c.count, 0);
+const channelCoverage = channels
+  .filter((c) => channelRank.has(c.idx))
+  .reduce((sum, c) => sum + c.count, 0) / channelTotal;
 
 // 固有トークンで喋る発言の割合。ft 系は 96.6%
 const namedMessages = named.reduce((sum, a) => sum + a.count, 0);
@@ -445,12 +671,21 @@ const stats = {
   tiled_conversations: tiledCount,
   tiled_chars: tiledChars,
   duplicate_windows: duplicates,
+  chain_windows: chainWindows,
+  chain_candidates: chainCandidates,
+  named_channels: NAMED_CHANNELS,
+  channel_coverage: Number(channelCoverage.toFixed(4)),
   qa_excerpts: qaExcerpts.length,
   long_excerpts: longExcerpts.length,
+  reacted_excerpts: reactedExcerpts.length,
+  reacted_messages: reactedMessages,
   qa_rounds: QA_ROUNDS,
   long_rounds: LONG_ROUNDS,
+  reacted_rounds: REACTED_ROUNDS,
   qa_chars: qaChars,
   long_chars: longChars,
+  reacted_chars: reactedChars,
+  reacted_conversations: reacted.length,
   qa_min_answer: EXCERPT.qaMinAnswer,
   qa_context: EXCERPT.qaContext,
   long_min: EXCERPT.longMin,
@@ -483,19 +718,31 @@ console.log(`長い発言         ${fmt(longExcerpts.length)} を ×${LONG_ROUND
   + `(${EXCERPT.longMin} 字以上 / ${fmt(longChars)} 字 = train の `
   + `${(longChars / trainChars * 100).toFixed(1)}% / 目標 ${(LONG_SHARE * 100).toFixed(1)}% / `
   + `${EXCERPT.longAnonEvery} 本に 1 本だけ匿名化)`);
+console.log(`リアクション付き ${fmt(reactedExcerpts.length)} を ×${REACTED_ROUNDS} `
+  + `(${EXCERPT.reactedMin} 個以上 / 発言 ${fmt(reactedMessages)} 件 / ${fmt(reactedChars)} 字 = train の `
+  + `${(reactedChars / trainChars * 100).toFixed(1)}% / 目標 ${(REACTED_SHARE * 100).toFixed(1)}%)`);
+console.log(`返信の鎖         ${fmt(chainWindows)} 窓 (木 ${fmt(chainCandidates)} 本 / `
+  + `${REPLY_MIN_MESSAGES} 発言以上 / 親は直近の発言で近似)`);
+console.log(`チャンネル       ${NAMED_CHANNELS} 個に固有トークン `
+  + `(発言の ${(channelCoverage * 100).toFixed(1)}% を被覆) + 溢れ ${CHANNEL_OVERFLOW}`);
 console.log(`文字数           train ${fmt(trainChars)} / val ${fmt(chars(val))}`);
 console.log(`1 会話あたり     ${Math.round(trainChars / train.length)} 字`);
 if (pretrainStats) {
   const p = pretrainStats;
   console.log(`段1 (事前学習)   ${fmt(p.pretrain_conversations)} 会話 / ${fmt(p.pretrain_chars)} 字`);
-  console.log(`  うち外部       ${fmt(p.external_conversations)} 会話 / ${fmt(p.external_chars)} 字 `
-    + `(${(p.external_chars / p.pretrain_chars * 100).toFixed(0)}%)  ${p.external_file}`);
+  for (const f of p.external_files) {
+    console.log(`  ${f.file.padEnd(24)} ${fmt(f.conversations).padStart(9)} 会話 / `
+      + `${fmt(f.chars).padStart(11)} 字 (${(f.chars / p.pretrain_chars * 100).toFixed(0)}%)`);
+  }
   console.log(`  うち evex      ${fmt(p.base_conversations_train)} 会話 / ${fmt(p.base_chars)} 字 `
-    + `(素の会話。水増しも切り出しもしない)`);
+    + `(${(p.base_chars / p.pretrain_chars * 100).toFixed(1)}% / 目標 ${(BASE_SHARE * 100).toFixed(0)}% / `
+    + `窓の水増し ${fmt(p.base_pool_conversations)} 本を ${p.base_passes} 周。切り出しは入れない)`);
   console.log(`  話者トークンの混入 0 (確認済み)`);
 }
 console.log(`段2 (仕上げ)     ${fmt(train.length)} 会話 / ${fmt(trainChars)} 字 (evex だけ)`);
+console.log(`段3 (evex度)     ${fmt(reacted.length)} 会話 / `
+  + `${fmt(reacted.reduce((sum, t) => sum + t.length, 0))} 字 (リアクション付きだけ)`);
 
-console.log(`\n出力 ${dst}/ (train.txt / base.txt / val.txt`
+console.log(`\n出力 ${dst}/ (train.txt / base.txt / val.txt / reacted.txt`
   + `${pretrainStats ? ' / pretrain.txt' : ''} / speakers.json / stats.json)`);
 console.log('speakers.json には userId と表示名が入っている。**HF には上げない**');
