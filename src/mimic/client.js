@@ -119,6 +119,25 @@ export const ENDPOINTS = {
     maxNewTokens: number(process.env.MIMIC_V35_MAX_NEW_TOKENS, 200),
     label: process.env.MIMIC_V35_LABEL ?? 'evex-3.5',
     format: process.env.MIMIC_V35_FORMAT ?? 'auto'
+  },
+  // evex-3.5 と**同じ形・同じ語彙**で、変えたのはコーパスと学習の配分だけ。
+  // だから読み比べれば「コーパスの工夫が効いたか」がそのまま出る。
+  //
+  //   段1 の外部     23.3M → 158.1M トークン (なりきり + JESC字幕 + open2ch)
+  //   外部の形       Discord の粒度に直した (`<|re|>` 0% → 18〜25% / 連投 0% → 22〜44%)
+  //   リアクション   22,667 件を切り出しに。段3 でそこだけ流す
+  //   チャンネル     <|c0|>..<|c15|> / <|cx|> を窓の先頭に (evex 系で初)
+  //   返信の鎖       時間の輪切りに加えてスレッド単位の窓
+  //   話者の学習率   件数の幾何平均を基準に ×0.33〜×2.42
+  //
+  // **channels.json を mimic-v4/ に置くこと。**無いとチャンネルが全部
+  // `<|cx|>` に落ちて、足した信号が推論だけ死ぬ (例外は出ない)
+  'evex-4': {
+    url: process.env.MIMIC_V4_URL ?? 'http://127.0.0.1:8772',
+    timeoutMs: number(process.env.MIMIC_V4_TIMEOUT_MS, 60_000),
+    maxNewTokens: number(process.env.MIMIC_V4_MAX_NEW_TOKENS, 200),
+    label: process.env.MIMIC_V4_LABEL ?? 'evex-4',
+    format: process.env.MIMIC_V4_FORMAT ?? 'auto'
   }
 };
 

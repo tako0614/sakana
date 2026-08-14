@@ -1,0 +1,39 @@
+[Unit]
+Description=Sakana mimic evex-4 (18.9M / 語彙12288 / 三段学習 / コーパス v7)
+# evex-1 (8767) / evex-2 (8765) / evex-3 (8770) / evex-3.5 (8771) と並走させる。
+#
+# **--corpus は mimic-v4/ を指す。**evex-3 の mimic-v3/ と混ぜてはいけない —
+# 語彙が 4096 と 12288 で別物なので、取り違えると全部バイト分解されて
+# 出力が崩壊する (例外は出ない)。evex-3.5 の mimic-v35/ とは語彙の大きさは
+# 同じだが**中身が違う** (コーパス v7 で作り直した) ので、これも混ぜない。
+#
+# **mimic-v4/ に channels.json を置くこと。**evex-4 は窓の先頭に
+# `<|c0|>..<|c15|>` を置く形で学習している。無いと全部 `<|cx|>` に落ちて、
+# 話題の手がかりが推論だけ死ぬ (例外は出ない)。pack.mjs が入れる。
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/sakana
+# ファイル名は pack.mjs が置く形に合わせる (ckpt.pt / tok.model / speakers.json)。
+#   LLM_CORPUS_DIR=corpus-v7 node scripts/llm/pack.mjs <ckpt-eN.pt> dist/mimic-v4
+ExecStart=/root/sakana/.venv-llm/bin/python -u src/mimic/server.py \
+  --ckpt /root/sakana/mimic-v4/ckpt.pt \
+  --corpus /root/sakana/mimic-v4 \
+  --port 8772 \
+  --threads 3
+
+Restart=on-failure
+RestartSec=5
+
+# 18.9M の重み (76MB) + torch のランタイム。evex-1/2/3 と ft 系が並ぶので控えめに。
+# 足りずに OOM で落ちるようなら 1800M まで上げる
+MemoryMax=1500M
+CPUWeight=30
+Nice=15
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
