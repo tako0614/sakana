@@ -55,6 +55,12 @@ export const ENGINES = {
   'evex-ft-2': {
     label: 'evex-ft-2',
     summary: 'evex-ft-1 と同じ土台で、聞かれたら答えるように学習し直したもの。事実は相変わらず当てにならないが、話は受ける'
+  },
+  // 土台を Qwen3-0.6B-Base から instruct 版に変えたもの。答えの形にはなるが、
+  // なりきりの噛み合いは ft-2 より落ちる。読み比べるために並べる
+  'evex-ft-3': {
+    label: 'evex-ft-3',
+    summary: 'evex-ft-2 と同じデータで、土台を instruct 版に変えたもの。答えの形になりやすい代わりに、なりきりは ft-2 より弱い'
   }
 };
 

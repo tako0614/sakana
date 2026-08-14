@@ -72,6 +72,19 @@ export const ENDPOINTS = {
     maxNewTokens: number(process.env.MIMIC_FT2_MAX_NEW_TOKENS, 160),
     label: process.env.MIMIC_FT2_LABEL ?? 'evex-ft-2',
     format: process.env.MIMIC_FT2_FORMAT ?? 'plain'
+  },
+  // ft-2 と同じコーパス (sft-v5) で、**base を instruct 版に変えたもの**。
+  //
+  // ft-2 の不満が「間違っている」ではなく「文の体をなしていない」だったので、
+  // 答えの形にする性質を持っている instruct を土台にした。実測では狙い通り
+  // 答えの形になった (敬体の漏れは 0%) が、なりきり時の噛み合いが 55% → 33% に
+  // 落ちて逐語コピーが 13.3% に増えた。**数字では決まらないので並べて読む。**
+  'evex-ft-3': {
+    url: process.env.MIMIC_FT3_URL ?? 'http://127.0.0.1:8769',
+    timeoutMs: number(process.env.MIMIC_FT3_TIMEOUT_MS, 120_000),
+    maxNewTokens: number(process.env.MIMIC_FT3_MAX_NEW_TOKENS, 160),
+    label: process.env.MIMIC_FT3_LABEL ?? 'evex-ft-3',
+    format: process.env.MIMIC_FT3_FORMAT ?? 'plain'
   }
 };
 
