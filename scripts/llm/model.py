@@ -70,9 +70,15 @@ def apply_rope(x, cos, sin):
     cos = cos[:t].view(1, 1, t, -1)
     sin = sin[:t].view(1, 1, t, -1)
 
-    even, odd = x[..., 0::2], x[..., 1::2]
+    # **回転は fp32 で計算して、最後に x の型に戻す。**
+    #
+    # cos/sin は fp32 の buffer なので、半精度の x と掛けると結果だけ fp32 に
+    # 昇格する。そのまま返すと q/k が fp32・v が半精度で
+    # scaled_dot_product_attention に入り、型が揃わない。
+    # 精度も落とさずに済むので、計算は fp32 のまま最後に揃える。
+    even, odd = x[..., 0::2].float(), x[..., 1::2].float()
     rotated = torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1)
-    return rotated.flatten(-2)
+    return rotated.flatten(-2).to(x.dtype)
 
 
 class Attention(nn.Module):

@@ -85,6 +85,24 @@ export const ENDPOINTS = {
     maxNewTokens: number(process.env.MIMIC_FT3_MAX_NEW_TOKENS, 160),
     label: process.env.MIMIC_FT3_LABEL ?? 'evex-ft-3',
     format: process.env.MIMIC_FT3_FORMAT ?? 'plain'
+  },
+  // ゼロから学習した系の 3 代目。**tokenizer が別物**なので、corpus-v4 の
+  // tok.model を持つ専用ディレクトリで起動する (evex-1/2 の mimic/ と混ぜない)。
+  //
+  // evex-2 との違いはコーパスと大きさの両方:
+  //   話者トークン 48 → 147 (発言の被覆 85.3% → 96.6%)
+  //   返信先を <|re|><|sM|> で残す (evex-2 は「返信かどうか」だけで相手を捨てていた)
+  //   窓 15分/20件/1200字 → 60分/60件/3600字、context 512 → 1024
+  //   噛み合いと長い発言の切り出し (train の 12.5% / 24.5%)
+  //   窓の切り方 3 通りで 2.08 倍 → train 6.48M → 23.95M トークン
+  //   5.87M → 15.74M パラメータ
+  // 同じコーパスで 5.87M も回してあるので、良くなった分の出どころが分かる
+  'evex-3': {
+    url: process.env.MIMIC_V3_URL ?? 'http://127.0.0.1:8770',
+    timeoutMs: number(process.env.MIMIC_V3_TIMEOUT_MS, 60_000),
+    maxNewTokens: number(process.env.MIMIC_V3_MAX_NEW_TOKENS, 200),
+    label: process.env.MIMIC_V3_LABEL ?? 'evex-3',
+    format: process.env.MIMIC_V3_FORMAT ?? 'auto'
   }
 };
 

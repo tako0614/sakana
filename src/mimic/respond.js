@@ -71,18 +71,49 @@ const MAX_TRIES = Number(process.env.MIMIC_MAX_TRIES ?? 3);
  */
 async function tokenRequest(messages, { wanted, engine, selfId }) {
   const scheme = await roleScheme(engine);
-  const roles = assignRoles(messages.map((entry) => entry.authorId), scheme);
-  const turns = messages.map((entry) => ({
-    token: roles.get(entry.authorId),
-    reply: entry.isReply,
-    content: messageText(entry.content)
-  }));
+
+  // **学習と同じ振り方にする。**名前を持つ人は固有トークン、それ以外だけに役を配る。
+  //
+  // 以前は文脈の全員に役を配っていた。build-corpus.mjs は名前持ちを <|sN|> で
+  // 書いているので、`-akku-` が居る会話は学習時 `<|s0|>`・推論時 `<|a|>` になり、
+  // **モデルから見て別の形**だった (speakers.js の「48人ぶんが丸ごと遊んでいた」)。
+  // 申告に無いトークンは渡さないので、話者を持たない世代では今までと同じ動きになる。
+  //
+  // evex-1 も evex-2 も corpus-v1 (48人) で学習している (evex-2 の中身は
+  // `v1-lr1e-3-mask` で、v1 との違いは LR とマスクだけ) ので、3 世代とも
+  // これが学習時の形。役だけのコーパスで回した v2-base12 / v2-wd は完走していない。
+  const declared = new Set(scheme?.speakers ?? []);
+  const namedOf = (authorId) => {
+    const token = authorId ? tokenFor(authorId) : null;      // opt-out はここで null
+    return token && declared.has(token) ? token : null;
+  };
+
+  const roles = assignRoles(
+    messages.map((entry) => entry.authorId).filter((authorId) => !namedOf(authorId)),
+    scheme
+  );
+  const tokenOf = (authorId) => namedOf(authorId) ?? roles.get(authorId) ?? null;
+
+  // 誰への返信かを解決する。文脈の中に相手が居るときだけ置く —
+  // 居ない相手を指すと、モデルが一度も見ていない形になる
+  const authorOfMessage = new Map(messages.filter((e) => e.id).map((e) => [e.id, e.authorId]));
+
+  const turns = messages.map((entry) => {
+    const target = entry.replyToId ? authorOfMessage.get(entry.replyToId) ?? null : null;
+    return {
+      token: tokenOf(entry.authorId),
+      reply: entry.isReply,
+      // 自分への返信は情報が無いので置かない (build-corpus.mjs と同じ判断)
+      replyTo: target && target !== entry.authorId ? tokenOf(target) : null,
+      content: messageText(entry.content)
+    };
+  });
 
   // 申告に無いトークンは渡さない
   const token = wanted ? tokenFor(wanted) : null;
-  const as = token && scheme?.speakers?.includes(token) ? token : null;
+  const as = token && declared.has(token) ? token : null;
   // 自分が既に喋っているならその役で続ける (下の plainRequest と同じ理由)
-  const mine = selfId ? roles.get(selfId) ?? null : null;
+  const mine = selfId ? tokenOf(selfId) : null;
   const trailing = as ?? mine ?? nextRole(roles, scheme);
 
   return {
@@ -190,7 +221,10 @@ function toTurn(entry) {
     authorId: entry.author?.id ?? entry.authorId ?? null,
     isBot: entry.author?.bot ?? Boolean(entry.isBot),
     content: entry.content ?? '',
-    isReply: Boolean(entry.reference?.messageId ?? entry.replyTo)
+    isReply: Boolean(entry.reference?.messageId ?? entry.replyTo),
+    // **誰への返信かを残す。**evex-3 以降は `<|re|><|sM|>` で相手も学習している。
+    // 真偽だけ持っていた頃は、賑やかなチャンネルで噛み合いの信号を捨てていた
+    replyToId: entry.reference?.messageId ?? entry.replyTo ?? null
   };
 }
 

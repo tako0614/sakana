@@ -1,6 +1,16 @@
 """「会話できているか」と「evex のままか」を数える。
 
+    # Qwen 追加学習 (evex-ft-N)
     .venv-llm/bin/python scripts/llm/conversational.py --model <dir> --corpus sft-v5
+
+    # ゼロから学習 (evex-N)
+    .venv-llm/bin/python scripts/llm/conversational.py --evex out-384x8/ckpt-e6.pt \
+        --corpus corpus-v4 --label '<|s0|>'
+
+**2つの系統を同じ尺度に載せる**のがこの道具の要点。土台も tokenizer も違うので
+val は比べられないが、「20字以上で返したか」「話を受けたか」「実発言の丸写しか」は
+どちらにも同じ意味がある。地の値 (そのコーパス自身の val) も同じ計算で出すので、
+系統をまたいで読める。
 
 val loss は「口調が移ったか」しか測らない。evex-ft-1 は val 2.5415 まで下げたのに
 `git rebase と merge の違いって何` に `まじ？` と返す。逆に外の対話データを混ぜ過ぎると
@@ -33,14 +43,15 @@ import argparse
 import json
 import math
 import re
+import sys
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--model", required=True, help="重みのディレクトリ")
-parser.add_argument("--corpus", default="sft-v5", help="地の値と語彙を取る sft ディレクトリ")
+parser.add_argument("--model", default=None, help="Qwen 系の重みのディレクトリ")
+parser.add_argument("--evex", default=None, help="ゼロから学習した系の ckpt-eN.pt")
+parser.add_argument("--corpus", default="sft-v5", help="地の値と語彙を取るコーパス")
 parser.add_argument("--seeds", type=int, default=3)
 parser.add_argument("--max-new", type=int, default=80)
 parser.add_argument("--threads", type=int, default=10)
@@ -54,22 +65,50 @@ parser.add_argument("--judge", default=None, help="流暢さを採点させる�
 parser.add_argument("--judge-sample", type=int, default=200, help="地の値に使う val の発言数")
 args = parser.parse_args()
 
+if bool(args.model) == bool(args.evex):
+    raise SystemExit("--model か --evex のどちらか一方を指定する")
+
+EVEX = bool(args.evex)
+
 torch.set_num_threads(args.threads)
 torch.set_grad_enabled(False)
 
 corpus = Path(args.corpus)
 LINE = re.compile(r"^([^\n:]{1,12}): ([\s\S]*)$")
+# ゼロから学習した系の話者と会話の切れ目。**bot 側 ownTurns と同じ範囲で切る**
+SPEAKER = re.compile(r"<\|s\d+\|>|<\|other\|>|<\|[a-hz]\|>|<\|end\|>|<\|conv\|>|<\|re\|>")
+# 発言の頭に付く返信の印。evex-3 以降は `<|re|><|相手|>本文` の順。
+# 相手を「次の話者」と読むと本文が丸ごと落ちて、返答が空だと数えてしまう
+REPLY_MARK = re.compile(r"^<\|re\|>(?:<\|s\d+\|>|<\|other\|>|<\|[a-hz]\|>)?")
 # 内容語だけ拾う。助詞や1文字は噛み合いの判定に使えない
 WORD = re.compile(r"[一-龥ァ-ヶー]{2,}|[A-Za-z][A-Za-z0-9_.-]{2,}")
 POLITE = re.compile(r"(です|ます|ください|ましょう|でしょう)[。！？\s]*$")
 MARKDOWN = re.compile(r"^[-*#>]|\*\*")
 
 
+def plain(text):
+    """ゼロから学習した系の記号を、数えられる形に戻す。
+
+    `<nl>` だけ改行に戻し、`<url>` `<file>` はそのまま残す — bot が実際に出す形が
+    それなので、地の値と生成の両方を同じ変換に通せば比較として成り立つ。
+    """
+    return text.replace("<nl>", "\n").strip()
+
+
 def bodies(name):
-    """sft の分割から発言の本文だけを取り出す。"""
-    path = corpus / f"{name}.jsonl"
+    """コーパスから発言の本文だけを取り出す。"""
     found = []
-    for line in path.read_text(encoding="utf8").split("\n"):
+
+    if EVEX:
+        # 1 行 1 会話。話者トークンで割ると各発言の本文になる
+        for line in (corpus / f"{name}.txt").read_text(encoding="utf8").splitlines():
+            for part in SPEAKER.split(line):
+                body = plain(part)
+                if body:
+                    found.append(body)
+        return found
+
+    for line in (corpus / f"{name}.jsonl").read_text(encoding="utf8").split("\n"):
         if not line:
             continue
         for row in json.loads(line)["text"].split("\n"):
@@ -118,6 +157,12 @@ base_line = score(val_bodies)
 
 label = args.label
 if label is None:
+    # ゼロから学習した系は最多の話者トークン、Qwen 系は最多のラベル。
+    # どちらも「重みに口調が入っている人」で測る (匿名の役で測りたいときは
+    # --label '<|b|>' / --label B を渡す)
+    label = "<|s0|>" if EVEX else None
+
+if label is None:
     rows = json.loads((corpus / "labels.json").read_text(encoding="utf8"))
     rows.sort(key=lambda r: -r.get("count", 0))
     label = rows[0]["label"]
@@ -137,17 +182,58 @@ QUESTIONS = [
     "ドメインどこで取るのが安い？",
 ]
 
-tok = AutoTokenizer.from_pretrained(args.model)
-model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32)
-model.eval()
-
 NEXT_TURN = re.compile(r"\n[^\n:]{1,12}:[ 　]")
 
 
 def first_turn(text):
+    """次の話者が始まるところで切る。"""
+    if EVEX:
+        body = REPLY_MARK.sub("", text)
+        cut = SPEAKER.search(body)
+        return plain(body[: cut.start()] if cut else body)
     cut = NEXT_TURN.search(text)
     body = text[: cut.start()] if cut else text
     return body.split("\n#")[0].strip()
+
+
+if EVEX:
+    import sentencepiece as spm
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from model import Config, MicroLM
+
+    sp = spm.SentencePieceProcessor(model_file=str(corpus / "tok.model"))
+    ckpt = torch.load(args.evex, map_location="cpu", weights_only=False)
+    # チェックポイントに形が入っている。環境変数から作り直すと、学習時と違う形を
+    # 黙って読んで壊れる (state_dict の食い違いで気付くが、読めてしまう組もある)
+    model = MicroLM(Config(**ckpt["config"]))
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    END_ID = sp.piece_to_id("<|end|>")
+
+    def ask(question, seed):
+        prompt = f"<|conv|><|a|>{question}{label}"
+        ids = torch.tensor([sp.encode(prompt, out_type=int)], dtype=torch.long)
+        torch.manual_seed(1000 + seed)
+        out = model.generate(ids, max_new_tokens=args.max_new, temperature=0.9,
+                             top_k=40, stop_id=END_ID)
+        return first_turn(sp.decode(out[0].tolist())[len(prompt):]), prompt
+else:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(args.model)
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32)
+    model.eval()
+
+    def ask(question, seed):
+        prompt = f"#ch2\nA: {question}\n{label}:"
+        ids = tok(prompt, return_tensors="pt")
+        torch.manual_seed(1000 + seed)
+        out = model.generate(
+            **ids, max_new_tokens=args.max_new, do_sample=True, temperature=0.9,
+            top_k=40, min_p=0.05, repetition_penalty=1.1, pad_token_id=tok.eos_token_id
+        )
+        return first_turn(tok.decode(out[0], skip_special_tokens=True)[len(prompt):]), prompt
 
 
 replies = []
@@ -156,16 +242,9 @@ shown = []
 
 for question in QUESTIONS:
     asked = {w.lower() for w in WORD.findall(question)}
-    prompt = f"#ch2\nA: {question}\n{label}:"
-    ids = tok(prompt, return_tensors="pt")
 
     for seed in range(args.seeds):
-        torch.manual_seed(1000 + seed)
-        out = model.generate(
-            **ids, max_new_tokens=args.max_new, do_sample=True, temperature=0.9,
-            top_k=40, min_p=0.05, repetition_penalty=1.1, pad_token_id=tok.eos_token_id
-        )
-        reply = first_turn(tok.decode(out[0], skip_special_tokens=True)[len(prompt):])
+        reply, _ = ask(question, seed)
         if not reply:
             continue
         replies.append(reply)
@@ -185,6 +264,8 @@ overlap = sum(overlaps) / len(overlaps) if overlaps else 0.0
 # このサーバーの発言は俗語だらけで、素の Qwen から見れば元々当てにくい。
 judged = None
 if args.judge:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
     del model                                    # 2つ同時に持つと CPU の RAM が厳しい
     j_tok = AutoTokenizer.from_pretrained(args.judge)
     j_model = AutoModelForCausalLM.from_pretrained(args.judge, dtype=torch.float32)
@@ -214,7 +295,7 @@ if args.judge:
 
 pct = lambda x: f"{x * 100:5.1f}%"  # noqa: E731
 
-print(f"{args.model} / 喋らせた人 {label} / {len(replies)} 本\n")
+print(f"{args.evex or args.model} / 喋らせた人 {label} / {len(replies)} 本\n")
 print("\n".join(shown))
 print(f"\n{'':<12} {'このモデル':>10} {'地の値 (val)':>12}")
 print(f"{'20字以上':<12} {pct(got['long']):>10} {pct(base_line['long']):>12}")

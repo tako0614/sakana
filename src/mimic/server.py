@@ -65,12 +65,18 @@ elif has_piece("<|other|>"):
 else:
     raise SystemExit("tokenizer が evex-1 でも evex-2 でもない")
 
-# 実在の人物に紐づく話者トークン。持っているのは evex-1 だけで、これがあると
-# 「その人として喋る」ができる (94万件から圧縮した本人の履歴が重みに入っている)。
-# 通常の返信は今のまま ROLES で動かす — 経路を分けておかないと、既に動いている
-# ものを壊す。bot 側は申告に無いトークンを渡さないので、世代を取り違えても
-# バイト分解されて出力が崩れることはない。
-SPEAKERS = [t for t in (f"<|s{i}|>" for i in range(64)) if has_piece(t)]
+# 実在の人物に紐づく話者トークン。これがあると「その人として喋る」ができる
+# (94万件から圧縮した本人の履歴が重みに入っている)。evex-1 は 48 人、
+# evex-3 は 147 人。通常の返信は今のまま ROLES で動かす — 経路を分けておかないと、
+# 既に動いているものを壊す。bot 側は申告に無いトークンを渡さないので、世代を
+# 取り違えてもバイト分解されて出力が崩れることはない。
+#
+# **上限を決め打ちにしない。**64 で切っていたので、147 人の世代を載せると
+# 83 人ぶんが黙って使われないままになる。番号は詰まっているので、
+# 最初に欠けたところで止めれば人数がそのまま出る。
+SPEAKERS = []
+while has_piece(f"<|s{len(SPEAKERS)}|>"):
+    SPEAKERS.append(f"<|s{len(SPEAKERS)}|>")
 
 blob = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 saved = blob["config"]

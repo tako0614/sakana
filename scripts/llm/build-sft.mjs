@@ -22,6 +22,10 @@ import path from 'node:path';
 import os from 'node:os';
 import { gunzipSync } from 'node:zlib';
 
+// 「どこを拾うか」は build-corpus.mjs (evex 用) と同じ規則なので共有する。
+// ここが持つのは平文への並べ方だけ。
+import { ADDRESSED, EXCERPT, longExcerptRanges, responseExcerptRanges } from './excerpts.mjs';
+
 process.env.ARCHIVE_DB_PATH = path.join(os.tmpdir(), 'sakana-sft-scratch.sqlite');
 const { splitIntoChunks } = await import('../../src/archive/chunks.js');
 const { assignRoles } = await import('../../src/mimic/serialize.js');
@@ -445,11 +449,44 @@ for (const conv of train) {
 // **その形を選ぶ確率**が低いだけなので、信号を増やす。2つやる。
 
 const QA_COPIES = Number(process.env.LLM_QA_COPIES ?? 1);
-const QA_MIN_ANSWER = Number(process.env.LLM_QA_MIN_ANSWER ?? 12);
-const QA_CONTEXT = Number(process.env.LLM_QA_CONTEXT ?? 2);
+const { qaMinAnswer: QA_MIN_ANSWER, qaContext: QA_CONTEXT } = EXCERPT;
 
 // 継続行 (ラベルの無い行) は前の発言の一部なので飛ばす
 const LABELLED = /^([^\n:]{1,12}): ([\s\S]*)$/;
+
+/**
+ * 会話の行を excerpts.mjs が読める turn に直す。
+ *
+ * `raw` は本文そのまま、`body` は先頭の宛先を落としたもの。切り出しの索引を
+ * 返してもらったあと `line` で元の行に戻す。
+ */
+function toTurns(conv) {
+  const turns = [];
+  for (const line of conv.lines) {
+    const m = line.match(LABELLED);
+    if (!m) continue;
+    const raw = m[2].trim();
+    const addressed = raw.match(ADDRESSED);
+    turns.push({
+      key: m[1],
+      raw,
+      body: addressed ? addressed[2].trim() : raw,
+      target: addressed ? addressed[1] : null,
+      line
+    });
+  }
+  return turns;
+}
+
+/** 索引の範囲を、元の会話と同じ形の短い会話にする。 */
+function sliceConv(conv, turns, [from, to]) {
+  const lines = turns.slice(from, to + 1).map((t) => t.line);
+  return {
+    at: conv.at, from: conv.from, channel: conv.channel,
+    roles: conv.roles, counts: conv.counts, lines, primed: 0,
+    text: `${conv.channel}\n${lines.join('\n')}`
+  };
+}
 
 /**
  * **前の人に噛み合っている**箇所を、前後だけ切り出して返す。
@@ -471,36 +508,8 @@ const LABELLED = /^([^\n:]{1,12}): ([\s\S]*)$/;
  * 直前数行から応答までを短い会話として切り出す。
  */
 function responseExcerpts(conv) {
-  const found = [];
-  const rows = [];
-  for (const line of conv.lines) {
-    const m = line.match(LABELLED);
-    if (m) rows.push({ label: m[1], body: m[2].trim(), line });
-  }
-
-  for (let i = 1; i < rows.length; i += 1) {
-    const before = rows[i - 1];
-    const after = rows[i];
-    if (before.label === after.label) continue;
-
-    // 宛先の `@名前` は「誰に答えたか」の印なので、中身の長さから除いて数える
-    const addressed = after.body.match(/^@([^\s]{1,12})[\s　]+([\s\S]*)$/);
-    const body = addressed ? addressed[2].trim() : after.body;
-    if (body.length < QA_MIN_ANSWER) continue;
-
-    const answersQuestion = /[?？][\s　]*$/.test(before.body);
-    const addressesPrev = Boolean(addressed && addressed[1] === before.label);
-    if (!answersQuestion && !addressesPrev) continue;
-
-    const from = Math.max(0, i - 1 - QA_CONTEXT);
-    const lines = rows.slice(from, i + 1).map((r) => r.line);
-    found.push({
-      at: conv.at, from: conv.from, channel: conv.channel,
-      roles: conv.roles, counts: conv.counts, lines, primed: 0,
-      text: `${conv.channel}\n${lines.join('\n')}`
-    });
-  }
-  return found;
+  const turns = toTurns(conv);
+  return responseExcerptRanges(turns).map((range) => sliceConv(conv, turns, range));
 }
 
 // **長い発言そのものを重く見せる。** 噛み合いだけ増やしても「単語しか吐かない」は
@@ -516,30 +525,11 @@ function responseExcerpts(conv) {
 //
 // 匿名化する割合を噛み合い側 (半分) より低くするのは、長い発言が個人の声そのもので、
 // 役に移すとなりきりの材料を減らすから。
-const LONG_MIN = Number(process.env.LLM_LONG_MIN ?? 40);
-const LONG_ANON_EVERY = Number(process.env.LLM_LONG_ANON_EVERY ?? 4);
+const { longMin: LONG_MIN, longAnonEvery: LONG_ANON_EVERY } = EXCERPT;
 
 function longExcerpts(conv) {
-  const found = [];
-  const rows = [];
-  for (const line of conv.lines) {
-    const m = line.match(LABELLED);
-    if (m) rows.push({ label: m[1], body: m[2].trim(), line });
-  }
-
-  for (let i = 0; i < rows.length; i += 1) {
-    if (rows[i].body.length < LONG_MIN) continue;
-    // 直前の文脈を付ける。単発で置くと「いきなり長文を書く」ことを学ぶ
-    const from = Math.max(0, i - QA_CONTEXT);
-    if (i === from) continue;                    // 会話の頭なら文脈が無いので使わない
-    const lines = rows.slice(from, i + 1).map((r) => r.line);
-    found.push({
-      at: conv.at, from: conv.from, channel: conv.channel,
-      roles: conv.roles, counts: conv.counts, lines, primed: 0,
-      text: `${conv.channel}\n${lines.join('\n')}`
-    });
-  }
-  return found;
+  const turns = toTurns(conv);
+  return longExcerptRanges(turns).map((range) => sliceConv(conv, turns, range));
 }
 
 const qaExcerpts = train.flatMap(responseExcerpts);

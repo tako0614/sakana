@@ -31,11 +31,24 @@ CONTROL = [
     "<url>", "<mention>", "<channel>", "<time>",
     "<code>", "</code>", "<nl>", "<file>",
 ]
-# 話者は会話ごとに出現順で振る相対トークン (src/mimic/serialize.js)。
-# evex-1 は実在の人物に紐づく 48 個を持っていたが、8 個で 99.1% を被覆できるうえ
-# 身元が消える。空いた 40 枠はそのまま BPE のマージに回る。
+# 名前を持たない人に会話ごとの出現順で振る相対トークン (src/mimic/serialize.js)。
+# 8 個で 99.1% を被覆する。
 ROLES = [f"<|{c}|>" for c in "abcdefgh"]
-SYMBOLS = CONTROL + ROLES
+
+# 固有の話者トークン。**何人いるかはコーパスが決める** —
+# build-corpus.mjs が speakers.json に書いた人数をそのまま読む。
+# 数を手で書くと、閾値を変えたときに静かにずれて「学習していないトークンを
+# 推論で渡す」形になる (evex-1 で一度やった)。
+#
+# v4 は 147 人 (200 件以上 / 発言の 96.6%)。evex-1 は 48 人 (85.3%) だった。
+# user_defined が 99 個増えるぶん実マージは約 140 減るが、被覆の +11.3pt の方が大きい。
+speakers_json = CORPUS / "speakers.json"
+SPEAKERS = (
+    [row["token"] for row in json.loads(speakers_json.read_text(encoding="utf8"))]
+    if speakers_json.exists() else []
+)
+
+SYMBOLS = CONTROL + SPEAKERS + ROLES
 
 train_txt = CORPUS / "train.txt"
 prefix = str(CORPUS / "tok")
@@ -107,8 +120,7 @@ for ids in sp.encode(lines, out_type=int):
     for i in ids:
         freq[i] += 1
 
-reserved = len(SYMBOLS) + 259  # 制御記号 + バイト 256 + unk/bos/eos
-learned = [f for i, f in enumerate(freq) if i >= 0]
+reserved = len(SYMBOLS) + 259  # 制御記号 + 話者 + バイト 256 + unk/bos/eos
 thin = sum(1 for i, f in enumerate(freq) if f < 100 and sp.id_to_piece(i) not in SYMBOLS)
 unused = sum(1 for f in freq if f == 0)
 
@@ -119,6 +131,8 @@ if thin > sp.get_piece_size() * 0.4:
 
 stats = {
     "vocab_size": sp.get_piece_size(),
+    "reserved_pieces": reserved,
+    "speaker_tokens": len(SPEAKERS),
     "thin_pieces": thin,
     "unused_pieces": unused,
     "chars_per_token": round(ratio, 3),
@@ -126,10 +140,18 @@ stats = {
     "val": val,
     "total_tokens": total_tokens,
 }
-(CORPUS / "stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2))
+
+# build-corpus.mjs が書いた条件と件数を消さない。両方あって初めて
+# 「どのコーパスをどの語彙で切ったか」が1ファイルで追える
+stats_path = CORPUS / "stats.json"
+if stats_path.exists():
+    stats = {**json.loads(stats_path.read_text(encoding="utf8")), **stats}
+stats_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2))
 
 print()
-print(f"vocab            {sp.get_piece_size()} cov={COVERAGE} (出現100回未満 {thin} / 未使用 {unused})")
+print(f"vocab            {sp.get_piece_size()} cov={COVERAGE} "
+      f"(固定 {reserved} = 制御 {len(CONTROL)} + 話者 {len(SPEAKERS)} + 役 {len(ROLES)} + バイト等 259 / "
+      f"出現100回未満 {thin} / 未使用 {unused})")
 print(f"圧縮率           {ratio:.2f} 文字/トークン")
 print(f"train            {train['tokens']:,} トークン ({train['lines']:,} 会話)")
 print(f"val              {val['tokens']:,} トークン ({val['lines']:,} 会話)")

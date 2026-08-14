@@ -1,0 +1,35 @@
+[Unit]
+Description=Sakana mimic evex-3 (15.74M / 147話者 / corpus-v4)
+# evex-1 (8767) / evex-2 (8765) と並走させる。読み比べるために全部残す。
+#
+# **--corpus は mimic/ ではなく mimic-v3/ を指す。**
+# corpus-v4 は tokenizer が別物 (話者トークンが 48 → 147 に増えて、実マージも
+# 変わっている)。evex-1/2 の tok.model で読むと全部バイト分解されて壊れる。
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/sakana
+# ファイル名は pack.mjs が置く形に合わせる (ckpt.pt / tok.model / speakers.json)。
+#   LLM_CORPUS_DIR=corpus-v4 node scripts/llm/pack.mjs <ckpt-eN.pt> dist/mimic-v3
+#   scp -r dist/mimic-v3/* <bot>:/root/sakana/mimic-v3/
+ExecStart=/root/sakana/.venv-llm/bin/python -u src/mimic/server.py \
+  --ckpt /root/sakana/mimic-v3/ckpt.pt \
+  --corpus /root/sakana/mimic-v3 \
+  --port 8770 \
+  --threads 3
+
+Restart=on-failure
+RestartSec=5
+
+# 15.74M の重み (63MB) + torch のランタイム。evex-1 / evex-2 / ft 系と並ぶので
+# 控えめに取る。足りずに OOM で落ちるようなら 1600M まで上げる
+MemoryMax=1400M
+CPUWeight=30
+Nice=15
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

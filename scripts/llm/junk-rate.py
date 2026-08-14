@@ -48,25 +48,44 @@ END_ID = sp.piece_to_id("<|end|>")
 
 # 実際の使い方に近い形にする。話者トークンだけ渡すと文脈が無くて記号の羅列になり、
 # 「記号だけ」の率が実際より高く出る (測りたいのは会話に混ざったときの率)。
+#
+# **トークンは決め打ちにしない。**世代で語彙が変わる (evex-1/2 は <|other|>、
+# evex-3 は <|a|>..<|h|>)。無いトークンを書くとバイト分解された文字列を渡すことに
+# なり、「記号だけ」の率が実際とは別のものを測ってしまう。
+def piece(*candidates):
+    for name in candidates:
+        if sp.piece_to_id(name) != sp.unk_id():
+            return name
+    return candidates[-1]
+
+
+ANON = piece("<|a|>", "<|other|>")
 PROMPTS = [
-    "<|conv|><|s3|>Cloudflare Containers ってどうなん<|s0|>",
-    "<|conv|><|s0|>rebase 疲れた<|s3|>",
-    "<|conv|><|other|>これバグってる？<|other|>",
-    "<|conv|><|s1|>今日ひま？<|s0|>",
-    "<|conv|><|s0|>それでいいと思う<|s1|>",
-    "<|conv|><|s2|>どこで止まってる？<|s0|>",
-    "<|conv|><|other|>おはよう<|s0|>",
-    "<|conv|><|s0|>やば<|other|>",
+    f"<|conv|><|s3|>Cloudflare Containers ってどうなん<|s0|>",
+    f"<|conv|><|s0|>rebase 疲れた<|s3|>",
+    f"<|conv|>{ANON}これバグってる？{ANON}",
+    f"<|conv|><|s1|>今日ひま？<|s0|>",
+    f"<|conv|><|s0|>それでいいと思う<|s1|>",
+    f"<|conv|><|s2|>どこで止まってる？<|s0|>",
+    f"<|conv|>{ANON}おはよう<|s0|>",
+    f"<|conv|><|s0|>やば{ANON}",
 ]
 
 # 正規化が作った記号。これだけの返答は bot が実際には出せない
 SYMBOLS = re.compile(r"<(?:url|file|mention|channel|time)>|<nl>|<\|[^|]*\|>|[\s　]+")
 
 
+# 発言の頭に付く返信の印。evex-3 以降は `<|re|><|相手|>本文` の順に書く。
+# **相手を「次の話者」と読むと本文が丸ごと落ちる** — それで「記号だけ」が
+# 42.2% に見えていた (モデルではなく数え方の問題)。serialize.js と同じ規則。
+REPLY_MARK = re.compile(r"^<\|re\|>(?:<\|s\d+\|>|<\|other\|>|<\|[a-hz]\|>)?")
+
+
 def first_turn(text):
     """次の話者トークンか <|end|> で切る (bot 側 ownTurns と同じ範囲)。"""
-    cut = re.search(r"<\|s\d+\|>|<\|other\|>|<\|[a-hz]\|>|<\|end\|>|<\|conv\|>", text)
-    return text[: cut.start()] if cut else text
+    body = REPLY_MARK.sub("", text)
+    cut = re.search(r"<\|s\d+\|>|<\|other\|>|<\|[a-hz]\|>|<\|end\|>|<\|conv\|>", body)
+    return body[: cut.start()] if cut else body
 
 
 def classify(reply):

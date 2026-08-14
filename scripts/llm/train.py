@@ -1,10 +1,18 @@
-"""学習ループ。CPU で回す前提。
+"""学習ループ。CPU でも GPU でも回る。
 
-    # 速度だけ測る (これで所要時間を決める)
+    # 速度だけ測る (これで所要時間を決める)。**本番の前に必ず通す**
     .venv-llm/bin/python scripts/llm/train.py --bench
 
-    # 本番
+    # 本番 (CPU)
     .venv-llm/bin/python scripts/llm/train.py --epochs 8
+
+    # 本番 (GPU)。batch を上げないと GPU が埋まらない
+    python train.py --corpus corpus-v4 --epochs 4 --batch 64 --lr 1e-3
+
+モデルの大きさは環境変数で決まる (model.py の Config):
+
+    LLM_DMODEL=384 LLM_LAYERS=8 LLM_HEADS=6 LLM_CONTEXT=1024   # evex-3  15.8M
+    LLM_DMODEL=256 LLM_LAYERS=6 LLM_HEADS=4 LLM_CONTEXT=512    # evex-2   5.87M
 
 train / val は build-corpus.mjs が時系列で切ってある。val は最後の 14 日で、
 ランダム分割にしていない (完全一致の短文が 23% あるので時間で切らないと嘘になる)。
@@ -39,6 +47,16 @@ parser.add_argument("--threads", type=int, default=12)
 # GPU が使えるなら使う。auto は「あれば cuda」。
 # CPU 決め打ちにしていたので、GPU のある機械に移しても回せなかった。
 parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+# 半精度で回す。**cuda に載せるだけでは速くならない。**
+#
+# 15.7M は 1 トークン 6×15.7M = 94 MFLOP。T4 の fp32 は 8.1 TFLOPS しかないので、
+# 実効 25% で 24k tok/s = 14700K の CPU (実測 12k) の 2 倍にしかならない。
+# 効くのは tensor core で、fp16 なら 65 TFLOPS ある。
+#
+# T4 (Turing / sm_75) には bf16 が無いので fp16 + GradScaler。sm_80 以上なら
+# bf16 でスケーリング不要。重みは fp32 のまま持つ (finetune.py と同じ形)。
+parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True,
+                    help="cuda のとき半精度で回す (cpu では無視される)")
 # weight decay をどこに掛けるか。
 #   all      … 全パラメータ (evex-1 と同じ。既定はこちらにして対照を崩さない)
 #   matrices … 行列だけ。RMSNorm のゲインと埋め込みを外す
@@ -123,6 +141,24 @@ if picked == "cuda":
 else:
     print(f"device cpu / threads {args.threads}")
 
+# 半精度の型を決める。bf16 は sm_80 (Ampere) 以上、fp16 は sm_70 以上で
+# tensor core に乗る。fp16 は指数部が狭くて勾配が 0 に落ちるので GradScaler が要る。
+#
+# **`torch.cuda.is_bf16_supported()` で判定してはいけない。** あれは T4 (sm_75) でも
+# True を返す — エミュレーションを含めて「動くか」を答えるので、tensor core を
+# 使わない経路に落ちる。実際に T4 で bf16 を選んでしまい、65 TFLOPS の fp16 経路に
+# 乗らずに 13,223 tok/s (実効 1.27 TFLOPS / MFU 15.7%) しか出なかった。
+# 世代で決めるのが確実。
+amp_on = bool(args.amp and picked == "cuda")
+amp_dtype = torch.float32
+if amp_on:
+    major = torch.cuda.get_device_capability(0)[0]
+    amp_dtype = torch.bfloat16 if major >= 8 else torch.float16
+    print(f"amp {str(amp_dtype).removeprefix('torch.')}"
+          f"{' + GradScaler' if amp_dtype is torch.float16 else ''} (sm_{major}x)")
+
+scaler = torch.amp.GradScaler("cuda", enabled=(amp_on and amp_dtype is torch.float16))
+
 
 # 正規化が作った記号。**文脈には残すが、書き方は教えない。**
 #
@@ -143,23 +179,37 @@ masked_ids = [sp.piece_to_id(p) for p in MASKED_PIECES if sp.piece_to_id(p) != s
 IGNORE = -1
 
 
+# **トークン列は最初に一度だけ device に載せる。**
+#
+# 元は毎 step numpy で窓を stack して .to(device) していた。CPU では気にならないが、
+# GPU だと 1 step が数十 ms しかないので、そこが支配的になって GPU が待つ。
+# 24M トークン × int64 = 192MB なので、丸ごと置いておける。
+OFFSETS = torch.arange(cfg.context + 1, device=device)
+
+
+def on_device(ids):
+    return torch.as_tensor(ids.astype(np.int64)).to(device)
+
+
 def batches(ids, batch_size, generator, mask=None):
     """context+1 の窓を無作為に切る。端は捨てる。"""
     high = len(ids) - cfg.context - 1
     use = args.mask_tokens if mask is None else mask
-    ban = torch.tensor(masked_ids, dtype=torch.long) if use else None
+    ban = torch.tensor(masked_ids, dtype=torch.long, device=device) if use else None
+    stream = on_device(ids)
 
     while True:
-        starts = torch.randint(0, high, (batch_size,), generator=generator)
-        block = np.stack([ids[s: s + cfg.context + 1] for s in starts.tolist()])
-        chunk = torch.from_numpy(block.astype(np.int64))
+        # 開始位置は CPU の generator で引く。**乱数の出方を変えないため** —
+        # device 側で引くと過去の run と同じ系列にならず、比べられなくなる
+        starts = torch.randint(0, high, (batch_size,), generator=generator).to(device)
+        chunk = stream[starts[:, None] + OFFSETS[None, :]]
         x, y = chunk[:, :-1], chunk[:, 1:]
 
         if ban is not None:
             # 入力 (x) はそのまま。目標 (y) だけ外すので、文脈としては見えたまま
             y = y.masked_fill(torch.isin(y, ban), IGNORE)
 
-        yield x.to(device), y.to(device)
+        yield x, y
 
 
 gen = torch.Generator().manual_seed(0)
@@ -210,6 +260,9 @@ def evaluate(ids, iters=40, mask=None):
     mask=True は学習と同じ尺度 (記号を外した loss)。mask=False は記号も含めた素の
     loss で、**過去の run と比べられるのはこちら**。記号を外すと平均が変わるので、
     そこを混ぜると「良くなった/悪くなった」を誤読する。両方出す。
+
+    **ここは半精度にしない。** 20 iter しか回さないので速度に効かないし、
+    fp16 で測ると evex-1 / evex-2 の val (4.2404 / 4.0384) と桁の揃わない数字になる。
     """
     model.eval()
     local = torch.Generator().manual_seed(1234)
@@ -226,10 +279,25 @@ def evaluate(ids, iters=40, mask=None):
 # 話者トークンだけを渡すと文脈が無く、モデルは <url> や <file> のような
 # 頻出トークンに流れる。実際の使い方 (直前の発言がある状態) に近い形で出す。
 # epoch 1〜2 のサンプルが記号の羅列になっていて信号にならなかったので直した。
+#
+# **トークンは決め打ちにしない。**世代で語彙が変わる — evex-1/2 は <|other|> を
+# 持っていたが v4 には無いので、そのまま書くとバイト分解された文字列を渡すことに
+# なり、サンプルが読めなくなって「学習が壊れている」ように見える。
+def piece(*candidates):
+    """語彙にあるものを先頭から選ぶ。どれも無ければ最後のものを返す。"""
+    for name in candidates:
+        if sp.piece_to_id(name) != sp.unk_id():
+            return name
+    return candidates[-1]
+
+
+ME, YOU, ANON = piece("<|s0|>"), piece("<|s3|>", "<|s0|>"), piece("<|a|>", "<|other|>")
 SAMPLE_PROMPTS = [
-    "<|conv|><|s3|>Cloudflare Containers ってどうなん<|s0|>",
-    "<|conv|><|s0|>rebase 疲れた<|s3|>",
-    "<|conv|><|other|>これバグってる？<|other|>",
+    f"<|conv|>{YOU}Cloudflare Containers ってどうなん{ME}",
+    f"<|conv|>{ME}rebase 疲れた{YOU}",
+    f"<|conv|>{ANON}これバグってる？{ANON}",
+    # 返信先まで置く形 (evex-3 以降)。学習と同じ並びを見せる
+    f"<|conv|>{ANON}日本の首都どこ{ME}<|re|>{ANON}",
     "<|conv|>",
 ]
 
@@ -238,7 +306,11 @@ def samples(tag):
     end_id = sp.piece_to_id("<|end|>")
     lines = []
     for prompt in SAMPLE_PROMPTS:
-        ids = torch.tensor([sp.encode(prompt, out_type=int)], dtype=torch.long)
+        # **モデルと同じ device に置く。**CPU 決め打ちにしていたので、cuda で回すと
+        # epoch の終わりにここで落ちた (「index is on cpu」)。学習は CPU でしか
+        # 回していなかったので気付けなかった。**チェックポイントの保存はこの前**なので
+        # 重みは残るが、そのあとの push まで進まずに全部無駄になる
+        ids = torch.tensor([sp.encode(prompt, out_type=int)], dtype=torch.long, device=device)
         got = model.generate(ids, max_new_tokens=120, temperature=0.9, top_k=40, stop_id=end_id)
         lines.append(f"[{prompt}] {sp.decode(got[0].tolist())}")
     model.train()
@@ -257,12 +329,16 @@ for step in range(total_steps):
         group["lr"] = lr_at(step)
 
     x, y = next(train_batches)
-    _, loss = model(x, y)
+    with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
+        _, loss = model(x, y)
 
     opt.zero_grad(set_to_none=True)
-    loss.backward()
+    scaler.scale(loss).backward()
+    # clip する前に必ず戻す。スケールしたままの勾配を切ると閾値が意味を失う
+    scaler.unscale_(opt)
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    opt.step()
+    scaler.step(opt)
+    scaler.update()
 
     seen += tokens_per_step
 
@@ -273,6 +349,10 @@ for step in range(total_steps):
         window, seen = time.time(), 0
 
     if args.bench and step + 1 == 200:
+        # **測る前に必ず同期する。** cuda はカーネルの起動が非同期なので、
+        # 待たずに time.time() を読むと実際より速い数字が出る
+        if picked == "cuda":
+            torch.cuda.synchronize()
         rate = 200 * tokens_per_step / (time.time() - started)
         need = steps_per_epoch * args.epochs * tokens_per_step / rate
         print()
@@ -299,8 +379,13 @@ for step in range(total_steps):
              "train_loss": tr, "val_loss": va, "val_raw": raw},
             out / f"ckpt-e{epoch}.pt"
         )
-        for line in samples(f"e{epoch}"):
-            print(f"    {line[:160]}", flush=True)
+        # **サンプルで落ちても学習は止めない。**読むためのおまけなので、ここで
+        # 例外を上げると残りの epoch と push が丸ごと消える (実際に消した)。
+        try:
+            for line in samples(f"e{epoch}"):
+                print(f"    {line[:160]}", flush=True)
+        except Exception as error:                                    # noqa: BLE001
+            print(f"    (サンプル生成は飛ばした: {error})", flush=True)
 
         (out / "history.json").write_text(json.dumps(history, indent=2))
 
