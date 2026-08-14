@@ -242,13 +242,15 @@ def env_for(size):
             "LLM_HEADS": str(heads), "LLM_CONTEXT": str(context)}}
 
 
-def bench(size, batch=24):
+def bench(size, batch=24, compile_on=False, strict=True):
     """実測の tok/s を返す。**本番の前に必ず通す。**
 
     Kaggle の週枠は 30 時間で、残りが 1 時間ということが普通にある。
     速度を測らずに epoch を決め打ちすると、押す前に切られて全部消える。
     """
     cmd = [sys.executable, "train.py", "--corpus", CORPUS, "--batch", str(batch), "--bench"]
+    if compile_on:
+        cmd += ["--compile"]
     print("\\n$ " + " ".join(cmd), flush=True)
 
     # **握りつぶさずに流す。**capture_output にしていたら、l4x1 で
@@ -263,11 +265,14 @@ def bench(size, batch=24):
             rate = float(line.split()[1].replace(",", "").replace("tok/s", ""))
     proc.wait()
     if rate is None:
+        # 速度の振りでは OOM も情報なので、止めずに None を返せるようにする
+        if not strict:
+            return None
         raise RuntimeError("bench の tok/s を読めなかった")
 
     # **GPU に乗らなかったら止める。**CPU で回すと 1 本 10 時間コースで、
     # 課金だけ進んで何も残らない
-    if rate < 20_000:
+    if rate < 20_000 and strict:
         raise SystemExit(f"{{rate:,.0f}} tok/s しか出ていない。GPU に乗っていない可能性が高いので止める")
     return rate
 
@@ -311,6 +316,8 @@ def run(size, epochs, batch=24, lr="1e-3", train_name="train", init=None, tag=""
         cmd += ["--wd-mode", os.environ["EVEX_WD"]]
     if os.environ.get("EVEX_SPEAKER_LR"):
         cmd += ["--speaker-lr-cap", os.environ["EVEX_SPEAKER_LR"]]
+    if os.environ.get("EVEX_COMPILE") == "1":
+        cmd += ["--compile"]
 
     print("\\n$ " + " ".join(cmd), flush=True)
     done = subprocess.run(cmd, env=env_for(size), check=False)
@@ -358,6 +365,47 @@ RESUME = os.environ.get("EVEX_RESUME")
 # 実測: 段1 ×1 + 段2 ×6 で evex に触れる計算量が 57%
 PRE_MINUTES = float(os.environ.get("EVEX_PRE_MIN", 56))
 FT_MINUTES = float(os.environ.get("EVEX_FT_MIN", 58))
+
+# --- 速度を振る ---
+#
+# **形より先にこれを測る。**実測 54,556 tok/s は T4 の理論値 (fp16 65 TFLOPS) の
+# 7.9% しか使えていない。19M は行列が小さいので、RMSNorm の fp32 往復・RoPE の
+# stack・SwiGLU の要素積といった**帯域律速の小さいカーネルの数**で律速している。
+#
+# batch を上げて torch.compile を掛けると、同じ金額で回せる量が変わる。
+# 本番が 2 時間の仕事なので、ここで 1.5 倍出れば 40 分ぶんが浮く。
+# **この振り自体は数分で終わる** (200 step の bench を並べるだけ)。
+if os.environ.get("EVEX_SPEED"):
+    grid = [(24, False), (48, False), (48, True), (96, True), (192, True)]
+    cost_per_hour = float(os.environ.get("EVEX_COST_HOUR", 0.40))
+    found = []
+
+    for batch, comp in grid:
+        label = f"batch {{batch}}" + (" + compile" if comp else "")
+        try:
+            rate = bench(SIZE, batch=batch, compile_on=comp, strict=False)
+        except Exception as error:                      # OOM も情報なので拾う
+            print(f"  {{label}}: 落ちた ({{type(error).__name__}})", flush=True)
+            rate = None
+        found.append((label, batch, comp, rate))
+
+    print("\\n=== 速度の振り ===", flush=True)
+    best = None
+    for label, batch, comp, rate in found:
+        if rate is None:
+            print(f"  {{label:<22}} —  (乗らなかった)", flush=True)
+            continue
+        # 本番で見るトークン数 = 段1 ×1 + 段2 ×6
+        total = PRETRAIN_TOKENS + TRAIN_TOKENS * 6
+        hours = total / rate / 3600
+        print(f"  {{label:<22}} {{rate:>8,.0f}} tok/s  本番 {{hours:>4.1f}} 時間 "
+              f"${{hours * cost_per_hour:>5.2f}}", flush=True)
+        if best is None or rate > best[1]:
+            best = (label, rate, batch, comp)
+    if best:
+        print(f"\\n最良: {{best[0]}} ({{best[1]:,.0f}} tok/s)", flush=True)
+    raise SystemExit(0)
+
 
 # --- 形を振る ---
 #

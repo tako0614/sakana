@@ -96,6 +96,17 @@ parser.add_argument("--speaker-lr-cap", type=float, default=1.0)
 # 大きい模型ほど不利という等トークン比較にならず、同じ持ち時間の比較になる
 # (実測の tok/s × 分 をここに入れる)。
 parser.add_argument("--max-tokens", type=int, default=0)
+# torch.compile で学習の 1 step を融合する。
+#
+# **この規模ではここがいちばん効く見込み。**実測 54,556 tok/s は T4 の理論値
+# (fp16 65 TFLOPS) の 7.9% しか使えていない。19M は行列が小さいので、
+# RMSNorm の fp32 往復・RoPE の stack・SwiGLU の要素積といった**帯域律速の
+# 小さいカーネルの数**で律速している。融合すればそこが縮む。
+#
+# 生成と保存は**元のモジュール**を使う (`raw`)。compile 越しに generate すると
+# 形が毎回変わって再コンパイルの嵐になるし、state_dict のキーに
+# `_orig_mod.` が付いて推論側が読めなくなる。
+parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
 args = parser.parse_args()
 
 corpus = Path(args.corpus)
@@ -436,12 +447,22 @@ def samples(tag):
         # 回していなかったので気付けなかった。**チェックポイントの保存はこの前**なので
         # 重みは残るが、そのあとの push まで進まずに全部無駄になる
         ids = torch.tensor([sp.encode(prompt, out_type=int)], dtype=torch.long, device=device)
-        got = model.generate(ids, max_new_tokens=120, temperature=0.9, top_k=40, stop_id=end_id)
+        got = raw.generate(ids, max_new_tokens=120, temperature=0.9, top_k=40, stop_id=end_id)
         lines.append(f"[{prompt}] {sp.decode(got[0].tolist())}")
     model.train()
     (out / f"samples-{tag}.txt").write_text("\n\n".join(lines), encoding="utf8")
     return lines
 
+
+# **compile はここまでの準備 (勾配フック / param_groups) が済んでから。**
+# 先に掛けると named_parameters のキーが変わって、話者の補正が刺さらない
+raw = model
+if args.compile:
+    if device.type == "cuda":
+        model = torch.compile(model)
+        print("torch.compile 有効 (最初の数十 step は遅い)")
+    else:
+        print("cpu なので torch.compile は掛けない")
 
 model.train()
 history = []
@@ -461,7 +482,7 @@ for step in range(total_steps):
     scaler.scale(loss).backward()
     # clip する前に必ず戻す。スケールしたままの勾配を切ると閾値が意味を失う
     scaler.unscale_(opt)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    torch.nn.utils.clip_grad_norm_(raw.parameters(), 1.0)
     scaler.step(opt)
     scaler.update()
 
@@ -500,7 +521,7 @@ for step in range(total_steps):
               f"({(time.time() - started) / 60:.0f} 分経過)", flush=True)
 
         torch.save(
-            {"model": model.state_dict(), "config": vars(cfg), "epoch": epoch,
+            {"model": raw.state_dict(), "config": vars(cfg), "epoch": epoch,
              "train_loss": tr, "val_loss": va, "val_raw": raw},
             out / f"ckpt-e{epoch}.pt"
         )
