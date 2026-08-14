@@ -394,6 +394,43 @@ try {
     if (without.trailing === spoken) fail('selfId 無しで自分の役を引いてはいけない');
 
     console.log(`self-role ok (bot は自分の役 ${spoken} で続ける / 未参加なら ${without.trailing})`);
+
+    // --- /as のときも整合させる ---
+    //
+    // 末尾だけペルソナに差し替えていたので、bot 自身の過去の返答は役のまま残り、
+    //   だこ: chromeの話してないねん / A: (botの返答) / だこ: @A 好き？ / あかり:
+    // という「A に聞かれたのに**あかり**が喋る番」の形が流れていた。
+    // 実使用の 3 件中 2 件がこれで答えていない。
+    const persona = top.userId;
+    const asked = [
+      { authorId: 'check-user-1', content: 'chromeの話してないねん', isReply: false },
+      { authorId: SELF, content: 'Firefoxは普通に使ってた気がするが', isReply: false },
+      { authorId: 'check-user-1', content: 'さかなのこと好き？', isReply: true }
+    ];
+    const asBuilt = await buildMimicPrompt(asked, { engine: 'evex-ft', selfId: SELF, wanted: persona });
+    if (asBuilt.trailing !== top.label) fail(`/as の末尾がペルソナでない: ${asBuilt.trailing}`);
+
+    const own = asBuilt.prompt.split('\n')
+      .filter((line) => line.includes('Firefoxは普通に'))
+      .map((line) => line.slice(0, line.indexOf(':')))[0];
+    if (own !== top.label) {
+      fail(`/as のとき bot 自身の発言がペルソナになっていない (${own} / 末尾は ${asBuilt.trailing})`);
+    }
+    // 役が飛んではいけない。bot が枠を使わない以上 A から順に埋まる
+    const used = [...asBuilt.prompt.matchAll(/^([A-HZ]): /gm)].map((m) => m[1]);
+    if (used.length && used[0] !== 'A') fail(`役が A から始まっていない: ${used.join(',')}`);
+
+    // **本人がその窓に居るときは寄せない。**同じラベルに 2 人が乗る形になる
+    const withPersona = await buildMimicPrompt(
+      [...asked, { authorId: persona, content: 'よんだ？', isReply: false }],
+      { engine: 'evex-ft', selfId: SELF, wanted: persona }
+    );
+    const mineNow = withPersona.prompt.split('\n')
+      .filter((line) => line.includes('Firefoxは普通に'))
+      .map((line) => line.slice(0, line.indexOf(':')))[0];
+    if (mineNow === top.label) fail('本人が居るのに bot をそのラベルに寄せている');
+
+    console.log(`as-role ok (/as ${top.label} なら bot 自身の発言もそのラベル / 本人が居れば寄せない)`);
   }
 
   console.log(

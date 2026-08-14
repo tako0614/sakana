@@ -88,11 +88,39 @@ async function tokenRequest(messages, { wanted, engine, selfId }) {
     return token && declared.has(token) ? token : null;
   };
 
+  // 申告に無いトークンは渡さない
+  const token = wanted ? tokenFor(wanted) : null;
+  const as = token && declared.has(token) ? token : null;
+
+  // **`/as` のときは bot 自身の過去の返答もその人に寄せる。**
+  //
+  // 末尾だけ差し替えていたので、実際に流れていたのはこの形だった:
+  //
+  //   だこ: chromeの話してないねん
+  //   <|a|>: (bot の前の返答)      ← bot 自身は役 A のまま
+  //   だこ: @A さかなのこと好き？    ← A 宛て = bot 宛て
+  //   <|s0|>:                     ← ここを「あかり」に書かせていた
+  //
+  // モデルから見ると「だこが A に聞いた。さて**あかり**が喋る番」なので、
+  // 答えないのが正しい振る舞いになる。[[bot-speaks-as-own-role]] で直したのと
+  // 同じ形が `/as` の経路に残っていた (実使用で 3 件中 2 件がこれで外していた)。
+  //
+  // **本人がその窓に居るときは寄せない。**同じトークンに 2 人が乗ると、
+  // それこそ学習で一度も無かった形になる。
+  const personaPresent = wanted != null && messages.some((entry) => entry.authorId === wanted);
+  const speakAs = as && !personaPresent ? as : null;
+
+  // 固有トークンを持つ人 (と `/as` 中の bot) は先に決める。役はその残りに配る —
+  // bot に役を配ってから寄せると <|a|> が誰にも使われないまま残り、
+  // 役が飛んだ会話という学習に無い形になる
+  const identity = (authorId) =>
+    (speakAs && selfId && authorId === selfId ? speakAs : namedOf(authorId));
+
   const roles = assignRoles(
-    messages.map((entry) => entry.authorId).filter((authorId) => !namedOf(authorId)),
+    messages.map((entry) => entry.authorId).filter((authorId) => !identity(authorId)),
     scheme
   );
-  const tokenOf = (authorId) => namedOf(authorId) ?? roles.get(authorId) ?? null;
+  const tokenOf = (authorId) => identity(authorId) ?? roles.get(authorId) ?? null;
 
   // 誰への返信かを解決する。文脈の中に相手が居るときだけ置く —
   // 居ない相手を指すと、モデルが一度も見ていない形になる
@@ -109,9 +137,6 @@ async function tokenRequest(messages, { wanted, engine, selfId }) {
     };
   });
 
-  // 申告に無いトークンは渡さない
-  const token = wanted ? tokenFor(wanted) : null;
-  const as = token && declared.has(token) ? token : null;
   // 自分が既に喋っているならその役で続ける (下の plainRequest と同じ理由)
   const mine = selfId ? tokenOf(selfId) : null;
   const trailing = as ?? mine ?? nextRole(roles, scheme);
@@ -131,16 +156,22 @@ async function tokenRequest(messages, { wanted, engine, selfId }) {
  * 「たこ」と「B」が同一人物という、学習中に一度も無かった形になる。
  */
 function plainRequest(messages, { wanted, channelId, selfId }) {
+  const as = wanted ? labelFor(wanted) : null;
+
+  // `/as` のときは bot 自身の過去の返答もその人に寄せる (tokenRequest と同じ理由)。
+  // 本人がその窓に居るときは寄せない — 同じラベルに 2 人が乗る形になる
+  const personaPresent = wanted != null && messages.some((entry) => entry.authorId === wanted);
+  const speakAs = as && !personaPresent ? as : null;
+  const identity = (id) => (speakAs && selfId && id === selfId ? speakAs : labelFor(id));
+
   const ids = messages.map((entry) => entry.authorId);
-  const roles = assignPlainRoles(ids.filter((id) => !labelFor(id)));
-  const labelOf = (id) => labelFor(id) ?? roles.get(id) ?? null;
+  const roles = assignPlainRoles(ids.filter((id) => !identity(id)));
+  const labelOf = (id) => identity(id) ?? roles.get(id) ?? null;
 
   const turns = messages.map((entry) => ({
     role: labelOf(entry.authorId),
     content: plainText(entry.content, labelOf)
   })).filter((turn) => turn.role && turn.content);
-
-  const as = wanted ? labelFor(wanted) : null;
 
   // **自分が既に喋っているならその役で続ける。**
   //
@@ -154,7 +185,7 @@ function plainRequest(messages, { wanted, channelId, selfId }) {
   //
   // モデルから見ると「だこが A に質問した。さて B が喋る番」なので、
   // **答えないのが正しい振る舞い**になる。噛み合わないのは当然だった。
-  const mine = selfId ? roles.get(selfId) ?? null : null;
+  const mine = selfId ? labelOf(selfId) : null;
   const trailing = as ?? mine ?? nextRole(roles, PLAIN_SCHEME);
 
   return {
