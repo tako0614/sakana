@@ -35,6 +35,14 @@ from model import Config, MicroLM
 parser = argparse.ArgumentParser()
 parser.add_argument("--corpus", default="corpus")
 parser.add_argument("--out", default="scripts/llm/out")
+# どのファイルを train に使うか。**二段学習のため。**
+#   pretrain … 外部の会話 + evex。会話能力の土台を作る (段1)
+#   train    … evex だけ。口調と 147 人を焼き付ける (段2)
+# val はどちらの段でも evex のものを使う ({corpus}/val.txt) —
+# 「外部を混ぜている最中に evex の val がどう動くか」が見たい値そのもの。
+parser.add_argument("--train-name", default="train", help="{corpus}/<name>.txt を学習に使う")
+# 段1 のチェックポイントから続ける。形が違うものは弾く
+parser.add_argument("--init", default=None, help="重みの初期値にする ckpt (段2 用)")
 parser.add_argument("--epochs", type=int, default=8)
 parser.add_argument("--batch", type=int, default=24)
 parser.add_argument("--lr", type=float, default=3e-4)
@@ -96,10 +104,10 @@ def load(name):
     return arr
 
 
-train_ids = load("train")
+train_ids = load(args.train_name)
 val_ids = load("val")
 
-print(f"train {len(train_ids):,} トークン / val {len(val_ids):,} トークン")
+print(f"train {len(train_ids):,} トークン ({args.train_name}.txt) / val {len(val_ids):,} トークン")
 print(f"vocab {cfg.vocab_size} / layers {cfg.n_layers} / d_model {cfg.d_model} "
       f"/ context {cfg.context} / dropout {cfg.dropout} (attn {cfg.attn_dropout})")
 print(f"threads {args.threads} / batch {args.batch} / wd {args.wd_mode}")
@@ -107,6 +115,23 @@ print(f"threads {args.threads} / batch {args.batch} / wd {args.wd_mode}")
 model = MicroLM(cfg)
 params = model.parameter_count()
 print(f"パラメータ {params:,} ({params / 1e6:.2f}M)")
+
+# --- 段1 の続きから始める ---
+#
+# **形が 1 つでも違ったら止める。**vocab や d_model が違う ckpt を
+# strict=False で読ませると、合ったテンソルだけ入って残りは初期値のまま走る。
+# 例外は出ないので「なぜか収束しない run」として時間だけ溶ける。
+if args.init:
+    blob = torch.load(args.init, map_location="cpu", weights_only=False)
+    saved = blob.get("config", {})
+    mismatch = {k: (saved.get(k), getattr(cfg, k))
+                for k in ("vocab_size", "n_layers", "d_model", "n_heads", "context")
+                if k in saved and saved[k] != getattr(cfg, k)}
+    if mismatch:
+        raise SystemExit(f"--init の形が違う: {mismatch}")
+
+    model.load_state_dict(blob["model"])
+    print(f"初期値 {args.init} (epoch {blob.get('epoch')} / val {blob.get('val_loss', float('nan')):.4f})")
 
 def cuda_usable():
     """torch.cuda.is_available() だけでは足りない。

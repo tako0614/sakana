@@ -205,9 +205,10 @@ PUSH = "{EVEX_PUSH}"
 CORPUS = "{CORPUS_DIR}"
 TOKEN = os.environ["HF_TOKEN"]
 
-# train.txt の実トークン数 (train-tokenizer.py が測った値)。持ち時間から
-# epoch を逆算するのに使う。コーパスを作り直したら stats.json から取り直す
-TRAIN_TOKENS = 23_950_617
+# 実トークン数 (train-tokenizer.py が測った値)。持ち時間から epoch を逆算する。
+# コーパスを作り直したら stats.json から取り直す
+PRETRAIN_TOKENS = 37_319_281        # 段1: 外部 + evex (外部が 48%)
+TRAIN_TOKENS = 19_280_662           # 段2: evex だけ
 
 # 本体は 2 ファイル。ここに丸ごと埋め込んである (写しを手で持たないため)
 Path("model.py").write_text(MODEL_PY, encoding="utf8")
@@ -263,7 +264,7 @@ def epochs_for(rate, minutes, tokens=TRAIN_TOKENS, hi=6):
     return max(1, min(hi, fits))
 
 
-def run(size, epochs, batch=24, lr="1e-3"):
+def run(size, epochs, batch=24, lr="1e-3", train_name="train", init=None, tag=""):
     """学習して出力ディレクトリを返す。
 
     **落ちても例外にしない。**train.py は epoch ごとにチェックポイントを書くので、
@@ -271,9 +272,12 @@ def run(size, epochs, batch=24, lr="1e-3"):
     回した時間が丸ごと消える (epoch 1 のサンプル生成で落ちて実際に消した)。
     """
     d_model, layers = size[0], size[1]
-    out = f"out-{{d_model}}x{{layers}}"
+    out = f"out-{{d_model}}x{{layers}}{{tag}}"
     cmd = [sys.executable, "train.py", "--corpus", CORPUS, "--batch", str(batch),
-           "--lr", lr, "--out", out, "--epochs", str(epochs)]
+           "--lr", lr, "--out", out, "--epochs", str(epochs),
+           "--train-name", train_name]
+    if init:
+        cmd += ["--init", init]
 
     print("\\n$ " + " ".join(cmd), flush=True)
     done = subprocess.run(cmd, env=env_for(size), check=False)
@@ -281,6 +285,13 @@ def run(size, epochs, batch=24, lr="1e-3"):
         print(f"⚠ train.py が {{done.returncode}} で終了。"
               f"残っているチェックポイントだけ押す", flush=True)
     return out
+
+
+def last_ckpt(out):
+    """その run で一番進んだチェックポイント。段2 の初期値に使う。"""
+    found = sorted(Path(out).glob("ckpt-e*.pt"),
+                   key=lambda p: int(p.stem.removeprefix("ckpt-e")))
+    return str(found[-1]) if found else None
 
 
 def push(out, prefix):
@@ -296,25 +307,28 @@ def push(out, prefix):
     print(f"pushed {{prefix}} ({{len(found)}} epoch) → https://huggingface.co/{{PUSH}}", flush=True)
 
 
-BIG = (384, 8, 6, 1024)     # evex-3 本命    約 15.8M
-SMALL = (256, 6, 4, 512)    # 対照 (evex-2 と同じ形) 約 5.87M
+SIZE = (384, 8, 6, 1024)    # evex-3.5  約 18.9M (語彙 12288 で埋め込みが 4.72M)
 
-# 持ち時間 (分)。Kaggle の週枠が残り 1 時間でも収まるように配る。
-# 環境変数で伸ばせる — 枠に余裕がある週は EVEX_BIG_MIN=60 などにする
-BIG_MINUTES = float(os.environ.get("EVEX_BIG_MIN", 32))
-SMALL_MINUTES = float(os.environ.get("EVEX_SMALL_MIN", 12))
+# 持ち時間 (分)。Kaggle の週枠に合わせて配る
+PRE_MINUTES = float(os.environ.get("EVEX_PRE_MIN", 45))
+FT_MINUTES = float(os.environ.get("EVEX_FT_MIN", 25))
 
-big_rate = bench(BIG)
-big_epochs = epochs_for(big_rate, BIG_MINUTES)
-print(f"\\n本命 {{big_rate:,.0f}} tok/s → {{BIG_MINUTES:.0f}} 分で {{big_epochs}} epoch", flush=True)
+# **段1: 外部の会話 + evex で土台を作る。**
+rate = bench(SIZE)
+pre_epochs = epochs_for(rate, PRE_MINUTES, tokens=PRETRAIN_TOKENS, hi=3)
+print(f"\\n段1 {{rate:,.0f}} tok/s → {{PRE_MINUTES:.0f}} 分で {{pre_epochs}} epoch", flush=True)
+stage1 = run(SIZE, pre_epochs, lr="1e-3", train_name="pretrain", tag="-pre")
+push(stage1, "pretrain")
 
-# **本命を先に回して押し切る。**対照はそのあと (途中で切れても本命は残る)
-push(run(BIG, big_epochs), "15m")
+# **段2: evex だけで仕上げる。**ここで分布が evex に戻る。
+# lr は段1 の 1/3 から。同じ 1e-3 で回すと土台を壊す
+init = last_ckpt(stage1)
+if init is None:
+    raise SystemExit("段1 のチェックポイントが無いので段2 に進めない")
 
-small_rate = bench(SMALL)
-small_epochs = epochs_for(small_rate, SMALL_MINUTES)
-print(f"\\n対照 {{small_rate:,.0f}} tok/s → {{SMALL_MINUTES:.0f}} 分で {{small_epochs}} epoch", flush=True)
-push(run(SMALL, small_epochs), "6m")
+ft_epochs = epochs_for(rate, FT_MINUTES, tokens=TRAIN_TOKENS, hi=4)
+print(f"\\n段2 {{FT_MINUTES:.0f}} 分で {{ft_epochs}} epoch / 初期値 {{init}}", flush=True)
+push(run(SIZE, ft_epochs, lr="3e-4", init=init, tag="-ft"), "evex35")
 
 print("\\n完了", flush=True)
 '''

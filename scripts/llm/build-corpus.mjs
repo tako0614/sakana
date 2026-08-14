@@ -349,6 +349,50 @@ await mkdir(dst, { recursive: true });
 await writeFile(path.join(dst, 'train.txt'), `${train.map((c) => c.text).join('\n')}\n`);
 await writeFile(path.join(dst, 'val.txt'), `${val.map((c) => c.text).join('\n')}\n`);
 
+// --- 段1 (事前学習) の train を作る ---
+//
+// **二段にする。**段1 で外部の会話を混ぜて土台を作り、段2 は evex だけで仕上げる。
+// 混合比だけで evex 率を守ろうとすると、外部が数倍あるぶん永久に薄まる。
+// 最後が evex なら分布は evex に戻り、土台の恩恵だけ取れる。
+//
+// 段1 にも evex を入れるのは、**147 個の話者トークンをここで動かしておく**ため。
+// 外部には役しか出てこないので、入れないと `<|sN|>` の埋め込みが段2 で
+// 初期値から始まることになる。
+//
+// val は段1 でも evex のものを使う (train.py が {corpus}/val.txt を読む)。
+// 「外部を混ぜている最中に evex の val がどう動くか」が見たい値そのもの。
+
+let pretrainStats = null;
+const externalPath = process.env.LLM_EXTERNAL ?? null;
+
+if (externalPath) {
+  const externalText = await readFile(externalPath, 'utf8');
+  const externalLines = externalText.split('\n').filter(Boolean);
+
+  // **外部に話者トークンが混ざっていないこと。**破れると <|s0|> が
+  // なりきり掲示板の口調を覚える。ここで止める
+  const leaked = externalLines.reduce((n, line) => n + (/<\|s\d+\|>/.test(line) ? 1 : 0), 0);
+  if (leaked > 0) {
+    throw new Error(`外部データに話者トークンが ${leaked} 行ある。build-external.mjs を直す`);
+  }
+
+  const pretrain = [...externalLines, ...train.map((c) => c.text)];
+  await writeFile(path.join(dst, 'pretrain.txt'), `${pretrain.join('\n')}\n`);
+
+  const externalChars = externalLines.reduce((sum, l) => sum + l.length, 0);
+  pretrainStats = {
+    external_file: externalPath,
+    external_conversations: externalLines.length,
+    external_chars: externalChars,
+    pretrain_conversations: pretrain.length,
+    pretrain_chars: externalChars + trainCharsOf(train)
+  };
+}
+
+function trainCharsOf(list) {
+  return list.reduce((sum, c) => sum + c.text.length, 0);
+}
+
 // **userId と表示名が入っている。HF にはこのファイルを上げない。**
 // 公開するのは rank と件数だけ (evex-1 / evex-2 と同じ扱い)
 await writeFile(path.join(dst, 'speakers.json'), JSON.stringify(
@@ -405,6 +449,7 @@ const stats = {
   val: val.length,
   val_leaked_to_train: valLeaked,
   val_duplicated: valDuplicated,
+  ...(pretrainStats ?? {}),
   train_chars: trainChars,
   val_chars: chars(val)
 };
@@ -429,5 +474,14 @@ console.log(`長い発言         ${fmt(longExcerpts.length)} を ×${LONG_ROUND
   + `${EXCERPT.longAnonEvery} 本に 1 本だけ匿名化)`);
 console.log(`文字数           train ${fmt(trainChars)} / val ${fmt(chars(val))}`);
 console.log(`1 会話あたり     ${Math.round(trainChars / train.length)} 字`);
-console.log(`\n出力 ${dst}/ (train.txt / val.txt / speakers.json / stats.json)`);
+if (pretrainStats) {
+  const p = pretrainStats;
+  console.log(`段1 (事前学習)   ${fmt(p.pretrain_conversations)} 会話 / ${fmt(p.pretrain_chars)} 字`);
+  console.log(`  うち外部       ${fmt(p.external_conversations)} 会話 / ${fmt(p.external_chars)} 字 `
+    + `(${(p.external_chars / p.pretrain_chars * 100).toFixed(0)}%)  ${p.external_file}`);
+  console.log(`  話者トークンの混入 0 (確認済み)`);
+}
+
+console.log(`\n出力 ${dst}/ (train.txt / val.txt${pretrainStats ? ' / pretrain.txt' : ''}`
+  + ` / speakers.json / stats.json)`);
 console.log('speakers.json には userId と表示名が入っている。**HF には上げない**');

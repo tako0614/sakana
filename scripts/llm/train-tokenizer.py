@@ -53,8 +53,33 @@ SYMBOLS = CONTROL + SPEAKERS + ROLES
 train_txt = CORPUS / "train.txt"
 prefix = str(CORPUS / "tok")
 
+# --- 学習に使うテキスト ---
+#
+# 外部データ (なりきり掲示板など) を混ぜるときは **evex を重くする**。
+# 語彙の枠は有限なので、素直に混ぜると merges が外部の語に持っていかれる。
+# 配信先は evex なので、evex の語を優先させたい。
+#
+# 既定の 3 倍だと evex 54.7M 字 ×3 = 164M 対 外部 36M で 82 対 18 になる
+# (段1 の混合比 60 対 40 とは別物。こちらは語彙の取り合いの話)。
+EVEX_WEIGHT = int(os.environ.get("LLM_TOK_EVEX_WEIGHT", 3))
+EXTRA = os.environ.get("LLM_TOK_EXTRA")          # 例: corpus-v5/external.txt
+
+tok_input = train_txt
+scratch = None
+if EXTRA:
+    scratch = CORPUS / "tok-input.txt"
+    with scratch.open("w", encoding="utf8") as sink:
+        evex = train_txt.read_text(encoding="utf8")
+        for _ in range(max(1, EVEX_WEIGHT)):
+            sink.write(evex)
+        del evex
+        sink.write(Path(EXTRA).read_text(encoding="utf8"))
+    tok_input = scratch
+    print(f"語彙の学習テキスト: {train_txt} ×{EVEX_WEIGHT} + {EXTRA} "
+          f"= {scratch.stat().st_size / 1e6:.0f} MB")
+
 spm.SentencePieceTrainer.train(
-    input=str(train_txt),
+    input=str(tok_input),
     model_prefix=prefix,
     vocab_size=VOCAB_SIZE,
     model_type="bpe",
@@ -76,6 +101,9 @@ spm.SentencePieceTrainer.train(
     remove_extra_whitespaces=False,
     num_threads=16,
 )
+
+if scratch is not None and scratch.exists():
+    scratch.unlink()                      # 語彙の学習にしか使わない (数百MB)
 
 sp = spm.SentencePieceProcessor(model_file=f"{prefix}.model")
 
