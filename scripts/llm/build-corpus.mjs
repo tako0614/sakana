@@ -618,6 +618,13 @@ if (externalPaths.length) {
 // ので過学習しやすい。lr を落として 1〜2 epoch にし、逐語コピーで見る。
 await writeFile(path.join(dst, 'reacted.txt'), `${reacted.join('\n')}\n`);
 
+// **件数だけの表。**話者の学習率補正 (train.py --speaker-lr-cap) が要るのは
+// 件数だけなので、身元を含まないこちらを HF のデータセットに上げる。
+// speakers.json をジョブに渡すと userId と表示名が外に出る
+await writeFile(path.join(dst, 'speaker-counts.json'), JSON.stringify(
+  named.map((a, rank) => ({ token: `<|s${rank}|>`, rank, count: a.count })), null, 1
+));
+
 // **userId と表示名が入っている。HF にはこのファイルを上げない。**
 // 公開するのは rank と件数だけ (evex-1 / evex-2 と同じ扱い)
 await writeFile(path.join(dst, 'speakers.json'), JSON.stringify(

@@ -330,12 +330,15 @@ def speaker_grad_scale():
     if args.speaker_lr_cap <= 1.0:
         return None
 
-    speakers_json = corpus / "speakers.json"
-    if not speakers_json.exists():
-        print("speakers.json が無いので話者の学習率補正は掛けない")
+    # **件数だけの表を先に見る。**HF のジョブには speakers.json (userId と
+    # 表示名が入っている) を上げないので、あちらでは speaker-counts.json しかない
+    found = next((corpus / name for name in ("speaker-counts.json", "speakers.json")
+                  if (corpus / name).exists()), None)
+    if found is None:
+        print("speaker-counts.json が無いので話者の学習率補正は掛けない")
         return None
 
-    rows = json.loads(speakers_json.read_text(encoding="utf8"))
+    rows = json.loads(found.read_text(encoding="utf8"))
     counts = [max(1, row["count"]) for row in rows]
     # 幾何平均。件数が 276 倍も開いているので算術平均だと上位に引っぱられる
     ref = math.exp(sum(math.log(c) for c in counts) / len(counts))
