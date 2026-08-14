@@ -686,6 +686,8 @@ const stats = {
   long_chars: longChars,
   reacted_chars: reactedChars,
   reacted_conversations: reacted.length,
+  // train に混ぜたぶん (周回込み) とは別。段3 のファイルそのものの大きさ
+  reacted_file_chars: reacted.reduce((sum, t) => sum + t.length, 0),
   qa_min_answer: EXCERPT.qaMinAnswer,
   qa_context: EXCERPT.qaContext,
   long_min: EXCERPT.longMin,

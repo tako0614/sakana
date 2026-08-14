@@ -12,6 +12,7 @@ safetensors にする。アーキテクチャの数値は checkpoint の中に�
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 
 import torch
@@ -20,6 +21,9 @@ from safetensors.torch import save_file
 parser = argparse.ArgumentParser()
 parser.add_argument("ckpt")
 parser.add_argument("out", nargs="?", default="dist/hf")
+# **落とした人がそのまま動かせる形にする。**重みだけ置いても、tokenizer と
+# model.py が無ければ 1 トークンも作れない
+parser.add_argument("--corpus", default=None, help="tok.model を持ってくる元")
 args = parser.parse_args()
 
 blob = torch.load(args.ckpt, map_location="cpu", weights_only=False)
@@ -46,8 +50,16 @@ config = {
 }
 (out / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
 
+# tokenizer と本体のコードを同梱する。**speakers.json は入れない**
+if args.corpus:
+    shutil.copy(Path(args.corpus) / "tok.model", out / "tok.model")
+shutil.copy(Path(__file__).with_name("model.py"), out / "model.py")
+
 size = (out / "model.safetensors").stat().st_size
 print(f"model.safetensors  {size / 1024 / 1024:.2f} MB")
 print(f"params             {config['params']:,}")
 print(f"epoch {config['trained_epoch']} / val {config['val_loss']:.4f}")
 print(f"tie_word_embeddings: head.weight は落として embed と結び直す前提 ({shared})")
+print(f"同梱: {sorted(p.name for p in out.iterdir())}")
+print("\n次: カードを作る (**形は成果物から書き起こす**)")
+print(f"  .venv-llm/bin/python scripts/llm/make-model-card.py {out} --corpus <コーパス>")
