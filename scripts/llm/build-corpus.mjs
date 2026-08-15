@@ -190,8 +190,14 @@ function toTurns(chunk) {
       reply: Boolean(row.reply),
       replyTo: target,
       content: row.content,
-      // **サーバーが実際に反応した発言**の印。切り出しの判定に使う
+      // **サーバーが実際に反応した発言**の印。切り出しの判定に使う。
+      //
+      // `hi` は**プロンプトにも出す** (evex-4.1 以降)。段3 で「リアクション付き
+      // だけで追加学習」をやったら噛み合いが 53.3% → 36.7% に落ちたが、あれは
+      // 土台を上書きしたのが敗因。**条件付けとして置くだけなら土台は壊れない**し、
+      // 推論で置かなければ元に戻せる
       reactions: row.reactions ?? 0,
+      hi: (row.reactions ?? 0) >= EXCERPT.reactedMin,
       // excerpts.mjs の判定に渡す形。宛先は別に持っているので raw と body は同じ
       key: self,
       raw: row.content,

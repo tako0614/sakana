@@ -266,7 +266,9 @@ export async function roleScheme(engine = null) {
     // チャンネルトークン (evex-4 以降)。**申告が空の世代には何も渡さない** —
     // 語彙に無い `<|c0|>` を渡すとバイトに分解されて先頭から形が崩れる
     channels: info.channels ?? [],
-    channelOverflow: info.channel_overflow ?? null
+    channelOverflow: info.channel_overflow ?? null,
+    // リアクションの印 (evex-4.1 以降)。申告が無ければ渡さない
+    quality: info.quality ?? null
   };
   schemes.set(key, found);
   return found;

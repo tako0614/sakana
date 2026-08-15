@@ -118,10 +118,14 @@ export function messageText(content) {
  *
  * trailing に話者トークンを置くと、その人の発言として続きを書かせられる。
  */
-export function buildPrompt(turns, trailingToken = null) {
+export function buildPrompt(turns, trailingToken = null, { quality = null } = {}) {
   const parts = ['<|conv|>'];
 
   for (const turn of turns) {
+    // **リアクションが付いた発言の印 (evex-4.1 以降)。**話者トークンの直前に置く。
+    // 学習側でここに置いてあるので、推論で同じ位置に置けば
+    // 「このサーバーが反応する種類の発言」を狙って書かせられる
+    if (turn.hi) parts.push('<|hi|>');
     parts.push(turn.token);
     if (turn.reply || turn.replyTo) parts.push('<|re|>');
     // 相手が分かるときだけ置く。分からない返信は `<|re|>` だけで前の世代と同じ形
@@ -129,7 +133,11 @@ export function buildPrompt(turns, trailingToken = null) {
     parts.push(turn.content);
   }
 
-  if (trailingToken) parts.push(trailingToken);
+  // 続きを書かせる側にも同じ印を置ける。**置かなければ前の世代と同じ形**
+  if (trailingToken) {
+    if (quality) parts.push(quality);
+    parts.push(trailingToken);
+  }
   return parts.join('');
 }
 

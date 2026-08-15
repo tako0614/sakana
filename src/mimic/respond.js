@@ -151,8 +151,16 @@ async function tokenRequest(messages, { wanted, engine, channelId, selfId }) {
   // 渡すとバイトに分解されて、窓の先頭から形が崩れる。
   const channel = channelTokenOf(channelId, scheme);
 
+  // **常に「反応された発言」として書かせる (evex-4.1 以降)。**
+  //
+  // 学習側では、リアクションが付いた発言の話者トークンの直前に `<|hi|>` が
+  // 置いてある。推論で同じ位置に置くと「このサーバーが反応する種類の発言」を
+  // 狙える。段3 と違って**土台を上書きしていない**ので、外せば元の分布に戻る。
+  // 申告が無い世代 (evex-4 以前) では null になり、何も置かれない
+  const quality = scheme?.quality ?? null;
+
   return {
-    prompt: `${channel ?? ''}${buildPrompt(turns, trailing)}`,
+    prompt: `${channel ?? ''}${buildPrompt(turns, trailing, { quality })}`,
     // 末尾に置いたトークンを渡す。同じ人の連投は残し、他人が喋り出したら切る
     cut: (text) => ownTurns(text, trailing),
     trailing,

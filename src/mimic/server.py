@@ -89,6 +89,10 @@ while has_piece(f"<|c{len(CHANNELS)}|>"):
     CHANNELS.append(f"<|c{len(CHANNELS)}|>")
 CHANNEL_OVERFLOW = "<|cx|>" if CHANNELS and has_piece("<|cx|>") else None
 
+# リアクションが付いた発言の印 (evex-4.1 以降)。持っていない世代では None になり、
+# bot 側は申告に無いトークンを渡さないので、古い世代の推論は変わらない
+QUALITY = "<|hi|>" if has_piece("<|hi|>") else None
+
 blob = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 saved = blob["config"]
 cfg = Config(
@@ -105,6 +109,7 @@ INFO = {
     "speakers": SPEAKERS,
     "channels": CHANNELS,
     "channel_overflow": CHANNEL_OVERFLOW,
+    "quality": QUALITY,
     "epoch": blob.get("epoch"),
     "val_loss": blob.get("val_loss"),
     "train_loss": blob.get("train_loss"),
