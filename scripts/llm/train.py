@@ -114,6 +114,29 @@ parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=
 # 何が起きてもそこから段2 に進める。書き先は epoch 終わりと同じ名前なので、
 # 完走すれば上書きされて何も残らない
 parser.add_argument("--save-steps", type=int, default=0)
+
+# --- evex-5 で足したもの。**既定は全部これまでどおり** ---
+#
+# Muon: 2 次元の行列だけを直交化して更新する optimizer。同じ精度に AdamW の
+# 52% の FLOP で届くと報告されている (arXiv:2502.16982)。**埋め込みと 1 次元は
+# AdamW のまま**にする決まりなので、`--wd-mode matrices` の分割がそのまま使える。
+# 伸びなければ `--optimizer adamw` で即戻せる
+parser.add_argument("--optimizer", default="adamw", choices=["adamw", "muon"])
+# WSD: warmup → 一定 → 最後だけ減衰。cosine と違って**総ステップを先に決めなくて
+# よい**ので、段1 の途中の重みがそのまま段2 の初期値として使える (MiniCPM)。
+# 段1 を 1 回だけ回して段2 を何本も分岐させるために要る
+parser.add_argument("--schedule", default="cosine", choices=["cosine", "wsd"])
+# 最後の何割を減衰に使うか。段2 は 1.0 (最初から減衰) にして仕上げ相にする
+parser.add_argument("--decay-frac", type=float, default=0.2)
+# z-loss: logsumexp を 0 に寄せて logits の絶対値が膨らむのを抑える。
+# fp16 で回すときの安定化。0 で切る
+parser.add_argument("--z-loss", type=float, default=0.0)
+# 損失を何分割して計算するか。1 で分割しない。
+#
+# **logits は batch×context×語彙。**48×1024×12288×4B = 2.25GB あって、
+# これが 2 回 OOM を出した張本人。時間方向に割れば実体化する量が 1/n になり、
+# 同じメモリで batch を増やせる
+parser.add_argument("--loss-chunks", type=int, default=1)
 args = parser.parse_args()
 
 corpus = Path(args.corpus)
@@ -331,7 +354,44 @@ def param_groups():
             {"params": plain, "weight_decay": 0.0}]
 
 
-opt = torch.optim.AdamW(param_groups(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
+def build_optimizer():
+    """AdamW か、行列だけ Muon + 残り AdamW の 2 本立て。
+
+    **Muon は 2 次元のパラメータ専用。**埋め込みと 1 次元 (RMSNorm のゲイン) は
+    標準の optimizer で回す決まりなので、`--wd-mode matrices` が既に持っている
+    「行列 / それ以外」の分割をそのまま使う。分け方を 2 箇所に持たない。
+    """
+    if args.optimizer == "adamw":
+        return [torch.optim.AdamW(param_groups(), lr=args.lr, betas=(0.9, 0.95),
+                                  weight_decay=0.1)]
+
+    if not hasattr(torch.optim, "Muon"):
+        raise SystemExit("この torch に torch.optim.Muon が無い (2.9 以降が要る)")
+
+    matrices, plain = [], []
+    seen = set()
+    for _, param in model.named_parameters():
+        if id(param) in seen:
+            continue
+        seen.add(id(param))
+        (matrices if param.dim() == 2 and param is not model.embed.weight
+         else plain).append(param)
+
+    print(f"Muon: 行列 {sum(p.numel() for p in matrices):,} / "
+          f"AdamW: 埋め込みと1次元 {sum(p.numel() for p in plain):,}")
+    # **`match_rms_adamw` を使う。**Muon の更新はスペクトルノルムで正規化されて
+    # いるので、素のままだと AdamW と適正な学習率が桁で違う。この調整を入れると
+    # AdamW と同じ更新の大きさに揃うので、**同じ --lr で対照が取れる**
+    # (Moonlight の「per-parameter update scale を合わせる」に相当)。
+    return [
+        torch.optim.Muon(matrices, lr=args.lr, weight_decay=0.1,
+                         adjust_lr_fn="match_rms_adamw"),
+        torch.optim.AdamW(plain, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0),
+    ]
+
+
+opts = build_optimizer()
+opt = opts[0]        # 既存の呼び出しが 1 本目を見ている箇所のため
 
 
 def speaker_grad_scale():
@@ -386,7 +446,19 @@ speaker_scale = speaker_grad_scale()
 def lr_at(step):
     if step < warmup_steps:
         return args.lr * (step + 1) / warmup_steps
+
     progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+
+    if args.schedule == "wsd":
+        # **一定 → 最後だけ減衰。**総ステップを先に決めなくてよいので、
+        # 途中の重みがそのまま次の段の初期値として使える (MiniCPM)。
+        # decay_frac=1.0 にすると最初から減衰 = 仕上げ相になる
+        keep = 1.0 - args.decay_frac
+        if progress <= keep:
+            return args.lr
+        tail = (progress - keep) / max(1e-9, args.decay_frac)
+        return args.lr * (1.0 - 0.9 * min(1.0, tail))
+
     return args.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, progress))))
 
 
@@ -482,19 +554,23 @@ window = time.time()
 seen = 0
 
 for step in range(total_steps):
-    for group in opt.param_groups:
-        group["lr"] = lr_at(step)
+    for optimizer in opts:
+        for group in optimizer.param_groups:
+            group["lr"] = lr_at(step)
 
     x, y = next(train_batches)
     with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
-        _, loss = model(x, y)
+        _, loss = model(x, y, chunks=args.loss_chunks, z_loss=args.z_loss)
 
-    opt.zero_grad(set_to_none=True)
+    for optimizer in opts:
+        optimizer.zero_grad(set_to_none=True)
     scaler.scale(loss).backward()
     # clip する前に必ず戻す。スケールしたままの勾配を切ると閾値が意味を失う
-    scaler.unscale_(opt)
+    for optimizer in opts:
+        scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(uncompiled.parameters(), 1.0)
-    scaler.step(opt)
+    for optimizer in opts:
+        scaler.step(optimizer)
     scaler.update()
 
     seen += tokens_per_step

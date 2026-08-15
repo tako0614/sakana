@@ -222,22 +222,46 @@ class MicroLM(nn.Module):
         table = self.ple_table(idx).view(shape) * math.sqrt(self.cfg.d_ple)
         return self.ple_norm(table + self.ple_proj(x).view(shape)).type_as(x)
 
-    def forward(self, idx, targets=None, attn_mask=None):
+    def forward(self, idx, targets=None, attn_mask=None, chunks=1, z_loss=0.0):
+        """targets を渡すと (None, loss)、渡さないと (logits, None)。
+
+        **targets があるとき logits は返さない。**呼ぶ側は全部捨てているうえ、
+        logits は batch×context×語彙 (48×1024×12288×4B = 2.25GB) あって、
+        これが 2 回 OOM を出した張本人。時間方向に割って足し合わせれば、
+        一度に実体化する量が 1/chunks になる。
+        """
         x = self.drop(self.embed(idx))
         per_layer = self.per_layer_inputs(idx, x)
 
         for i, block in enumerate(self.blocks):
             p = per_layer[:, :, i] if per_layer is not None else None
             x = block(x, self.cos, self.sin, p, attn_mask)
-        logits = self.head(self.norm(x))
+        h = self.norm(x)
 
         if targets is None:
-            return logits, None
+            return self.head(h), None
 
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1
-        )
-        return logits, loss
+        # 損失に入る位置の数。**割った塊ごとに平均すると、塊で個数が違うときに
+        # 重みがずれる。**先に総数を出して足し込む
+        counted = (targets != -1).sum().clamp(min=1)
+        size = max(1, h.size(1) // max(1, chunks))
+        loss = h.new_zeros((), dtype=torch.float32)
+
+        for hc, tc in zip(h.split(size, dim=1), targets.split(size, dim=1)):
+            logits = self.head(hc).float()
+            flat, flat_t = logits.view(-1, logits.size(-1)), tc.reshape(-1)
+            loss = loss + F.cross_entropy(
+                flat, flat_t, ignore_index=-1, reduction="sum"
+            )
+            # z-loss: logsumexp を 0 に寄せて logits が膨らむのを抑える。
+            # fp16 で回すときの安定化 (PaLM / Gemma と同じ)
+            if z_loss:
+                keep = flat_t != -1
+                if keep.any():
+                    z = torch.logsumexp(flat[keep], dim=-1)
+                    loss = loss + z_loss * z.pow(2).sum()
+
+        return None, loss / counted
 
     def parameter_count(self):
         # tying しているので head は数えない (embed と同じテンソル)
