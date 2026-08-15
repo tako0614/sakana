@@ -451,12 +451,22 @@ def push(out, prefix):
         print(f"⚠ {{out}} にチェックポイントが無いので押さない", flush=True)
         return
 
+    # **最新の 1 本だけ上げる。**`upload_folder` はフォルダ内の全チェックポイントを
+    # 毎回上げ直すので、epoch が進むほどコミットが膨らんで
+    # `413 Payload Too Large` になる (epoch 1 は通って 2 以降が全部落ちた)。
+    # 1 ファイルずつなら 103MB で収まる
+    newest = max(found, key=lambda p: int(p.stem.removeprefix("ckpt-e")))
     try:
-        subprocess.run(["cp", f"{{CORPUS}}/tok.model", out], check=True)
-        api.upload_folder(repo_id=PUSH, folder_path=out, path_in_repo=prefix,
-                          commit_message=f"evex {{prefix}}")
-        print(f"pushed {{prefix}} ({{len(found)}} epoch) → https://huggingface.co/{{PUSH}}",
-              flush=True)
+        api.upload_file(path_or_fileobj=str(newest), path_in_repo=f"{{prefix}}/{{newest.name}}",
+                        repo_id=PUSH, commit_message=f"evex {{prefix}} {{newest.name}}")
+        # tokenizer と履歴は小さいので毎回上げ直して構わない
+        for small in (Path(out) / "history.json", Path(f"{{CORPUS}}/tok.model")):
+            path = small
+            if path.exists():
+                api.upload_file(path_or_fileobj=str(path),
+                                path_in_repo=f"{{prefix}}/{{path.name}}", repo_id=PUSH,
+                                commit_message=f"evex {{prefix}} {{path.name}}")
+        print(f"pushed {{prefix}}/{{newest.name}} → https://huggingface.co/{{PUSH}}", flush=True)
     except Exception as error:
         print(f"⚠ push に失敗したが学習は続ける: {{type(error).__name__}} "
               f"{{str(error)[:160]}}", flush=True)
@@ -813,12 +823,24 @@ COLAB_RUN = """# --- 続きを回す ---
 
 
 COLAB_PUSH = """# --- 押す。**1 epoch でも回ったら必ずここまで来ること** ---
+#
+# **1 ファイルずつ上げる。**フォルダごと上げると epoch が進むほどコミットが
+# 膨らんで `413 Payload Too Large` になる (HF Jobs で epoch 2 以降が全部落ちた)
 api = HfApi(token=os.environ["HF_TOKEN"])
 api.create_repo(PUSH, private=True, exist_ok=True)
-!cp {CORPUS}/tok.model out-evex5/
-api.upload_folder(repo_id=PUSH, folder_path="out-evex5",
-                  path_in_repo="pretrain-evex5", commit_message="evex-5 段2 の続き")
-print("pushed → https://huggingface.co/" + PUSH)
+
+for path in sorted(glob.glob("out-evex5/ckpt-e*.pt")) + ["out-evex5/history.json",
+                                                         f"{CORPUS}/tok.model"]:
+    if not os.path.exists(path):
+        continue
+    try:
+        api.upload_file(path_or_fileobj=path, repo_id=PUSH,
+                        path_in_repo="pretrain-evex5/" + os.path.basename(path),
+                        commit_message="evex-5 " + os.path.basename(path))
+        print("pushed", path)
+    except Exception as error:
+        print("⚠", path, type(error).__name__, str(error)[:120])
+print("→ https://huggingface.co/" + PUSH)
 """
 
 
