@@ -31,6 +31,19 @@ class Config:
     # 正則化は残差側の dropout で足りるので、ここは 0 にして融合経路に乗せる。
     attn_dropout: float = float(os.environ.get("LLM_ATTN_DROPOUT", 0.0))
 
+    # --- evex-5 で足したもの。**既定は False で、旧世代の重みがそのまま読める** ---
+    #
+    # PLE (Per-Layer Embeddings / Gemma 3n)。トークンごと・層ごとの補助ベクトルを
+    # 引いて各層の残差に足す。**行列積ではなく引き算**なので、容量は増えるのに
+    # 計算量はほぼ増えない (d_ple=64 で パラメータ +34% / FLOP +1.04%)。
+    #
+    # evex は CPU 推論で行列積律速なので、この交換比は理屈が合う。
+    ple: bool = os.environ.get("LLM_PLE", "0") == "1"
+    d_ple: int = int(os.environ.get("LLM_DPLE", 64))
+    # q/k を RMSNorm してから RoPE を掛ける (Gemma 3)。ほぼ 0 パラメータで
+    # 学習が安定し、学習率を上げられる
+    qk_norm: bool = os.environ.get("LLM_QK_NORM", "0") == "1"
+
     @property
     def d_ff(self):
         # SwiGLU は行列が 3 つなので、4*d_model 相当に合わせて 2/3 に縮める。
@@ -88,8 +101,11 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(cfg.d_model, cfg.d_model * 3, bias=False)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.dropout = cfg.attn_dropout
+        # **RoPE の前に掛ける。**後だと回転した向きごと正規化してしまう
+        self.qn = RMSNorm(cfg.d_head) if cfg.qk_norm else None
+        self.kn = RMSNorm(cfg.d_head) if cfg.qk_norm else None
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, attn_mask=None):
         b, t, _ = x.shape
         h, dh = self.cfg.n_heads, self.cfg.d_head
 
@@ -98,12 +114,21 @@ class Attention(nn.Module):
         k = k.view(b, t, h, dh).transpose(1, 2)
         v = v.view(b, t, h, dh).transpose(1, 2)
 
+        if self.qn is not None:
+            q, k = self.qn(q).type_as(v), self.kn(k).type_as(v)
+
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        # is_causal で三角マスクは自前で持たない (CPU でも flash 経路に乗る)
+        # is_causal で三角マスクは自前で持たない (CPU でも flash 経路に乗る)。
+        #
+        # **文書内マスクを渡すと融合カーネルから落ちる。**呼ぶ側が既に因果性を
+        # 含めたマスクを組んでいるので、そのときは is_causal を外す
         out = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0.0
+            q, k, v,
+            attn_mask=attn_mask,
+            is_causal=attn_mask is None,
+            dropout_p=self.dropout if self.training else 0.0
         )
         return self.proj(out.transpose(1, 2).contiguous().view(b, t, self.cfg.d_model))
 
@@ -128,9 +153,22 @@ class Block(nn.Module):
         self.ff = SwiGLU(cfg)
         self.drop = nn.Dropout(cfg.dropout)
 
-    def forward(self, x, cos, sin):
-        x = x + self.drop(self.attn(self.n1(x), cos, sin))
-        return x + self.drop(self.ff(self.n2(x)))
+        # PLE の注入 (Gemma 3n の per-layer input)。その層ぶんの補助ベクトル p を
+        # ゲートで混ぜて残差に足す。**行列は d_model×d_ple の 2 枚だけ**なので、
+        # 引いてきた容量に対して計算量はほとんど増えない
+        if cfg.ple:
+            self.ple_gate = nn.Linear(cfg.d_model, cfg.d_ple, bias=False)
+            self.ple_out = nn.Linear(cfg.d_ple, cfg.d_model, bias=False)
+        else:
+            self.ple_gate = self.ple_out = None
+
+    def forward(self, x, cos, sin, per_layer=None, attn_mask=None):
+        x = x + self.drop(self.attn(self.n1(x), cos, sin, attn_mask))
+        x = x + self.drop(self.ff(self.n2(x)))
+
+        if self.ple_out is not None and per_layer is not None:
+            x = x + self.ple_out(F.silu(self.ple_gate(x)) * per_layer)
+        return x
 
 
 class MicroLM(nn.Module):
@@ -142,6 +180,17 @@ class MicroLM(nn.Module):
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layers))
         self.norm = RMSNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+
+        # PLE の 2 系統 (Gemma 3n と同じ組み合わせ):
+        #   ple_table  トークン同一性。語彙 × 層 × d_ple の引き表
+        #   ple_proj   文脈側。入力埋め込みから層ぶんを作る (per_layer_model_projection)
+        # 足して RMSNorm したものが、その層の補助ベクトルになる
+        if cfg.ple:
+            self.ple_table = nn.Embedding(cfg.vocab_size, cfg.n_layers * cfg.d_ple)
+            self.ple_proj = nn.Linear(cfg.d_model, cfg.n_layers * cfg.d_ple, bias=False)
+            self.ple_norm = RMSNorm(cfg.d_ple)
+        else:
+            self.ple_table = self.ple_proj = self.ple_norm = None
 
         # weight tying。669万トークンで語彙 4096 ぶんの出力行列を別に学ぶ余裕はない
         self.head.weight = self.embed.weight
@@ -163,10 +212,23 @@ class MicroLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def per_layer_inputs(self, idx, x):
+        """各層に配る補助ベクトル (B, T, n_layers, d_ple)。PLE が無ければ None。"""
+        if self.ple_table is None:
+            return None
+        b, t = idx.shape
+        shape = (b, t, self.cfg.n_layers, self.cfg.d_ple)
+        # 表の側だけ sqrt(d_ple) で持ち上げる (Gemma 3n と同じ。射影側と桁を揃える)
+        table = self.ple_table(idx).view(shape) * math.sqrt(self.cfg.d_ple)
+        return self.ple_norm(table + self.ple_proj(x).view(shape)).type_as(x)
+
+    def forward(self, idx, targets=None, attn_mask=None):
         x = self.drop(self.embed(idx))
-        for block in self.blocks:
-            x = block(x, self.cos, self.sin)
+        per_layer = self.per_layer_inputs(idx, x)
+
+        for i, block in enumerate(self.blocks):
+            p = per_layer[:, :, i] if per_layer is not None else None
+            x = block(x, self.cos, self.sin, p, attn_mask)
         logits = self.head(self.norm(x))
 
         if targets is None:
