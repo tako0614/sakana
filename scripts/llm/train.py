@@ -137,6 +137,17 @@ parser.add_argument("--z-loss", type=float, default=0.0)
 # これが 2 回 OOM を出した張本人。時間方向に割れば実体化する量が 1/n になり、
 # 同じメモリで batch を増やせる
 parser.add_argument("--loss-chunks", type=int, default=1)
+# 文書内マスク。窓が会話をまたいだとき、前の会話にアテンションさせない。
+#
+# **いまは会話を連結して context で切っているので、1 つの窓に 1〜3 会話が入る。**
+# 素の因果マスクだと、いま書いている発言が**無関係な前の会話**を参照できる。
+# ここを塞ぐと言語モデリングと文脈内学習が良くなると報告がある (Trillion 7B)。
+#
+# ただし**マスクを渡すと融合カーネルから落ちて遅くなる**。bench で実測して決める
+parser.add_argument("--doc-mask", action=argparse.BooleanOptionalAction, default=False)
+# Rho-1: 参照モデルで採点したトークンだけ学習する (uint8 の 0/1 配列)。
+# **入力としては全部見せたまま、損失からだけ外す**ので、文脈は壊れない
+parser.add_argument("--keep-mask", default=None)
 args = parser.parse_args()
 
 corpus = Path(args.corpus)
@@ -169,6 +180,18 @@ def load(name):
 
 train_ids = load(args.train_name)
 val_ids = load("val")
+
+# Rho-1 の採点結果。train_ids と**同じ長さ**でなければ位置がずれるので止める
+keep_mask = None
+if args.keep_mask:
+    keep_mask = np.load(args.keep_mask)
+    if len(keep_mask) != len(train_ids):
+        raise SystemExit(
+            f"keep-mask の長さが合わない ({len(keep_mask):,} 対 {len(train_ids):,})。"
+            f"採点したコーパスと学習するコーパスが違う")
+    kept = int(keep_mask.sum())
+    print(f"Rho-1: {kept:,} / {len(keep_mask):,} トークン "
+          f"({kept / len(keep_mask) * 100:.1f}%) だけ損失に入れる")
 
 if args.max_tokens and len(train_ids) > args.max_tokens:
     # **先頭から切る。**コーパスは build-corpus.mjs が時系列に並べているので、
@@ -302,29 +325,56 @@ def on_device(ids):
     return torch.as_tensor(ids.astype(np.int64)).to(device)
 
 
-def batches(ids, batch_size, generator, mask=None):
+END_ID = sp.piece_to_id("<|end|>")
+
+
+def document_mask(x):
+    """会話をまたいだアテンションを塞ぐ (B, 1, T, T) の真偽マスク。
+
+    **`<|end|>` は自分の会話に属する。**その次のトークンから新しい会話なので、
+    「自分より前にある `<|end|>` の数」を会話番号にすると境界がちょうど合う。
+
+    因果性もここに含める — `attn_mask` を渡すと `is_causal` が使えなくなるため。
+    """
+    ends = (x == END_ID).to(torch.int32)
+    # 自分より**前**にある <|end|> の数 (自分は含めない)
+    doc = torch.cumsum(ends, dim=1) - ends
+    same = doc[:, :, None] == doc[:, None, :]
+    causal = torch.ones(x.size(1), x.size(1), dtype=torch.bool, device=x.device).tril()
+    return (same & causal).unsqueeze(1)
+
+
+def batches(ids, batch_size, generator, mask=None, keep=None):
     """context+1 の窓を無作為に切る。端は捨てる。"""
     high = len(ids) - cfg.context - 1
     use = args.mask_tokens if mask is None else mask
     ban = torch.tensor(masked_ids, dtype=torch.long, device=device) if use else None
     stream = on_device(ids)
+    keep_stream = None
+    if keep is not None:
+        keep_stream = torch.from_numpy(keep.astype("bool")).to(device)
 
     while True:
         # 開始位置は CPU の generator で引く。**乱数の出方を変えないため** —
         # device 側で引くと過去の run と同じ系列にならず、比べられなくなる
         starts = torch.randint(0, high, (batch_size,), generator=generator).to(device)
-        chunk = stream[starts[:, None] + OFFSETS[None, :]]
+        index = starts[:, None] + OFFSETS[None, :]
+        chunk = stream[index]
         x, y = chunk[:, :-1], chunk[:, 1:]
 
         if ban is not None:
             # 入力 (x) はそのまま。目標 (y) だけ外すので、文脈としては見えたまま
             y = y.masked_fill(torch.isin(y, ban), IGNORE)
 
-        yield x, y
+        # Rho-1。**y と同じ位置で引く** (y は 1 つずらしているので index も揃える)
+        if keep_stream is not None:
+            y = y.masked_fill(~keep_stream[index[:, 1:]], IGNORE)
+
+        yield x, y, (document_mask(x) if args.doc_mask else None)
 
 
 gen = torch.Generator().manual_seed(0)
-train_batches = batches(train_ids, args.batch, gen)
+train_batches = batches(train_ids, args.batch, gen, keep=keep_mask)
 
 tokens_per_step = args.batch * cfg.context
 steps_per_epoch = max(1, len(train_ids) // tokens_per_step)
@@ -478,8 +528,10 @@ def evaluate(ids, iters=40, mask=None):
     stream = batches(ids, args.batch, local, mask=mask)
     total = 0.0
     for _ in range(iters):
-        x, y = next(stream)
-        _, loss = model(x, y)
+        # **val に Rho-1 は掛けない** (keep なし)。掛けると測っているものが
+        # 変わって、過去の run と比べられなくなる。文書内マスクは学習と揃える
+        x, y, doc = next(stream)
+        _, loss = model(x, y, attn_mask=doc)
         total += loss.item()
     model.train()
     return total / iters
@@ -558,9 +610,10 @@ for step in range(total_steps):
         for group in optimizer.param_groups:
             group["lr"] = lr_at(step)
 
-    x, y = next(train_batches)
+    x, y, doc = next(train_batches)
     with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_on):
-        _, loss = model(x, y, chunks=args.loss_chunks, z_loss=args.z_loss)
+        _, loss = model(x, y, attn_mask=doc,
+                        chunks=args.loss_chunks, z_loss=args.z_loss)
 
     for optimizer in opts:
         optimizer.zero_grad(set_to_none=True)
