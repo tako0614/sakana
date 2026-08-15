@@ -23,8 +23,8 @@ ROOT = Path(__file__).resolve().parents[2]
 LLM = ROOT / "scripts" / "llm"
 
 MODE = (sys.argv[1] if len(sys.argv) > 1 else "ft").lower()
-if MODE not in {"ft", "evex", "runner"}:
-    raise SystemExit("使い方: make-kaggle-notebook.py [ft|evex|runner]")
+if MODE not in {"ft", "evex", "runner", "scorer"}:
+    raise SystemExit("使い方: make-kaggle-notebook.py [ft|evex|runner|scorer]")
 
 DATASET = "tako080614/sakana-sft"          # private。実在の会話が入っている
 
@@ -218,8 +218,8 @@ TOKEN = os.environ["HF_TOKEN"]
 
 # 実トークン数 (train-tokenizer.py が測った値)。持ち時間から epoch を逆算する。
 # コーパスを作り直したら stats.json から取り直す
-PRETRAIN_TOKENS = 209_636_220       # 段1: 外部 146.7M + evex 62.9M (evex が 30.0%)
-TRAIN_TOKENS = 44_484_559           # 段2: evex だけ (切り方 8 通り + 切り出し)
+PRETRAIN_TOKENS = 208_844_436       # 段1: 外部 70% + evex 30% (corpus-v10)
+TRAIN_TOKENS = 44_718_427           # 段2: evex だけ (切り方 8 通り + 切り出し)
 REACTED_TOKENS = 692_050            # 段3: **使わない** (evex-4 で噛み合いが 53.3 → 36.7)
 
 # 本体は 2 ファイル。ここに丸ごと埋め込んである (写しを手で持たないため)
@@ -366,10 +366,16 @@ def run(size, epochs, batch=BATCH, lr="1e-3", train_name="train", init=None, tag
         cmd += ["--compile"]
     # evex-5 の学習側の軸。**渡さなければ全部これまでどおり**
     for flag, key in (("--optimizer", "EVEX_OPTIMIZER"), ("--schedule", "EVEX_SCHEDULE"),
-                      ("--decay-frac", "EVEX_DECAY_FRAC"), ("--z-loss", "EVEX_Z_LOSS"),
-                      ("--loss-chunks", "EVEX_LOSS_CHUNKS")):
+                      ("--z-loss", "EVEX_Z_LOSS"), ("--loss-chunks", "EVEX_LOSS_CHUNKS")):
         if os.environ.get(key):
             cmd += [flag, os.environ[key]]
+    # **WSD の減衰は段によって違う。**段1 は一定のまま走らせて最後だけ落とす
+    # (途中の重みを段2 の初期値に使えるようにするため)。段2 は**最初から減衰** =
+    # 仕上げ相にする。1 つの環境変数で両方を賄うと、どちらかが必ず間違う
+    if os.environ.get("EVEX_SCHEDULE") == "wsd":
+        cmd += ["--decay-frac",
+                "1.0" if train_name != "pretrain"
+                else os.environ.get("EVEX_DECAY_FRAC", "0.2")]
     if os.environ.get("EVEX_DOC_MASK") == "1":
         cmd += ["--doc-mask"]
     # Rho-1 の採点結果。段1 にだけ掛ける (段2 は evex 本体なので全部使う)
@@ -639,6 +645,70 @@ def markdown(source):
 def embed(name):
     """学習の本体をノートブックに書き出すセル。写しを手で持たないための仕掛け。"""
     return code(f"%%writefile {name}\n{(LLM / name).read_text(encoding='utf8')}")
+
+
+# Rho-1 の採点をジョブで回すための台本。208.8M トークンの forward は CPU では
+# 20 時間かかるので GPU に投げる。runner と同じで**本体を 1 ファイルに埋め込む**
+SCORER = f'''
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from huggingface_hub import HfApi, snapshot_download
+
+DATASET = "{DATASET}"
+PUSH = "{EVEX_PUSH}"
+CORPUS = os.environ.get("EVEX_CORPUS", "corpus-v10")
+REF = os.environ["EVEX_REF"]          # 押してある参照モデルの path (repo 内)
+NAME = os.environ.get("EVEX_SCORE_NAME", "pretrain")
+KEEP = os.environ.get("EVEX_KEEP", "0.6")
+TOKEN = os.environ["HF_TOKEN"]
+
+Path("model.py").write_text(MODEL_PY, encoding="utf8")
+Path("score-tokens.py").write_text(SCORE_TOKENS_PY, encoding="utf8")
+
+snapshot_download(repo_id=DATASET, repo_type="dataset", local_dir=".",
+                  allow_patterns=[CORPUS + "/*"], token=TOKEN)
+got = snapshot_download(repo_id=PUSH, local_dir="ref",
+                        allow_patterns=[REF], token=TOKEN)
+ref_path = str(Path(got, REF))
+print("参照", ref_path, flush=True)
+
+cmd = [sys.executable, "score-tokens.py", "--ckpt", ref_path, "--corpus", CORPUS,
+       "--name", NAME, "--keep", KEEP, "--batch", os.environ.get("EVEX_SCORE_BATCH", "32")]
+print("$ " + " ".join(cmd), flush=True)
+done = subprocess.run(cmd, check=False)
+if done.returncode != 0:
+    raise SystemExit(f"採点が {{done.returncode}} で終了")
+
+api = HfApi(token=TOKEN)
+api.upload_file(path_or_fileobj=f"{{CORPUS}}/{{NAME}}.keep.npy",
+                path_in_repo=f"{{CORPUS}}/{{NAME}}.keep.npy",
+                repo_id=DATASET, repo_type="dataset")
+print(f"pushed {{CORPUS}}/{{NAME}}.keep.npy", flush=True)
+'''
+
+
+if MODE == "scorer":
+    header = (
+        "# /// script\n"
+        '# requires-python = ">=3.10"\n'
+        '# dependencies = ["torch", "numpy", "sentencepiece", "huggingface_hub"]\n'
+        "# ///\n\n"
+    )
+    body = header + "".join(
+        f"{name.removesuffix('.py').upper().replace('-', '_')}_PY = r'''"
+        + (LLM / name).read_text(encoding="utf8").replace("'''", "\\x27\\x27\\x27")
+        + "'''\n\n"
+        for name in ("model.py", "score-tokens.py")
+    ) + SCORER
+
+    out = ROOT / "dist" / "evex-score.py"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(body, encoding="utf8")
+    print(f"{out}  {out.stat().st_size / 1024:.0f} KB")
+    raise SystemExit(0)
 
 
 if MODE == "runner":
