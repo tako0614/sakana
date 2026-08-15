@@ -138,6 +138,17 @@ export const ENDPOINTS = {
     maxNewTokens: number(process.env.MIMIC_V4_MAX_NEW_TOKENS, 200),
     label: process.env.MIMIC_V4_LABEL ?? 'evex-4',
     format: process.env.MIMIC_V4_FORMAT ?? 'auto'
+  },
+  // evex-4 と同じ形・同じ語彙で、コーパスだけ v8 (evex 比率 30% / 連投の分布合わせ /
+  // 切り方 8 通り)。**数字は evex-4 の方が良い** (役の噛み合い 53.3% 対 36.7%) が、
+  // 切り出しが薄まったのが原因で分かっており、手触りは別に読む価値がある。
+  // train-val の差が大きく (2.5067/5.2162)、逐語コピー 0% のまま学習分布に寄っている
+  'evex-4.1': {
+    url: process.env.MIMIC_V41_URL ?? 'http://127.0.0.1:8773',
+    timeoutMs: number(process.env.MIMIC_V41_TIMEOUT_MS, 60_000),
+    maxNewTokens: number(process.env.MIMIC_V41_MAX_NEW_TOKENS, 200),
+    label: process.env.MIMIC_V41_LABEL ?? 'evex-4.1',
+    format: process.env.MIMIC_V41_FORMAT ?? 'auto'
   }
 };
 
