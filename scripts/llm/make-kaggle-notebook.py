@@ -286,6 +286,25 @@ def bench(size, batch=BATCH, compile_on=COMPILE, strict=True):
     return rate
 
 
+def pick_batch(size):
+    """乗る batch を**測って**決める。落ちたら半分にして試す。
+
+    **形を変えると乗る batch も変わる。**19M では 48 が通ったが、30M や
+    context 2048 では同じ 48 で OOM する。決め打ちのまま投げると、段1 の
+    1 step 目で落ちて job ごと無駄になる (回せる job は限られている)。
+    bench は 200 step なので、1 段あたり数分の保険で済む。
+    """
+    batch = BATCH
+    while batch >= 8:
+        rate = bench(size, batch=batch, compile_on=COMPILE, strict=False)
+        if rate and rate >= 20_000:
+            print(f"batch {{batch}} で {{rate:,.0f}} tok/s", flush=True)
+            return batch, rate
+        print(f"batch {{batch}} は乗らなかった。半分にする", flush=True)
+        batch //= 2
+    raise SystemExit("batch 8 でも乗らない。形かハードを見直す")
+
+
 def epochs_for(rate, minutes, tokens=TRAIN_TOKENS, hi=6):
     """持ち時間に収まる epoch 数。上限は 6 (evex-2 の 12 epoch 相当)。
 
@@ -345,6 +364,30 @@ def last_ckpt(out):
     found = sorted(Path(out).glob("ckpt-e*.pt"),
                    key=lambda p: int(p.stem.removeprefix("ckpt-e")))
     return str(found[-1]) if found else None
+
+
+def best_ckpt(out):
+    """**val が最小の** epoch。段3 の初期値はこちらでなければならない。
+
+    段1 が強くなってから、段2 は 1 epoch で val が底を打って以降は
+    丸暗記になる (実測: 4.7410 → 4.7852 → ... → 5.0172)。最後の epoch から
+    段3 を始めると、**一番過学習した重みを土台にする**ことになる
+    (実際にそれをやって段3 が 5.0413 まで悪化した)。
+    """
+    history = Path(out, "history.json")
+    if not history.exists():
+        return last_ckpt(out)
+
+    rows = [r for r in json.loads(history.read_text(encoding="utf8"))
+            if r.get("val_loss") is not None]
+    if not rows:
+        return last_ckpt(out)
+
+    best = min(rows, key=lambda r: r["val_loss"])
+    found = Path(out, f"ckpt-e{{best['epoch']}}.pt")
+    print(f"段3 の初期値は val 最小の epoch {{best['epoch']}} "
+          f"(val {{best['val_loss']:.4f}}) を使う", flush=True)
+    return str(found) if found.exists() else last_ckpt(out)
 
 
 def push(out, prefix):
@@ -466,8 +509,13 @@ if os.environ.get("EVEX_SWEEP"):
               f"{{rate:>7,.0f}} tok/s  {{budget:>12,}} tok  val {{shown}}", flush=True)
     raise SystemExit(0)
 
-rate = bench(SIZE)
-ft_epochs = epochs_for(rate, FT_MINUTES, tokens=TRAIN_TOKENS, hi=8)
+BATCH, rate = pick_batch(SIZE)
+
+# 段2 の epoch。**分から逆算すると多すぎる。**19M で 58 分配ったら 8 epoch に
+# なり、val は epoch 1 が底で残り 7 epoch は悪化させただけだった (約 $0.25 の無駄)。
+# 段1 が強い今は 1〜2 で足りるので、既定は 2 にして分の逆算は上限としてだけ使う
+ft_epochs = int(os.environ.get(
+    "EVEX_FT_EPOCHS", min(2, epochs_for(rate, FT_MINUTES, tokens=TRAIN_TOKENS, hi=8))))
 
 if RESUME:
     # 押してある重みを落として初期値にする。lr は段2 の続きなので低めから
@@ -507,7 +555,7 @@ else:
     #
     # 段2 の重みは別名 (evex4-s2) で押してあるので、段3 が悪ければそちらに戻せる
     if os.environ.get("EVEX_STAGE3", "1") == "1":
-        init2 = last_ckpt(stage2)
+        init2 = best_ckpt(stage2)
         if init2 is None:
             print("⚠ 段2 のチェックポイントが無いので段3 は飛ばす", flush=True)
         else:
