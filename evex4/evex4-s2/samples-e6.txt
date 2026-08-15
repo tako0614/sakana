@@ -1,0 +1,9 @@
+[<|c2|><|conv|><|s3|>Cloudflare Containers ってどうなん<|s0|>] <|c2|><|conv|><|s3|>Cloudflare Containers ってどうなん<|s0|><|re|><|s3|>ActivityPubでホストできるの?<|s3|><|re|><|s0|>無料枠だよ<|end|>
+
+[<|c2|><|conv|><|s0|>rebase 疲れた<|s3|>] <|c2|><|conv|><|s0|>rebase 疲れた<|s3|><|re|><|s0|>でもJavascriptのPython版はインストールするときにWebGPU用意したりするから<|end|>
+
+[<|c0|><|conv|><|a|>これバグってる？<|a|>] <|c0|><|conv|><|a|>これバグってる？<|a|>どゆこと<|b|><|re|><|d|>これはスタンプ機能が重すぎる<|end|>
+
+[<|c0|><|conv|><|a|>日本の首都どこ<|s0|><|re|><|a|>] <|c0|><|conv|><|a|>日本の首都どこ<|s0|><|re|><|a|>尖閣諸島は全国的に尖閣諸島<|end|>
+
+[<|c0|><|conv|>] <|c0|><|conv|><|a|><|re|><|b|>そう<|b|><|re|><|a|>まじ？<|c|><|re|><|e|>この世の中の子供たちが将来の夢を見てみたいよね<|end|>

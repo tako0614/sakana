@@ -1,0 +1,9 @@
+[<|c2|><|conv|><|s3|>Cloudflare Containers ってどうなん<|s0|>] <|c2|><|conv|><|s3|>Cloudflare Containers ってどうなん<|s0|>Cloudflare Workersでttypingを監視すれば<|end|>
+
+[<|c2|><|conv|><|s0|>rebase 疲れた<|s3|>] <|c2|><|conv|><|s0|>rebase 疲れた<|s3|><|re|><|s6|>それもうソフトウェア開発だよ。CDは不整合で。<|s3|><|re|><|s6|>うん<|end|>
+
+[<|c0|><|conv|><|a|>これバグってる？<|a|>] <|c0|><|conv|><|a|>これバグってる？<|a|><|re|><|c|>なんでや<|a|>cloudflare tunnelで解決する方法何すんねん<|b|><|re|><|a|>github copilotがclaude codeとclaude codeとcodexとcodexとclaude codeとcodexとclaude codeとcodexとcodexとclaude codeとcodexとcodexとcodexとcodexとclaude codeとcodexとclaude codeとcodexとcodexとcodexとclaude codeとcodexとcodexとcodexとcodexとcodexとcodexとcodexとcodexとcodexとcodexとcodexとcodexとcodexとcodexとcodexとcodexとcodexとclaude codeとcodexとcodexとcodexとcodexとcodexと
+
+[<|c0|><|conv|><|a|>日本の首都どこ<|s0|><|re|><|a|>] <|c0|><|conv|><|a|>日本の首都どこ<|s0|><|re|><|a|>孫正義さん?<|b|><|re|><|a|>日本共産党員<|end|>
+
+[<|c0|><|conv|>] <|c0|><|conv|><|s3|>まあどうせ<|s3|>普通に<|s3|>アサイーケード買うのもアリなんよな<|s3|>あれ<|s3|>アサイーケード買ったことないけど<|s8|><|re|><|s3|>普通にこの2つが1番オススメ<|s3|><|re|><|s8|>なんかいろいろやってるイメージある<|s3|><|re|><|s8|>なんか家賃の勉強してるイメージある<|s8|>なるほどね<|s3|>普通に考えて<|s3|>その結果俺がこの３つ使ってて、俺の会社にアサイーケードが入っていて、うちの職場にスポンサーが台パンしたせいで手が安達で手押し出来なくなった<|s8|>あぁ...<|s3|>たこピは金持ってるけど<|s3|>俺らが一番お金持ってるから

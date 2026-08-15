@@ -2,6 +2,23 @@
 
 `discord.js` で動く、憲法・立法・司法・行政執行を備えたAIコミュニティ統治botです。
 
+## Browser chat
+
+`web/` は [chat.takos.jp](https://chat.takos.jp) 用の静的Reactアプリです。入力と生成結果を
+推論APIへ送らず、Hugging Faceから公開モデルを取得した後はWeb Worker内のWebGPU/WASMで
+推論します。モデルファイルは8 MiB単位でIndexedDBへ保存し、大きい`evex-ft-1`は
+WebGPU対応端末だけを対象にします。
+
+```bash
+npm --prefix web install
+npm run web:test
+npm run web:build
+npm run web:dev
+```
+
+ブラウザ成果物の作り方、固定しているHugging Face revision、Cloudflare Pagesの境界は
+[`web/README.md`](web/README.md)にあります。
+
 ## Commands
 
 通常の統治操作はコマンドではなく、`@立法`・`@裁判`・bot本体へのメンションで行います。

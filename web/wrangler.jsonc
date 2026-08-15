@@ -1,0 +1,7 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "takos-chat",
+  "pages_build_output_dir": "./dist",
+  "compatibility_date": "2026-08-13",
+  "send_metrics": false
+}

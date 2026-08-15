@@ -1,0 +1,9 @@
+[<|c2|><|conv|><|s3|>Cloudflare Containers ってどうなん<|s0|>] <|c2|><|conv|><|s3|>Cloudflare Containers ってどうなん<|s0|><|re|><|s7|>Cloudflare Pages/Suno Computer Science/<nl>Cloudflare Pages/Suno Computer Science/<nl><nl>無料で使えるしCloudFlareとSSO/Google Pages/Suno Computer Science/<nl><nl>Workers/Lisp/Google Pages/Suno Computer Science/<nl><nl>Workers/Lisp/Google Pages/Suno Computer Science/<nl><nl>Workers/Lisp/Google Pages/Suno
+
+[<|c2|><|conv|><|s0|>rebase 疲れた<|s3|>] <|c2|><|conv|><|s0|>rebase 疲れた<|s3|><|re|><|s0|>バイブバイブコードとか紙とペンで書くといいよ<|s0|>あとはPythonのエコシステムとかで<|s12|>なんかそれ使ってたような<|s8|><|re|><|s0|>それはそうかも<nl>私もPythonとPythonのコンセプトを眺めながら設計思想があるせいで、それ自体には完全に眺めながら設計思想があるっていう話をしてた<|s0|>TypeScriptが型パズル<|s8|>JSが型パズルして型パズル起こす癖を持て余してるらしい<|s12|>TSは型パズルするよね<|s8|>pyのが好きだけど最近jsよりtsxのほうが多い...<|s12|><|re|><|s8|>そう<|s8|>Pythonは嫌いじゃないけどPythonは嫌い
+
+[<|c0|><|conv|><|a|>これバグってる？<|a|>] <|c0|><|conv|><|a|>これバグってる？<|a|><|re|><|b|>これ、結構前に作ったな<|a|><|re|><|b|>俺のは全部claudeに全部投げてるよ<|end|>
+
+[<|c0|><|conv|><|a|>日本の首都どこ<|s0|><|re|><|a|>] <|c0|><|conv|><|a|>日本の首都どこ<|s0|><|re|><|a|>いや、それは普通にそう<|a|>普通に国内20位くらいの国立高校に受ける<|end|>
+
+[<|c0|><|conv|>] <|c0|><|conv|><|s8|><|re|><|s8|>でも、それが出来ないなら意味ないこともあるから...<|s8|>まね...<|s7|><|re|><|s8|>ほえー、すごく難しい<|s7|><|re|><|s8|>それ<|s6|><|re|><|s8|>ほな<nl>真面目に言うと？<|s8|>別に何でもできるから私は好きだから…<nl>ただ単に人としてどうにかなりるかは好みです<|s6|>わかる<nl>純粋に純粋に自分が好きだから<nl>その人の意見を当てたくもない<|s4|><|re|><|s8|>俺の思想が低すぎる<|s6|><|re|><|s8|>それはそう<|s6|>だから純粋に自分が好きだから<nl>いいんじゃないかな<nl>純粋に自分を見る目がない<|s8|><|re|><|s4|>だから、私はそれを好きに選べるべきなので, そこに人が接していたら人間

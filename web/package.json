@@ -1,0 +1,32 @@
+{
+  "name": "sakana-web-chat",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "test": "vitest run",
+    "smoke": "node scripts/smoke.mjs",
+    "preview": "vite preview",
+    "deploy:preview": "npm run build && wrangler pages deploy dist --project-name takos-chat --branch preview",
+    "deploy": "npm run build && wrangler pages deploy dist --project-name takos-chat --branch main"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "4.2.0",
+    "onnxruntime-web": "1.26.0-dev.20260416-b7804b056c",
+    "react": "19.2.5",
+    "react-dom": "19.2.5"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "latest",
+    "fake-indexeddb": "latest",
+    "playwright-core": "latest",
+    "typescript": "latest",
+    "vite": "latest",
+    "vitest": "latest",
+    "wrangler": "4.122.0"
+  }
+}
