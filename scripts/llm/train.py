@@ -424,7 +424,12 @@ def build_optimizer():
         if id(param) in seen:
             continue
         seen.add(id(param))
-        (matrices if param.dim() == 2 and param is not model.embed.weight
+        # **埋め込みは Muon に渡さない。**2 次元でも「行列として直交化する」
+        # 対象ではない (Muon の決まり)。PLE 表も引き表なので同じ扱いにする —
+        # ここを外すと 6.29M ぶんが誤って Muon 側に入る
+        embeddings = {id(m.weight) for m in model.modules()
+                      if isinstance(m, torch.nn.Embedding)}
+        (matrices if param.dim() == 2 and id(param) not in embeddings
          else plain).append(param)
 
     print(f"Muon: 行列 {sum(p.numel() for p in matrices):,} / "
