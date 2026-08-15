@@ -35,17 +35,43 @@
 // 学習の揺れなのか分からなくなる。索引から決める。
 
 export const SHAPE = {
-  // 複数行の投稿を連投に割る割合。1.0 にすると `<nl>` が消えすぎるので、
-  // evex の `<nl>`/発言 0.10 に合わせて少し残す
-  splitEvery: Number(process.env.LLM_SHAPE_SPLIT_EVERY ?? 5),   // 5 本に 4 本を割る
-  // 1 投稿を割ってよい最大数。長い投稿が 20 連投になると窓が 1 人で埋まる
-  splitMax: Number(process.env.LLM_SHAPE_SPLIT_MAX ?? 6),
   // 割った断片の最短。1〜2 字の断片ばかり作ると `<|a|>w<|a|>w` になる
   splitMin: Number(process.env.LLM_SHAPE_SPLIT_MIN ?? 3),
   // 返信の印を付ける割合。evex は発言の 17.2%。掲示板は「直前に答える」形が
   // 5 割を超えるので、3 本に 1 本にして近づける
   replyEvery: Number(process.env.LLM_SHAPE_REPLY_EVERY ?? 3)
 };
+
+// **連投の長さの分布を evex に合わせる。**
+//
+// 最初は「改行のあるところで全部割る / 上限 6」にしていた。割合 (連投率) は
+// 合わせられるが、**分布が合わない**。実測 (evex 1,354,092 まとまり / なりきり):
+//
+//         1連    2連    3連    4連    5連    6連   7+
+//   evex  72.7%  17.8%  5.5%  2.0%  0.9%  0.4%  0.7%   平均 1.47
+//   旧    75.1%  11.3%  5.2%  3.0%  1.6%  3.1%  0.8%   平均 1.59
+//
+// **6連が 7.8 倍**なのは上限 6 にちょうど溜まっていたから (実装の癖がそのまま
+// データに出ていた)。一番多いはずの 2連は逆に足りない。bot の返答が細切れの
+// 連投になったのはこれが効いている。
+//
+// なので「何回割るか」ではなく **「何連投にするか」を先に決めて、その数に
+// なるように行を束ねる**。12 行の投稿は 6 連投ではなく 2 連投 (6 行ずつ) になる。
+const RUN_WEIGHTS = [[1, 727], [2, 178], [3, 55], [4, 20], [5, 9], [6, 4], [7, 7]];
+
+/**
+ * その投稿を何連投にするか。**乱数は使わない** — 作り直すたびに中身が変わると、
+ * コーパスの差なのか学習の揺れなのか分からなくなる。
+ * 977 は 1000 と互いに素なので、索引の並びに偏りを持ち込まずに散る。
+ */
+function targetRun(index) {
+  let x = (index * 977) % 1000;
+  for (const [length, weight] of RUN_WEIGHTS) {
+    if (x < weight) return length;
+    x -= weight;
+  }
+  return 1;
+}
 
 const NL = '<nl>';
 
@@ -56,28 +82,28 @@ const NL = '<nl>';
  * 消すと段1 に `<nl>` がまったく出なくなり、今度は evex 側の 0.10 が浮く。
  */
 function splitPost(content, index, opts) {
-  const { splitEvery, splitMax, splitMin } = opts;
+  const { splitMin } = opts;
 
-  if (index % splitEvery === 0) return [content];        // 5 本に 1 本は残す
-  if (!content.includes(NL)) return [content];
+  const want = targetRun(index);
+  if (want <= 1 || !content.includes(NL)) return [content];
 
   const lines = content.split(NL).map((x) => x.trim()).filter(Boolean);
   if (lines.length < 2) return [content];
 
-  // 短すぎる断片は前にくっつける。`<|a|>w<|a|>w` を作らないため
-  const merged = [];
-  for (const line of lines) {
-    if (merged.length && line.length < splitMin) {
-      merged[merged.length - 1] += NL + line;
-    } else {
-      merged.push(line);
-    }
+  // **狙った数になるように束ねる。**行数が足りなければその数まで。
+  // 12 行を 2 連投にするなら 6 行ずつの発言 2 つ (`<nl>` は本文に残る)
+  const pieces = Math.min(want, lines.length);
+  const perPiece = Math.ceil(lines.length / pieces);
+  const bundled = [];
+  for (let i = 0; i < lines.length; i += perPiece) {
+    bundled.push(lines.slice(i, i + perPiece).join(NL));
   }
 
-  // 上限を超えるぶんは最後の 1 発言にまとめる
-  if (merged.length > splitMax) {
-    const tail = merged.splice(splitMax - 1);
-    merged.push(tail.join(NL));
+  // 短すぎる断片は前にくっつける。`<|a|>w<|a|>w` を作らないため
+  const merged = [];
+  for (const piece of bundled) {
+    if (merged.length && piece.length < splitMin) merged[merged.length - 1] += NL + piece;
+    else merged.push(piece);
   }
 
   return merged.length > 1 ? merged : [content];

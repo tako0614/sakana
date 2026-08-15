@@ -180,9 +180,7 @@ for await (const line of lines(path.join(src, file))) {
     // **なりきりはここが一番効く。**1 投稿の中位が 99 字 (evex は 20 字) で
     // `<nl>` が 1 発言に 1.25 個あるので、割ると Discord の粒度にかなり近づく。
     //
-    // splitEvery は実測で決めた: 既定の 5 (5本に4本を割る) だと連投が 47.7% に
-    // なって evex の 32.2% を大きく超える。3 にすると 40% 前後で収まる
-    const text = `${buildPrompt(discordify(posts, stats.conversations, { splitEvery: 3 }))}<|end|>`;
+    const text = `${buildPrompt(discordify(posts, stats.conversations))}<|end|>`;
     stats.conversations += 1;
     stats.chars += text.length;
     await write(text);

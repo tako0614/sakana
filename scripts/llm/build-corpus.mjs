@@ -103,8 +103,14 @@ const TILINGS = [
   { gapMs: 30 * MINUTE, maxMessages: 60, maxChars: 2400 },
   { gapMs: 120 * MINUTE, maxMessages: 60, maxChars: 5400 },
   { gapMs: 15 * MINUTE, maxMessages: 60, maxChars: 1500 },
-  { gapMs: 180 * MINUTE, maxMessages: 60, maxChars: 7200 }
-].slice(0, Number(process.env.LLM_TILINGS ?? 5));
+  { gapMs: 180 * MINUTE, maxMessages: 60, maxChars: 7200 },
+  // **evex-4.1 で 5 → 8 通りに。**evex度を上げるのに「同じ本文を何周もする」のは
+  // 丸暗記に寄るだけなので、**違う切り方を増やして材料そのものを厚くする**。
+  // 件数の上限も振る — 沈黙と字数だけだと、賑やかな時間帯の切れ目が動かない
+  { gapMs: 45 * MINUTE, maxMessages: 24, maxChars: 3000 },
+  { gapMs: 90 * MINUTE, maxMessages: 100, maxChars: 4500 },
+  { gapMs: 20 * MINUTE, maxMessages: 40, maxChars: 1800 }
+].slice(0, Number(process.env.LLM_TILINGS ?? 8));
 
 // val は「最後の N 日ぶんの会話」。ランダム分割にしない —
 // 「草」「www」のような完全一致が 23% あるので、時間で切らないと val が嘘になる

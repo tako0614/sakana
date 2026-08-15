@@ -99,6 +99,16 @@ VERBATIM_MIN = 20
 # 顔文字 `(´・ω・｀)` は evex にも普通に出るので、**中身が日本語の語**のものだけ数える
 STAGE = re.compile(r"[(（][^)）\n]*[ぁ-んァ-ヶ一-龥]{2,}[^)）\n]*[)）]?")
 
+# なんJ弁 (open2ch の livejupiter)。evex-4 で段1 に 90M トークン入れたので、
+# その口調が漏れていないかを地の値と比べる。**地の値も 0 ではない** —
+# このサーバーでも「ワイ」「〜やで」はネタで使われるので、比で見る
+JARGON = re.compile(r"ワイ|ンゴ|やで(?![すし])|やろ(?![う])|せや|おんj|なんj|ニキ|ネキ|やきう|"
+                    r"すまんな|ええぞ|know|草生")
+# 字幕の翻訳調 (JESC)。「〜なのね」「〜だわ」「〜かい？」のような話し言葉の型と、
+# 人名の呼びかけ。地の値と比べて上なら字幕が漏れている
+SUBTITLE = re.compile(r"[のだ]わ[。、！？\s]|なのね|[かだ]い[？?]|くそっ|やれやれ|"
+                      r"おい、|ちくしょう|なんてこった")
+
 
 def plain(text):
     """ゼロから学習した系の記号を、数えられる形に戻す。
@@ -157,6 +167,9 @@ def score(texts):
         "markdown": sum(1 for t in texts if MARKDOWN.search(t)) / len(texts),
         # なりきり掲示板の地の文が漏れていないか (evex-3.5 で外部を混ぜたため)
         "stage": sum(1 for t in texts if STAGE.search(t)) / len(texts),
+        # なんJ弁 / 字幕の翻訳調。段1 の外部が漏れていないか (evex-4 で追加)
+        "jargon": sum(1 for t in texts if JARGON.search(t)) / len(texts),
+        "subtitle": sum(1 for t in texts if SUBTITLE.search(t)) / len(texts),
         "oov": (sum(1 for w in words if w not in vocab) / len(words)) if words else 0.0,
         # 学習データの発言と完全一致。「その人が言いそうなこと」ではなく
         # 「実際に言ったこと」を出していたら、それは覚えただけ。
@@ -399,6 +412,8 @@ print(f"{'噛み合い':<12} {pct(overlap):>10} {'—':>12}")
 print(f"{'敬体':<12} {pct(got['polite']):>10} {pct(base_line['polite']):>12}")
 print(f"{'markdown':<12} {pct(got['markdown']):>10} {pct(base_line['markdown']):>12}")
 print(f"{'地の文の括弧':<12} {pct(got['stage']):>10} {pct(base_line['stage']):>12}")
+print(f"{'なんJ弁':<12} {pct(got['jargon']):>10} {pct(base_line['jargon']):>12}")
+print(f"{'字幕の翻訳調':<12} {pct(got['subtitle']):>10} {pct(base_line['subtitle']):>12}")
 print(f"{'未知語':<12} {pct(got['oov']):>10} {pct(base_line['oov']):>12}")
 print(f"{'逐語コピー':<12} {pct(got['verbatim']):>10} {'—':>12}")
 print(f"{'平均の長さ':<12} {got['chars']:9.0f}字 {base_line['chars']:11.0f}字")
@@ -420,6 +435,7 @@ if distinct:
           "= `/as` は飾り。下位の差が上位より大幅に小さいなら、"
           "発言の少ない人が学習できていない")
 
-print("\n地の文の括弧が地の値より大きく上なら、なりきり掲示板の口調が漏れている。"
+print("\n地の文の括弧 / なんJ弁 / 字幕の翻訳調 が地の値より大きく上なら、"
+      "段1 の外部データの口調が漏れている。"
       "\n未知語が地の値より大きく上なら Qwen の地が出ている。"
       "\n敬体と markdown が上なら instruct の口調が漏れている。")
