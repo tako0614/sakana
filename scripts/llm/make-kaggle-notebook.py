@@ -340,7 +340,7 @@ def epochs_for(rate, minutes, tokens=TRAIN_TOKENS, hi=6):
 
 
 def run(size, epochs, batch=BATCH, lr="1e-3", train_name="train", init=None, tag="",
-        max_tokens=0, save_steps=0):
+        max_tokens=0, save_steps=0, push_to=None):
     """学習して出力ディレクトリを返す。
 
     **落ちても例外にしない。**train.py は epoch ごとにチェックポイントを書くので、
@@ -388,10 +388,21 @@ def run(size, epochs, batch=BATCH, lr="1e-3", train_name="train", init=None, tag
         cmd += ["--save-steps", str(save_steps)]
 
     print("\\n$ " + " ".join(cmd), flush=True)
-    done = subprocess.run(cmd, env=env_for(size), check=False)
-    if done.returncode != 0:
-        print(f"⚠ train.py が {{done.returncode}} で終了。"
-              f"残っているチェックポイントだけ押す", flush=True)
+
+    # **epoch ごとに押す。**まとめて最後に押す作りだったせいで、外から
+    # SIGTERM を受けたときに段2 の 4 epoch (約 70 分) がまるごと消えた。
+    # 段1 には途中保存を入れたのに、押す側が最後だけだったので意味が無かった。
+    # 出力を 1 行ずつ見て、epoch が終わるたびに押す
+    proc = subprocess.Popen(cmd, env=env_for(size), stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+    for line in proc.stdout:
+        print(line.rstrip(), flush=True)
+        if line.startswith("--- epoch") and push_to:
+            push(out, push_to)
+    proc.wait()
+    if proc.returncode != 0:
+        print(f"⚠ train.py が {{proc.returncode}} で終了。"
+              f"押してあるところまでは残っている", flush=True)
     return out
 
 
@@ -588,14 +599,16 @@ if RESUME:
     lr = os.environ.get("EVEX_LR", "1.5e-4")
     print(f"\\n{{RESUME}} の続き {{ft_epochs}} epoch / lr {{lr}} / 初期値 {{found[-1]}} / "
           f"corpus {{CORPUS}}", flush=True)
-    push(run(SIZE, ft_epochs, lr=lr, init=str(found[-1]), tag="-" + tag), RESUME + "-" + tag)
+    push(run(SIZE, ft_epochs, lr=lr, init=str(found[-1]), tag="-" + tag,
+             push_to=RESUME + "-" + tag), RESUME + "-" + tag)
 
 else:
     # **段1: 外部の会話 + 素の evex で土台を作る。**
     pre_epochs = epochs_for(rate, PRE_MINUTES, tokens=PRETRAIN_TOKENS, hi=3)
     print(f"\\n段1 {{rate:,.0f}} tok/s → {{PRE_MINUTES:.0f}} 分で {{pre_epochs}} epoch", flush=True)
     stage1 = run(SIZE, pre_epochs, lr=PRE_LR, train_name="pretrain", tag="-pre",
-                 save_steps=int(os.environ.get("EVEX_SAVE_STEPS", 500)))
+                 save_steps=int(os.environ.get("EVEX_SAVE_STEPS", 500)),
+                 push_to="pretrain")
     push(stage1, "pretrain")
 
     init = last_ckpt(stage1)
@@ -604,7 +617,7 @@ else:
 
     # **段2 A: 段1 から続ける (本命)。**lr は段1 の 1/3 から
     print(f"\\n段2 A (段1 から) {{FT_MINUTES:.0f}} 分で {{ft_epochs}} epoch / 初期値 {{init}}", flush=True)
-    stage2 = run(SIZE, ft_epochs, lr=FT_LR, init=init, tag="-ft")
+    stage2 = run(SIZE, ft_epochs, lr=FT_LR, init=init, tag="-ft", push_to="evex4-s2")
     push(stage2, "evex4-s2")
 
     # **段3: リアクションの付いた切り出しだけ。**サーバーが実際に反応した発言で
