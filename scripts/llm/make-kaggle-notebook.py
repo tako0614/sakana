@@ -218,9 +218,9 @@ TOKEN = os.environ["HF_TOKEN"]
 
 # 実トークン数 (train-tokenizer.py が測った値)。持ち時間から epoch を逆算する。
 # コーパスを作り直したら stats.json から取り直す
-PRETRAIN_TOKENS = 179_002_073       # 段1: 外部 158.1M + evex 20.9M (evex が 11.7%)
-TRAIN_TOKENS = 31_455_563           # 段2: evex だけ (水増しと切り出し込み)
-REACTED_TOKENS = 692_050            # 段3: リアクションの付いた切り出しだけ
+PRETRAIN_TOKENS = 209_636_220       # 段1: 外部 146.7M + evex 62.9M (evex が 30.0%)
+TRAIN_TOKENS = 44_484_559           # 段2: evex だけ (切り方 8 通り + 切り出し)
+REACTED_TOKENS = 692_050            # 段3: **使わない** (evex-4 で噛み合いが 53.3 → 36.7)
 
 # 本体は 2 ファイル。ここに丸ごと埋め込んである (写しを手で持たないため)
 Path("model.py").write_text(MODEL_PY, encoding="utf8")
@@ -528,8 +528,9 @@ BATCH, rate = pick_batch(SIZE)
 # 段2 の epoch。**分から逆算すると多すぎる。**19M で 58 分配ったら 8 epoch に
 # なり、val は epoch 1 が底で残り 7 epoch は悪化させただけだった (約 $0.25 の無駄)。
 # 段1 が強い今は 1〜2 で足りるので、既定は 2 にして分の逆算は上限としてだけ使う
-ft_epochs = int(os.environ.get(
-    "EVEX_FT_EPOCHS", min(2, epochs_for(rate, FT_MINUTES, tokens=TRAIN_TOKENS, hi=8))))
+# **段2 は 8 epoch。**val は epoch 1 が底だが、噛み合いは epoch 8 が最良だった
+# (26.7% → 30.0% → 53.3%)。val は短い相槌の予測に支配されるので選択には使えない
+ft_epochs = int(os.environ.get("EVEX_FT_EPOCHS", 8))
 
 if RESUME:
     # 押してある重みを落として初期値にする。lr は段2 の続きなので低めから
@@ -568,7 +569,8 @@ else:
     # 落として 2 epoch。**逐語コピー (20字以上) で必ず確かめる**。上がるなら捨てる。
     #
     # 段2 の重みは別名 (evex4-s2) で押してあるので、段3 が悪ければそちらに戻せる
-    if os.environ.get("EVEX_STAGE3", "1") == "1":
+    # 既定で切る。evex-4 で段3 を掛けたら噛み合いが 53.3% → 36.7% に落ちた
+    if os.environ.get("EVEX_STAGE3", "0") == "1":
         init2 = best_ckpt(stage2)
         if init2 is None:
             print("⚠ 段2 のチェックポイントが無いので段3 は飛ばす", flush=True)
