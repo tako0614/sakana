@@ -212,7 +212,9 @@ from pathlib import Path
 from huggingface_hub import HfApi, snapshot_download
 
 DATASET = "{DATASET}"
-PUSH = "{EVEX_PUSH}"
+# 押し先。**世代ごとに分ける。**1 つのリポジトリに溜め続けると、commit の
+# メタデータが上限に当たって `413 Payload Too Large` になる (実際になった)
+PUSH = os.environ.get("EVEX_PUSH_REPO", "{EVEX_PUSH}")
 CORPUS = os.environ.get("EVEX_CORPUS", "{CORPUS_DIR}")
 TOKEN = os.environ["HF_TOKEN"]
 
@@ -438,16 +440,26 @@ def best_ckpt(out):
 
 
 def push(out, prefix):
-    """**1 本終わるたびに押す。**まとめて最後にすると枠切れで全部消える。"""
+    """**1 本終わるたびに押す。**まとめて最後にすると枠切れで全部消える。
+
+    **押せなくても学習は殺さない。**epoch ごとに押すようにしたら、push の
+    413 (リポジトリに溜めすぎ) がそのままジョブを落として 38 分が消えた。
+    押すのは保険であって本体ではないので、失敗しても続ける。
+    """
     found = sorted(Path(out).glob("ckpt-e*.pt")) if Path(out).exists() else []
     if not found:
         print(f"⚠ {{out}} にチェックポイントが無いので押さない", flush=True)
         return
 
-    subprocess.run(["cp", f"{{CORPUS}}/tok.model", out], check=True)   # 重みだけでは読めない
-    api.upload_folder(repo_id=PUSH, folder_path=out, path_in_repo=prefix,
-                      commit_message=f"evex-3 {{prefix}}")
-    print(f"pushed {{prefix}} ({{len(found)}} epoch) → https://huggingface.co/{{PUSH}}", flush=True)
+    try:
+        subprocess.run(["cp", f"{{CORPUS}}/tok.model", out], check=True)
+        api.upload_folder(repo_id=PUSH, folder_path=out, path_in_repo=prefix,
+                          commit_message=f"evex {{prefix}}")
+        print(f"pushed {{prefix}} ({{len(found)}} epoch) → https://huggingface.co/{{PUSH}}",
+              flush=True)
+    except Exception as error:
+        print(f"⚠ push に失敗したが学習は続ける: {{type(error).__name__}} "
+              f"{{str(error)[:160]}}", flush=True)
 
 
 # 形。**振りの候補**でもある (d_model, layers, heads, context)。
@@ -588,7 +600,10 @@ ft_epochs = int(os.environ.get("EVEX_FT_EPOCHS", 8))
 
 if RESUME:
     # 押してある重みを落として初期値にする。lr は段2 の続きなので低めから
-    got = snapshot_download(repo_id=PUSH, local_dir="resume",
+    # **取りに行く先と押す先は別。**世代ごとに押し先を分けたので、
+    # 段1 は前の世代のリポジトリに置いてあることがある
+    got = snapshot_download(repo_id=os.environ.get("EVEX_RESUME_REPO", PUSH),
+                            local_dir="resume",
                             allow_patterns=[RESUME + "/*"], token=TOKEN)
     found = sorted(Path(got, RESUME).glob("ckpt-e*.pt"),
                    key=lambda p: int(p.stem.removeprefix("ckpt-e")))
@@ -671,7 +686,9 @@ from pathlib import Path
 from huggingface_hub import HfApi, snapshot_download
 
 DATASET = "{DATASET}"
-PUSH = "{EVEX_PUSH}"
+# 押し先。**世代ごとに分ける。**1 つのリポジトリに溜め続けると、commit の
+# メタデータが上限に当たって `413 Payload Too Large` になる (実際になった)
+PUSH = os.environ.get("EVEX_PUSH_REPO", "{EVEX_PUSH}")
 CORPUS = os.environ.get("EVEX_CORPUS", "corpus-v10")
 REF = os.environ["EVEX_REF"]          # 押してある参照モデルの path (repo 内)
 NAME = os.environ.get("EVEX_SCORE_NAME", "pretrain")
