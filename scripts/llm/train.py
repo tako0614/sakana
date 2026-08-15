@@ -103,10 +103,17 @@ parser.add_argument("--max-tokens", type=int, default=0)
 # RMSNorm の fp32 往復・RoPE の stack・SwiGLU の要素積といった**帯域律速の
 # 小さいカーネルの数**で律速している。融合すればそこが縮む。
 #
-# 生成と保存は**元のモジュール**を使う (`raw`)。compile 越しに generate すると
+# 生成と保存は**元のモジュール**を使う (`uncompiled`)。compile 越しに generate すると
 # 形が毎回変わって再コンパイルの嵐になるし、state_dict のキーに
 # `_orig_mod.` が付いて推論側が読めなくなる。
 parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
+# 何 step ごとに途中保存するか。0 で切る (既定)。
+#
+# **段1 は 179M トークンを 1 epoch で回すので、33 分のあいだ 1 度も書かない。**
+# 実際にその 33 分を保存時の例外でまるごと落とした。途中で書いておけば、
+# 何が起きてもそこから段2 に進める。書き先は epoch 終わりと同じ名前なので、
+# 完走すれば上書きされて何も残らない
+parser.add_argument("--save-steps", type=int, default=0)
 args = parser.parse_args()
 
 corpus = Path(args.corpus)
@@ -447,7 +454,8 @@ def samples(tag):
         # 回していなかったので気付けなかった。**チェックポイントの保存はこの前**なので
         # 重みは残るが、そのあとの push まで進まずに全部無駄になる
         ids = torch.tensor([sp.encode(prompt, out_type=int)], dtype=torch.long, device=device)
-        got = raw.generate(ids, max_new_tokens=120, temperature=0.9, top_k=40, stop_id=end_id)
+        got = uncompiled.generate(ids, max_new_tokens=120, temperature=0.9, top_k=40,
+                                  stop_id=end_id)
         lines.append(f"[{prompt}] {sp.decode(got[0].tolist())}")
     model.train()
     (out / f"samples-{tag}.txt").write_text("\n\n".join(lines), encoding="utf8")
@@ -456,7 +464,10 @@ def samples(tag):
 
 # **compile はここまでの準備 (勾配フック / param_groups) が済んでから。**
 # 先に掛けると named_parameters のキーが変わって、話者の補正が刺さらない
-raw = model
+# **`raw` という名前は使えない。**下の epoch ブロックが「素の val」に使っている。
+# 最初 raw にしたら、保存のところで float の state_dict を呼んで落ちた
+# (段1 の 33 分がまるごと消えた)
+uncompiled = model
 if args.compile:
     if device.type == "cuda":
         model = torch.compile(model)
@@ -482,11 +493,22 @@ for step in range(total_steps):
     scaler.scale(loss).backward()
     # clip する前に必ず戻す。スケールしたままの勾配を切ると閾値が意味を失う
     scaler.unscale_(opt)
-    torch.nn.utils.clip_grad_norm_(raw.parameters(), 1.0)
+    torch.nn.utils.clip_grad_norm_(uncompiled.parameters(), 1.0)
     scaler.step(opt)
     scaler.update()
 
     seen += tokens_per_step
+
+    # 途中保存。**epoch 終わりと同じ名前に書く** — 完走すれば上書きされるので、
+    # 呼ぶ側 (runner の last_ckpt) は今までどおり ckpt-e*.pt を見るだけで済む
+    if args.save_steps and (step + 1) % args.save_steps == 0:
+        partial = step // steps_per_epoch + 1
+        torch.save(
+            {"model": uncompiled.state_dict(), "config": vars(cfg), "epoch": partial,
+             "train_loss": loss.item(), "val_loss": None, "partial_step": step + 1},
+            out / f"ckpt-e{partial}.pt"
+        )
+        print(f"  途中保存 step {step + 1} → ckpt-e{partial}.pt", flush=True)
 
     if (step + 1) % 20 == 0:
         rate = seen / (time.time() - window)
@@ -521,7 +543,7 @@ for step in range(total_steps):
               f"({(time.time() - started) / 60:.0f} 分経過)", flush=True)
 
         torch.save(
-            {"model": raw.state_dict(), "config": vars(cfg), "epoch": epoch,
+            {"model": uncompiled.state_dict(), "config": vars(cfg), "epoch": epoch,
              "train_loss": tr, "val_loss": va, "val_raw": raw},
             out / f"ckpt-e{epoch}.pt"
         )

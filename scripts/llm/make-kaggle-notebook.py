@@ -303,7 +303,7 @@ def epochs_for(rate, minutes, tokens=TRAIN_TOKENS, hi=6):
 
 
 def run(size, epochs, batch=BATCH, lr="1e-3", train_name="train", init=None, tag="",
-        max_tokens=0):
+        max_tokens=0, save_steps=0):
     """学習して出力ディレクトリを返す。
 
     **落ちても例外にしない。**train.py は epoch ごとにチェックポイントを書くので、
@@ -327,6 +327,10 @@ def run(size, epochs, batch=BATCH, lr="1e-3", train_name="train", init=None, tag
         cmd += ["--speaker-lr-cap", os.environ["EVEX_SPEAKER_LR"]]
     if COMPILE:
         cmd += ["--compile"]
+    # 長い epoch の途中でも書く。段1 は 179M トークンを 1 epoch で回すので、
+    # 33 分のあいだ 1 度も書かないと事故で全部消える (実際に消した)
+    if save_steps:
+        cmd += ["--save-steps", str(save_steps)]
 
     print("\\n$ " + " ".join(cmd), flush=True)
     done = subprocess.run(cmd, env=env_for(size), check=False)
@@ -484,7 +488,8 @@ else:
     # **段1: 外部の会話 + 素の evex で土台を作る。**
     pre_epochs = epochs_for(rate, PRE_MINUTES, tokens=PRETRAIN_TOKENS, hi=3)
     print(f"\\n段1 {{rate:,.0f}} tok/s → {{PRE_MINUTES:.0f}} 分で {{pre_epochs}} epoch", flush=True)
-    stage1 = run(SIZE, pre_epochs, lr=PRE_LR, train_name="pretrain", tag="-pre")
+    stage1 = run(SIZE, pre_epochs, lr=PRE_LR, train_name="pretrain", tag="-pre",
+                 save_steps=int(os.environ.get("EVEX_SAVE_STEPS", 500)))
     push(stage1, "pretrain")
 
     init = last_ckpt(stage1)
