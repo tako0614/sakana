@@ -416,11 +416,17 @@ const reactedPerRound = sizeOf(reactedExcerpts);
  * 割合の分母は train 全体なので、噛み合いと長い発言は互いの周回数に依存する。
  * 候補が 1〜3 の 9 通りしかないので、素直に全部試して二乗誤差で選ぶ。
  */
+// 周回数の上限。**3 では足りない。**切り方を 5 → 8 通りに増やしたとき、
+// 素の窓が 1.54 倍になったのに周回数は 3 で頭打ちになり、噛み合い切り出しの
+// 割合が 11.9% → 8.4% (目標 12.3%) まで薄まった。噛み合いの実測もほぼ同じ比で
+// 53.3% → 36.7% に落ちている。**基のコーパスを増やすほどここが効く。**
+const MAX_ROUNDS = Number(process.env.LLM_MAX_ROUNDS ?? 8);
+
 function pickRounds() {
   let best = null;
-  for (let nQa = 1; nQa <= 3; nQa += 1) {
-    for (let nLong = 1; nLong <= 3; nLong += 1) {
-      for (let nRe = 1; nRe <= 3; nRe += 1) {
+  for (let nQa = 1; nQa <= MAX_ROUNDS; nQa += 1) {
+    for (let nLong = 1; nLong <= MAX_ROUNDS; nLong += 1) {
+      for (let nRe = 1; nRe <= MAX_ROUNDS; nRe += 1) {
         const total = tiledChars + nQa * qaPerRound + nLong * longPerRound
           + nRe * reactedPerRound;
         const error = ((nQa * qaPerRound / total) - QA_SHARE) ** 2
