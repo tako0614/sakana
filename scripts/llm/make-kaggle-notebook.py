@@ -239,7 +239,13 @@ def env_for(size):
     d_model, layers, heads, context = size
     return {{**os.environ,
             "LLM_DMODEL": str(d_model), "LLM_LAYERS": str(layers),
-            "LLM_HEADS": str(heads), "LLM_CONTEXT": str(context)}}
+            "LLM_HEADS": str(heads), "LLM_CONTEXT": str(context),
+            # **断片化で落ちるのを防ぐ。**30M / batch 48 は bench (200 step) を
+            # 通ったのに本番の 1 step 目で OOM した。空きは 838 MiB あるのに
+            # 「reserved but unallocated が 962 MiB」という典型的な断片化で、
+            # 1.12 GiB の連続領域が取れなかった。可変セグメントにすると繋がる
+            "PYTORCH_CUDA_ALLOC_CONF": os.environ.get(
+                "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")}}
 
 
 # batch と compile。**実測で決めた既定** (t4-small / 18.88M):
@@ -299,6 +305,14 @@ def pick_batch(size):
         rate = bench(size, batch=batch, compile_on=COMPILE, strict=False)
         if rate and rate >= 20_000:
             print(f"batch {{batch}} で {{rate:,.0f}} tok/s", flush=True)
+            # **bench を通っても本番で落ちることがある。**bench は train.txt を
+            # 200 step 回すだけで、途中保存も勾配フックも無い。実際 30M は
+            # bench を通ってから本番の 1 step 目で OOM した。ぎりぎりを避けて
+            # 1 段下げる余地を残す (EVEX_BATCH_MARGIN=0 で切れる)
+            if os.environ.get("EVEX_BATCH_MARGIN", "1") == "1" and batch > 8:
+                print(f"  安全側に batch {{batch // 2}} で回す "
+                      f"(EVEX_BATCH_MARGIN=0 で無効化)", flush=True)
+                return batch // 2, rate * 0.95
             return batch, rate
         print(f"batch {{batch}} は乗らなかった。半分にする", flush=True)
         batch //= 2
