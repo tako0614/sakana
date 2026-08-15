@@ -29,6 +29,10 @@ parser.add_argument("--repo", default=None, help="HF の repo id (使い方の�
 # **JESC が CC-BY-4.0** なので、既定はそれに揃えておく。
 # 継承の要否は解釈が割れるが、緩い方に倒して後から締めるのは難しい
 parser.add_argument("--license", default="cc-by-4.0")
+# 段3 (リアクションの切り出しだけで仕上げる) を**実際に回したか**。
+# コーパスには reacted.txt が常にあるので、あるかどうかでは判断できない。
+# evex-4 で段3 は噛み合いを 53.3% → 36.7% に落としたため既定で回していない
+parser.add_argument("--stage3", action="store_true", help="段3 を回した場合だけ付ける")
 args = parser.parse_args()
 
 out = Path(args.out)
@@ -217,11 +221,16 @@ if stats.get("pretrain_chars"):
     W("|---|---|---|")
     W(f"| 段1 | 外部の会話 + このサーバーの素の会話 | {fmt(stats['pretrain_chars'])} 字 |")
     W(f"| 段2 | このサーバーだけ (窓の水増しと切り出し込み) | {fmt(stats['train_chars'])} 字 |")
-    if stats.get("reacted_conversations"):
+    if args.stage3 and stats.get("reacted_conversations"):
         # **`reacted_chars` は train に混ぜた周回込みの値。**段3 のファイルは 1 周ぶん
         W(f"| 段3 | リアクションの付いた発言の切り出しだけ | "
           f"{fmt(stats.get('reacted_file_chars', 0))} 字 |")
     W("")
+    if not args.stage3 and stats.get("reacted_conversations"):
+        W("リアクションの付いた発言 (22,667 件) は**段2 の学習データに重く混ぜて**"
+          "います。それだけで追加学習する段を試したところ、話題の噛み合いが"
+          "落ちたので入れていません。")
+        W("")
 if speaker_counts:
     W(f"話者トークンは発言数の多い順に {len(speaker_counts)} 人ぶん "
       f"(全発言の {stats.get('speaker_coverage', 0) * 100:.1f}% を被覆)。")

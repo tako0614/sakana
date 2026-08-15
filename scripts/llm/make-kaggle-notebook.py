@@ -240,6 +240,10 @@ def env_for(size):
     return {{**os.environ,
             "LLM_DMODEL": str(d_model), "LLM_LAYERS": str(layers),
             "LLM_HEADS": str(heads), "LLM_CONTEXT": str(context),
+            # evex-5 の形。**既定は切ってある** — 環境変数で入れる
+            "LLM_PLE": os.environ.get("EVEX_PLE", "0"),
+            "LLM_DPLE": os.environ.get("EVEX_DPLE", "64"),
+            "LLM_QK_NORM": os.environ.get("EVEX_QK_NORM", "0"),
             # **断片化で落ちるのを防ぐ。**30M / batch 48 は bench (200 step) を
             # 通ったのに本番の 1 step 目で OOM した。空きは 838 MiB あるのに
             # 「reserved but unallocated が 962 MiB」という典型的な断片化で、
@@ -360,6 +364,18 @@ def run(size, epochs, batch=BATCH, lr="1e-3", train_name="train", init=None, tag
         cmd += ["--speaker-lr-cap", os.environ["EVEX_SPEAKER_LR"]]
     if COMPILE:
         cmd += ["--compile"]
+    # evex-5 の学習側の軸。**渡さなければ全部これまでどおり**
+    for flag, key in (("--optimizer", "EVEX_OPTIMIZER"), ("--schedule", "EVEX_SCHEDULE"),
+                      ("--decay-frac", "EVEX_DECAY_FRAC"), ("--z-loss", "EVEX_Z_LOSS"),
+                      ("--loss-chunks", "EVEX_LOSS_CHUNKS")):
+        if os.environ.get(key):
+            cmd += [flag, os.environ[key]]
+    if os.environ.get("EVEX_DOC_MASK") == "1":
+        cmd += ["--doc-mask"]
+    # Rho-1 の採点結果。段1 にだけ掛ける (段2 は evex 本体なので全部使う)
+    keep = os.environ.get("EVEX_KEEP_MASK")
+    if keep and train_name == "pretrain":
+        cmd += ["--keep-mask", f"{{CORPUS}}/{{keep}}"]
     # 長い epoch の途中でも書く。段1 は 179M トークンを 1 epoch で回すので、
     # 33 分のあいだ 1 度も書かないと事故で全部消える (実際に消した)
     if save_steps:
@@ -458,6 +474,15 @@ if os.environ.get("EVEX_SPEED"):
     cost_per_hour = float(os.environ.get("EVEX_COST_HOUR", 0.40))
     found = []
 
+    # evex-5 の軸も同じ土俵で測る。**Muon は CPU で 26 倍遅かった**が、
+    # 直交化が CPU 向きでないだけなので GPU で測るまで採否を決めない。
+    # 文書内マスクは融合カーネルから落ちるので、その代償をここで見る
+    extra = []
+    if os.environ.get("EVEX_SPEED_AXES") == "1":
+        extra = [("muon", {{"EVEX_OPTIMIZER": "muon"}}),
+                 ("doc-mask", {{"EVEX_DOC_MASK": "1"}}),
+                 ("PLE", {{"EVEX_PLE": "1", "EVEX_QK_NORM": "1"}})]
+
     for batch, comp in grid:
         label = f"batch {{batch}}" + (" + compile" if comp else "")
         try:
@@ -466,6 +491,18 @@ if os.environ.get("EVEX_SPEED"):
             print(f"  {{label}}: 落ちた ({{type(error).__name__}})", flush=True)
             rate = None
         found.append((label, batch, comp, rate))
+
+    # 軸ごとに 1 本ずつ。基準は既定の batch + compile
+    for name, env in extra:
+        os.environ.update(env)
+        try:
+            rate = bench(SIZE, batch=BATCH, compile_on=COMPILE, strict=False)
+        except Exception as error:
+            print(f"  {{name}}: 落ちた ({{type(error).__name__}})", flush=True)
+            rate = None
+        for key in env:
+            os.environ.pop(key, None)
+        found.append((f"+ {{name}}", BATCH, COMPILE, rate))
 
     print("\\n=== 速度の振り ===", flush=True)
     best = None

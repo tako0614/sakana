@@ -71,11 +71,25 @@ const CHUNK = {
 // 基のコーパスが増えるとそのままでは薄まるので、周回数をここから逆算する。
 // 多すぎても駄目 — build-sft.mjs の実測で 28.5% にすると窓の中身が
 // 3〜4 行の短い会話ばかりになり、元の長い会話が学べなくなる
-const QA_SHARE = Number(process.env.LLM_QA_SHARE ?? 0.123);
-const LONG_SHARE = Number(process.env.LLM_LONG_SHARE ?? 0.256);
-// リアクション切り出しの目標。噛み合いの半分にしておく — 件数が 22,667 と
-// 少ないので、周回数を上げすぎると同じ 2.4M 字を何度も見せることになる
-const REACTED_SHARE = Number(process.env.LLM_REACTED_SHARE ?? 0.06);
+// **切り出しは「一問一答 ⇔ 会話の流れ」の調整つまみ。**
+//
+// 切り出しは 3〜4 turn の短い窓なので「短く punchy に返す」を教える。素の窓は
+// 「会話を自然に続ける」を教える。割合を下げるほど流れ寄りになる。
+//
+// evex-4.1 で偶然この割合まで下がったとき (周回数の上限 3 に張り付いた)、
+// `conversational.py` の噛み合いは 53.3% → 36.7% に落ちたが、**使った本人は
+// 4.1 の方が良いと言った。**噛み合いは「質問の語を拾ったか」しか見ないので、
+// 話を広げる返しを低く評価する。実機の返答:
+//
+//   evex-4    いや、今日が明けましてよ                      (短く投げっぱなし)
+//   evex-4.1  はい。まずね、テストの点数を取らないといけなくて… (話が展開する)
+//
+// なので **4.1 の実績値をそのまま目標にする**。以前の 12.3% / 25.6% は
+// evex-ft-2 / ft-3 で測った値で、別のモデル族・別の狙いのもの。
+// 一問一答を強くしたいときは上げる (LLM_QA_SHARE などで振れる)。
+const QA_SHARE = Number(process.env.LLM_QA_SHARE ?? 0.084);
+const LONG_SHARE = Number(process.env.LLM_LONG_SHARE ?? 0.161);
+const REACTED_SHARE = Number(process.env.LLM_REACTED_SHARE ?? 0.033);
 
 // 窓の切り方を変えて増やす。**train だけに掛ける** —
 // val に掛けると中身が重複して loss の意味が変わる。
