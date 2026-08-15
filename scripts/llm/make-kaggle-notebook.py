@@ -23,8 +23,8 @@ ROOT = Path(__file__).resolve().parents[2]
 LLM = ROOT / "scripts" / "llm"
 
 MODE = (sys.argv[1] if len(sys.argv) > 1 else "ft").lower()
-if MODE not in {"ft", "evex", "runner", "scorer"}:
-    raise SystemExit("使い方: make-kaggle-notebook.py [ft|evex|runner|scorer]")
+if MODE not in {"ft", "evex", "runner", "scorer", "colab"}:
+    raise SystemExit("使い方: make-kaggle-notebook.py [ft|evex|runner|scorer|colab]")
 
 DATASET = "tako080614/sakana-sft"          # private。実在の会話が入っている
 
@@ -720,6 +720,121 @@ print(f"pushed {{CORPUS}}/{{NAME}}.keep.npy", flush=True)
 '''
 
 
+
+# --- Colab / Kaggle で「続きから」回すためのノートブック ---
+#
+# HF Jobs のクレジットが尽きたときの逃げ道。**押してある一番新しい重みを
+# 自分で見つけて続ける**ので、どこで切れても同じ手順で再開できる。
+#
+# 続きから回すときは**学習率を下げる**。WSD の減衰相の途中で再スタートすると
+# スケジュールが最初からになって LR が跳ね上がる (evex-3.5 を延長したときと同じ罠)。
+
+COLAB_SETUP = f"""import os, glob, re
+from huggingface_hub import snapshot_download, HfApi
+
+# Colab なら左の鍵アイコンで HF_TOKEN を登録しておく。無ければ入力を求める
+try:
+    from google.colab import userdata
+    os.environ["HF_TOKEN"] = userdata.get("HF_TOKEN")
+except Exception:
+    try:
+        from kaggle_secrets import UserSecretsClient
+        os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+    except Exception:
+        import getpass
+        os.environ["HF_TOKEN"] = getpass.getpass("HF_TOKEN: ")
+
+CORPUS = "{CORPUS_DIR}"
+DATASET = "{DATASET}"
+# 押し先。世代ごとに分ける (1 つに溜めると 413 になる)
+PUSH = "tako080614/evex-5-ckpt"
+# 段1 はこちらに置いてある
+RESUME_REPO = "tako080614/evex-3.5"
+
+snapshot_download(repo_id=DATASET, repo_type="dataset", local_dir=".",
+                  allow_patterns=[CORPUS + "/*"], token=os.environ["HF_TOKEN"])
+print("corpus:", sorted(os.path.basename(p) for p in glob.glob(CORPUS + "/*")))
+"""
+
+
+COLAB_PICK = """# --- 押してある一番新しい重みを探す ---
+#
+# 段2 の epoch が 1 つでも押してあればそれを、無ければ段1 を初期値にする。
+# **どこで切れても同じ手順で再開できる**ようにするための仕掛け。
+
+def newest(repo, prefix):
+    try:
+        got = snapshot_download(repo_id=repo, local_dir=f"resume-{prefix}",
+                                allow_patterns=[prefix + "/*"],
+                                token=os.environ["HF_TOKEN"])
+    except Exception as error:
+        print(f"  {repo}/{prefix} は取れなかった: {type(error).__name__}")
+        return None, 0
+    found = sorted(glob.glob(f"{got}/{prefix}/ckpt-e*.pt"),
+                   key=lambda p: int(re.search(r"ckpt-e(\\d+)", p).group(1)))
+    if not found:
+        return None, 0
+    n = int(re.search(r"ckpt-e(\\d+)", found[-1]).group(1))
+    return found[-1], n
+
+init, done = newest(PUSH, "pretrain-evex5")     # 段2 の続き
+if init:
+    STAGE = "段2 の続き"
+    LR = "1.5e-4"          # 減衰相の途中なので下げる
+    EPOCHS = max(1, 8 - done)
+else:
+    init, _ = newest(RESUME_REPO, "pretrain")   # 段1 から段2 を始める
+    STAGE = "段1 から段2"
+    LR = "4.2e-4"
+    EPOCHS = 8
+    done = 0
+
+if not init:
+    raise SystemExit("初期値になる重みが見つからない")
+print(f"{STAGE}: {init} (済み {done} epoch) → あと {EPOCHS} epoch / lr {LR}")
+"""
+
+
+COLAB_RUN = """# --- 続きを回す ---
+#
+# 形は evex-5 のまま。**1 つでも取り違えると重みが読めない**
+%env LLM_DMODEL=384
+%env LLM_LAYERS=8
+%env LLM_HEADS=6
+%env LLM_CONTEXT=1024
+%env LLM_PLE=1
+%env LLM_DPLE=64
+%env LLM_QK_NORM=1
+
+!python train.py --corpus {CORPUS} --out out-evex5 --epochs {EPOCHS} --batch 24 \\
+  --lr {LR} --init {init} --optimizer muon --schedule wsd --decay-frac 1.0 \\
+  --doc-mask --z-loss 1e-4 --loss-chunks 4 --compile --save-steps 400
+"""
+
+
+COLAB_PUSH = """# --- 押す。**1 epoch でも回ったら必ずここまで来ること** ---
+api = HfApi(token=os.environ["HF_TOKEN"])
+api.create_repo(PUSH, private=True, exist_ok=True)
+!cp {CORPUS}/tok.model out-evex5/
+api.upload_folder(repo_id=PUSH, folder_path="out-evex5",
+                  path_in_repo="pretrain-evex5", commit_message="evex-5 段2 の続き")
+print("pushed → https://huggingface.co/" + PUSH)
+"""
+
+
+COLAB_INTRO = """# evex-5 の続き (Colab / Kaggle)
+
+HF Jobs のクレジットが尽きたときの逃げ道。**押してある一番新しい重みを自分で
+見つけて続ける**ので、どこで切れても同じ手順で再開できる。
+
+- 残り 3 epoch なら **約 52 分**。Colab の 1 セッションに収まる
+- GPU を有効にすること (ランタイム → ランタイムのタイプを変更 → T4)
+- `HF_TOKEN` は Colab の鍵アイコン / Kaggle の Secrets に入れておく
+
+**続きは学習率を下げる。**WSD の減衰相の途中で再スタートするとスケジュールが
+最初からになって LR が跳ね上がる (evex-3.5 を延長したときに踏んだ罠)。
+"""
+
 if MODE == "scorer":
     header = (
         "# /// script\n"
@@ -767,7 +882,20 @@ if MODE == "runner":
     print(f"  hf upload {DATASET} {out} runner/run.py --repo-type dataset")
     raise SystemExit(0)
 
-if MODE == "ft":
+if MODE == "colab":
+    cells = [
+        markdown(COLAB_INTRO),
+        code("%pip install -q sentencepiece -U huggingface_hub\n"),
+        embed("model.py"),
+        embed("train.py"),
+        code(COLAB_SETUP),
+        code(COLAB_PICK),
+        code(COLAB_RUN),
+        code(COLAB_PUSH),
+    ]
+    out = ROOT / "dist" / "evex-5-continue.ipynb"
+    embedded = ["model.py", "train.py"]
+elif MODE == "ft":
     cells = [
         markdown(FT_INTRO),
         # torch は Kaggle に入っている。transformers はローカルで確かめた版に固定する
