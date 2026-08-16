@@ -212,6 +212,30 @@ from pathlib import Path
 from huggingface_hub import HfApi, snapshot_download
 
 DATASET = "{DATASET}"
+
+# **走らせ方はデータセット側の runner/config.json で決める。**
+#
+# Kaggle のノートブックはブラウザで編集するしかなく、セルを書き換えるのは
+# 壊しやすい (実際に選択が外れてショートカットが暴発した)。設定をファイルに
+# 出しておけば、**ノートブックを触らずに何を回すかを変えられる**。
+# 環境変数が既に立っていればそちらを優先する (ジョブ側の指定を上書きしない)。
+def _apply_config():
+    from huggingface_hub import hf_hub_download
+    try:
+        path = hf_hub_download("{DATASET}", "runner/config.json", repo_type="dataset",
+                               token=os.environ["HF_TOKEN"])
+    except Exception as error:
+        print(f"runner/config.json は無い ({{type(error).__name__}})。環境変数だけで回す",
+              flush=True)
+        return
+    import json as _json
+    loaded = _json.loads(open(path, encoding="utf8").read())
+    for key, value in loaded.items():
+        os.environ.setdefault(key, str(value))
+    print("config.json:", " ".join(f"{{k}}={{v}}" for k, v in sorted(loaded.items())), flush=True)
+
+
+_apply_config()
 # 押し先。**世代ごとに分ける。**1 つのリポジトリに溜め続けると、commit の
 # メタデータが上限に当たって `413 Payload Too Large` になる (実際になった)
 PUSH = os.environ.get("EVEX_PUSH_REPO", "{EVEX_PUSH}")

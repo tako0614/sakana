@@ -150,6 +150,9 @@ const speakerTokens = named.map((_, rank) => `<|s${rank}|>`);
 const byChannel = new Map();
 let read = 0;
 let bots = 0;
+// `-#` (Discord の小文字表示) を含む発言の数。**bot 除外の取りこぼしの目安**
+let subtext = 0;
+let subtextOnly = 0;
 
 // readline は使わない。U+2028 / U+2029 も行終端として扱うので、それを含む本文で
 // JSON レコードが割れる (実データに 5 件あった)。
@@ -165,7 +168,22 @@ for (const line of raw.split('\n')) {
     JSON.parse(line);
   if (isBot) { bots += 1; continue; }
 
-  const text = messageText(content);
+  // **`-#` の行を落とす (evex-5.3)。**Discord の小文字表示 (subtext) の指定で
+  // あって発言ではない。corpus-v10 に 3,407 行あり、しかも `<|s6|>` `<|s10|>` の
+  // ような**実在の話者の発言として**残っていた (中身は `-# Prompt:` `-# model:` で、
+  // 画像生成 bot の出力)。上の `isBot` が webhook を取りこぼしている疑いが濃い。
+  //
+  // ここでは行を落とすだけにして、**取りこぼしの件数は数えて報告する**
+  // (webhook 自体の除去はアーカイブ側の作業なので次回に回す)。
+  const stripped = String(content ?? '')
+    .split('\n').filter((row) => !/^\s*-#(?:\s|$)/.test(row)).join('\n');
+  if (stripped !== String(content ?? '')) {
+    subtext += 1;
+    // 小文字表示しか無い発言は、丸ごと bot の footer。turn ごと落とす
+    if (!stripped.trim()) { subtextOnly += 1; continue; }
+  }
+
+  const text = messageText(stripped);
 
   if (!byChannel.has(ch)) byChannel.set(ch, []);
   byChannel.get(ch).push({
@@ -519,11 +537,26 @@ if (PER_SPEAKER > 0) {
   for (const [, found] of bySpeaker) {
     speakerStats.speakers += 1;
     speakerStats.unique += found.length;
-    // 足りない人は巡回して埋める。**上限を置く** — 203 件の人を 400 本にすると
-    // 同じ本文が 2 回出る。4 倍を超えると丸暗記に寄るので、そこで止める
-    const want = Math.min(PER_SPEAKER, found.length * SPEAKER_MAX_REPEAT);
+    // **上限で頭打ちにしない (evex-5.3)。**5.2 は `min(2500, found*4)` だったので、
+    //
+    //   上位話者 (55,964 発言)  2,500 本 = 手持ちの 4.5% しか使わない
+    //   下位話者 (203 発言)     812 本 (4 倍) 止まり
+    //
+    // と**上位は絞られ、下位は伸びていない**形になっていた。実測でも弁別性は
+    // 5.1 の +1.5% から +1.6% しか動かず、誤差の範囲だった。
+    //
+    // 手持ちが多い人は全部使い、**少ない人だけ繰り返しで底上げする**。
+    // 繰り返しは丸暗記に寄るので、逐語コピーを測って上がったら倍率を戻すこと
+    // (5.2 は 4 倍 x 8 epoch = 32 回で 0.0% だった)
+    const want = Math.max(found.length,
+      Math.min(PER_SPEAKER, found.length * SPEAKER_MAX_REPEAT));
     for (let i = 0; i < want; i += 1) speakerExcerpts.push(found[i % found.length]);
   }
+
+  // **切り出しの行番号を控える。**損失マスク (speaker-mask.py) が
+  // 「どの行が話者ごとの切り出しか」を知る必要がある。連続した塊で push するので
+  // 範囲で足りる。ここを取り違えると他人の発言を損失から外すことになる
+  speakerStats.from = train.length;
 
   for (const x of speakerExcerpts) {
     const text = wrap(x.turns, x.ch);         // **匿名化しない**
@@ -531,6 +564,7 @@ if (PER_SPEAKER > 0) {
     speakerStats.chars += text.length;
     train.push({ at: cutoff - 1, ch: x.ch, turns: x.turns, text });
   }
+  speakerStats.to = train.length;             // [from, to) が切り出しの行番号
 }
 
 // **リアクションの付いた発言。**段3 でここだけを流すので、
@@ -770,6 +804,12 @@ const stats = {
   qa_rounds: QA_ROUNDS,
   long_rounds: LONG_ROUNDS,
   reacted_rounds: REACTED_ROUNDS,
+  // **目標割合を残す。**実績しか書いていなかったので、v13 を既定値で組んだら
+  // 周回が 5/5/3 → 3/3/2 に落ちて、噛み合い切り出しが 4 割減った。
+  // 前の世代と揃えたいときに何を渡せばいいか分からないのは事故のもと
+  qa_share_target: QA_SHARE,
+  long_share_target: LONG_SHARE,
+  reacted_share_target: REACTED_SHARE,
   qa_chars: qaChars,
   long_chars: longChars,
   reacted_chars: reactedChars,
@@ -779,6 +819,14 @@ const stats = {
   qa_min_answer: EXCERPT.qaMinAnswer,
   qa_context: EXCERPT.qaContext,
   long_min: EXCERPT.longMin,
+  // **話者ごとの切り出しの行番号 [from, to)。**speaker-mask.py がここを読んで
+  // 「対象の人の発言だけ損失に入れる」マスクを作る。train は書き出しまで
+  // 並べ替えないので、push した時点の範囲がそのまま train.txt の行番号になる
+  per_speaker: PER_SPEAKER,
+  per_speaker_max_repeat: SPEAKER_MAX_REPEAT,
+  per_speaker_excerpts: speakerStats.emitted,
+  per_speaker_chars: speakerStats.chars,
+  speaker_excerpt_range: PER_SPEAKER > 0 ? [speakerStats.from, speakerStats.to] : null,
   reply_total: replyTotal,
   reply_with_target: replyWithTarget,
   train: train.length,
@@ -793,6 +841,8 @@ const stats = {
 await writeFile(path.join(dst, 'stats.json'), JSON.stringify(stats, null, 1));
 
 console.log(`読んだ行         ${fmt(read)} (bot を除外 ${fmt(bots)})`);
+console.log(`  -# を含む発言  ${fmt(subtext)} (うち小文字表示だけ ${fmt(subtextOnly)} は turn ごと除外)`
+  + `  ← **bot 除外の取りこぼしの目安。**webhook が isBot=false で来ている疑い`);
 console.log(`話者トークン     ${named.length} 人 (${NAMED_MIN_MESSAGES} 件以上 / `
   + `発言の ${(coverage * 100).toFixed(1)}% を被覆) + 役 ${ROLE_TOKENS.length} + 溢れ 1`);
 console.log(`返信             ${fmt(replyTotal)} 件 / うち相手が分かるもの ${fmt(replyWithTarget)}`);
