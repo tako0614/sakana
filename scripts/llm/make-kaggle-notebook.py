@@ -404,9 +404,14 @@ def run(size, epochs, batch=BATCH, lr="1e-3", train_name="train", init=None, tag
                 else os.environ.get("EVEX_DECAY_FRAC", "0.2")]
     if os.environ.get("EVEX_DOC_MASK") == "1":
         cmd += ["--doc-mask"]
-    # Rho-1 の採点結果。段1 にだけ掛ける (段2 は evex 本体なので全部使う)
-    keep = os.environ.get("EVEX_KEEP_MASK")
-    if keep and train_name == "pretrain":
+    # **マスクは段ごとに別の環境変数で渡す。**1 つで賄うと必ずどちらかが間違う。
+    #
+    #   EVEX_KEEP_MASK     段1 用。Rho-1 の採点結果 (いまは使っていない)
+    #   EVEX_FT_KEEP_MASK  段2 用。話者ごとの切り出しで「対象の人の発言だけ」を
+    #                      損失に入れる (evex-5.3 / speaker-mask.py が作る)
+    keep = (os.environ.get("EVEX_KEEP_MASK") if train_name == "pretrain"
+            else os.environ.get("EVEX_FT_KEEP_MASK"))
+    if keep:
         cmd += ["--keep-mask", f"{{CORPUS}}/{{keep}}"]
     # 長い epoch の途中でも書く。段1 は 179M トークンを 1 epoch で回すので、
     # 33 分のあいだ 1 度も書かないと事故で全部消える (実際に消した)

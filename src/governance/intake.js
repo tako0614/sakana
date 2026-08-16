@@ -392,6 +392,17 @@ function acceptedCaseResult(error) {
 // 席の調査は要約だけ公開する（憲法第九条8・実行規則 investigation.publicRecord）。
 const PANEL_LENS_LABELS = ['textual', 'rights', 'adversarial'];
 
+function investigationLines(panel, policy) {
+  if ((policy?.investigation?.publicRecord ?? 'none') === 'none') return [];
+  return (panel.traces ?? [])
+    .map(({ seat, trace }) => investigationSummary(trace, {
+      seat,
+      lens: PANEL_LENS_LABELS[(seat - 1) % PANEL_LENS_LABELS.length],
+      maximumSteps: panel.maximumSteps
+    }))
+    .filter(Boolean);
+}
+
 async function publishJudicialScreeningRecord(guild, investigation, caseRecord, candidate, evidence, panel) {
   if (!caseRecord?.public_thread_id) return false;
   const law = getLaw(candidate.lawId);
@@ -407,13 +418,7 @@ async function publishJudicialScreeningRecord(guild, investigation, caseRecord, 
     )),
     candidate.reasons?.length ? `事件化の理由: ${candidate.reasons.join(' / ')}` : null,
     '',
-    ...(panel.traces ?? [])
-      .map(({ seat, trace }) => investigationSummary(trace, {
-        seat,
-        lens: PANEL_LENS_LABELS[(seat - 1) % PANEL_LENS_LABELS.length],
-        maximumSteps: panel.maximumSteps
-      }))
-      .filter(Boolean),
+    ...investigationLines(panel, getActiveConstitution(guild.id)?.policy),
     '',
     'これは事件を開始するための審査です。有罪・処分は成立法に基づく別の司法パネルが判断します。'
   ].filter((line) => line !== null).join('\n'));

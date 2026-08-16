@@ -8,6 +8,7 @@
 // その台帳で、幻の証拠を弾く唯一の検算になる。
 import {
   activityContext,
+  getActiveConstitution,
   getCase,
   getOperationalSetting,
   listCaseEvidence,
@@ -23,10 +24,12 @@ import { contextRelevance } from './context.js';
 import { IMPLEMENTED_TOOLS } from './rules.js';
 
 const DAY_MS = 86_400_000;
-const CONTENT_LIMIT = 400;
+// ツールループは毎リクエストでmessages配列を丸ごと再送するので、返す量は手数の
+// 二乗で効く。索引として使える最小限まで絞る。全文が要るものは別の経路で読む。
+const CONTENT_LIMIT = 160;
 const DEFAULT_LOOKBACK_DAYS = 30;
 const MAXIMUM_LOOKBACK_DAYS = 90;
-const MAXIMUM_ROWS = 50;
+const MAXIMUM_ROWS = 25;
 
 function boundedInteger(value, fallback, minimum, maximum) {
   const parsed = Number(value);
@@ -87,7 +90,7 @@ const TOOLS = {
     },
     run(context, args) {
       const terms = searchTerms(args.query);
-      const limit = boundedInteger(args.limit, 20, 1, MAXIMUM_ROWS);
+      const limit = boundedInteger(args.limit, 10, 1, MAXIMUM_ROWS);
       const pool = searchGuildActivity(context.guildId, since(context, args.days), terms, 500);
       return pool
         .map((row) => ({ row, score: contextRelevance(String(args.query ?? ''), row.content) }))
@@ -113,7 +116,7 @@ const TOOLS = {
         context.guildId,
         String(args.userId ?? ''),
         since(context, args.days),
-        boundedInteger(args.limit, 30, 1, MAXIMUM_ROWS)
+        boundedInteger(args.limit, 10, 1, MAXIMUM_ROWS)
       );
     }
   },
@@ -134,7 +137,7 @@ const TOOLS = {
         context.guildId,
         since(context, args.days),
         [String(args.channelId ?? '')],
-        boundedInteger(args.limit, 30, 1, MAXIMUM_ROWS)
+        boundedInteger(args.limit, 10, 1, MAXIMUM_ROWS)
       );
     }
   },
@@ -152,9 +155,34 @@ const TOOLS = {
     },
     run(context, args) {
       return activityContext(context.guildId, String(args.messageId ?? ''), {
-        before: boundedInteger(args.before, 5, 0, 20),
-        after: boundedInteger(args.after, 5, 0, 20)
+        before: boundedInteger(args.before, 4, 0, 10),
+        after: boundedInteger(args.after, 4, 0, 10)
       });
+    }
+  },
+  read_constitution: {
+    description: 'Read the constitution. Without an article heading it returns the list of headings; with one it returns that article in full.',
+    parameters: {
+      type: 'object',
+      properties: {
+        heading: { type: 'string', description: 'Exact Markdown heading text, e.g. 第八条（立法）. Omit to list every heading.' }
+      },
+      required: []
+    },
+    run(context, args) {
+      const constitution = getActiveConstitution(context.guildId);
+      if (!constitution) return { error: 'no active constitution' };
+      const content = String(constitution.content ?? '');
+      const sections = content.split(/^## /m).slice(1)
+        .map((part) => ({ heading: part.split('\n')[0].trim(), body: '## ' + part.trim() }));
+      const heading = String(args.heading ?? '').trim();
+      if (!heading) {
+        return { version: constitution.version, headings: sections.map((entry) => entry.heading) };
+      }
+      const found = sections.find((entry) => entry.heading === heading)
+        ?? sections.find((entry) => entry.heading.includes(heading));
+      if (!found) return { error: `unknown heading: ${heading}`, headings: sections.map((entry) => entry.heading) };
+      return { version: constitution.version, heading: found.heading, text: found.body.slice(0, 4000) };
     }
   },
   read_law: {
@@ -193,13 +221,13 @@ const TOOLS = {
       type: 'object',
       properties: {
         accusedId: { type: 'string', description: 'Discord user id. Omit for every recent case.' },
-        limit: { type: 'integer', description: 'How many cases, 1-50.' }
+        limit: { type: 'integer', description: 'How many cases, 1-25.' }
       },
       required: []
     },
     run(context, args) {
       const accusedId = String(args.accusedId ?? '').trim();
-      return listCases(context.guildId, { limit: boundedInteger(args.limit, 25, 1, 50) })
+      return listCases(context.guildId, { limit: boundedInteger(args.limit, 10, 1, 25) })
         .filter((entry) => !accusedId || String(entry.accused_id) === accusedId)
         .map((entry) => ({
           id: entry.id,
@@ -219,7 +247,7 @@ const TOOLS = {
       properties: {
         lawId: { type: 'integer', description: 'Enacted law id.' },
         offenseCode: { type: 'string', description: 'Offense code such as O1. Omit for every offense of the law.' },
-        limit: { type: 'integer', description: 'How many cases, 1-20.' }
+        limit: { type: 'integer', description: 'How many cases, 1-10.' }
       },
       required: ['lawId']
     },
@@ -230,7 +258,7 @@ const TOOLS = {
         .filter((entry) => Number(entry.law_id) === lawId
           && (!offenseCode || entry.offense_code === offenseCode)
           && Number(entry.id) !== Number(context.caseId ?? 0))
-        .slice(0, boundedInteger(args.limit, 10, 1, 20));
+        .slice(0, boundedInteger(args.limit, 5, 1, 10));
       return cases.map((entry) => ({
         caseId: entry.id,
         status: entry.status,
@@ -241,7 +269,7 @@ const TOOLS = {
           seat: decision.seat,
           verdict: decision.verdict,
           sanction: decision.sanction_json ? JSON.parse(decision.sanction_json) : null,
-          reasons: JSON.parse(decision.reasons_json ?? '[]').slice(0, 4)
+          reasons: JSON.parse(decision.reasons_json ?? '[]').slice(0, 2)
         }))
       }));
     }
@@ -314,13 +342,14 @@ function summarize(name, args, result) {
         : name === 'read_context' ? `記録 ${String(args.messageId ?? '').slice(0, 24)} の前後`
           : name === 'read_law' ? (args.code ? String(args.code).slice(0, 24) : '法令一覧')
             : name === 'read_precedent' ? `法 ${args.lawId ?? '?'} の過去の判断`
-              : name === 'read_cases' ? '事件一覧'
+              : name === 'read_constitution' ? (args.heading ? String(args.heading).slice(0, 24) : '憲法の目次')
+                : name === 'read_cases' ? '事件一覧'
                 : `事件 ${args.caseId ?? '当件'}`;
   return { count, detail };
 }
 
 // 席ごとに1つ作る。retrieved はその席が実際に見たIDの台帳で、引用の検算に使う。
-export function buildToolset({ guildId, allowed, caseId = null }) {
+export function buildToolset({ guildId, allowed, caseId = null, maximumOutputBytes = 10 * 1024 }) {
   const context = {
     guildId: String(guildId),
     caseId,
@@ -329,6 +358,7 @@ export function buildToolset({ guildId, allowed, caseId = null }) {
   const permitted = new Set(allowed.filter((name) => name in TOOLS));
   const retrieved = new Map();
   const trace = [];
+  let spentBytes = 0;
   return {
     definitions: toolDefinitions([...permitted]),
     retrieved,
@@ -336,8 +366,17 @@ export function buildToolset({ guildId, allowed, caseId = null }) {
     get steps() {
       return trace.length;
     },
+    get spentBytes() {
+      return spentBytes;
+    },
     async run(name, rawArguments) {
       const step = trace.length + 1;
+      // 最悪ケースを固定する。予算を使い切ったらツールを閉じて結論へ行かせる。
+      if (spentBytes >= maximumOutputBytes) {
+        const error = 'investigation output budget spent; stop calling tools and answer now';
+        trace.push({ step, tool: String(name), arguments: rawArguments, count: 0, detail: '予算切れ', error });
+        return { error };
+      }
       if (!permitted.has(name)) {
         const error = `tool not permitted by the constitution: ${name}`;
         trace.push({ step, tool: String(name), arguments: rawArguments, count: 0, detail: '許可外', error });
@@ -377,6 +416,7 @@ export function buildToolset({ guildId, allowed, caseId = null }) {
           });
         }
       }
+      spentBytes += JSON.stringify(view ?? null).length;
       const { count, detail } = summarize(name, args, view);
       trace.push({ step, tool: name, arguments: args, count, detail, error: null, result: view });
       return view;

@@ -15,6 +15,7 @@ import {
   recordProposalDeliberation,
   setProposalKind,
   threadDiscussion,
+  threadDiscussionCount,
   updateGovernanceGuild,
   updateProposal,
   writeAudit
@@ -33,7 +34,7 @@ import { compileConstitution, governanceRulesSummary } from './rules.js';
 import { investigationSummary } from './tools.js';
 import { openProposalVote, publicPanelOutputs, retryPatch } from './service.js';
 
-const AGENDA_DISCUSSION_LIMIT = 300;
+const AGENDA_DISCUSSION_LIMIT = 60;
 const SCAN_WINDOW_MS = 7 * 86_400_000;
 
 function constitutionRules(constitution) {
@@ -192,7 +193,10 @@ function decisionSummary(decision) {
 // 席の調査は要約だけ公開する（憲法第九条8・実行規則 investigation.publicRecord）。
 const PANEL_LENS_LABELS = ['textual', 'rights', 'adversarial'];
 
-function investigationLines(decision) {
+// 公開の粒度は憲法の実行規則が決める。既定は none で、調査の中身は席の理由文が
+// 語る（憲法第九条8）。完全な往復は governance_investigation_steps に残る。
+function investigationLines(decision, constitution) {
+  if ((constitution?.policy?.investigation?.publicRecord ?? 'none') === 'none') return [];
   return (decision.traces ?? [])
     .map(({ seat, trace }) => investigationSummary(trace, {
       seat,
@@ -217,7 +221,7 @@ function decisionFile(proposal, decision, extra = {}) {
 // 継続審議でも、国会は書けるところまで条文を書いて出す。人間は白紙にではなく
 // たたき台に対して直しを言えばよい。draft が null になるのは席が割れて方向すら
 // 定まらなかったときだけ。
-async function deferAgendaItem(guild, proposal, decision, extra = {}, draft = null) {
+async function deferAgendaItem(guild, proposal, decision, extra = {}, draft = null, constitution = null) {
   const deferrals = Number(proposal.deferrals ?? 0) + 1;
   const updated = updateProposal(proposal.id, {
     deferrals,
@@ -244,12 +248,12 @@ async function deferAgendaItem(guild, proposal, decision, extra = {}, draft = nu
       : '国会は今回この議題の結論を出しませんでした。次の国会まで、このスレで討論できます。',
     decision.question ? `\n**聞きたいこと**: ${decision.question}` : null,
     decision.reasons.length ? `\n理由:\n${decision.reasons.map((line) => `- ${line}`).join('\n')}` : null,
-    ...investigationLines(decision).map((line) => `\n${line}`)
+    ...investigationLines(decision, constitution).map((line) => `\n${line}`)
   ].filter(Boolean).join('\n'), { state: '議論中', files });
   return { proposalId: proposal.id, title: proposal.title, decision: 'defer', deferrals, drafted: Boolean(draft) };
 }
 
-async function rejectAgendaItem(guild, proposal, decision) {
+async function rejectAgendaItem(guild, proposal, decision, constitution = null) {
   const updated = updateProposal(proposal.id, {
     status: 'rejected',
     stage_ends_at: null,
@@ -261,7 +265,7 @@ async function rejectAgendaItem(guild, proposal, decision) {
     '## 不採択',
     '国会はこの議題を法律にしないと決めました。',
     decision.reasons.length ? `\n理由:\n${decision.reasons.map((line) => `- ${line}`).join('\n')}` : null,
-    ...investigationLines(decision).map((line) => `\n${line}`)
+    ...investigationLines(decision, constitution).map((line) => `\n${line}`)
   ].filter(Boolean).join('\n'), { state: '不成立', files: [decisionFile(proposal, decision)] });
   return { proposalId: proposal.id, title: proposal.title, decision: 'reject' };
 }
@@ -373,7 +377,7 @@ async function legislateAgendaItem(guild, governance, constitution, proposal, de
         `条文案の憲法適合を確認できませんでした (合憲 ${constitutional}/${constitution.policy.judiciary.panelSeats})。`,
         ...concerns
       ]
-    }, reviewSummary, draftArtifacts(body, amendment));
+    }, reviewSummary, draftArtifacts(body, amendment), constitution);
   }
   current = updateProposal(current.id, {
     title: body.title.slice(0, 100),
@@ -393,7 +397,7 @@ async function legislateAgendaItem(guild, governance, constitution, proposal, de
     amendment ? '憲法改正案として投票にかけます。' : '法律案として投票にかけます。',
     decision.reasons.length ? `\n理由:\n${decision.reasons.map((line) => `- ${line}`).join('\n')}` : null,
     `\n合憲 ${constitutional}/${constitution.policy.judiciary.panelSeats}`,
-    ...investigationLines(decision).map((line) => `\n${line}`)
+    ...investigationLines(decision, constitution).map((line) => `\n${line}`)
   ].filter(Boolean).join('\n'), {
     files: [
       decisionFile(current, decision, reviewSummary),
@@ -418,10 +422,19 @@ async function processAgendaItem(guild, governance, constitution, input) {
   const rules = constitutionRules(constitution);
   let proposal = await ensureAgendaPost(guild, governance, input);
   const maximumDeferrals = constitution.policy.legislation.maximumDeferrals;
-  const allowDefer = Number(proposal.deferrals ?? 0) < maximumDeferrals;
+  // proposal行は「国会が最初に回ったとき」に作られる。created_atで切ると、それ以前の
+  // 議論――つまり人間が実際に話し合った内容――が丸ごと落ちる。スレ全体を渡す。
   const discussion = threadDiscussion(
-    guild.id, proposal.forum_thread_id, Number(proposal.created_at ?? 0), AGENDA_DISCUSSION_LIMIT
-  ).map((row) => ({ authorId: row.user_id, content: String(row.content).slice(0, 800), occurredAt: row.created_at }));
+    guild.id, proposal.forum_thread_id, 0, AGENDA_DISCUSSION_LIMIT
+  ).map((row) => ({ authorId: row.user_id, content: String(row.content).slice(0, 400), occurredAt: row.created_at }));
+  // 前回の継続審議のあと誰も何も書いていないなら、待っても同じ結論にしかならない。
+  // 意見を聞くための継続審議は、聞いた結果が返ってきたときだけ繰り返せる。
+  const deferrals = Number(proposal.deferrals ?? 0);
+  const askedAt = Number(proposal.stage_started_at ?? 0);
+  const repliesSinceAsking = deferrals > 0 && askedAt
+    ? threadDiscussionCount(guild.id, proposal.forum_thread_id, askedAt)
+    : 1;
+  const allowDefer = deferrals < maximumDeferrals && repliesSinceAsking > 0;
   const laws = listLaws(guild.id, { activeOnly: false, limit: 200 });
   const activeLaws = laws.filter((law) => law.status === 'active');
   const candidates = buildLegislativeCandidates({
@@ -475,11 +488,12 @@ async function processAgendaItem(guild, governance, constitution, input) {
     discussion,
     decision: decisionSummary(decision)
   });
-  if (decision.decision === 'reject') return rejectAgendaItem(guild, proposal, decision);
+  if (decision.decision === 'reject') return rejectAgendaItem(guild, proposal, decision, constitution);
   if (decision.decision === 'defer') {
     return deferAgendaItem(
       guild, proposal, decision, {},
-      await draftForDeferral(guild, constitution, proposal, decision)
+      await draftForDeferral(guild, constitution, proposal, decision),
+      constitution
     );
   }
   return legislateAgendaItem(guild, governance, constitution, proposal, decision);

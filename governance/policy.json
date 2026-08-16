@@ -84,8 +84,13 @@
   "investigation": {
     "maximumSteps": {
       "police": 8,
-      "court": 12,
-      "parliament": 12
+      "court": 8,
+      "parliament": 8
+    },
+    "maximumOutputKilobytes": {
+      "police": 10,
+      "court": 10,
+      "parliament": 10
     },
     "tools": {
       "police": [
@@ -93,7 +98,8 @@
         "read_user_messages",
         "read_context",
         "read_law",
-        "read_cases"
+        "read_cases",
+        "read_constitution"
       ],
       "court": [
         "search_messages",
@@ -102,7 +108,8 @@
         "read_law",
         "read_cases",
         "read_precedent",
-        "read_case_record"
+        "read_case_record",
+        "read_constitution"
       ],
       "parliament": [
         "search_messages",
@@ -110,10 +117,11 @@
         "read_context",
         "read_law",
         "read_cases",
-        "read_precedent"
+        "read_precedent",
+        "read_constitution"
       ]
     },
-    "publicRecord": "summary",
+    "publicRecord": "none",
     "maximumRedefense": 1
   }
 }

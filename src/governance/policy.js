@@ -200,28 +200,32 @@ export function validateConstitutionPolicy(policy, { technicalOnly = false } = {
 export function validateInvestigationPolicy(investigation) {
   if (!investigation) throw new Error('憲法policyにinvestigationがありません。');
   const roles = ['police', 'court', 'parliament'];
-  const allowed = new Set(['maximumSteps', 'tools', 'publicRecord', 'maximumRedefense']);
+  const allowed = new Set([
+    'maximumSteps', 'maximumOutputKilobytes', 'tools', 'publicRecord', 'maximumRedefense'
+  ]);
   if (Object.keys(investigation).some((key) => !allowed.has(key))
     || [...allowed].some((key) => !(key in investigation))) {
     throw new Error('investigationに未対応の設定があります。');
   }
-  for (const key of ['maximumSteps', 'tools']) {
+  for (const key of ['maximumSteps', 'maximumOutputKilobytes', 'tools']) {
     if (Object.keys(investigation[key]).sort().join(',') !== [...roles].sort().join(',')) {
       throw new Error(`investigation.${key} は police/court/parliament の3つです。`);
     }
   }
   for (const role of roles) {
-    finite(investigation.maximumSteps[role], `investigation.maximumSteps.${role}`, { min: 1, max: 20 });
-    if (!Number.isInteger(investigation.maximumSteps[role])) {
-      throw new Error(`investigation.maximumSteps.${role} は整数である必要があります。`);
+    for (const [key, max] of [['maximumSteps', 20], ['maximumOutputKilobytes', 256]]) {
+      finite(investigation[key][role], `investigation.${key}.${role}`, { min: 1, max });
+      if (!Number.isInteger(investigation[key][role])) {
+        throw new Error(`investigation.${key}.${role} は整数である必要があります。`);
+      }
     }
     const tools = investigation.tools[role];
     if (!Array.isArray(tools) || new Set(tools).size !== tools.length) {
       throw new Error(`investigation.tools.${role} が不正です。`);
     }
   }
-  if (!['summary', 'full'].includes(investigation.publicRecord)) {
-    throw new Error('investigation.publicRecord は summary または full です。');
+  if (!['none', 'summary', 'full'].includes(investigation.publicRecord)) {
+    throw new Error('investigation.publicRecord は none、summary または full です。');
   }
   finite(investigation.maximumRedefense, 'investigation.maximumRedefense', { min: 0, max: 3 });
   if (!Number.isInteger(investigation.maximumRedefense)) {
