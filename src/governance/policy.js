@@ -201,19 +201,20 @@ export function validateInvestigationPolicy(investigation) {
   if (!investigation) throw new Error('憲法policyにinvestigationがありません。');
   const roles = ['police', 'court', 'parliament'];
   const allowed = new Set([
-    'maximumSteps', 'maximumOutputKilobytes', 'tools', 'publicRecord', 'maximumRedefense'
+    'maximumSteps', 'maximumOutputKilobytes', 'maximumMinutes',
+    'tools', 'publicRecord', 'maximumRedefense'
   ]);
   if (Object.keys(investigation).some((key) => !allowed.has(key))
     || [...allowed].some((key) => !(key in investigation))) {
     throw new Error('investigationに未対応の設定があります。');
   }
-  for (const key of ['maximumSteps', 'maximumOutputKilobytes', 'tools']) {
+  for (const key of ['maximumSteps', 'maximumOutputKilobytes', 'maximumMinutes', 'tools']) {
     if (Object.keys(investigation[key]).sort().join(',') !== [...roles].sort().join(',')) {
       throw new Error(`investigation.${key} は police/court/parliament の3つです。`);
     }
   }
   for (const role of roles) {
-    for (const [key, max] of [['maximumSteps', 20], ['maximumOutputKilobytes', 256]]) {
+    for (const [key, max] of [['maximumSteps', 20], ['maximumOutputKilobytes', 256], ['maximumMinutes', 30]]) {
       finite(investigation[key][role], `investigation.${key}.${role}`, { min: 1, max });
       if (!Number.isInteger(investigation[key][role])) {
         throw new Error(`investigation.${key}.${role} は整数である必要があります。`);

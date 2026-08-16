@@ -250,6 +250,49 @@ assert.ok(
   `調査は憲法の手数 ${investigation.maximumSteps.police} で打ち切る`
 );
 
+// --- 実時間の上限 -----------------------------------------------------------
+// 手数と総量だけでは審議時間が決まらない。1手が遅ければ席は何十分でも粘れる。
+{
+  assert.deepEqual(Object.keys(investigation.maximumMinutes).sort(), ['court', 'parliament', 'police'],
+    '調査に費やせる時間も憲法が役割ごとに定める');
+  const slow = structuredClone(compiled.rules);
+  slow.investigation.maximumMinutes.parliament = 999;
+  assert.throws(() => rules.validateGovernanceRules(slow), /maximumMinutes/,
+    '審議時間の技術上限はコードが固定する');
+
+  plan = Array.from({ length: 20 }, () => ({
+    name: 'search_messages', arguments: { query: '連投テスト', days: 7 }
+  }));
+  conclusion = candidate(['burst-0'], ['burst-1']);
+  const outer = globalThis.fetch;
+  // 1手ごとに遅いproviderを模す。手数の上限より先に時間の上限が来る。
+  // 憲法が許す最短の時間予算は1分。1手あたり9秒かかるproviderなら、20手を
+  // 使い切るより先に時間で打ち切られる。
+  globalThis.fetch = async (url, options) => {
+    if (JSON.parse(options.body).tools?.length) await new Promise((r) => setTimeout(r, 9_000));
+    return outer(url, options);
+  };
+  const started = Date.now();
+  const timed = await screenJudicialMention({
+    guildId: GUILD_ID,
+    request: { text: '連投がひどい', authorId: 'reporter' },
+    constitution: db.getActiveConstitution(GUILD_ID),
+    activeLaws: [law],
+    recentCases: [],
+    panel: compiled.rules.panels.judicialScreening,
+    investigation: { ...investigation, maximumMinutes: { ...investigation.maximumMinutes, police: 1 } , maximumSteps: { ...investigation.maximumSteps, police: 20 } }
+  });
+  globalThis.fetch = outer;
+  assert.equal(timed.outputs.length, 3, '時間で打ち切っても結論だけは必ず取る');
+  assert.ok(
+    timed.traces.every(({ trace }) => trace.length < 20),
+    '手数を使い切る前に時間で打ち切る'
+  );
+  const elapsed = Date.now() - started;
+  console.log(`  [計測] 時間で打ち切るまで ${Math.round(elapsed / 1000)}秒 / 手数 ${timed.traces[0].trace.length}`);
+  assert.ok(elapsed < 90_000, '上限を大きく超えて粘らない');
+}
+
 // --- providerがツールを扱えない場合 -----------------------------------------
 failTools = true;
 plan = [{ name: 'search_messages', arguments: { query: '連投テスト', days: 7, limit: 20 } }];

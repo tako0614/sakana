@@ -83,14 +83,19 @@
   },
   "investigation": {
     "maximumSteps": {
-      "police": 8,
-      "court": 8,
-      "parliament": 8
+      "police": 6,
+      "court": 6,
+      "parliament": 6
     },
     "maximumOutputKilobytes": {
       "police": 10,
       "court": 10,
       "parliament": 10
+    },
+    "maximumMinutes": {
+      "police": 3,
+      "court": 4,
+      "parliament": 4
     },
     "tools": {
       "police": [

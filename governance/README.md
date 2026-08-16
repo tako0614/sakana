@@ -36,9 +36,13 @@
   （`investigation.publicRecord` の既定は `none`）、完全な往復は
   `governance_investigation_steps` に残します（憲法第九条8）
 - ツールループは毎リクエストで会話全体を再送するので、費用は手数の二乗で効きます。
-  憲法は手数（`maximumSteps`）と1審議で受け取れる総量（`maximumOutputKilobytes`）の
-  両方を固定し、上限に達したらその時点の記録だけで判断させます（第九条9）。
-  憲法本文はDATAへ積まず、`read_constitution` で必要な条文だけ読ませます
+  憲法は手数（`maximumSteps`）、1審議で受け取れる総量（`maximumOutputKilobytes`）、
+  調査に費やせる時間（`maximumMinutes`）の3つを固定し、いずれかの上限に達したら
+  その時点の記録だけで判断させます（第九条9）。憲法本文はDATAへ積まず、
+  `read_constitution` で必要な条文だけ読ませます
+- 調査段は「次に何を引くか」を決めるだけなので思考モードを切ります。有効にすると
+  1手ごとに推論が走り、審議が何十分もかかります。考えるのは結論段だけです。
+  独立したツールは1ターンでまとめて呼ばせ、往復回数そのものを減らします
 
 ## 国会
 
