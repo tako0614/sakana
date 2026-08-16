@@ -484,6 +484,55 @@ for (let round = 0; round < LONG_ROUNDS; round += 1) {
   });
 }
 
+// --- 話者ごとの切り出し (evex-5.2) ---
+//
+// **`/as` が壊れている。**弁別性の実測 (同じ人を 2 回引いた重なり − 他人との重なり):
+//
+//   evex-3.5  上位 -1.3% / 下位 +3.7%   ← 評判 1 位
+//   evex-5.1  上位 +0.1% / 下位 +1.5%   ← 誰を指名しても似たことしか言わない
+//
+// 話者トークンは**その人が喋ったときにしか勾配が来ない**ので、段1 の外部を
+// 23.3M → 158M にしたぶん相対的に薄まった。学習率で補正しようとして失敗済み
+// (下位の弁別性 0.0%) — **出現回数そのものを増やすしかない。**
+//
+// 147 人それぞれから同じ本数だけ切り出し、**足りない人は繰り返して底上げする**。
+// 発言数は最多 55,964 / 最少 203 で 276 倍の開きがあるので、ここを均すのが狙い。
+// **匿名化しない** (名前のまま出すのが目的)。
+const PER_SPEAKER = Number(process.env.LLM_PER_SPEAKER ?? 0);
+const SPEAKER_MAX_REPEAT = Number(process.env.LLM_SPEAKER_MAX_REPEAT ?? 4);
+
+let speakerExcerpts = [];
+let speakerStats = { speakers: 0, unique: 0, emitted: 0, chars: 0 };
+
+if (PER_SPEAKER > 0) {
+  const bySpeaker = new Map();
+  for (const conv of trainBase) {
+    conv.turns.forEach((turn, i) => {
+      if (!turn.token || !turn.token.startsWith('<|s')) return;
+      const from = Math.max(0, i - EXCERPT.qaContext);
+      if (i === from) return;                 // 会話の頭は文脈が無い
+      if (!bySpeaker.has(turn.token)) bySpeaker.set(turn.token, []);
+      bySpeaker.get(turn.token).push(slice(conv, [from, i]));
+    });
+  }
+
+  for (const [, found] of bySpeaker) {
+    speakerStats.speakers += 1;
+    speakerStats.unique += found.length;
+    // 足りない人は巡回して埋める。**上限を置く** — 203 件の人を 400 本にすると
+    // 同じ本文が 2 回出る。4 倍を超えると丸暗記に寄るので、そこで止める
+    const want = Math.min(PER_SPEAKER, found.length * SPEAKER_MAX_REPEAT);
+    for (let i = 0; i < want; i += 1) speakerExcerpts.push(found[i % found.length]);
+  }
+
+  for (const x of speakerExcerpts) {
+    const text = wrap(x.turns, x.ch);         // **匿名化しない**
+    speakerStats.emitted += 1;
+    speakerStats.chars += text.length;
+    train.push({ at: cutoff - 1, ch: x.ch, turns: x.turns, text });
+  }
+}
+
 // **リアクションの付いた発言。**段3 でここだけを流すので、
 // train に混ぜるぶんとは別に `reacted` にも溜めておく
 const reacted = [];
@@ -762,6 +811,12 @@ console.log(`長い発言         ${fmt(longExcerpts.length)} を ×${LONG_ROUND
 console.log(`リアクション付き ${fmt(reactedExcerpts.length)} を ×${REACTED_ROUNDS} `
   + `(${EXCERPT.reactedMin} 個以上 / 発言 ${fmt(reactedMessages)} 件 / ${fmt(reactedChars)} 字 = train の `
   + `${(reactedChars / trainChars * 100).toFixed(1)}% / 目標 ${(REACTED_SHARE * 100).toFixed(1)}%)`);
+if (PER_SPEAKER > 0) {
+  console.log(`話者ごとの切り出し ${fmt(speakerStats.emitted)} 本 `
+    + `(${speakerStats.speakers} 人 / 元 ${fmt(speakerStats.unique)} 本を 1 人 ${PER_SPEAKER} 本まで `
+    + `${SPEAKER_MAX_REPEAT} 倍を上限に底上げ / ${fmt(speakerStats.chars)} 字 = train の `
+    + `${(speakerStats.chars / trainChars * 100).toFixed(1)}% / 匿名化しない)`);
+}
 console.log(`返信の鎖         ${fmt(chainWindows)} 窓 (木 ${fmt(chainCandidates)} 本 / `
   + `${REPLY_MIN_MESSAGES} 発言以上 / 親は直近の発言で近似)`);
 console.log(`チャンネル       ${NAMED_CHANNELS} 個に固有トークン `
