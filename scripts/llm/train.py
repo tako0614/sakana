@@ -306,7 +306,15 @@ scaler = torch.amp.GradScaler("cuda", enabled=(amp_on and amp_dtype is torch.flo
 # 文脈からは消さない — 「誰かが画像を貼って、他の人が反応する」流れは学ばせたい。
 #
 # <nl> と <code> は外さない。改行もコードブロックもモデルが書いて良いもの。
-MASKED_PIECES = ("<file>", "<url>", "<mention>", "<channel>", "<time>")
+# `<|hi|>` も同じ扱いにする。**条件として読むだけで、書き方は教えない。**
+#
+# evex-5 で入れ忘れたら、`www<|hi|>` のように本文として吐くようになった。
+# 推論側で禁止すれば表には出ないが、それは症状の抑え込みで、モデルは
+# そこに確率を割いたままになる (`<file>` で一度通った道)。
+#
+# `<|conv|>` と `<|cN|>` は窓の先頭にしか出ないので、モデルが途中で書くことは
+# ほぼ無い。実際に漏れたのは `<|hi|>` だけなので、ここはそれだけ足す
+MASKED_PIECES = ("<file>", "<url>", "<mention>", "<channel>", "<time>", "<|hi|>")
 masked_ids = [sp.piece_to_id(p) for p in MASKED_PIECES if sp.piece_to_id(p) != sp.unk_id()]
 
 # model.py の cross_entropy は ignore_index=-1 なので、-100 ではなく -1 を置く
