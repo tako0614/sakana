@@ -37,6 +37,7 @@ import {
   createGovernanceProcedureChannel,
   ensureGovernanceCourtForum,
   ensureGovernanceOperationsThread,
+  ensureGovernanceParliamentThread,
   governanceProcedureOverwrites,
   governancePermissionReport,
   postAuthorityChange,
@@ -224,6 +225,8 @@ function procedureComponents(governance, supportsImmediateReview) {
     link('議会', governance.parliament_forum_id),
     link('裁判所', governance.court_forum_id),
     lawSite ? new ButtonBuilder().setLabel('法令集').setStyle(ButtonStyle.Link).setURL(lawSite) : null,
+    // 国会がいつ開かれて何を決めたかは、議題スレを個別に見なくても追えるようにする。
+    governance.parliament_thread_id ? link('国会記録', governance.parliament_thread_id) : null,
     governance.operations_thread_id ? link('運営変更', governance.operations_thread_id) : null
   ].filter(Boolean);
   return [
@@ -454,6 +457,9 @@ export async function ensureGovernanceUx(guild, governance = getGovernanceGuild(
     current = updateGovernanceGuild(guild.id, { procedure_message_id: procedureMessage.id });
   }
   await ensureGovernanceOperationsThread(guild, current, procedureMessage);
+  // 国会記録は開会時にも作られるが、案内から辿れるよう導入時に用意しておく。
+  await ensureGovernanceParliamentThread(guild, getGovernanceGuild(guild.id), procedureMessage)
+    .catch((error) => console.error('国会記録スレを作れませんでした:', error?.message ?? error));
   current = getGovernanceGuild(guild.id);
   const dashboard = await renderGovernanceProcedureHub(guild, current);
   if (procedureMessage.content !== dashboard.content || !componentsMatch(procedureMessage, dashboard.components)) {

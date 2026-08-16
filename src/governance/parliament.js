@@ -1,4 +1,5 @@
 import {
+  countParliamentSessions,
   createProposal,
   getActiveConstitution,
   getConstitution,
@@ -13,6 +14,7 @@ import {
   recordInstrumentRelation,
   recordParliamentSession,
   recordProposalDeliberation,
+  setParliamentSessionMinutes,
   setProposalKind,
   threadDiscussion,
   threadDiscussionCount,
@@ -20,7 +22,7 @@ import {
   updateProposal,
   writeAudit
 } from './db.js';
-import { createAgendaPost, postProposalUpdate } from './discord.js';
+import { createAgendaPost, postParliamentMinutes, postProposalUpdate } from './discord.js';
 import {
   deliberateAgendaItem,
   discoverWeeklyIssues,
@@ -418,6 +420,53 @@ async function legislateAgendaItem(guild, governance, constitution, proposal, de
   };
 }
 
+const OUTCOME_LABELS = {
+  legislate: '投票へ',
+  defer: '継続審議',
+  reject: '不採択',
+  error: '次回へ持ち越し'
+};
+
+// 「国会が開かれたこと」は議題スレを個別に見ないと分からなかった。開会ごとに
+// 手続の`国会記録`へ1件残し、そこから各議題のスレへ辿れるようにする。
+async function publishMinutes(guild, governance, constitution, session) {
+  const { sessionId, number, manual, now, outcomes, waiting } = session;
+  const nextAt = now + sessionIntervalMilliseconds(constitution);
+  const lines = [
+    `## 第${number}回 国会`,
+    `<t:${Math.floor(now / 1000)}:F>${manual ? '（臨時開会）' : ''}`,
+    ''
+  ];
+  if (!outcomes.length) {
+    lines.push('議題はありませんでした。`議会`にスレを立てると、次の国会で扱います。');
+  } else {
+    for (const outcome of outcomes) {
+      const proposal = getProposal(outcome.proposalId);
+      const link = proposal?.forum_thread_id
+        ? `[${outcome.title}](https://discord.com/channels/${guild.id}/${proposal.forum_thread_id})`
+        : outcome.title;
+      const label = OUTCOME_LABELS[outcome.decision] ?? outcome.decision;
+      const detail = outcome.decision === 'legislate' && outcome.voteEndsAt
+        ? `締切 <t:${Math.floor(outcome.voteEndsAt / 1000)}:R>`
+        : outcome.decision === 'defer'
+          ? `${outcome.deferrals}回目${outcome.drafted ? '・たたき台あり' : ''}`
+          : outcome.decision === 'error'
+            ? String(outcome.error ?? '').slice(0, 80)
+            : '';
+      lines.push(`- **${label}** ${link}${detail ? ` — ${detail}` : ''}`);
+    }
+  }
+  if (waiting > 0) lines.push('', `今回入りきらなかった議題: ${waiting}件（次の国会で扱います）`);
+  lines.push('', `次の開会: <t:${Math.floor(nextAt / 1000)}:R>（運営者は /governance から臨時に開けます）`);
+  try {
+    const message = await postParliamentMinutes(guild, governance, lines.join('\n'));
+    setParliamentSessionMinutes(sessionId, message.id);
+  } catch (error) {
+    // 議事録が出せなくても国会の結論そのものは既に確定している。
+    console.error('Parliament minutes failed:', error?.message ?? error);
+  }
+}
+
 async function processAgendaItem(guild, governance, constitution, input) {
   const rules = constitutionRules(constitution);
   let proposal = await ensureAgendaPost(guild, governance, input);
@@ -541,13 +590,16 @@ export async function runParliamentSession(guild, governance, now = Date.now(), 
       });
     }
   }
-  recordParliamentSession({
+  const sessionId = recordParliamentSession({
     guildId: guild.id,
     constitutionId: constitution.id,
     manual,
     agendaCount: agenda.length,
     outcomes,
     startedAt: now
+  });
+  await publishMinutes(guild, governance, constitution, {
+    sessionId, number: countParliamentSessions(guild.id), manual, now, outcomes, waiting
   });
   updateGovernanceGuild(guild.id, {
     last_session_at: now,

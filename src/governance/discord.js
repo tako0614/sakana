@@ -228,6 +228,36 @@ export async function postEnforcementRecord(guild, governance, text, { files = [
   });
 }
 
+// 国会が開かれたことは議題スレを見ないと分からない。開会ごとの議事録を
+// 手続の1本のスレへ時系列で残す（執行記録と対）。
+export async function ensureGovernanceParliamentThread(guild, governance, procedureMessage = null) {
+  let thread = governance.parliament_thread_id
+    ? await guild.channels.fetch(governance.parliament_thread_id).catch(() => null)
+    : null;
+  if (thread?.isThread?.()) return thread;
+  const channel = await guild.channels.fetch(governance.procedure_channel_id).catch(() => null);
+  if (!channel?.isTextBased?.()) throw new Error('手続channelが見つかりません。');
+  const starter = procedureMessage
+    ?? await channel.messages.fetch(governance.procedure_message_id).catch(() => null);
+  if (!starter) throw new Error('手続の案内messageが見つかりません。');
+  thread = await channel.threads.create({
+    name: '国会記録',
+    autoArchiveDuration: 10_080,
+    reason: `${guild.name} parliament minutes`
+  });
+  updateGovernanceGuild(guild.id, { parliament_thread_id: thread.id });
+  return thread;
+}
+
+export async function postParliamentMinutes(guild, governance, text, { files = [] } = {}) {
+  const thread = await ensureGovernanceParliamentThread(guild, governance);
+  return thread.send({
+    content: String(text).slice(0, 2000),
+    files,
+    allowedMentions: { parse: [] }
+  });
+}
+
 export async function ensureGovernanceOperationsThread(guild, governance, procedureMessage = null) {
   let thread = governance.operations_thread_id
     ? await guild.channels.fetch(governance.operations_thread_id).catch(() => null)
