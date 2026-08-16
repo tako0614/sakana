@@ -717,7 +717,7 @@ function deliberationText(decision, heading) {
   ].join('\n').slice(0, 2_000);
 }
 
-export async function completeProposalDebate(guild, proposal, now = Date.now()) {
+export async function completeProposalDebate(guild, proposal, now = Date.now(), { quietClose = false } = {}) {
   const constitution = getActiveConstitution(guild.id);
   const procedurePolicy = getConstitution(proposal.constitution_id)?.policy ?? constitution.policy;
   const runtime = proposalRuntime(proposal);
@@ -750,7 +750,9 @@ export async function completeProposalDebate(guild, proposal, now = Date.now()) 
       })
     : {
         decision: 'finalize',
-        summary: '討議期間中に法案を変更する意見はありませんでした。',
+        summary: quietClose
+          ? '実行規則の無風期間が過ぎるまで意見が投稿されなかったため、討議を締め切りました。'
+          : '討議期間中に法案を変更する意見はありませんでした。',
         accepted: [],
         rejected: [],
         changes: [],
@@ -2197,14 +2199,18 @@ async function ensureAppealRestriction(guild, sanctionId) {
   }
 }
 
-async function advanceProposal(guild, proposal, now) {
+export async function advanceProposal(guild, proposal, now) {
   if (proposal.workflow_status === 'queued') return proposal;
   if (proposal.retry_after && proposal.retry_after > now) return proposal;
   const runtime = proposalRuntime(proposal);
   if (!runtime || runtime.state.handler === 'terminal') return proposal;
   if (runtime.state.handler === 'draft') return draftStoredProposal(guild, proposal);
   if (runtime.state.handler === 'public_discussion') {
-    if (proposal.stage_ends_at === null || Number(proposal.stage_ends_at) > now) return proposal;
+    if (proposal.stage_ends_at === null || Number(proposal.stage_ends_at) > now) {
+      if (!quietClosableProposal(proposal, runtime, now)) return proposal;
+      // 誰も来ないまま無風期間を過ぎた討議は、締切まで待たずに締める。
+      return completeProposalDebate(guild, updateProposal(proposal.id, { stage_ends_at: now }), now, { quietClose: true });
+    }
     if (['initial', 'revision'].includes(runtime.state.config.phase)) {
       return completeProposalDebate(guild, proposal, now);
     }
@@ -2222,11 +2228,39 @@ async function advanceProposal(guild, proposal, now) {
   }
   if (runtime.state.handler === 'ai_deliberation') return completeProposalDebate(guild, proposal, now);
   if (runtime.state.handler === 'constitutional_panel') return constitutionalReviewProposal(guild, proposal);
-  if (runtime.state.handler === 'public_vote'
-    && proposal.stage_ends_at !== null && Number(proposal.stage_ends_at) <= now) {
-    return closeProposalVote(guild, proposal);
+  if (runtime.state.handler === 'public_vote') {
+    if (proposal.stage_ends_at !== null && Number(proposal.stage_ends_at) <= now) {
+      return closeProposalVote(guild, proposal);
+    }
+    if (allBallotsCast(proposal, runtime)) {
+      // 受付時に固定した有権者が全員投票したので、残り時間で結果は動かない。
+      await postProposalUpdate(guild, proposal, '受付時の有権者が全員投票したため、締切を待たずに開票します。', { state: '投票' });
+      return closeProposalVote(guild, proposal);
+    }
   }
   return proposal;
+}
+
+function quietClosableProposal(proposal, runtime, now) {
+  if (!['initial', 'revision'].includes(runtime.state.config.phase)) return false;
+  const quietClose = runtime.state.config.quietClose;
+  if (typeof quietClose !== 'string') return false;
+  const quiet = durationMilliseconds(quietClose);
+  if (quiet <= 0) return false;
+  const startedAt = Number(proposal.stage_started_at ?? proposal.created_at);
+  if (!Number.isFinite(startedAt) || now - startedAt < quiet) return false;
+  return proposalDiscussion(proposal.id, startedAt, now, 1).length === 0;
+}
+
+function allBallotsCast(proposal, runtime) {
+  const vote = proposal.kind === 'amendment'
+    ? runtime.compiled.rules.votes.constitutionalAmendment
+    : runtime.compiled.rules.votes.law;
+  if (vote.earlyClose !== 'all_ballots_cast') return false;
+  const summary = proposalVoteSummary(proposal.id);
+  const electorate = Number(summary.electorate);
+  if (!Number.isFinite(electorate) || electorate <= 0) return false;
+  return summary.yes + summary.no + summary.abstain >= electorate;
 }
 
 async function queueProposalBehind(guild, proposal, blocker, reason) {

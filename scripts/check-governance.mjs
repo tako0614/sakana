@@ -31,10 +31,10 @@ assert.doesNotMatch(constitutionalProse, /Discord|database|browser|tool|primitiv
 const compiledConstitution = rulesModule.compileConstitution({ content: constitution, policy });
 assert.equal(compiledConstitution.sourceFormat, 'embedded-rules-v1', '初期憲法自身が実行規則を持つ');
 assert.equal(compiledConstitution.rules.$schema, 'sakana.governance-rules/v1');
-assert.equal(compiledConstitution.rules.votes.constitutionalAmendment.duration, '1d');
+assert.equal(compiledConstitution.rules.votes.constitutionalAmendment.duration, '12h');
 assert.equal(compiledConstitution.rules.panels.proposalRelation.seats, 3);
 assert.deepEqual(compiledConstitution.policy, policy, '憲法内rulesから現行挙動と等価なpolicy projectionを作る');
-assert.match(rulesModule.governanceRulesSummary(compiledConstitution.rules), /草案討議 1d/);
+assert.match(rulesModule.governanceRulesSummary(compiledConstitution.rules), /草案討議 12h \(無風は6hで打ち切り\)/);
 const injectedRules = structuredClone(compiledConstitution.rules);
 injectedRules.workflows.law.states.drafting.handler = 'eval_user_text';
 assert.throws(() => rulesModule.validateGovernanceRules(injectedRules), /未対応のworkflow handler/,
@@ -165,7 +165,7 @@ governanceDb.bootstrapGovernanceGuild({
 const storedConstitution = governanceDb.getActiveConstitution('g1');
 assert.equal(storedConstitution.source_format, 'embedded-rules-v1');
 assert.equal(storedConstitution.rules_hash, compiledConstitution.rulesHash);
-assert.equal(storedConstitution.rules.workflows.law.states.discussion.duration, '1d');
+assert.equal(storedConstitution.rules.workflows.law.states.discussion.duration, '12h');
 
 const activityBase = Date.now();
 for (const [index, [id, hash]] of [['m1', 'same'], ['m2', 'same'], ['m3', 'different']].entries()) {
@@ -758,6 +758,7 @@ assert.equal(governanceDb.listCaseSubmissions(caseWithTime.id)[0].kind, 'defense
 governanceDb.updateCase(caseWithTime.id, { public_thread_id: 'public-court' });
 const {
   addEvidenceToCase,
+  advanceProposal,
   applyInterimProtectionFromLogs,
   approveCase,
   castAndPublishVote,
@@ -1804,6 +1805,115 @@ assert.ok(finalPosts.some((payload) => /本文は変更せず投票へ進みま�
 assert.ok(finalPosts.some((payload) => /投票を開始しました/.test(payload.content)));
 assert.equal(governanceDb.listProposalDeliberations(finalProposal.id)[0].outcome, 'finalized');
 assert.deepEqual(voted.body, safeBill, '最終案固定後の違憲審査と投票で本文を変えない');
+
+const lawStates = compiledConstitution.rules.workflows.law.states;
+assert.equal(lawStates.discussion.config.quietClose, '6h');
+assert.equal(lawStates.revision_discussion.config.quietClose, '3h');
+assert.equal(compiledConstitution.rules.votes.law.earlyClose, 'all_ballots_cast');
+const quietRules = structuredClone(compiledConstitution.rules);
+quietRules.workflows.law.states.discussion.config.quietClose = '13h';
+assert.throws(() => rulesModule.validateGovernanceRules(quietRules), /無風打ち切りの下限が討議期間を超えています/,
+  '無風打ち切りは討議期間より長く設定できない');
+const strayConfigRules = structuredClone(compiledConstitution.rules);
+strayConfigRules.workflows.law.states.discussion.config.autoPass = true;
+assert.throws(() => rulesModule.validateGovernanceRules(strayConfigRules), /未対応の項目があります/,
+  '公開討議のschema外フィールドは成立前に拒否する');
+const strayEarlyCloseRules = structuredClone(compiledConstitution.rules);
+strayEarlyCloseRules.votes.law.earlyClose = 'when_ai_agrees';
+assert.throws(() => rulesModule.validateGovernanceRules(strayEarlyCloseRules), /earlyClose/,
+  '未対応の早期開票条件は成立前に拒否する');
+
+const quietGuild = {
+  id: 'g2', name: 'Test Community',
+  roles: { cache: new Map([['trusted-g2', { name: '貴族院' }]]) },
+  members: {
+    fetch: async () => new Map([['voter', {
+      id: 'voter', user: { bot: false }, roles: { cache: { has: () => false } }
+    }]])
+  }
+};
+const quietPosts = [];
+let quietProposal = governanceDb.createProposal({
+  guildId: 'g2', source: 'petition', title: '無風打ち切りテスト', summary: '意見が付かない討議を締切前に締める',
+  proposerId: 'r', constitutionId: governanceDb.getActiveConstitution('g2').id,
+  body: safeBill, status: 'discussion',
+  stageStartedAt: debateNow - 7 * 3_600_000,
+  stageEndsAt: debateNow + 5 * 3_600_000
+});
+quietProposal = governanceDb.updateProposal(quietProposal.id, { forum_thread_id: 'quiet-debate-thread' });
+modelOutput = {
+  verdict: 'constitutional',
+  reasons: ['憲法上の権限を拡張しない狭い規則である。'],
+  constitutionArticles: ['第一条（主権）']
+};
+const quietAdvanced = await advanceProposal({
+  ...quietGuild,
+  channels: {
+    fetch: async () => ({
+      ...debateThread, id: 'quiet-debate-thread',
+      send: async (payload) => { quietPosts.push(payload); return payload; }
+    })
+  }
+}, quietProposal, debateNow);
+assert.equal(quietAdvanced.status, 'voting', '意見が一件も付かない討議は無風期間の経過で締切前に締める');
+assert.equal(Number(quietAdvanced.stage_ends_at) > debateNow, true);
+assert.ok(quietPosts.some((payload) => /無風期間/.test(payload.content)),
+  '早じまいの理由を案件投稿へ公開する');
+
+let livelyProposal = governanceDb.createProposal({
+  guildId: 'g2', source: 'petition', title: '無風打ち切り除外テスト', summary: '意見が付いた討議は満了まで開く',
+  proposerId: 'r', constitutionId: governanceDb.getActiveConstitution('g2').id,
+  body: safeBill, status: 'discussion',
+  stageStartedAt: debateNow - 7 * 3_600_000,
+  stageEndsAt: debateNow + 5 * 3_600_000
+});
+livelyProposal = governanceDb.updateProposal(livelyProposal.id, { forum_thread_id: 'lively-debate-thread' });
+governanceDb.recordActivity({
+  messageId: 'lively-opinion', guildId: 'g2', channelId: 'lively-debate-thread', parentId: 'parliament-2',
+  userId: 'participant', activityDate: '2026-08-13', contentHash: 'lively-opinion-hash',
+  content: '適用範囲を狭くしてほしい', createdAt: debateNow - 6 * 3_600_000
+});
+const livelyAdvanced = await advanceProposal({
+  ...quietGuild,
+  channels: { fetch: async () => { throw new Error('討議中の案件を進めてはならない'); } }
+}, livelyProposal, debateNow);
+assert.equal(livelyAdvanced.status, 'discussion', '意見が一件でも付いた討議は締切まで開いたままにする');
+
+let earlyVoteProposal = governanceDb.createProposal({
+  guildId: 'g2', source: 'petition', title: '全員投票テスト', summary: '有権者全員の投票で締切前に開票する',
+  proposerId: 'r', constitutionId: governanceDb.getActiveConstitution('g2').id,
+  body: safeBill, status: 'voting',
+  stageStartedAt: debateNow,
+  stageEndsAt: Date.now() + 6 * 3_600_000
+});
+earlyVoteProposal = governanceDb.updateProposal(earlyVoteProposal.id, { forum_thread_id: 'early-vote-thread' });
+governanceDb.snapshotProposalVoters(earlyVoteProposal.id, [
+  { userId: 'voter-1', eligibleGeneral: true, trusted: false },
+  { userId: 'voter-2', eligibleGeneral: true, trusted: false }
+]);
+governanceDb.castProposalVote(earlyVoteProposal.id, 'voter-1', 'abstain');
+const earlyVotePosts = [];
+const earlyVoteThread = {
+  ...debateThread, id: 'early-vote-thread', locked: false, archived: false,
+  setLocked: async () => {}, setArchived: async () => {},
+  send: async (payload) => { earlyVotePosts.push(payload); return payload; }
+};
+const earlyVoteGuild = { ...quietGuild, channels: { fetch: async () => earlyVoteThread } };
+assert.equal(
+  (await advanceProposal(earlyVoteGuild, governanceDb.getProposal(earlyVoteProposal.id), Date.now())).status,
+  'voting',
+  '未投票の有権者が残っている間は締切前に開票しない'
+);
+governanceDb.castProposalVote(earlyVoteProposal.id, 'voter-2', 'abstain');
+const earlyClosed = await advanceProposal(
+  earlyVoteGuild, governanceDb.getProposal(earlyVoteProposal.id), Date.now()
+);
+assert.equal(earlyClosed.status, 'rejected', '有権者全員が投票した時点で締切を待たずに開票する');
+assert.ok(earlyVotePosts.some((payload) => /締切を待たずに開票します/.test(payload.content)),
+  '早期開票の理由を案件投稿へ公開する');
+assert.throws(() => governanceDb.castProposalVote(earlyVoteProposal.id, 'voter-1', 'yes'),
+  /この投票は受付中ではありません/, '早期開票後は投票を受け付けない');
+
 modelOutput = safeBill;
 
 let restrictionRetryCalls = 0;
