@@ -50,7 +50,14 @@ parser.add_argument("--ckpt", required=True, help="参照モデル (evex で仕�
 parser.add_argument("--corpus", default="corpus-v8")
 parser.add_argument("--name", default="pretrain", help="採点する .u16.npy の名前")
 parser.add_argument("--keep", type=float, default=0.6, help="残す割合")
-parser.add_argument("--mode", default="low", choices=["low", "high"])
+# **`low` は使ってはいけない。**evex-5 preview で段1 に掛けたら、残ったのが
+# 句読点・構造記号・助詞ばかり (内容語が上位15 に 1 つも無い) で、外部 66.2% /
+# evex 67.9% とドメインの差もまったく付かなかった。役の噛み合いが 36.7% → 16.7%。
+#
+# 狙いは「ドメインで選ぶ」だったが、効いた軸は「予測しやすいか」でこれは
+# ドメインと直交する。**ドメインで絞りたいなら LLM_BASE_SHARE で evex の比率を
+# 上げる方が素直。**Rho-1 を使うなら原典どおり excess loss にすること。
+parser.add_argument("--mode", default="high", choices=["low", "high"])
 parser.add_argument("--batch", type=int, default=16)
 parser.add_argument("--threads", type=int, default=10)
 args = parser.parse_args()
