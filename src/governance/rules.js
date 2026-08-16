@@ -21,6 +21,10 @@ const HANDLERS = new Set([
   'terminal'
 ]);
 
+export const VOTE_EARLY_CLOSE = new Set(['never', 'all_ballots_cast']);
+const DISCUSSION_PHASES = ['initial', 'revision', 'legacy_draft', 'legacy_debate'];
+const QUIET_CLOSE_PHASES = ['initial', 'revision'];
+
 const DURATION_RE = /^(immediate|[1-9]\d*(?:m|h|d))$/;
 const MAX_DURATION_MS = 365 * 86_400_000;
 
@@ -29,9 +33,9 @@ function object(value, name) {
   return value;
 }
 
-function exactKeys(value, keys, name) {
+function exactKeys(value, keys, name, optionalKeys = []) {
   object(value, name);
-  const allowed = new Set(keys);
+  const allowed = new Set([...keys, ...optionalKeys]);
   const unknown = Object.keys(value).filter((key) => !allowed.has(key));
   if (unknown.length) throw new Error(`${name} に未対応の項目があります: ${unknown.join(', ')}`);
   const missing = keys.filter((key) => !(key in value));
@@ -126,7 +130,16 @@ function validateVotes(votes) {
     || votes.allowedScopes.some((scope) => !['all', 'trusted'].includes(scope))
     || !votes.allowedScopes.includes(votes.defaultScope)) throw new Error('votes.allowedScopes が不正です。');
   for (const [name, vote] of [['law', votes.law], ['constitutionalAmendment', votes.constitutionalAmendment]]) {
-    exactKeys(vote, ['duration', 'yesRatio', 'comparison', 'quorumRatio', 'minimumBallots', 'publicBallots', 'trustedVeto'], `votes.${name}`);
+    exactKeys(
+      vote,
+      ['duration', 'yesRatio', 'comparison', 'quorumRatio', 'minimumBallots', 'publicBallots', 'trustedVeto'],
+      `votes.${name}`,
+      ['earlyClose']
+    );
+    // earlyCloseを書かない旧憲法は締切満了だけで開票する。
+    if ('earlyClose' in vote && !VOTE_EARLY_CLOSE.has(vote.earlyClose)) {
+      throw new Error(`votes.${name}.earlyClose は never または all_ballots_cast です。`);
+    }
     durationMilliseconds(vote.duration, `votes.${name}.duration`);
     ratio(vote.yesRatio, `votes.${name}.yesRatio`);
     ratio(vote.quorumRatio, `votes.${name}.quorumRatio`);
@@ -218,9 +231,21 @@ function validateWorkflow(name, workflow) {
       && (state.duration === null || durationMilliseconds(state.duration) === 0)) {
       throw new Error(`${state.handler} には0より長い期間が必要です。`);
     }
-    if (state.handler === 'public_discussion'
-      && !['initial', 'revision', 'legacy_draft', 'legacy_debate'].includes(state.config.phase)) {
-      throw new Error('public_discussion.config.phase が不正です。');
+    if (state.handler === 'public_discussion') {
+      exactKeys(state.config, ['phase'], `workflows.${name}.states.${stateName}.config`, ['quietClose']);
+      if (!DISCUSSION_PHASES.includes(state.config.phase)) throw new Error('public_discussion.config.phase が不正です。');
+      // quietCloseを書かない討議は、意見がなくても期間を満了するまで開いたままになる。
+      if (state.config.quietClose !== undefined && state.config.quietClose !== null) {
+        const label = `workflows.${name}.states.${stateName}.config.quietClose`;
+        const quiet = durationMilliseconds(state.config.quietClose, label);
+        if (quiet === 0) throw new Error(`${label} には0より長い期間が必要です。`);
+        if (!QUIET_CLOSE_PHASES.includes(state.config.phase)) {
+          throw new Error('無風打ち切りは草案討議と再討議にだけ設定できます。');
+        }
+        if (quiet > durationMilliseconds(state.duration)) {
+          throw new Error('無風打ち切りの下限が討議期間を超えています。');
+        }
+      }
     }
     if (state.handler === 'terminal') {
       terminalCount += 1;
@@ -659,10 +684,13 @@ export function governanceRulesSummary(rules) {
   const initial = workflowStateByHandler(law, 'public_discussion', (state) => state.config.phase === 'initial');
   const revision = workflowStateByHandler(law, 'public_discussion', (state) => state.config.phase === 'revision');
   const lines = [];
-  if (initial) lines.push(`草案討議 ${initial.duration}`);
-  if (revision) lines.push(`実質変更後の再討議 ${revision.duration}`);
+  if (initial) lines.push(`草案討議 ${initial.duration}${initial.config.quietClose ? ` (無風は${initial.config.quietClose}で打ち切り)` : ''}`);
+  if (revision) lines.push(`実質変更後の再討議 ${revision.duration}${revision.config.quietClose ? ` (無風は${revision.config.quietClose}で打ち切り)` : ''}`);
   lines.push(`法律投票 ${rules.votes.law.duration}`);
   lines.push(`憲法改正投票 ${rules.votes.constitutionalAmendment.duration}`);
+  if (rules.votes.law.earlyClose === 'all_ballots_cast' || rules.votes.constitutionalAmendment.earlyClose === 'all_ballots_cast') {
+    lines.push('有権者全員の投票で即時開票');
+  }
   lines.push(`違憲審査 ${rules.panels.constitutional.seats}席`);
   lines.push(`類似案件判定 ${rules.panels.proposalRelation.seats}席`);
   return lines.join(' / ');
