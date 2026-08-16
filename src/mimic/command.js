@@ -34,6 +34,11 @@ async function overview(userId) {
     .setTitle('🧠 使うモデル')
     .setDescription(`いまのあなた: **${ENGINES[current].label}**`);
 
+  // **1 エンジン 1 フィールドにまとめる。**説明と状態を別々に足していたら、
+  // 世代が増えたとき 2 倍の速さで埋め込みの上限 (25 フィールド) に当たって
+  // `/model` がまるごと落ちた。状態は説明の下に 1 行足すだけで足りる
+  const selfHostedKeys = new Set(selfHosted);
+
   for (const [key, info] of Object.entries(ENGINES)) {
     const marks = [];
     if (key === current) marks.push('← あなた');
@@ -42,26 +47,30 @@ async function overview(userId) {
     const users = counts.get(key) ?? 0;
     if (users > 0) marks.push(`${users}人が選択`);
 
-    embed.addFields({
-      name: `${info.label}${marks.length ? ` (${marks.join(' / ')})` : ''}`,
-      value: info.summary
-    });
+    const lines = [info.summary];
+    if (selfHostedKeys.has(key)) {
+      const state = health.get(key) ?? { up: false };
+      lines.push(state.up
+        ? `起動中 (epoch ${state.epoch ?? '?'} / val ${state.val_loss?.toFixed?.(4) ?? '?'})`
+        : `**停止中** (${endpointFor(key).url})。選んでも答えられません`);
+    }
+
+    embed.addFields({ name: `${info.label}${marks.length ? ` (${marks.join(' / ')})` : ''}`,
+                      value: lines.join('\n') });
   }
 
-  // 別プロセスなので、立っていないなら選んでも答えられない。世代ごとに出す。
-  for (const key of selfHosted) {
-    const info = health.get(key) ?? { up: false };
-    embed.addFields({
-      name: `${ENGINES[key].label} の状態`,
-      value: info.up
-        ? [
-          `起動中 (epoch ${info.epoch ?? '?'} / val ${info.val_loss?.toFixed?.(4) ?? '?'})`,
-          'メンションすると会話の続きを1発言だけ返します。道具も検索も使いません。',
-          '`/as` で誰として喋るかを選べます。'
-        ].join('\n')
-        : `推論プロセスが起動していません (${endpointFor(key).url})。選んでも答えられません。`
-    });
+  // **上限を超えたら落ちる。**Discord は 1 埋め込み 25 フィールドまでで、
+  // 超えると例外になって `/model` が「エラーが発生しました」で終わる
+  const LIMIT = 25;
+  if (embed.data.fields && embed.data.fields.length > LIMIT) {
+    const dropped = embed.data.fields.length - (LIMIT - 1);
+    embed.data.fields = embed.data.fields.slice(0, LIMIT - 1);
+    embed.addFields({ name: 'ほか', value: `${dropped} 個は表示しきれないので省いた` });
   }
+
+  embed.setFooter({
+    text: 'メンションすると会話の続きを1発言だけ返します。/as で誰として喋るかを選べます'
+  });
 
   return embed;
 }
