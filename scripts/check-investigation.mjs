@@ -42,6 +42,12 @@ const hugeBudget = structuredClone(compiled.rules);
 hugeBudget.investigation.maximumSteps.police = 999;
 assert.throws(() => rules.validateGovernanceRules(hugeBudget), /maximumSteps/,
   '手数の技術上限はコードが固定する');
+const hugeOutput = structuredClone(compiled.rules);
+hugeOutput.investigation.maximumOutputKilobytes.court = 9999;
+assert.throws(() => rules.validateGovernanceRules(hugeOutput), /maximumOutputKilobytes/,
+  '1審議で受け取れる調査結果の総量にも技術上限がある');
+assert.equal(investigation.publicRecord, 'none',
+  '調査の箇条書きは既定で公開しない（理由文が語る）');
 
 // --- 許可リスト -------------------------------------------------------------
 const GUILD_ID = 'g-investigation';
@@ -56,6 +62,7 @@ const GUILD_ID = 'g-investigation';
   const broken = await toolset.run('search_messages', '{not json');
   assert.match(broken.error, /JSON/, '壊れた引数は拒否する');
 }
+
 
 // --- テスト用サーバーとログ -------------------------------------------------
 db.bootstrapGovernanceGuild({
@@ -110,6 +117,20 @@ for (let index = 0; index < 6; index += 1) {
     content: `連投テスト ${index}`,
     createdAt: base + index * 1000
   });
+}
+
+// --- 累計出力予算 -----------------------------------------------------------
+// ツールループは毎リクエストで配列を丸ごと再送するので、総量を固定しないと
+// 1件あたりの費用が青天井になる。
+{
+  const toolset = tools.buildToolset({
+    guildId: GUILD_ID, allowed: investigation.tools.police, maximumOutputBytes: 300
+  });
+  const first = await toolset.run('search_messages', { query: '連投テスト', days: 7 });
+  assert.equal(first.length, 6, '予算内では通常どおり返す');
+  assert.ok(toolset.spentBytes > 300, '返した分だけ予算を消費する');
+  const spent = await toolset.run('search_messages', { query: '連投テスト', days: 7 });
+  assert.match(spent.error, /budget spent/, '予算を使い切ったらツールを閉じて結論へ行かせる');
 }
 
 // --- providerのstub ---------------------------------------------------------
@@ -239,5 +260,42 @@ assert.equal(panel.failedSeats, 3,
   'ツールが使えなければ証拠を引用できず、席は不受理側へ倒れる');
 assert.ok(requestCount >= 6, 'ツール段が落ちても結論段は呼ぶ');
 failTools = false;
+
+// --- 1席あたりの入力量 -------------------------------------------------------
+// ツールループはmessages配列を毎回再送するので、DATAに憲法全文を積むと手数+1回ぶん
+// 再送される。ここが膨らむと1件あたりの費用が二乗で効く。
+{
+  plan = Array.from({ length: 20 }, () => ({
+    name: 'search_messages', arguments: { query: '連投テスト', days: 7, limit: 25 }
+  }));
+  conclusion = candidate(['burst-0'], ['burst-1']);
+  let largestRequest = 0;
+  let totalRequest = 0;
+  const outer = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    largestRequest = Math.max(largestRequest, options.body.length);
+    totalRequest += options.body.length;
+    return outer(url, options);
+  };
+  await screen();
+  globalThis.fetch = outer;
+  const perSeat = Math.round(totalRequest / 3 / 1024);
+  console.log(`  [計測] 最大リクエスト ${Math.round(largestRequest / 1024)}KB / 1席あたり合計 ${perSeat}KB / 3席 ~${Math.round(totalRequest / 3.5 / 1000)}k tokens`);
+  assert.ok(largestRequest < 40 * 1024,
+    `1リクエストの最大が大きすぎる: ${Math.round(largestRequest / 1024)}KB`);
+  assert.ok(perSeat < 160,
+    `1席あたりの入力合計が大きすぎる: ${perSeat}KB`);
+}
+
+// --- 憲法はツールで読む（DATAへ毎回積まない） --------------------------------
+{
+  const toolset = tools.buildToolset({ guildId: GUILD_ID, allowed: investigation.tools.parliament });
+  const index = await toolset.run('read_constitution', {});
+  assert.ok(Array.isArray(index.headings) && index.headings.length > 10, '見出しの目次を返す');
+  const article = await toolset.run('read_constitution', { heading: index.headings.find((h) => h.startsWith('第八条')) });
+  assert.match(article.text, /立法/, '見出しを指定すればその条文だけ返す');
+  const missing = await toolset.run('read_constitution', { heading: '第九十九条' });
+  assert.match(missing.error, /unknown heading/, '存在しない見出しは拒否して目次を返す');
+}
 
 console.log('check-investigation: ok');

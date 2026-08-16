@@ -9,6 +9,7 @@ export const IMPLEMENTED_TOOLS = Object.freeze([
   'read_case_record',
   'read_cases',
   'read_channel',
+  'read_constitution',
   'read_context',
   'read_law',
   'read_precedent',
@@ -332,7 +333,9 @@ function validateLegislativeWorkflow(name, workflow) {
 // 憲法第十五条3。席が使える調査手段は実行規則が列挙したものだけで、AIの解釈で
 // 増やせない。コードは「実装があるか」しか見ない。何を許すかは憲法が決める。
 function validateInvestigation(investigation) {
-  exactKeys(investigation, ['maximumSteps', 'tools', 'publicRecord', 'maximumRedefense'], 'investigation');
+  exactKeys(investigation, [
+    'maximumSteps', 'maximumOutputKilobytes', 'tools', 'publicRecord', 'maximumRedefense'
+  ], 'investigation');
   const roles = ['police', 'court', 'parliament'];
   exactKeys(investigation.maximumSteps, roles, 'investigation.maximumSteps');
   for (const role of roles) {
@@ -348,8 +351,14 @@ function validateInvestigation(investigation) {
       if (!IMPLEMENTED_TOOLS.includes(name)) throw new Error(`未実装の調査手段があります: ${name}`);
     }
   }
-  if (!['summary', 'full'].includes(investigation.publicRecord)) {
-    throw new Error('investigation.publicRecord は summary または full です。');
+  // 席が1回の審議で受け取れる調査結果の総量。ツールループは配列を毎回再送するので
+  // ここを固定しないと1件あたりの費用が青天井になる。
+  exactKeys(investigation.maximumOutputKilobytes, roles, 'investigation.maximumOutputKilobytes');
+  for (const role of roles) {
+    integer(investigation.maximumOutputKilobytes[role], `investigation.maximumOutputKilobytes.${role}`, { min: 1, max: 256 });
+  }
+  if (!['none', 'summary', 'full'].includes(investigation.publicRecord)) {
+    throw new Error('investigation.publicRecord は none、summary または full です。');
   }
   integer(investigation.maximumRedefense, 'investigation.maximumRedefense', { min: 0, max: 3 });
 }
@@ -449,6 +458,7 @@ export function policyFromGovernanceRules(input) {
     },
     investigation: {
       maximumSteps: { ...rules.investigation.maximumSteps },
+      maximumOutputKilobytes: { ...rules.investigation.maximumOutputKilobytes },
       tools: {
         police: [...rules.investigation.tools.police],
         court: [...rules.investigation.tools.court],

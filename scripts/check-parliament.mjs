@@ -218,6 +218,13 @@ globalThis.fetch = async (url, init) => {
 
 const agendaState = compiled.rules.workflows.law.initial;
 
+// 人間はスレを立ててから議論する。国会はそのあとで初めて回る。
+db.recordActivity({
+  messageId: 'thread-old-1', guildId: GUILD_ID, channelId: memberThread.id, parentId: 'parliament',
+  userId: 'member-1', activityDate: '2026-08-16', contentHash: 'old-1',
+  content: '短時間の連投を止めたい', createdAt: Date.now() - 3_600_000
+});
+
 // --- 1回目: 継続審議 --------------------------------------------------------
 let governance = db.getGovernanceGuild(GUILD_ID);
 let session = await runParliamentSession(guild, governance, Date.now(), { manual: true });
@@ -236,6 +243,40 @@ assert.ok(posts.some((post) => (post.files ?? []).some((file) => file.name === '
 assert.ok(db.getProposal(db.getProposalByForumThread(memberThread.id).id).body,
   'たたき台は提案に保存して次の国会が読み直せるようにする');
 assert.ok(db.getGovernanceGuild(GUILD_ID).last_session_at, '開会時刻を記録する');
+
+// --- スレの過去発言が国会へ届く ---------------------------------------------
+// proposal行は「国会が最初に回ったとき」に作られる。created_atで切ると、人間が
+// それ以前に話し合った内容が丸ごと落ちる。
+assert.ok(
+  db.threadDiscussion(GUILD_ID, memberThread.id, 0).some((row) => row.message_id === 'thread-old-1'),
+  'proposal行より前のスレ発言も国会に届く'
+);
+
+// --- 誰も答えていないのに継続審議を繰り返さない ------------------------------
+mode = 'defer';
+db.updateProposal(proposal.id, { retry_after: null });
+session = await runParliamentSession(guild, db.getGovernanceGuild(GUILD_ID), Date.now(), { manual: true });
+proposal = db.getProposal(proposal.id);
+assert.notEqual(session.outcomes[0].decision, 'defer',
+  '前回の継続審議のあと誰も書いていなければ、もう一度は待たない');
+assert.equal(proposal.deferrals, 1, '空振りの継続審議で回数を消費しない');
+
+// 人間が答えたら、また意見を聞ける。
+db.recordActivity({
+  messageId: 'thread-reply-1', guildId: GUILD_ID, channelId: memberThread.id, parentId: 'parliament',
+  userId: 'member-2', activityDate: '2026-08-16', contentHash: 'reply-1',
+  content: '5分に10件くらいが妥当だと思う', createdAt: Date.now()
+});
+db.updateProposal(proposal.id, { retry_after: null });
+session = await runParliamentSession(guild, db.getGovernanceGuild(GUILD_ID), Date.now(), { manual: true });
+proposal = db.getProposal(proposal.id);
+assert.equal(session.outcomes[0].decision, 'defer', '新しい発言があれば継続審議を続けられる');
+assert.equal(proposal.deferrals, 2);
+
+// --- 調査記録はスレへ出さない -----------------------------------------------
+assert.equal(compiled.policy.investigation.publicRecord, 'none');
+assert.ok(!posts.some((post) => String(post.content).includes('## 調査記録')),
+  '調査の箇条書きはスレへ出さない（理由文が語る）');
 
 // --- 周期を待たない開会は起きない -------------------------------------------
 governance = db.getGovernanceGuild(GUILD_ID);

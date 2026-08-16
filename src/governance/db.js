@@ -1852,13 +1852,30 @@ export function proposalDiscussion(proposalId, since, until, limit = 300) {
 }
 
 // 提案スレは議題になる前から人間が討論する。proposal行の有無に関係なくthread単位で読む。
-export function threadDiscussion(guildId, threadId, since, limit = 300) {
-  return db.prepare(`
+// スレそのものが提案なので、proposal行ができる前の議論も含めて全部が対象。
+// 長いスレでは古い方ではなく新しい方を残す（先頭投稿だけは常に付ける）。
+export function threadDiscussion(guildId, threadId, since = 0, limit = 60) {
+  const newest = db.prepare(`
     SELECT message_id, user_id, content, created_at
     FROM governance_activity
     WHERE guild_id = ? AND channel_id = ? AND created_at >= ? AND content <> ''
-    ORDER BY created_at, message_id LIMIT ?
-  `).all(String(guildId), String(threadId), Number(since), Number(limit));
+    ORDER BY created_at DESC, message_id DESC LIMIT ?
+  `).all(String(guildId), String(threadId), Number(since), Number(limit)).reverse();
+  const first = db.prepare(`
+    SELECT message_id, user_id, content, created_at
+    FROM governance_activity
+    WHERE guild_id = ? AND channel_id = ? AND content <> ''
+    ORDER BY created_at, message_id LIMIT 1
+  `).get(String(guildId), String(threadId));
+  if (first && !newest.some((row) => row.message_id === first.message_id)) newest.unshift(first);
+  return newest;
+}
+
+export function threadDiscussionCount(guildId, threadId, since = 0) {
+  return db.prepare(`
+    SELECT COUNT(*) c FROM governance_activity
+    WHERE guild_id = ? AND channel_id = ? AND created_at >= ? AND content <> ''
+  `).get(String(guildId), String(threadId), Number(since)).c;
 }
 
 export function recordParliamentSession({ guildId, constitutionId, manual = false, agendaCount = 0, outcomes = [], startedAt }) {

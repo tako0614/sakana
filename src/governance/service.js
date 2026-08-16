@@ -116,6 +116,17 @@ import { closeGovernanceVote, compileConstitution, durationMilliseconds, workflo
 // 席の調査は要約だけ公開する（憲法第九条8・実行規則 investigation.publicRecord）。
 const PANEL_LENS_LABELS = ['textual', 'rights', 'adversarial'];
 
+function investigationLines(panel, policy) {
+  if ((policy?.investigation?.publicRecord ?? 'none') === 'none') return [];
+  return (panel.traces ?? [])
+    .map(({ seat, trace }) => investigationSummary(trace, {
+      seat,
+      lens: PANEL_LENS_LABELS[(seat - 1) % PANEL_LENS_LABELS.length],
+      maximumSteps: panel.maximumSteps
+    }))
+    .filter(Boolean);
+}
+
 const RETRY_BASE_MS = 5 * 60_000;
 const RETRY_MAX_MS = 60 * 60_000;
 
@@ -750,13 +761,7 @@ async function finishPoliceReview(guild, caseRecord) {
     `有効な違反認定: ${panel.outputs.filter((entry) => entry.verdict === 'responsible').length}/${procedure.panelSeats}`,
     `無効・失敗席: ${panel.failedSeats}`,
     '',
-    ...(panel.traces ?? [])
-      .map(({ seat, trace }) => investigationSummary(trace, {
-        seat,
-        lens: PANEL_LENS_LABELS[(seat - 1) % PANEL_LENS_LABELS.length],
-        maximumSteps: panel.maximumSteps
-      }))
-      .filter(Boolean),
+    ...investigationLines(panel, policy),
     '',
     '```json',
     JSON.stringify({
@@ -874,13 +879,7 @@ async function publishDecisionRecord(guild, caseRecord, phase, panel) {
     `判決記録（${phaseLabel}）`,
     ...publicLawDetails(law, caseRecord.offense_code),
     ...publicLines,
-    ...(panel.traces ?? [])
-      .map(({ seat, trace }) => investigationSummary(trace, {
-        seat,
-        lens: PANEL_LENS_LABELS[(seat - 1) % PANEL_LENS_LABELS.length],
-        maximumSteps: panel.maximumSteps
-      }))
-      .filter(Boolean)
+    ...investigationLines(panel, constitutionForCase(caseRecord).policy)
   ].join('\n'));
 
   await postCourtRecord(guild, caseRecord, '構成要件ごとの判断・理由・採用証拠を添付します。', {
