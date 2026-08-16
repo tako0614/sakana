@@ -334,7 +334,8 @@ function validateLegislativeWorkflow(name, workflow) {
 // 増やせない。コードは「実装があるか」しか見ない。何を許すかは憲法が決める。
 function validateInvestigation(investigation) {
   exactKeys(investigation, [
-    'maximumSteps', 'maximumOutputKilobytes', 'tools', 'publicRecord', 'maximumRedefense'
+    'maximumSteps', 'maximumOutputKilobytes', 'maximumMinutes',
+    'tools', 'publicRecord', 'maximumRedefense'
   ], 'investigation');
   const roles = ['police', 'court', 'parliament'];
   exactKeys(investigation.maximumSteps, roles, 'investigation.maximumSteps');
@@ -356,6 +357,12 @@ function validateInvestigation(investigation) {
   exactKeys(investigation.maximumOutputKilobytes, roles, 'investigation.maximumOutputKilobytes');
   for (const role of roles) {
     integer(investigation.maximumOutputKilobytes[role], `investigation.maximumOutputKilobytes.${role}`, { min: 1, max: 256 });
+  }
+  // 手数と総量だけでは審議時間が決まらない。1手が遅ければ席は何十分でも粘れる。
+  // 実時間の上限を置き、超えたらその時点の記録で結論を出させる。
+  exactKeys(investigation.maximumMinutes, roles, 'investigation.maximumMinutes');
+  for (const role of roles) {
+    integer(investigation.maximumMinutes[role], `investigation.maximumMinutes.${role}`, { min: 1, max: 30 });
   }
   if (!['none', 'summary', 'full'].includes(investigation.publicRecord)) {
     throw new Error('investigation.publicRecord は none、summary または full です。');
@@ -459,6 +466,7 @@ export function policyFromGovernanceRules(input) {
     investigation: {
       maximumSteps: { ...rules.investigation.maximumSteps },
       maximumOutputKilobytes: { ...rules.investigation.maximumOutputKilobytes },
+      maximumMinutes: { ...rules.investigation.maximumMinutes },
       tools: {
         police: [...rules.investigation.tools.police],
         court: [...rules.investigation.tools.court],
