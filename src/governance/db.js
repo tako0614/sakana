@@ -1080,6 +1080,20 @@ db.exec(`
 }
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (21, ?)').run(Date.now());
 
+// 国会が開かれたことは議題スレを見ないと分からなかった。開会ごとの議事録を
+// 手続の1本のスレへ時系列で残す。
+{
+  const columns = new Set(db.pragma('table_info(governance_guilds)').map((row) => row.name));
+  if (!columns.has('parliament_thread_id')) {
+    db.exec("ALTER TABLE governance_guilds ADD COLUMN parliament_thread_id TEXT NOT NULL DEFAULT ''");
+  }
+  const sessionColumns = new Set(db.pragma('table_info(governance_parliament_sessions)').map((row) => row.name));
+  if (!sessionColumns.has('minutes_message_id')) {
+    db.exec('ALTER TABLE governance_parliament_sessions ADD COLUMN minutes_message_id TEXT');
+  }
+}
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (22, ?)').run(Date.now());
+
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
 db.prepare("UPDATE governance_outbox SET status = 'error', last_error = 'interrupted before completion' WHERE status = 'running'").run();
@@ -1287,7 +1301,8 @@ export function updateGovernanceGuild(guildId, patch) {
     'parliament_forum_id', 'court_forum_id', 'court_chat_channel_id', 'statute_forum_id',
     'procedure_channel_id', 'procedure_message_id', 'operations_thread_id',
     'active_constitution_id', 'last_session_at', 'session_retry_after',
-    'session_failure_count', 'session_last_error', 'enforcement_thread_id'
+    'session_failure_count', 'session_last_error', 'enforcement_thread_id',
+    'parliament_thread_id'
   ]);
   const entries = Object.entries(patch).filter(([key]) => allowed.has(key));
   if (entries.length === 0) return getGovernanceGuild(guildId);
@@ -1876,6 +1891,15 @@ export function threadDiscussionCount(guildId, threadId, since = 0) {
     SELECT COUNT(*) c FROM governance_activity
     WHERE guild_id = ? AND channel_id = ? AND created_at >= ? AND content <> ''
   `).get(String(guildId), String(threadId), Number(since)).c;
+}
+
+export function countParliamentSessions(guildId) {
+  return db.prepare('SELECT COUNT(*) c FROM governance_parliament_sessions WHERE guild_id = ?').get(String(guildId)).c;
+}
+
+export function setParliamentSessionMinutes(id, messageId) {
+  db.prepare('UPDATE governance_parliament_sessions SET minutes_message_id = ? WHERE id = ?')
+    .run(String(messageId), Number(id));
 }
 
 export function recordParliamentSession({ guildId, constitutionId, manual = false, agendaCount = 0, outcomes = [], startedAt }) {

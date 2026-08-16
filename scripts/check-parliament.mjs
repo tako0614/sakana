@@ -133,6 +133,19 @@ const guild = {
           ]
         };
       }
+      if (id === 'procedure') {
+        return {
+          id,
+          isTextBased: () => true,
+          messages: { fetch: async () => ({ id: 'procedure-msg' }) },
+          threads: {
+            create: async ({ name }) => {
+              const created = fakeThread('minutes', name, { id: 'bot', bot: true });
+              return created;
+            }
+          }
+        };
+      }
       return threads.get(id) ?? null;
     }
   }
@@ -216,6 +229,8 @@ globalThis.fetch = async (url, init) => {
   }), { status: 200 });
 };
 
+db.updateGovernanceGuild(GUILD_ID, { procedure_message_id: 'procedure-msg' });
+
 const agendaState = compiled.rules.workflows.law.initial;
 
 // 人間はスレを立ててから議論する。国会はそのあとで初めて回る。
@@ -243,6 +258,16 @@ assert.ok(posts.some((post) => (post.files ?? []).some((file) => file.name === '
 assert.ok(db.getProposal(db.getProposalByForumThread(memberThread.id).id).body,
   'たたき台は提案に保存して次の国会が読み直せるようにする');
 assert.ok(db.getGovernanceGuild(GUILD_ID).last_session_at, '開会時刻を記録する');
+
+// --- 開かれたことが分かる ---------------------------------------------------
+// 議題スレを個別に見なくても、いつ開かれて何を決めたかを1本で追える。
+const minutes = posts.filter((post) => post.threadId === 'minutes');
+assert.equal(minutes.length, 1, '開会ごとに議事録を1件残す');
+assert.match(minutes[0].content, /第1回 国会/, '第何回かを書く');
+assert.match(minutes[0].content, /継続審議/, '議題ごとの結論を書く');
+assert.match(minutes[0].content, /次の開会/, '次にいつ開くかを書く');
+assert.equal(db.getGovernanceGuild(GUILD_ID).parliament_thread_id, 'minutes',
+  '議事録スレを統治DBに固定する');
 
 // --- スレの過去発言が国会へ届く ---------------------------------------------
 // proposal行は「国会が最初に回ったとき」に作られる。created_atで切ると、人間が
