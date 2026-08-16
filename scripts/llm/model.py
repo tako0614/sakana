@@ -77,11 +77,16 @@ def rope_cache(context, d_head, device, base=10000.0):
     return freqs.cos(), freqs.sin()
 
 
-def apply_rope(x, cos, sin):
+def apply_rope(x, cos, sin, offset=0):
+    """offset は「この列が何トークン目から始まるか」。
+
+    **KV キャッシュを使うときに要る。**2 トークン目以降は 1 個ずつ入れるので、
+    そのままだと毎回「0 トークン目」として回してしまい、位置が壊れる。
+    """
     # x: (B, heads, T, d_head)
     t = x.shape[2]
-    cos = cos[:t].view(1, 1, t, -1)
-    sin = sin[:t].view(1, 1, t, -1)
+    cos = cos[offset:offset + t].view(1, 1, t, -1)
+    sin = sin[offset:offset + t].view(1, 1, t, -1)
 
     # **回転は fp32 で計算して、最後に x の型に戻す。**
     #
@@ -105,7 +110,12 @@ class Attention(nn.Module):
         self.qn = RMSNorm(cfg.d_head) if cfg.qk_norm else None
         self.kn = RMSNorm(cfg.d_head) if cfg.qk_norm else None
 
-    def forward(self, x, cos, sin, attn_mask=None):
+    def forward(self, x, cos, sin, attn_mask=None, cache=None, offset=0):
+        """cache に (k, v) を渡すと、そこに継ぎ足して使う (生成用)。
+
+        返すのは出力だけ。**新しい cache は self.last_cache に置く** —
+        Block と MicroLM の戻り値の形を変えると学習側まで書き換えになる。
+        """
         b, t, _ = x.shape
         h, dh = self.cfg.n_heads, self.cfg.d_head
 
@@ -117,17 +127,28 @@ class Attention(nn.Module):
         if self.qn is not None:
             q, k = self.qn(q).type_as(v), self.kn(k).type_as(v)
 
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        q = apply_rope(q, cos, sin, offset)
+        k = apply_rope(k, cos, sin, offset)
+
+        if cache is not None:
+            past_k, past_v = cache
+            if past_k is not None:
+                k = torch.cat((past_k, k), dim=2)
+                v = torch.cat((past_v, v), dim=2)
+            self.last_cache = (k, v)
 
         # is_causal で三角マスクは自前で持たない (CPU でも flash 経路に乗る)。
         #
         # **文書内マスクを渡すと融合カーネルから落ちる。**呼ぶ側が既に因果性を
         # 含めたマスクを組んでいるので、そのときは is_causal を外す
+        # **キャッシュを使って 1 トークンだけ入れるときは is_causal を外す。**
+        # 問い合わせが 1 個で鍵が過去全部なので、三角マスクを掛けると
+        # 自分より前を全部隠してしまう
+        causal = attn_mask is None and q.shape[2] == k.shape[2]
         out = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
-            is_causal=attn_mask is None,
+            is_causal=causal,
             dropout_p=self.dropout if self.training else 0.0
         )
         return self.proj(out.transpose(1, 2).contiguous().view(b, t, self.cfg.d_model))
@@ -162,8 +183,8 @@ class Block(nn.Module):
         else:
             self.ple_gate = self.ple_out = None
 
-    def forward(self, x, cos, sin, per_layer=None, attn_mask=None):
-        x = x + self.drop(self.attn(self.n1(x), cos, sin, attn_mask))
+    def forward(self, x, cos, sin, per_layer=None, attn_mask=None, cache=None, offset=0):
+        x = x + self.drop(self.attn(self.n1(x), cos, sin, attn_mask, cache, offset))
         x = x + self.drop(self.ff(self.n2(x)))
 
         if self.ple_out is not None and per_layer is not None:
@@ -222,7 +243,8 @@ class MicroLM(nn.Module):
         table = self.ple_table(idx).view(shape) * math.sqrt(self.cfg.d_ple)
         return self.ple_norm(table + self.ple_proj(x).view(shape)).type_as(x)
 
-    def forward(self, idx, targets=None, attn_mask=None, chunks=1, z_loss=0.0):
+    def forward(self, idx, targets=None, attn_mask=None, chunks=1, z_loss=0.0,
+                caches=None, offset=0):
         """targets を渡すと (None, loss)、渡さないと (logits, None)。
 
         **targets があるとき logits は返さない。**呼ぶ側は全部捨てているうえ、
@@ -235,7 +257,8 @@ class MicroLM(nn.Module):
 
         for i, block in enumerate(self.blocks):
             p = per_layer[:, :, i] if per_layer is not None else None
-            x = block(x, self.cos, self.sin, p, attn_mask)
+            x = block(x, self.cos, self.sin, p, attn_mask,
+                      None if caches is None else caches[i], offset)
         h = self.norm(x)
 
         if targets is None:
@@ -288,9 +311,32 @@ class MicroLM(nn.Module):
         サンプリングが違うと差がモデル由来かハーネス由来か分からなくなる。
         """
         self.eval()
+
+        # **KV キャッシュ。**無いと 1 トークン出すたびに文脈全体を 8 層へ通し直す。
+        # 文脈 300 で 40 トークン生成すると 12,000 トークン分の計算になり、
+        # 本来の 340 に対して 35 倍の無駄 (bot の応答が遅い原因はこれ)。
+        #
+        # 最初に prompt をまとめて通し (prefill)、そのあとは 1 トークンずつ。
+        caches = [(None, None) for _ in self.blocks]
+        fed = 0
+
         for step in range(max_new_tokens):
             window = idx[:, -self.cfg.context:]
-            logits, _ = self(window)
+            if fed == 0:
+                piece, offset = window, 0            # prefill
+            else:
+                piece, offset = idx[:, -1:], fed     # 1 トークンだけ
+            logits, _ = self(piece, caches=caches, offset=offset)
+            fed = offset + piece.shape[1]
+
+            # 次の周のために、各層が置いた新しい鍵と値を拾う
+            caches = [block.attn.last_cache for block in self.blocks]
+            # 文脈からあふれたら古い方を捨てる (窓と同じ長さに保つ)
+            if fed > self.cfg.context:
+                drop = fed - self.cfg.context
+                caches = [(k[:, :, drop:], v[:, :, drop:]) for k, v in caches]
+                fed = self.cfg.context
+
             logits = logits[:, -1, :]
 
             # 繰り返しペナルティは温度より前に掛ける (transformers と同じ順序)。
