@@ -324,10 +324,11 @@ failTools = false;
   globalThis.fetch = outer;
   const perSeat = Math.round(totalRequest / 3 / 1024);
   console.log(`  [計測] 最大リクエスト ${Math.round(largestRequest / 1024)}KB / 1席あたり合計 ${perSeat}KB / 3席 ~${Math.round(totalRequest / 3.5 / 1000)}k tokens`);
+  // 守りたいのは総量の絶対値ではなく形。ツール結果を畳まないと1リクエストが
+  // 手数に比例して膨らみ、費用が二乗で効く。畳めば最大リクエストは手数に
+  // よらず頭打ちになる。
   assert.ok(largestRequest < 40 * 1024,
-    `1リクエストの最大が大きすぎる: ${Math.round(largestRequest / 1024)}KB`);
-  assert.ok(perSeat < 160,
-    `1席あたりの入力合計が大きすぎる: ${perSeat}KB`);
+    `畳めていない。手数を増やすと1リクエストが膨らんでいる: ${Math.round(largestRequest / 1024)}KB`);
 }
 
 // --- 憲法はツールで読む（DATAへ毎回積まない） --------------------------------
