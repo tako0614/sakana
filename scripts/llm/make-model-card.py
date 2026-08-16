@@ -63,6 +63,11 @@ CHANNELS = count_series("<|c{}|>")
 ROLES = [f"<|{c}|>" for c in "abcdefgh" if has(f"<|{c}|>")]
 HAS_REPLY = has("<|re|>")
 HAS_OVERFLOW = has("<|z|>")
+# リアクションが付いた発言の印 (evex-4.1 以降)。**推論では常に置く**
+HAS_QUALITY = has("<|hi|>")
+# PLE (Per-Layer Embeddings)。config から読む
+PLE = bool(config.get("ple"))
+D_PLE = config.get("d_ple")
 
 # 話者の件数だけ (身元は出さない)
 speaker_counts = []
@@ -77,12 +82,13 @@ fmt = lambda n: f"{n:,}"  # noqa: E731
 # **実物のトークンで組む。**説明用に手で書くと、語彙に無いものを書いてしまう
 
 ch = "<|c2|>" if CHANNELS else ""
-example = (f"{ch}<|conv|><|s0|>これバグってる？<|s3|>"
+hi = "<|hi|>" if HAS_QUALITY else ""
+example = (f"{ch}<|conv|><|s0|>これバグってる？{hi}<|s3|>"
            + ("<|re|><|s0|>" if HAS_REPLY else "")
            + "どこで止まってる？<|end|>")
 ask = (f"{ch}<|conv|>"
        + (f"{ROLES[0]}日本の首都どこ" if ROLES else "<|other|>日本の首都どこ")
-       + "<|s0|>")
+       + f"{hi}<|s0|>")
 
 lines = []
 W = lines.append
@@ -114,6 +120,12 @@ W(f"- パラメータ **{fmt(config['params'])}** "
   f"{config['n_heads']} head / context {config['context']})")
 W(f"- 語彙 **{fmt(config['vocab_size'])}** (sentencepiece BPE / byte_fallback)")
 W(f"- {config.get('architecture', 'decoder-only transformer')} / weight tying")
+if PLE:
+    W(f"- **PLE (Per-Layer Embeddings, d_ple={D_PLE})** — Gemma 3n と同じ、"
+      "トークンごと・層ごとの補助ベクトル。**行列積ではなく引き表**なので、"
+      "容量は +36% なのに 1 トークンあたりの計算量は +3% しか増えません "
+      "(CPU 推論で行列積律速なモデルには効きます)")
+    W("- QK-norm — q/k を RoPE の**前**に RMSNorm")
 if config.get("val_loss") is not None:
     W(f"- val loss **{config['val_loss']:.4f}** (epoch {config.get('trained_epoch')})")
 W("")
@@ -151,6 +163,9 @@ if HAS_OVERFLOW:
     W("| `<|z|>` | 1 | 役が足りないとき |")
 if HAS_REPLY:
     W("| `<|re|>` | 1 | 返信。**直後に返信先のトークンを置く** |")
+if HAS_QUALITY:
+    W("| `<|hi|>` | 1 | **リアクションが付いた発言**の印。話者トークンの直前。"
+      "推論では常に置くと「反応される種類の発言」を狙えます |")
 W("| `<nl>` | 1 | 発言の中の改行 |")
 W("| `<url>` `<file>` `<mention>` `<channel>` `<time>` | 5 | "
   "正規化した中身。**学習で損失から外してある**ので、モデルは自分では書きません |")
@@ -205,6 +220,11 @@ W("print(sp.decode(got[0].tolist())[len(prompt):])")
 W("```")
 W("")
 W("**生成は `<|end|>` か、次の話者トークンが出たところで切ってください。**")
+if HAS_QUALITY:
+    W("")
+    W("`<|hi|>` `<|conv|>` `<|cN|>` は**生成から禁止してください**。"
+      "プロンプト側が置くもので、本文として出るものではありません "
+      "(禁止しないと `草<|hi|>` のように漏れます)。")
 W("切らずに流すと、他の人の発言まで作り続けます。")
 W("")
 
