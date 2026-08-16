@@ -24,8 +24,10 @@
   },
   "legislation": {
     "voteMilliseconds": 43200000,
+    "sessionIntervalMilliseconds": 259200000,
+    "agendaLimit": 5,
     "maximumDeferrals": 3,
-    "maximumSessionIntervalMilliseconds": 604800000
+    "logScan": true
   },
   "judiciary": {
     "defenseMilliseconds": 86400000,

@@ -4,7 +4,6 @@ import {
   getConstitution,
   getCurrentLawVersion,
   getLaw,
-  getOperationalSetting,
   getProposal,
   getProposalByForumThread,
   listLaws,
@@ -40,23 +39,17 @@ function constitutionRules(constitution) {
   return constitution.rules ?? compileConstitution({ content: constitution.content }).rules;
 }
 
-function workflowKeyFor(proposal) {
-  return proposal.kind === 'amendment' ? 'constitutionalAmendment' : 'law';
-}
-
 function agendaStateName(rules, key = 'law') {
   return rules.workflows[key].initial;
 }
 
-export function sessionIntervalMilliseconds(guildId, constitution) {
-  const hours = Math.max(1, Math.floor(getOperationalSetting(guildId, 'parliament_interval_hours')));
-  // 運営が立法を凍結できないよう、憲法が定める上限より長くはできない。
-  return Math.min(hours * 3_600_000, constitution.policy.legislation.maximumSessionIntervalMilliseconds);
+// 開会間隔・議題数・自律起案の可否は運営が変えられない。改憲でだけ動く。
+export function sessionIntervalMilliseconds(constitution) {
+  return constitution.policy.legislation.sessionIntervalMilliseconds;
 }
 
 export function nextSessionAt(governance, constitution) {
-  const interval = sessionIntervalMilliseconds(governance.guild_id, constitution);
-  return Number(governance.last_session_at ?? 0) + interval;
+  return Number(governance.last_session_at ?? 0) + sessionIntervalMilliseconds(constitution);
 }
 
 function agendaProposals(guildId, rules) {
@@ -119,7 +112,7 @@ async function adoptMemberThreads(guild, governance, constitution, rules, room) 
 // 公開ログから自分で議題を立てる。人間の提案と同格に扱う。
 async function discoverAgenda(guild, governance, constitution, rules, room) {
   if (room <= 0) return [];
-  if (!getOperationalSetting(guild.id, 'parliament_scan_enabled')) return [];
+  if (!constitution.policy.legislation.logScan) return [];
   const now = Date.now();
   const publicChannelIds = [...guild.channels.cache.values()]
     .filter((channel) => channel.isTextBased?.() && !channel.isThread?.())
@@ -362,8 +355,7 @@ async function legislateAgendaItem(guild, governance, constitution, proposal, de
 async function processAgendaItem(guild, governance, constitution, input) {
   const rules = constitutionRules(constitution);
   let proposal = await ensureAgendaPost(guild, governance, input);
-  const key = workflowKeyFor(proposal);
-  const maximumDeferrals = rules.workflows[key].config.maximumDeferrals;
+  const maximumDeferrals = constitution.policy.legislation.maximumDeferrals;
   const allowDefer = Number(proposal.deferrals ?? 0) < maximumDeferrals;
   const discussion = threadDiscussion(
     guild.id, proposal.forum_thread_id, Number(proposal.created_at ?? 0), AGENDA_DISCUSSION_LIMIT
@@ -436,12 +428,12 @@ export async function runParliamentSession(guild, governance, now = Date.now(), 
   }
   if (!manual) {
     if (governance.session_retry_after && governance.session_retry_after > now) return null;
-    if (governance.last_session_at && now - governance.last_session_at < sessionIntervalMilliseconds(guild.id, constitution)) {
+    if (governance.last_session_at && now - governance.last_session_at < sessionIntervalMilliseconds(constitution)) {
       return null;
     }
   }
   const rules = constitutionRules(constitution);
-  const limit = Math.max(0, Math.floor(getOperationalSetting(guild.id, 'parliament_agenda_limit')));
+  const limit = constitution.policy.legislation.agendaLimit;
   const carried = agendaProposals(guild.id, rules);
   const room = Math.max(0, limit - carried.length);
   const adopted = await adoptMemberThreads(guild, governance, constitution, rules, room);

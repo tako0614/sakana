@@ -160,9 +160,6 @@ function operationsComponents(governance) {
         .setStyle(governance.enforcement_mode === 'live' ? ButtonStyle.Secondary : ButtonStyle.Danger),
       new ButtonBuilder().setCustomId('gov:admin:settings').setLabel('AI利用上限').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('gov:admin:investigation').setLabel('AI調査範囲').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('gov:admin:parliament_toggle')
-        .setLabel(getOperationalSetting(governance.guild_id, 'parliament_scan_enabled') === 1 ? '自律起案 ON' : '自律起案 OFF')
-        .setStyle(getOperationalSetting(governance.guild_id, 'parliament_scan_enabled') === 1 ? ButtonStyle.Success : ButtonStyle.Secondary)
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('gov:admin:parliament_now').setLabel('国会を開く').setStyle(ButtonStyle.Primary),
@@ -185,7 +182,6 @@ export async function renderGovernanceOperationsPanel(guild, governance) {
   const electorateName = governance.trusted_role_id
     ? (guild.roles.cache.get(governance.trusted_role_id)?.name ?? '特別有権者')
     : '特別有権者';
-  const scanEnabled = getOperationalSetting(guild.id, 'parliament_scan_enabled') === 1;
   const notificationStats = governanceNotificationStats(guild.id);
   return {
     content: [
@@ -198,7 +194,7 @@ export async function renderGovernanceOperationsPanel(guild, governance) {
       `Bot権限: ${permissions.ok ? 'OK' : `不足: ${permissions.missing.join('、')}`}`,
       `失敗した処理: ${failures.length + workflows.length}件`,
       `特別有権者: ${electorate}`,
-      `国会: ${getOperationalSetting(guild.id, 'parliament_interval_hours')}時間ごと / 1回 ${getOperationalSetting(guild.id, 'parliament_agenda_limit')}議題 / 自律起案 ${scanEnabled ? '有効' : '無効'}${governance.last_session_at ? ` / 前回 <t:${Math.floor(Number(governance.last_session_at) / 1000)}:R>` : ''}`,
+      `国会(憲法で固定): ${Math.round((constitution?.policy.legislation.sessionIntervalMilliseconds ?? 0) / 3_600_000)}時間ごと / 1回 ${constitution?.policy.legislation.agendaLimit ?? '?'}議題 / 継続審議 ${constitution?.policy.legislation.maximumDeferrals ?? '?'}回 / 自律起案 ${constitution?.policy.legislation.logScan ? '有効' : '無効'}${governance.last_session_at ? ` / 前回 <t:${Math.floor(Number(governance.last_session_at) / 1000)}:R>` : ''}`,
       `AI受付: 一般 ${getOperationalSetting(guild.id, 'general_daily_calls')}回/日 / ${electorateName} ${getOperationalSetting(guild.id, 'trusted_daily_calls')}回/日`,
       `AI調査: 会話 ${getOperationalSetting(guild.id, 'investigation_conversation_limit')}件 / 対象者 ${getOperationalSetting(guild.id, 'investigation_actor_limit')}件 / サーバー ${getOperationalSetting(guild.id, 'investigation_guild_limit')}件 / 最大事件 ${getOperationalSetting(guild.id, 'investigation_case_limit')}件`,
       `通知上限: 全体 ${getOperationalSetting(guild.id, 'notification_everyone_daily_limit')}回 / ${electorateName} ${getOperationalSetting(guild.id, 'notification_trusted_daily_limit')}回 / 当事者1人 ${getOperationalSetting(guild.id, 'notification_user_daily_limit')}回（各24時間）`,
@@ -377,20 +373,20 @@ export async function syncGovernanceActionCards(guild, channel) {
 
 export async function renderGovernanceProcedureHub(guild, governance) {
   const supportsImmediateReview = Boolean(summaryProcedure(getActiveConstitution(guild.id)?.policy));
+
   const proposals = activeProposals(guild.id, 100);
   const voting = proposals.filter((proposal) => proposalHandler(proposal) === 'public_vote');
   const agenda = proposals.filter((proposal) => proposalHandler(proposal) === 'parliament_agenda');
   const approvals = listCases(guild.id, { statuses: ['approval'], limit: 20 });
-  const intervalHours = getOperationalSetting(guild.id, 'parliament_interval_hours');
-  const nextAt = governance.last_session_at
-    ? Number(governance.last_session_at) + intervalHours * 3_600_000
-    : null;
+  const constitution = getActiveConstitution(guild.id);
+  const intervalMs = constitution?.policy.legislation.sessionIntervalMilliseconds ?? 0;
+  const nextAt = governance.last_session_at ? Number(governance.last_session_at) + intervalMs : null;
   return {
     content: [
       `# ${guild.name} 手続`,
       '',
       `法律にしたいことは <#${governance.parliament_forum_id}> へ投稿してください。違反申立てや上訴は <@&${governance.judiciary_role_id}> に自然文で話してください。`,
-      `国会は${intervalHours}時間ごとに開き、議会の投稿と公開ログを議題として読みます。${nextAt ? `次の開会: <t:${Math.floor(nextAt / 1000)}:R>` : '次の開会: まもなく'}`,
+      `国会は${Math.round(intervalMs / 3_600_000)}時間ごとに開き、議会の投稿と公開ログを議題として読みます。${nextAt ? `次の開会: <t:${Math.floor(nextAt / 1000)}:R>` : '次の開会: まもなく'}`,
       '投票と執行承認が始まると、この下に操作カードが出ます。',
       '',
       `議題 ${agenda.length}件 / いま操作できる案件: 投票 ${voting.length}件 / 承認 ${approvals.length}件`
@@ -488,10 +484,8 @@ function settingsModal(guildId) {
     .setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short).setRequired(true).setValue(String(value));
   return new ModalBuilder()
     .setCustomId('gov:admin_modal:settings')
-    .setTitle('国会とAI回数')
+    .setTitle('AI利用上限')
     .addComponents(
-      new ActionRowBuilder().addComponents(input('parliament_interval_hours', '国会の間隔（時間・最大168）', getOperationalSetting(guildId, 'parliament_interval_hours'))),
-      new ActionRowBuilder().addComponents(input('parliament_agenda_limit', '1回で扱う議題数（最大20）', getOperationalSetting(guildId, 'parliament_agenda_limit'))),
       new ActionRowBuilder().addComponents(input('general_daily_calls', '一般参加者のAI受付回数/日', getOperationalSetting(guildId, 'general_daily_calls'))),
       new ActionRowBuilder().addComponents(input('trusted_daily_calls', '特別有権者のAI受付回数/日', getOperationalSetting(guildId, 'trusted_daily_calls'))),
       new ActionRowBuilder().addComponents(input('investigation_case_limit', '一度に開始する事件数（最大10）', getOperationalSetting(guildId, 'investigation_case_limit')))
@@ -586,7 +580,7 @@ export async function handleGovernanceUxInteraction(interaction) {
   if (!governance) throw new Error('統治機能が初期化されていません。');
 
   if (interaction.isModalSubmit() && customId === 'gov:admin_modal:settings') {
-    const keys = ['parliament_interval_hours', 'parliament_agenda_limit', 'general_daily_calls', 'trusted_daily_calls'];
+    const keys = ['general_daily_calls', 'trusted_daily_calls', 'investigation_case_limit'];
     const updates = [];
     for (const key of keys) {
       const parsed = parseOperationalSetting(key, interaction.fields.getTextInputValue(key));
@@ -594,8 +588,8 @@ export async function handleGovernanceUxInteraction(interaction) {
       updates.push([key, parsed.value]);
     }
     for (const [key, value] of updates) setOperationalSetting(interaction.guildId, key, value, interaction.user.id);
-    createAdministrativeAct({ guildId: interaction.guildId, kind: 'operational_settings', actorId: interaction.user.id, summary: '国会とAI受付の設定を変更', detail: Object.fromEntries(updates) });
-    await interaction.reply({ content: '国会とAI受付の設定を更新しました。', flags: EPHEMERAL });
+    createAdministrativeAct({ guildId: interaction.guildId, kind: 'operational_settings', actorId: interaction.user.id, summary: 'AI受付の設定を変更', detail: Object.fromEntries(updates) });
+    await interaction.reply({ content: 'AI受付の設定を更新しました。', flags: EPHEMERAL });
     await refreshDashboard(interaction);
     return true;
   }
@@ -715,21 +709,6 @@ export async function handleGovernanceUxInteraction(interaction) {
   }
   if (customId === 'gov:admin:notifications') {
     await interaction.showModal(notificationSettingsModal(interaction.guildId));
-    return true;
-  }
-  if (customId === 'gov:admin:parliament_toggle') {
-    const current = getOperationalSetting(interaction.guildId, 'parliament_scan_enabled') === 1;
-    const next = current ? 0 : 1;
-    setOperationalSetting(interaction.guildId, 'parliament_scan_enabled', next, interaction.user.id);
-    createAdministrativeAct({
-      guildId: interaction.guildId,
-      kind: 'operational_settings',
-      actorId: interaction.user.id,
-      summary: `自律起案を${next ? '有効化' : '無効化'}`,
-      detail: { parliament_scan_enabled: next }
-    });
-    await interaction.reply({ content: `自律起案を${next ? '有効' : '無効'}にしました。`, flags: EPHEMERAL });
-    await refreshDashboard(interaction);
     return true;
   }
   if (customId === 'gov:admin:parliament_now') {

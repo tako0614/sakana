@@ -64,8 +64,14 @@ policyModule.validateConstitutionPolicy(policy);
 assert.equal(policy.schemaVersion, 2);
 assert.deepEqual(policyModule.summaryProcedure(policy), policy.judiciary.summaryProcedure);
 assert.deepEqual(Object.keys(policy.legislation).sort(),
-  ['maximumDeferrals', 'maximumSessionIntervalMilliseconds', 'voteMilliseconds'],
-  '立法の運用値は国会の間隔上限・継続審議上限・投票期間だけになった');
+  ['agendaLimit', 'logScan', 'maximumDeferrals', 'sessionIntervalMilliseconds', 'voteMilliseconds'],
+  '国会の量的な決定は憲法の実行規則にだけ置く');
+assert.equal(compiledConstitution.rules.parliament.sessionInterval, '72h');
+assert.equal(policy.legislation.sessionIntervalMilliseconds, 72 * 3_600_000);
+for (const key of ['parliament_interval_hours', 'parliament_agenda_limit', 'parliament_scan_enabled']) {
+  assert.equal(parseOperationalSetting(key, '1').ok, false,
+    '国会の量的な値は運営者の運用設定から変更できない');
+}
 assert.match(constitution, /定期的に開かれる国会/);
 assert.match(constitution, /投票の受付を開始した後に、条文または執行定義を変更してはならない/);
 assert.match(constitution, /継続審議の回数は実行規則が定める上限を超えてはならず/);
@@ -82,7 +88,14 @@ assert.throws(() => policyModule.validateConstitutionPolicy({
 assert.throws(() => policyModule.validateConstitutionPolicy({
   ...policy,
   legislation: { voteMilliseconds: policy.legislation.voteMilliseconds }
-}), /legislationに未対応の設定/, '国会の上限値を欠いたpolicyは受理しない');
+}), /legislationに未対応の設定/, '国会の値を欠いたpolicyは受理しない');
+const parliamentRules = structuredClone(compiledConstitution.rules);
+parliamentRules.parliament.sessionInterval = '30m';
+assert.throws(() => rulesModule.validateGovernanceRules(parliamentRules), /sessionInterval は1時間以上/);
+const strayParliament = structuredClone(compiledConstitution.rules);
+strayParliament.parliament.operatorOverride = true;
+assert.throws(() => rulesModule.validateGovernanceRules(strayParliament), /未対応の項目があります/,
+  '国会の実行規則へschema外の抜け道を足せない');
 
 const eligible = policyModule.evaluateEligibility({
   joinedAt: Date.now() - 31 * policyModule.DAY_MS,

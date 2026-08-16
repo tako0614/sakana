@@ -117,6 +117,18 @@ function validatePanels(panels) {
   }
 }
 
+// 開会の間隔や1回の議題数は運用値ではなく統治の中身なので、運営panelではなく
+// 憲法の実行規則に置く。変えるには改憲手続が要る。
+function validateParliament(parliament) {
+  exactKeys(parliament, ['sessionInterval', 'agendaLimit', 'maximumDeferrals', 'logScan'], 'parliament');
+  const interval = durationMilliseconds(parliament.sessionInterval, 'parliament.sessionInterval');
+  if (interval < 3_600_000) throw new Error('parliament.sessionInterval は1時間以上である必要があります。');
+  if (interval > 30 * 86_400_000) throw new Error('parliament.sessionInterval の技術上限は30日です。');
+  integer(parliament.agendaLimit, 'parliament.agendaLimit', { min: 1, max: 20 });
+  integer(parliament.maximumDeferrals, 'parliament.maximumDeferrals', { min: 1, max: 20 });
+  if (typeof parliament.logScan !== 'boolean') throw new Error('parliament.logScan は真偽値である必要があります。');
+}
+
 function validateVotes(votes) {
   exactKeys(votes, ['defaultScope', 'allowedScopes', 'law', 'constitutionalAmendment'], 'votes');
   if (!['all', 'trusted'].includes(votes.defaultScope)) throw new Error('votes.defaultScope が不正です。');
@@ -191,12 +203,7 @@ function validateSanctions(sanctions) {
 
 function validateWorkflow(name, workflow) {
   exactKeys(workflow, ['initial', 'config', 'states'], `workflows.${name}`);
-  if (['law', 'constitutionalAmendment'].includes(name)) {
-    exactKeys(workflow.config, ['maximumDeferrals', 'maximumSessionInterval'], `workflows.${name}.config`);
-    integer(workflow.config.maximumDeferrals, `workflows.${name}.config.maximumDeferrals`, { min: 1, max: 20 });
-    const interval = durationMilliseconds(workflow.config.maximumSessionInterval, `workflows.${name}.config.maximumSessionInterval`);
-    if (interval < 3_600_000) throw new Error(`workflows.${name}.config.maximumSessionInterval は1時間以上である必要があります。`);
-  } else if (name === 'constitutionalCase') {
+  if (name === 'constitutionalCase') {
     exactKeys(workflow.config, ['petitionsPerMemberPerDay'], `workflows.${name}.config`);
     integer(workflow.config.petitionsPerMemberPerDay, `workflows.${name}.config.petitionsPerMemberPerDay`, { min: 1, max: 1000 });
   } else {
@@ -299,10 +306,11 @@ function validateLegislativeWorkflow(name, workflow) {
 }
 
 export function validateGovernanceRules(input) {
-  const rules = exactKeys(input, ['$schema', 'electorates', 'panels', 'votes', 'sanctions', 'workflows'], 'governance-rules');
+  const rules = exactKeys(input, ['$schema', 'electorates', 'panels', 'parliament', 'votes', 'sanctions', 'workflows'], 'governance-rules');
   if (rules.$schema !== GOVERNANCE_RULES_SCHEMA) throw new Error('未対応のgovernance-rules schemaです。');
   validateElectorates(rules.electorates);
   validatePanels(rules.panels);
+  validateParliament(rules.parliament);
   validateVotes(rules.votes);
   validateSanctions(rules.sanctions);
   exactKeys(rules.workflows, ['law', 'constitutionalAmendment', 'criminalCase', 'constitutionalCase'], 'workflows');
@@ -335,7 +343,6 @@ export function extractGovernanceRules(content) {
 export function policyFromGovernanceRules(input) {
   const rules = validateGovernanceRules(structuredClone(input));
   const general = rules.electorates.general;
-  const lawFlow = rules.workflows.law;
   const vote = rules.votes.law;
   const constitutional = rules.panels.constitutional;
   const criminal = rules.panels.criminal;
@@ -366,8 +373,10 @@ export function policyFromGovernanceRules(input) {
     },
     legislation: {
       voteMilliseconds: durationMilliseconds(vote.duration),
-      maximumDeferrals: lawFlow.config.maximumDeferrals,
-      maximumSessionIntervalMilliseconds: durationMilliseconds(lawFlow.config.maximumSessionInterval)
+      sessionIntervalMilliseconds: durationMilliseconds(rules.parliament.sessionInterval),
+      agendaLimit: rules.parliament.agendaLimit,
+      maximumDeferrals: rules.parliament.maximumDeferrals,
+      logScan: rules.parliament.logScan
     },
     judiciary: {
       defenseMilliseconds: durationMilliseconds(rules.workflows.criminalCase.states.defense?.duration ?? rules.workflows.constitutionalCase.states.defense.duration),
@@ -458,10 +467,10 @@ export function closeGovernanceVote({ kind, yes, no, abstain, electorate, truste
 }
 
 export function governanceRulesSummary(rules) {
-  const law = rules.workflows.law;
   const lines = [];
-  lines.push(`国会の開会間隔上限 ${law.config.maximumSessionInterval}`);
-  lines.push(`継続審議 ${law.config.maximumDeferrals}回まで`);
+  lines.push(`国会 ${rules.parliament.sessionInterval}ごと / 1回 ${rules.parliament.agendaLimit}議題`);
+  lines.push(`継続審議 ${rules.parliament.maximumDeferrals}回まで`);
+  lines.push(`公開記録からの議題発見 ${rules.parliament.logScan ? 'あり' : 'なし'}`);
   lines.push(`法律投票 ${rules.votes.law.duration}`);
   lines.push(`憲法改正投票 ${rules.votes.constitutionalAmendment.duration}`);
   if (rules.votes.law.earlyClose === 'all_ballots_cast' || rules.votes.constitutionalAmendment.earlyClose === 'all_ballots_cast') {
