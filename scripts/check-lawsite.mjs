@@ -46,7 +46,7 @@ const constitution = {
 
 // --- 表示の素材 -------------------------------------------------------------
 assert.equal(escapeHtml('<script>alert(1)</script>'), '&lt;script&gt;alert(1)&lt;/script&gt;');
-assert.equal(formatDate(1_700_000_000_000), '2023-11-15', 'JSTの日付で表示する');
+assert.equal(formatDate(1_700_000_000_000), '2023年11月15日', 'JSTの和暦風の日付で表示する');
 assert.equal(formatDate(null), '-');
 assert.equal(instrumentPath(lawV2), '/law/12');
 assert.equal(instrumentPath(constitution), '/constitution/3');
@@ -79,10 +79,12 @@ assert.deepEqual(outlineBlocks('# 見出し\n\n本文1\n本文2\n\n## 小見出�
 const list = renderList({ guildId: '123', rows: [lawV2, constitution], query: '', history: false });
 assert.match(list, /<title>法令集<\/title>/);
 assert.match(list, /<a href="\/law\/12\?guild=123">連続投稿規制法<\/a>/, '一覧から詳細へ行ける');
+assert.match(list, /<table class="laws">/, '一覧は表で並べる');
+assert.match(list, /name="q"/, '検索はJS無しのGETフォームで動く');
+assert.match(list, /法令名・本文・条文を検索/);
 assert.match(list, /<a href="\/constitution\/3\?guild=123">/);
 assert.match(list, /badge-ok">現行法/);
 assert.match(list, /2件/);
-assert.match(list, /name="q"/, '検索はJS無しのGETフォームで動く');
 assert.doesNotMatch(list, /連続投稿を制限する。\n適用範囲/, '一覧に全文は出さない');
 
 const empty = renderList({ guildId: '123', rows: [], query: 'リンク', history: false });
@@ -96,24 +98,25 @@ assert.match(
 
 // --- 法令の詳細 -------------------------------------------------------------
 const detail = renderLaw({ guildId: '123', row: lawV2, versions: [lawV1, lawV2] });
-assert.match(detail, /<h1>連続投稿規制法<\/h1>/);
-assert.match(detail, /<h2>条文<\/h2>/);
+assert.match(detail, /<h1>連続投稿規制法/, '開いている法令をヘッダにも出す');
+assert.match(detail, /class="law-title">連続投稿規制法<\/h2>/);
+assert.match(detail, /<h2 class="section" id="articles">条文<\/h2>/);
 assert.match(detail, /id="a-A1"/, '条文にアンカーを振る');
 assert.match(detail, /href="#a-A2"/, '目次から条文へ飛べる');
-assert.match(detail, /<h2>違反と処分<\/h2>/);
-assert.match(detail, /発言停止 \/ 最大10分/, '処分の上限を人が読める形にする');
-assert.match(detail, /<h2>機能制限の定義<\/h2>/);
-assert.match(detail, /<h2>沿革<\/h2>/);
+assert.match(detail, /違反と処分<\/h2>/);
+assert.match(detail, /発言停止　上限 10分/, '処分の上限を人が読める形にする');
+assert.match(detail, /機能制限の定義<\/h2>/);
+assert.match(detail, /<h2>沿革<\/h2>/, '沿革のパネルを出す');
 assert.match(detail, /href="\/law\/11\?guild=123">第1版/, '沿革から旧版へ行ける');
 assert.match(detail, /本文hash: hash-v2/);
 assert.doesNotMatch(detail, /現行版を見る/, '現行版に旧版の案内は出さない');
 
 const oldDetail = renderLaw({ guildId: '123', row: lawV1, versions: [lawV1, lawV2] });
-assert.match(oldDetail, /これは過去の版です。<a href="\/law\/12\?guild=123">現行版を見る/);
+assert.match(oldDetail, /これは過去の版です。<a href="\/law\/12\?guild=123">現行版（第2版）を見る/);
 
 const bare = renderLaw({ guildId: '123', row: { ...lawV2, provisions_json: null }, versions: [] });
-assert.doesNotMatch(bare, /<h2>条文<\/h2>/, '執行定義が無い法令でも本文だけで表示する');
-assert.doesNotMatch(bare, /<h2>沿革<\/h2>/, '版が1つなら沿革は出さない');
+assert.doesNotMatch(bare, /id="articles">条文/, '執行定義が無い法令でも本文だけで表示する');
+assert.doesNotMatch(bare, /<h2>沿革<\/h2>/, '版が1つも無ければ沿革のパネルを出さない');
 assert.match(
   renderLaw({ guildId: '123', row: { ...lawV2, text: '<script>x</script>' }, versions: [] }),
   /&lt;script&gt;x&lt;\/script&gt;/,
@@ -121,14 +124,19 @@ assert.match(
 );
 assert.doesNotMatch(
   renderLaw({ guildId: '123', row: { ...lawV2, provisions_json: '{壊れたJSON' }, versions: [] }),
-  /<h2>条文<\/h2>/,
+  /id="articles">条文/,
   '壊れた執行定義でも画面を落とさない'
+);
+assert.match(
+  renderLaw({ guildId: '123', row: lawV1, versions: [lawV1] }),
+  /この法令は旧法です。執行されません/,
+  '現行でない法令はその旨を出す'
 );
 
 // --- 憲法 -------------------------------------------------------------------
 const constitutionPage = renderConstitution({ guildId: '123', row: constitution, versions: [constitution] });
 assert.match(constitutionPage, /第一条（主権）/);
-assert.match(constitutionPage, /<h2>実行規則<\/h2>/);
+assert.match(constitutionPage, /実行規則<\/h2>/);
 assert.match(constitutionPage, /<details class="rules">/, '実行規則は畳んで置く');
 assert.doesNotMatch(constitutionPage, /```governance-rules/, '条文側にfenceを残さない');
 
