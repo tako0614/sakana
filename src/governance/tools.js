@@ -26,10 +26,10 @@ import { IMPLEMENTED_TOOLS } from './rules.js';
 const DAY_MS = 86_400_000;
 // ツールループは毎リクエストでmessages配列を丸ごと再送するので、返す量は手数の
 // 二乗で効く。索引として使える最小限まで絞る。全文が要るものは別の経路で読む。
-const CONTENT_LIMIT = 160;
+const CONTENT_LIMIT = 240;
 const DEFAULT_LOOKBACK_DAYS = 30;
 const MAXIMUM_LOOKBACK_DAYS = 90;
-const MAXIMUM_ROWS = 25;
+const MAXIMUM_ROWS = 30;
 
 function boundedInteger(value, fallback, minimum, maximum) {
   const parsed = Number(value);
@@ -90,7 +90,7 @@ const TOOLS = {
     },
     run(context, args) {
       const terms = searchTerms(args.query);
-      const limit = boundedInteger(args.limit, 10, 1, MAXIMUM_ROWS);
+      const limit = boundedInteger(args.limit, 15, 1, MAXIMUM_ROWS);
       const pool = searchGuildActivity(context.guildId, since(context, args.days), terms, 500);
       return pool
         .map((row) => ({ row, score: contextRelevance(String(args.query ?? ''), row.content) }))
@@ -116,7 +116,7 @@ const TOOLS = {
         context.guildId,
         String(args.userId ?? ''),
         since(context, args.days),
-        boundedInteger(args.limit, 10, 1, MAXIMUM_ROWS)
+        boundedInteger(args.limit, 15, 1, MAXIMUM_ROWS)
       );
     }
   },
@@ -137,7 +137,7 @@ const TOOLS = {
         context.guildId,
         since(context, args.days),
         [String(args.channelId ?? '')],
-        boundedInteger(args.limit, 10, 1, MAXIMUM_ROWS)
+        boundedInteger(args.limit, 15, 1, MAXIMUM_ROWS)
       );
     }
   },

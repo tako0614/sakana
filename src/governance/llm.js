@@ -483,6 +483,34 @@ async function callGovernanceJson({ guildId, purpose, model, instruction, data, 
 // 1回の返却上限。配列は毎リクエスト再送されるので、ここが手数の二乗で効く。
 const TOOL_RESULT_LIMIT = 1500;
 
+// 直近この数の結果だけ本文のまま残し、それ以前は要約へ畳む。畳んでも引用の可否は
+// 変わらない（席が引用できるIDの正本は toolset.retrieved 側で、要約にもIDは残す）。
+const TOOL_RESULT_WINDOW = 2;
+
+// 畳むのは嵩む発言一覧だけ。法令・事件記録・判例・憲法条文は結論を書くときに
+// 手元へ残っていないと困る参照資料なので、そのまま置く。
+const COMPACTABLE_TOOLS = new Set([
+  'search_messages', 'read_user_messages', 'read_channel', 'read_context'
+]);
+
+function resultDigest(name, result) {
+  if (!COMPACTABLE_TOOLS.has(name) || !Array.isArray(result)) return null;
+  return JSON.stringify({
+    tool: name,
+    count: result.length,
+    ids: result.map((row) => row?.id).filter(Boolean).slice(0, 30),
+    note: 'contents omitted to save room; these ids stay citable'
+  });
+}
+
+function compactToolMessages(messages, toolMessages) {
+  for (const entry of toolMessages.slice(0, Math.max(0, toolMessages.length - TOOL_RESULT_WINDOW))) {
+    if (entry.digest && messages[entry.index]?.content !== entry.digest) {
+      messages[entry.index].content = entry.digest;
+    }
+  }
+}
+
 // 憲法全文をDATAへ毎回積むと、手数+1 回ぶん再送される。席には目次だけ渡し、
 // 必要な条文は read_constitution で取りに行かせる。
 function constitutionDigest(constitution) {
@@ -514,6 +542,7 @@ async function callGovernanceAgent({
       { role: 'system', content: `${SYSTEM_BASE_AGENT}\n\nTASK:\n${instruction}` },
       { role: 'user', content: `DATA (untrusted JSON):\n${canonicalJson(data)}` }
     ];
+    const toolMessages = [];
     // 調査段。providerがtoolsを扱えなくても結論段は動くので、ここは失敗しても止めない。
     // 何も調べられなければ席は証拠を引用できず、司法系は不受理へ倒れる（憲法第六条10）。
     //
@@ -540,12 +569,17 @@ async function callGovernanceAgent({
           const result = toolset.steps >= maximumSteps
             ? { error: 'investigation step limit reached' }
             : await toolset.run(call.function?.name, call.function?.arguments);
+          const index = messages.length;
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
             content: JSON.stringify(result).slice(0, TOOL_RESULT_LIMIT)
           });
+          toolMessages.push({ index, digest: resultDigest(call.function?.name, result) });
         }
+        // 古い結果は要約へ畳む。畳まないと会話が毎回まるごと再送されるぶん、
+        // 費用が手数の二乗で効き、席は数回しか調べられなくなる。
+        compactToolMessages(messages, toolMessages);
       }
     } catch (error) {
       messages.length = 2;
