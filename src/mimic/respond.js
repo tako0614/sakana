@@ -251,14 +251,22 @@ export async function buildMimicPrompt(
     : tokenRequest(messages, { wanted, engine, channelId, selfId });
 }
 
-// 自分の返答に付けている `-# evex-1 / たこ として` を落とす。
-// 文脈に入れるときに残すと、モデルが footer ごと真似し始める。
-const FOOTER = /\n-#[^\n]*$/;
+// **`-#` の行は文脈に入れない。**あれは Discord の小文字表示 (subtext) の指定で
+// あって発言ではない。自分の返答に付けている `-# evex-5.2-b / たこ として` や
+// `-# thinking 3 秒前` がそのまま入ると、モデルが footer ごと真似し始める。
+//
+// **末尾の1行だけ消す形では足りなかった。**前は `/\n-#[^\n]*$/` で消していたが、
+// あれは「フッターがちょうど最後の行にある」ときしか当たらない。後ろに改行が
+// 1つ残っているだけで素通りするし、本文の途中にある `-#` は当然残る。
+// **行単位で落とす。**
+const SUBTEXT = /^\s*-#(?:\s|$)/;
 
-function stripFooter(text) {
-  let out = String(text ?? '');
-  while (FOOTER.test(out)) out = out.replace(FOOTER, '');
-  return out.trim();
+function stripSubtext(text) {
+  return String(text ?? '')
+    .split('\n')
+    .filter((line) => !SUBTEXT.test(line))
+    .join('\n')
+    .trim();
 }
 
 // その返答を書いたモデル。footer の先頭に必ずモデル名が入っている
@@ -320,9 +328,15 @@ export async function handleMimicRequest(
     // ものは学習データと同じ形なので収まる。DeepSeek 側の回答は落とす。
     const own = (turn) => selfId && turn.authorId === selfId;
     const mine = (turn) => bySelfHosted(turn.content);
+    //
+    // **落とすのは選別した後。**bySelfHosted は footer のラベルを見て
+    // 「自作モデルが書いたものか」を判定しているので、先に消すと自分の返答が
+    // 全部よそ者あつかいになって文脈から丸ごと消える。
+    // **人の発言も通す。**利用者が `-# ` で書いた行も同じく見た目の指定なので、
+    // 文脈に入れる意味が無い (全部消えたらその turn ごと落ちる)。
     const usable = (turns) => turns
       .filter((turn) => (own(turn) ? mine(turn) : !turn.isBot))
-      .map((turn) => (own(turn) ? { ...turn, content: stripFooter(turn.content) } : turn))
+      .map((turn) => ({ ...turn, content: stripSubtext(turn.content) }))
       .filter((turn) => turn.content.trim());
     const recentTurns = usable(recent.map(toTurn));
 
