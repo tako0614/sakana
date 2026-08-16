@@ -70,9 +70,8 @@ const CAPS = {
 };
 const DEFAULT_CAP = Number(process.env.LLM_2CH_CAP_OTHER ?? 10_000_000);
 
-// 露骨な表現。`-cleaned` は上流が有害表現を落とした版だが、
-// なりきり掲示板と同じ網を掛けておく (条件を揃えておくと後で説明しやすい)
-const EXPLICIT = /エッチ|セックス|性器|射精|愛撫|喘ぎ|挿入|勃起|陰茎|陰部|変態プレイ/;
+// **露骨な表現の除去は廃止した** (build-external.mjs に理由を書いた)。
+// `-cleaned` は上流が有害表現を落とした版なので、そちらの選択だけは残る。
 
 // アンカー (`>>123`) と引用行 (`>そうかな`)。宛先の情報は残らないので落とす。
 // evex 側の返信は `<|re|><|sN|>` で表すので、数字が本文に残ると形がぶれる
@@ -87,7 +86,6 @@ function cleanPost(body) {
     .trim();
 
   if (!text || text.length < 2) return null;
-  if (EXPLICIT.test(text)) return null;
   return text.length > MAX_POST_CHARS ? text.slice(0, MAX_POST_CHARS) : text;
 }
 
@@ -116,7 +114,7 @@ async function* lines(file) {
 }
 
 const stats = {
-  dialogues: 0, posts: 0, dropped_explicit: 0, dropped_empty: 0,
+  dialogues: 0, posts: 0, dropped_empty: 0,
   capped: 0, windows: 0, chars: 0, duplicates: 0,
   by_board: {}
 };
@@ -180,7 +178,6 @@ for await (const line of lines(src)) {
   for (const post of row.posts ?? []) {
     stats.posts += 1;
     const raw = String(post.content ?? '');
-    if (EXPLICIT.test(raw)) { stats.dropped_explicit += 1; continue; }
 
     const body = cleanPost(raw);
     if (!body) { stats.dropped_empty += 1; continue; }
@@ -200,7 +197,6 @@ await new Promise((resolve) => sink.end(resolve));
 
 const fmt = (n) => n.toLocaleString();
 console.log(`対話           ${fmt(stats.dialogues)} / 発話 ${fmt(stats.posts)}`);
-console.log(`  露骨を除外   ${fmt(stats.dropped_explicit)}`);
 console.log(`  空を除外     ${fmt(stats.dropped_empty)} (アンカーだけ / 短い)`);
 console.log(`窓             ${fmt(stats.windows)} (最大 ${MAX_CHARS} 字 / ${MAX_POSTS} 発話) `
   + `/ ${fmt(stats.chars)} 字  重複 ${fmt(stats.duplicates)} 件は落とした`);

@@ -57,9 +57,18 @@ const STAGE = /[(（][^)）\n]*[)）]?/g;
 // 中の人の連絡 (`(/参加ありがとうございます`)。会話ではないので落とす
 const OOC = /^[(（]\s*\//;
 
-// 露骨な表現。標本 127万字では ほぼ皆無 (エッチ3 / 裸8 / 脱が1 / 喘1) だが、
-// 606,492 投稿には尾がある。投稿ごと落とす
-const EXPLICIT = /エッチ|セックス|性器|射精|愛撫|喘ぎ|挿入|勃起|陰茎|陰部|変態プレイ/;
+// **露骨な表現の除去は廃止した。**
+//
+// 12 語の正規表現で外部データだけを叩いていたが、実測すると:
+//
+//   なりきり掲示板   904 / 1,047,273 投稿 (0.09%) を除去 → 残り 0%
+//   open2ch          600 / 5,672,367 投稿 (0.01%) を除去 → 残り 0%
+//   **evex 本体      フィルタ無し。該当する会話が 4,766 / 814,259 (0.59%) 残る**
+//
+// 学習の重心は evex 側 (計算量の 80%) なので、**外部だけ 100% 除去して本体は
+// 0% 除去**という逆立ちした状態だった。守っているものが無いのに
+// 「機械的に除去している」という説明だけが残るのは、むしろ誤解を招く。
+// 推論側にも安全機構は置いていない (open weight で公開するので意味が無い)。
 
 // 1 投稿が長すぎるもの。evex は中位 20 字で、なりきりは中位 99 字。
 // 25,369 字の投稿まであるので上限を切る (窓ひとつを 1 投稿で埋めてしまう)
@@ -68,7 +77,6 @@ const MAX_POST_CHARS = Number(process.env.LLM_RP_MAX_POST ?? 600);
 function cleanPost(body) {
   const text = String(body ?? '').trim();
   if (!text || OOC.test(text)) return null;
-  if (EXPLICIT.test(text)) return null;
 
   const kept = KEEP_STAGE
     ? text
@@ -86,7 +94,7 @@ const write = (line) => new Promise((resolve) => {
 });
 
 const stats = {
-  threads: 0, skipped_threads: 0, posts: 0, dropped_ooc: 0, dropped_explicit: 0,
+  threads: 0, skipped_threads: 0, posts: 0, dropped_ooc: 0,
   dropped_empty: 0, truncated: 0, conversations: 0, chars: 0
 };
 
@@ -155,7 +163,6 @@ for await (const line of lines(path.join(src, file))) {
     stats.posts += 1;
     const raw = String(post.post_content ?? '').trim();
     if (OOC.test(raw)) { stats.dropped_ooc += 1; continue; }
-    if (EXPLICIT.test(raw)) { stats.dropped_explicit += 1; continue; }
 
     const body = cleanPost(raw);
     if (!body) { stats.dropped_empty += 1; continue; }
@@ -195,7 +202,6 @@ console.log(`読んだ file     ${SOURCES.join(', ')}`);
 console.log(`スレッド        ${fmt(stats.threads)} (重複や条件外で飛ばした ${fmt(stats.skipped_threads)})`);
 console.log(`投稿            ${fmt(stats.posts)}`);
 console.log(`  OOC を除外    ${fmt(stats.dropped_ooc)}`);
-console.log(`  露骨を除外    ${fmt(stats.dropped_explicit)}`);
 console.log(`  空を除外      ${fmt(stats.dropped_empty)}`);
 console.log(`  長すぎて切った ${fmt(stats.truncated)} (${MAX_POST_CHARS} 字)`);
 console.log(`ト書き          ${KEEP_STAGE ? '残した' : '落とした'} (LLM_RP_STAGE)`);
