@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "sakana-laws",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-13",
+  "send_metrics": false,
+  "observability": { "enabled": true },
+  // 法令集は公開ページなのでworkers.devで出す。版ごとのpreview URLは増やさない。
+  "workers_dev": true,
+  "preview_urls": false,
+  "d1_databases": [
+    {
+      "binding": "LAWS",
+      "database_name": "sakana-laws",
+      "database_id": "a7a062b4-750f-46bd-b1b6-1663e6537efe",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

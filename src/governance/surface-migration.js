@@ -14,9 +14,9 @@ import {
   ensureGovernanceOperationsThread,
   postAuthorityChange,
   syncGovernanceRecordUi,
-  syncStatuteBook,
   withoutLegacyPublicIds
 } from './discord.js';
+import { syncLawSite } from './lawsite.js';
 import { ensureGovernanceUx } from './ux.js';
 import { ensurePublicCaseRecord } from './service.js';
 
@@ -209,7 +209,7 @@ export async function applyGovernanceSurfaceMigration(guild) {
   });
   const ux = await ensureGovernanceUx(guild, inspected.governance);
   let governance = ux.governance;
-  await syncStatuteBook(guild, governance, { verifyExisting: true });
+  syncLawSite(guild, { verifyExisting: true });
   for (const caseRecord of listCases(guild.id, { limit: 1_000 })) {
     if (caseRecord.summary.startsWith('[E2E:')) continue;
     if (!caseRecord.public_thread_id) await ensurePublicCaseRecord(guild, caseRecord);

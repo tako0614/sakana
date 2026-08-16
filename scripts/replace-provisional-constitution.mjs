@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { Client, GatewayIntentBits } from 'discord.js';
 import { governanceCategoryName, loadBootstrapDocuments } from '../src/governance/config.js';
 import { getGovernanceGuild, governanceDatabase, writeAudit } from '../src/governance/db.js';
-import { syncStatuteBook } from '../src/governance/discord.js';
+import { syncLawSite } from '../src/governance/lawsite.js';
 import { ensureGovernanceUx } from '../src/governance/ux.js';
 import { canonicalJson, policyHash, sha256 } from '../src/governance/policy.js';
 
@@ -125,10 +125,11 @@ try {
     await category.setName(governanceCategoryName(serverName), '仮の統治名をサーバー名へ置換');
   }
   const ux = await ensureGovernanceUx(guild, getGovernanceGuild(guildId));
-  await syncStatuteBook(guild, ux.governance, { verifyExisting: true });
+  const queued = syncLawSite(guild, { verifyExisting: true });
   synced = {
     procedureChannelId: ux.governance.procedure_channel_id,
-    statuteForumId: ux.governance.statute_forum_id
+    lawSiteQueued: queued.queued,
+    lawSiteConfigured: !queued.skipped
   };
 } finally {
   client.destroy();

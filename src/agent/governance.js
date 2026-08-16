@@ -9,6 +9,7 @@ import {
   listProposals,
   proposalVoteSummary
 } from '../governance/db.js';
+import { lawSiteLink } from '../governance/lawsite.js';
 
 export const governanceDefinition = {
   type: 'function',
@@ -86,8 +87,7 @@ function proposalKindLabel(value) {
 
 function proposalStateLabel(value) {
   return ({
-    drafting: 'AI起草中', draft: '草案', constitutional_review: '違憲審査',
-    debate: '討議中', voting: '投票中', enacted: '成立', rejected: '否決', remanded: '差戻し'
+    agenda: '議題（国会待ち）', voting: '投票中', enacted: '成立', rejected: '不成立'
   })[value] ?? value;
 }
 
@@ -108,6 +108,11 @@ const PUBLIC_ADMINISTRATIVE_KINDS = new Set([
   'enforcement_mode', 'trusted_role', 'trusted_member_add', 'trusted_member_remove', 'governance_status'
 ]);
 
+function lawSiteLine(guildId) {
+  const link = lawSiteLink(guildId);
+  return link ? `公開場所: ${link}\n` : '';
+}
+
 function publicAdministrativeActs(guildId, limit) {
   return listAdministrativeActs(guildId, Math.max(limit * 4, 100))
     .filter((act) => PUBLIC_ADMINISTRATIVE_KINDS.has(act.kind))
@@ -119,9 +124,6 @@ export function runGovernanceInfo(ctx, args) {
   const governance = getGovernanceGuild(guildId);
   if (!governance) return 'このサーバーでは統治機能が初期化されていません。';
   const action = String(args.action ?? 'status');
-  if (['constitution', 'laws', 'law'].includes(action)) {
-    requireVisible(ctx, governance.statute_forum_id, '法令集');
-  }
   if (['administration', 'administrative_act'].includes(action)) {
     requireVisible(ctx, governance.procedure_channel_id, '手続');
   }
@@ -133,7 +135,6 @@ export function runGovernanceInfo(ctx, args) {
   }
   if (action === 'status') {
     requireVisible(ctx, governance.procedure_channel_id, '手続');
-    requireVisible(ctx, governance.statute_forum_id, '法令集');
     requireVisible(ctx, governance.parliament_forum_id, '議会');
     requireVisible(ctx, governance.court_forum_id, '裁判所');
   }
@@ -143,26 +144,26 @@ export function runGovernanceInfo(ctx, args) {
       `状態: ${governanceStateLabel(governance.status)} / 執行: ${enforcementLabel(governance.enforcement_mode)}`,
       `憲法: v${constitution?.version ?? '?'}`,
       `手続: <#${governance.procedure_channel_id}>`,
-      `法令集: <#${governance.statute_forum_id}>`,
+      lawSiteLink(guildId) ? `法令集: ${lawSiteLink(guildId)}` : null,
       `現行法: ${listLaws(guildId).length}件`,
-      `進行中法案: ${listProposals(guildId, { statuses: ['drafting', 'draft', 'constitutional_review', 'debate', 'voting'], limit: 100 }).length}件`,
+      `議題: ${listProposals(guildId, { statuses: ['agenda'], limit: 100 }).length}件 / 投票中: ${listProposals(guildId, { statuses: ['voting'], limit: 100 }).length}件`,
       `進行中事件: ${listCases(guildId, { statuses: ['filing', 'defense', 'deliberation', 'approval', 'appeal_window', 'appeal'], limit: 100 }).length}件`
-    ].join('\n');
+    ].filter(Boolean).join('\n');
   }
   if (action === 'constitution') {
     const constitution = getActiveConstitution(guildId);
     return constitution
-      ? `公開場所: 法令集 <#${governance.statute_forum_id}>\n現行憲法 v${constitution.version}\n\n${constitution.content}`
+      ? `${lawSiteLine(guildId)}現行憲法 v${constitution.version}\n\n${constitution.content}`
       : '現行憲法がありません。';
   }
   if (action === 'laws') {
     const laws = listLaws(guildId);
-    return `公開場所: 法令集 <#${governance.statute_forum_id}>\n`
+    return lawSiteLine(guildId)
       + (laws.map((law) => `${law.title} / 施行 ${new Date(law.effective_at).toISOString()}`).join('\n') || '現行法はありません。');
   }
   if (action === 'law') {
     const law = requestedRecord(args, listLaws(guildId), guildId, '法律');
-    return `公開場所: 法令集 <#${governance.statute_forum_id}>\n${law.title}\n\n${law.text}`;
+    return `${lawSiteLine(guildId)}${law.title}\n\n${law.text}`;
   }
   if (action === 'proposals') {
     const proposals = listProposals(guildId, { limit: 50 });

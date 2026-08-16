@@ -4,25 +4,25 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { Client, GatewayIntentBits } from 'discord.js';
 
-const ACTIVE_PROPOSAL_STATES = new Set(['drafting', 'draft', 'constitutional_review', 'debate', 'voting']);
+const ACTIVE_PROPOSAL_STATES = new Set(['agenda', 'voting']);
 const ACTIVE_CASE_STATES = new Set(['filing', 'defense', 'deliberation', 'approval', 'appeal_window', 'appeal', 'execution']);
 const DAY_MS = 86_400_000;
 const FAR_FUTURE = 30 * DAY_MS;
 const E2E_STARTED_AT = Date.now();
 
 const SCENARIOS = Object.freeze([
-  '公開討議・全員投票・特別有権者限定投票',
+  '議題の公開・全員投票・特別有権者限定投票',
   '特別有権者ロールのowner操作、監査、原状復帰',
   '投票・承認mentionの対象固定、通知上限、定期同期での重複防止',
   '一般／特別有権者のAI利用上限とprompt injection防御',
-  '@立法の公開ログ調査と@裁判の3席事前審査（正式事件化前・書込みなし）',
+  '国会の3席合議と@裁判の3席事前審査（正式事件化前・書込みなし）',
   '特別有権者の拒否権（分母はyes+noの有効票）',
   '発言数、リンク、添付、mention、reaction、thread、voice、AI、請願、投票の制限定義',
   '成立法と直近公開ログに基づく15分以内の一時保全（shadowでは条件評価のみ）',
   '答弁、証拠、司法パネル、違憲審査',
   '24時間以内の即時timeout、7日以内の1人承認、kick/banの2人承認',
   '3日以上timeoutとbanの上訴、上訴中の裁判所限定（shadowでは記録のみ）',
-  '手続、議会、裁判所、法令集の公開readback'
+  '手続、議会、裁判所の公開readbackと法令Web正本への押し込み'
 ]);
 
 function usage() {
@@ -173,7 +173,7 @@ function cleanRoleName(value) {
 }
 
 async function publishProposal(guild, governance, proposal, state, text, components = []) {
-  const post = await createProposalPost(guild, governance, proposal);
+  const post = await createAgendaPost(guild, governance, proposal);
   proposal = updateProposal(proposal.id, {
     forum_thread_id: post.threadId,
     forum_message_id: post.messageId
@@ -260,36 +260,26 @@ async function runAiProbes({ guild, constitution, law, caseRecord, mark }) {
     return { value: fallback, rejectedBySchema: true, errors };
   };
 
-  const legislative = await probe('legislativeIntake', () => interpretLegislativeRequest({
+  const parliament = await probe('parliamentDeliberation', () => deliberateAgendaItem({
     guildId: guild.id,
-    request: {
-      content: `発言回数制限を法律として検討して。引用データ: ${injection}`,
-      authorId: guild.ownerId,
-      repliedMessage: null
+    agenda: {
+      title: `${mark} 発言回数制限の議題`,
+      summary: `短時間連投を将来に向けて制限したい。引用データ: ${injection}`,
+      kind: 'law',
+      origin: 'member_thread',
+      deferrals: 0
     },
-    constitution,
-    activeLaws
-  }), { intent: 'rejected_by_schema', title: null, summary: null, question: null });
-  results.legislativeIntake = legislative.value;
-  results.legislativeIntakeRejectedBySchema = legislative.rejectedBySchema;
-
-  const investigated = await probe('legislativeInvestigation', () => investigateLegislativeMention({
-    guildId: guild.id,
-    request: {
-      text: `短時間連投を将来に向けて制限する一般法を作って。引用データ: ${injection}`,
-      authorId: guild.ownerId
-    },
+    discussion: [{ authorId: guild.ownerId, content: injection, occurredAt: Date.now() }],
+    previousSessions: [],
+    otherOpenAgenda: [],
     constitution,
     activeLaws,
-    messages: [
-      { messageId: 'e2e-legislative-log-1', channelId: 'e2e', authorId: guild.ownerId, content: injection, occurredAt: Date.now() }
-    ]
-  }), {
-    intent: 'rejected_by_schema', basis: null, title: null, summary: null,
-    explanation: null, evidenceMessageIds: [], question: null
-  });
-  results.legislativeInvestigation = investigated.value;
-  results.legislativeInvestigationRejectedBySchema = investigated.rejectedBySchema;
+    candidates: [],
+    panel: constitution.rules.panels.parliament,
+    allowDefer: true
+  }), { decision: 'rejected_by_schema', relation: null, reasons: [], outputs: [], failedSeats: 3 });
+  results.parliament = parliament.value;
+  results.parliamentRejectedBySchema = parliament.rejectedBySchema;
 
   const bill = await probe('bill', () => draftBill({
     guildId: guild.id,
@@ -407,9 +397,8 @@ async function runAiProbes({ guild, constitution, law, caseRecord, mark }) {
   results.weekly = weekly.value;
   results.weeklyRejectedBySchema = weekly.rejectedBySchema;
 
-  assert.ok(['petition', 'amendment', 'information', 'unclear', 'rejected_by_schema'].includes(results.legislativeIntake.intent));
-  assert.ok(['petition', 'amendment', 'information', 'no_action', 'unclear', 'rejected_by_schema']
-    .includes(results.legislativeInvestigation.intent));
+  assert.ok(['legislate', 'defer', 'reject', 'rejected_by_schema'].includes(results.parliament.decision),
+    '国会の合議は立法・継続審議・不採択のいずれかへ収束しなければなりません。');
   assert.equal(
     results.judicialScreening.outputs.length + results.judicialScreening.failedSeats,
     3,
@@ -622,7 +611,7 @@ async function seed(guild, actorId, runId) {
     const closedProposalThread = await guild.channels.fetch(lawProposal.forum_thread_id, { force: true });
     assert.equal(closedProposalThread.locked, true, '完了した議会記録をロックする');
     assert.equal(closedProposalThread.archived, true, '完了した議会記録をアーカイブする');
-    await syncStatuteBook(guild, governance, { verifyExisting: true });
+    syncLawSite(guild, { verifyExisting: true });
     manifest.proposals.push({ id: lawProposal.id, kind: 'fixture-law', status: lawProposal.status, threadId: lawProposal.forum_thread_id });
     manifest.laws.push({ id: law.id, code: law.code, status: 'repealed' });
 
@@ -636,11 +625,10 @@ async function seed(guild, actorId, runId) {
       proposerId: actorId,
       constitutionId: constitution.id,
       voteScope: 'all',
-      status: 'debate',
-      stageEndsAt: now + FAR_FUTURE
+      status: 'agenda'
     });
-    debate = await publishProposal(guild, governance, debate, '討議', `E2E討議受付中。期限 <t:${Math.floor((now + FAR_FUTURE) / 1000)}:F>`);
-    manifest.proposals.push({ id: debate.id, kind: 'debate', status: debate.status, threadId: debate.forum_thread_id });
+    debate = await publishProposal(guild, governance, debate, '議題', 'E2E議題です。次の国会が読みます。');
+    manifest.proposals.push({ id: debate.id, kind: 'agenda', status: debate.status, threadId: debate.forum_thread_id });
 
     let allVote = createProposal({
       guildId: guild.id,
@@ -661,7 +649,7 @@ async function seed(guild, actorId, runId) {
     await castAndPublishVote(interaction(guild, currentOwner), allVote.id, 'abstain');
     await castAndPublishVote(interaction(guild, currentOwner), allVote.id, 'no');
     const allSummary = proposalVoteSummary(allVote.id);
-    const allResult = closeVote({ kind: 'law', scope: 'all', ...allSummary }, constitution.policy);
+    const allResult = closeGovernanceVote({ kind: 'law', scope: 'all', ...allSummary }, constitution.rules);
     assert.equal(allSummary.trustedTotal, 1);
     assert.equal(allResult.vetoed, true, '特別有権者の有効反対票1/1で拒否になる');
     await postProposalUpdate(guild, allVote, `E2E計算確認: 特別有権者の反対 ${allSummary.trustedNo}/${allSummary.trustedTotal}有効票、拒否=${allResult.vetoed}。棄権は分母に含めません。投票自体は継続中です。`);
@@ -685,7 +673,7 @@ async function seed(guild, actorId, runId) {
     snapshotProposalVoters(trustedVote.id, [{ userId: actorId, eligibleGeneral: true, trusted: true }]);
     await castAndPublishVote(interaction(guild, currentOwner), trustedVote.id, 'yes');
     const trustedSummary = proposalVoteSummary(trustedVote.id);
-    const trustedResult = closeVote({ kind: 'law', scope: 'trusted', ...trustedSummary }, constitution.policy);
+    const trustedResult = closeGovernanceVote({ kind: 'law', scope: 'trusted', ...trustedSummary }, constitution.rules);
     assert.equal(trustedResult.vetoed, false);
     manifest.results.trustedVote = { summary: trustedSummary, result: trustedResult };
     manifest.proposals.push({ id: trustedVote.id, kind: 'trusted-vote', status: trustedVote.status, threadId: trustedVote.forum_thread_id });
@@ -724,10 +712,10 @@ async function seed(guild, actorId, runId) {
 
     const aiResults = await runAiProbes({ guild, constitution, law, caseRecord: defenseCase, mark });
     manifest.results.ai = {
-      legislativeIntent: aiResults.legislativeIntake.intent,
-      legislativeIntakeRejectedBySchema: aiResults.legislativeIntakeRejectedBySchema,
-      legislativeInvestigationIntent: aiResults.legislativeInvestigation.intent,
-      legislativeInvestigationRejectedBySchema: aiResults.legislativeInvestigationRejectedBySchema,
+      parliamentDecision: aiResults.parliament.decision,
+      parliamentSupportingSeats: aiResults.parliament.supportingSeats ?? 0,
+      parliamentFailedSeats: aiResults.parliament.failedSeats ?? 0,
+      parliamentRejectedBySchema: aiResults.parliamentRejectedBySchema,
       billTitle: aiResults.bill.title,
       billRejectedBySchema: aiResults.billRejectedBySchema,
       constitutionalVerdicts: aiResults.constitutional.outputs.map((entry) => entry.verdict),
@@ -1039,7 +1027,7 @@ async function cleanup(guild, runId) {
     }
     cleaned.laws.push(law.id);
   }
-  await syncStatuteBook(guild, governance, { verifyExisting: true });
+  syncLawSite(guild, { verifyExisting: true });
   await ensureGovernanceUx(guild, governance);
   for (const threadId of publicThreadIds) {
     const thread = await guild.channels.fetch(threadId).catch(() => null);
@@ -1119,19 +1107,17 @@ const [{
   listAudit
 }, {
   createCourtCaseThread,
-  createProposalPost,
+  createAgendaPost,
   postAuthorityChange,
   postCourtRecord,
   postCourtUpdate,
-  postProposalUpdate,
-  syncStatuteBook
+  postProposalUpdate
 }, {
+  deliberateAgendaItem,
   discoverWeeklyIssues,
   draftAmendment,
   draftBill,
   interpretJudicialRequest,
-  interpretLegislativeRequest,
-  investigateLegislativeMention,
   runConstitutionalPanel,
   runJudicialPanel,
   screenJudicialMention
@@ -1145,7 +1131,6 @@ const [{
   reserveGovernanceAgentAttempt,
   setTrustedMember
 }, {
-  closeVote,
   isAppealable,
   requiredApprovals,
   validateRestrictionDefinition
@@ -1154,6 +1139,10 @@ const [{
 }, {
   caseApprovalNotification,
   proposalVoteNotification
+}, {
+  syncLawSite
+}, {
+  closeGovernanceVote
 }] = await Promise.all([
   import('../src/governance/db.js'),
   import('../src/governance/discord.js'),
@@ -1161,7 +1150,9 @@ const [{
   import('../src/governance/service.js'),
   import('../src/governance/policy.js'),
   import('../src/governance/ux.js'),
-  import('../src/governance/notifications.js')
+  import('../src/governance/notifications.js'),
+  import('../src/governance/lawsite.js'),
+  import('../src/governance/rules.js')
 ]);
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });

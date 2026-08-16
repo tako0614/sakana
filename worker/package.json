@@ -1,0 +1,14 @@
+{
+  "name": "sakana-laws",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --local",
+    "migrate:local": "wrangler d1 migrations apply sakana-laws --local",
+    "migrate": "wrangler d1 migrations apply sakana-laws --remote",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.122.0"
+  }
+}
