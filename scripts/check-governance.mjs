@@ -62,7 +62,7 @@ assert.equal(parseOperationalSetting('investigation_guild_limit', '501').ok, fal
   'サーバー全体のAI調査件数は安全上限を超えられない');
 policyModule.validateConstitutionPolicy(policy);
 assert.equal(policy.schemaVersion, 2);
-assert.deepEqual(policyModule.summaryProcedure(policy), policy.judiciary.summaryProcedure);
+assert.deepEqual(policyModule.policeProcedure(policy), policy.judiciary.policeProcedure);
 assert.deepEqual(Object.keys(policy.legislation).sort(),
   ['agendaLimit', 'logScan', 'maximumDeferrals', 'sessionIntervalMilliseconds', 'voteMilliseconds'],
   '国会の量的な決定は憲法の実行規則にだけ置く');
@@ -121,18 +121,17 @@ assert.equal(policyModule.validateRestrictionDefinition({
   code: 'RAW_PERMISSION',
   rules: [{ primitive: 'block_links', enabled: true, permission: 'Administrator' }]
 }, policy), false, '宣言schema外のDiscord権限は拒否する');
-assert.equal(policyModule.validateInterimProtectionDefinition({
-  trigger: { type: 'message_burst', minimumMessages: 5, windowSeconds: 30 },
-  durationSeconds: 300
-}), true, '短時間のmessage burstだけを一時保全の客観条件にできる');
-assert.equal(policyModule.validateInterimProtectionDefinition({
-  trigger: { type: 'message_burst', minimumMessages: 4, windowSeconds: 30 },
-  durationSeconds: 300
-}), false, '5件未満の低い閾値では発言を制限できない');
-assert.equal(policyModule.validateInterimProtectionDefinition({
-  trigger: { type: 'message_burst', minimumMessages: 5, windowSeconds: 30 },
-  durationSeconds: 901
-}), false, '一時保全は15分を超えられない');
+assert.equal(policy.judiciary.policeProcedure.detentionMaximumSeconds * 1000
+  <= policy.judiciary.policeProcedure.contestMilliseconds, true,
+  '拘留は不服申立ての期限より長く続かない');
+const longDetention = structuredClone(compiledConstitution.rules);
+longDetention.sanctions.detention.maximum = '2d';
+assert.throws(() => rulesModule.validateGovernanceRules(longDetention), /24時間を超えられません/,
+  '拘留は保全なので技術上限を超えられない');
+const overlappingPolice = structuredClone(compiledConstitution.rules);
+overlappingPolice.sanctions.police.immediate = ['warning', 'restriction', 'timeout', 'ban'];
+assert.throws(() => rulesModule.validateGovernanceRules(overlappingPolice), /重複できません/,
+  '警察の即時処分と裁判所送りは重複できない');
 assert.equal(policyModule.validateSanctionAgainstOffense(
   { type: 'restriction', definitionCode: 'NOT_ALLOWED', durationSeconds: 600 },
   {
@@ -634,29 +633,6 @@ const scopedProposal = governanceDb.createProposal({
 });
 assert.equal(scopedProposal.vote_scope, 'trusted');
 
-const interimLawProposal = governanceDb.createProposal({
-  guildId: 'g2', kind: 'law', source: 'test', title: '公開ログ一時保全test', summary: 'test',
-  proposerId: 'u', constitutionId: governanceDb.getActiveConstitution('g2').id, voteScope: 'all'
-});
-const interimLaw = governanceDb.enactLaw({
-  guildId: 'g2', proposalId: interimLawProposal.id, code: 'LAW-INTERIM-TEST', title: '公開ログ一時保全test',
-  text: '公開ログの短時間burstだけを一時保全条件にする。',
-  constitutionId: governanceDb.getActiveConstitution('g2').id,
-  effectiveAt: Date.now() - 60_000,
-  provisions: {
-    articles: [{ code: 'A1', text: '一時保全は判決ではなく自動終了する。' }],
-    offenses: [{
-      code: 'MESSAGE_BURST', title: 'message burst', elements: ['短時間に反復投稿したこと'],
-      sanctions: [{ type: 'warning' }],
-      interimProtection: {
-        trigger: { type: 'message_burst', minimumMessages: 5, windowSeconds: 30 },
-        durationSeconds: 300
-      }
-    }],
-    sanctionDefinitions: []
-  }
-});
-
 const caseWithTime = governanceDb.createCase({
   guildId: 'g2', reporterId: 'r', accusedId: 'a', lawId: law.id, offenseCode: 'O1',
   summary: 'time', allegedAt: 123456789, status: 'defense'
@@ -666,22 +642,22 @@ assert.equal(caseWithTime.alleged_at, 123456789, '違反行為時刻を証拠時
 const summaryCase = governanceDb.createCase({
   guildId: 'g1', reporterId: 'summary-reporter', accusedId: 'summary-accused',
   lawId: law.id, offenseCode: 'O1', summary: '迅速手続test', allegedAt: Date.now(),
-  status: 'summary_active', constitutionId: activeConstitution.id, procedureVersion: 2,
-  summaryEventKey: 'auto:test:1'
+  status: 'contest_window', constitutionId: activeConstitution.id, procedureVersion: 2,
+  policeEventKey: 'auto:test:1'
 });
 assert.equal(summaryCase.constitution_id, activeConstitution.id, '事件受付時の憲法を固定する');
 assert.equal(summaryCase.procedure_version, 2);
-assert.equal(governanceDb.findCaseBySummaryEvent('g1', 'auto:test:1').id, summaryCase.id);
+assert.equal(governanceDb.findCaseByPoliceEvent('g1', 'auto:test:1').id, summaryCase.id);
 assert.throws(() => governanceDb.createCase({
   guildId: 'g1', reporterId: 'summary-reporter', accusedId: 'summary-accused',
-  lawId: law.id, offenseCode: 'O1', summary: '二重発火', status: 'summary_review',
-  constitutionId: activeConstitution.id, procedureVersion: 2, summaryEventKey: 'auto:test:1'
+  lawId: law.id, offenseCode: 'O1', summary: '二重発火', status: 'police_review',
+  constitutionId: activeConstitution.id, procedureVersion: 2, policeEventKey: 'auto:test:1'
 }), /UNIQUE/, '同じ自動検知イベントから事件を二重作成しない');
 const reviewableWarning = governanceDb.createSanction({
   caseId: summaryCase.id, guildId: 'g1', userId: 'summary-accused', type: 'warning',
   status: 'reviewable', requiredApprovals: 0, appealable: false
 });
-assert.equal(governanceDb.listReviewableSanctions('g1', 'summary-accused')[0].id, reviewableWarning.id,
+assert.equal(governanceDb.listContestableSanctions('g1', 'summary-accused')[0].id, reviewableWarning.id,
   'warningは期間なしで裁判請求対象として取得できる');
 
 const administrativeAct = governanceDb.createAdministrativeAct({
@@ -711,7 +687,7 @@ governanceDb.updateCase(caseWithTime.id, { public_thread_id: 'public-court' });
 const {
   addEvidenceToCase,
   advanceProposal,
-  applyInterimProtectionFromLogs,
+  applyDetentionFromLogs,
   approveCase,
   castAndPublishVote,
   completeCaseResponse,
@@ -719,7 +695,7 @@ const {
   recordGovernanceMessage,
   recordCourtSubmission,
   recordCourtSubmissionEdit,
-  requestSummaryTrial
+  requestTrial
 } = await import('../src/governance/service.js');
 
 // 立法の合議・継続審議・成立まではscripts/check-parliament.mjsが実際に一巡させる。
@@ -821,7 +797,7 @@ assert.equal(await recordCourtSubmission({
 assert.equal(summaryDirectDeleted, true);
 const oldWarningExecution = Date.now() - 365 * policyModule.DAY_MS;
 governanceDb.updateSanction(reviewableWarning.id, { executed_at: oldWarningExecution });
-const requestedTrial = await requestSummaryTrial(summaryGuild, { id: 'summary-accused' }, reviewableWarning.id);
+const requestedTrial = await requestTrial(summaryGuild, { id: 'summary-accused' }, reviewableWarning.id);
 assert.equal(requestedTrial.status, 'defense');
 assert.equal(requestedTrial.review_count, 1, '即時処分ごとの裁判請求は一度だけ記録する');
 assert.ok(requestedTrial.defense_until <= Date.now() + policyModule.DAY_MS + 1_000,
@@ -829,105 +805,11 @@ assert.ok(requestedTrial.defense_until <= Date.now() + policyModule.DAY_MS + 1_0
 assert.ok(governanceDb.getSanction(reviewableWarning.id).review_requested_at,
   '1年前のwarningでも期限なく裁判を求められる');
 await assert.rejects(
-  requestSummaryTrial(summaryGuild, { id: 'summary-accused' }, reviewableWarning.id),
+  requestTrial(summaryGuild, { id: 'summary-accused' }, reviewableWarning.id),
   /既に使われています/,
   '同じ処分の裁判請求を二重に開始しない'
 );
 
-const interimCourtMessages = [];
-const interimThreads = new Map();
-const interimGuild = {
-  id: 'g2', name: 'Test Community',
-  ownerId: 'owner',
-  channels: { fetch: async (id) => interimThreads.get(id) ?? null },
-  members: {
-    fetch: async (id) => ({
-      id,
-      permissions: { has: () => false }
-    })
-  }
-};
-const makeInterimCase = (suffix, userId, occurredAt) => {
-  let record = governanceDb.createCase({
-    guildId: 'g2', reporterId: `reporter-${suffix}`, accusedId: userId,
-    lawId: interimLaw.id, offenseCode: 'MESSAGE_BURST', summary: `一時保全${suffix}`,
-    status: 'defense', defenseUntil: occurredAt + 3_600_000, allegedAt: occurredAt
-  });
-  const threadId = `interim-court-${suffix}`;
-  record = governanceDb.updateCase(record.id, { public_thread_id: threadId });
-  interimThreads.set(threadId, {
-    isThread: () => true,
-    fetchStarterMessage: async () => null,
-    send: async (payload) => { interimCourtMessages.push(payload.content); return payload; }
-  });
-  return record;
-};
-const interimNow = Date.now();
-const seedBurst = (suffix, userId, occurredAt, count) => {
-  const channelId = `burst-channel-${suffix}`;
-  for (let index = 0; index < count; index += 1) {
-    governanceDb.recordActivity({
-      messageId: `burst-${suffix}-${index}`, guildId: 'g2', channelId, parentId: null, userId,
-      activityDate: '2026-08-12', contentHash: `burst-hash-${suffix}-${index}`,
-      content: `burst ${index}`, createdAt: occurredAt - (count - index - 1) * 1000
-    });
-  }
-  return { channelId, messageId: `burst-${suffix}-${count - 1}` };
-};
-const insufficientCase = makeInterimCase('insufficient', 'burst-insufficient', interimNow);
-const insufficientEvidence = seedBurst('insufficient', 'burst-insufficient', interimNow, 4);
-governanceDb.addCaseEvidence({
-  caseId: insufficientCase.id, submittedBy: 'reporter-insufficient', authorId: 'burst-insufficient',
-  ...insufficientEvidence, content: '4件だけ', occurredAt: interimNow
-});
-governanceDb.updateGovernanceGuild('g2', { enforcement_mode: 'live' });
-assert.equal(await applyInterimProtectionFromLogs(interimGuild, insufficientCase, interimNow), null,
-  '成立法があっても公開ログが5件未満なら一時保全しない');
-
-const staleAt = interimNow - 31_000;
-const staleCase = makeInterimCase('stale', 'burst-stale', staleAt);
-const staleEvidence = seedBurst('stale', 'burst-stale', staleAt, 5);
-governanceDb.addCaseEvidence({
-  caseId: staleCase.id, submittedBy: 'reporter-stale', authorId: 'burst-stale',
-  ...staleEvidence, content: '古い5件', occurredAt: staleAt
-});
-assert.equal(await applyInterimProtectionFromLogs(interimGuild, staleCase, interimNow), null,
-  '過去のburstを使って現在の発言を制限しない');
-
-const protectedCase = makeInterimCase('active', 'burst-active', interimNow);
-const protectedEvidence = seedBurst('active', 'burst-active', interimNow, 5);
-governanceDb.addCaseEvidence({
-  caseId: protectedCase.id, submittedBy: 'reporter-active', authorId: 'burst-active',
-  ...protectedEvidence, content: '直近5件', occurredAt: interimNow
-});
-const interimProtection = await applyInterimProtectionFromLogs(interimGuild, protectedCase, interimNow);
-assert.equal(interimProtection.status, 'active');
-assert.equal(interimProtection.observed_events, 5);
-assert.match(interimCourtMessages.at(-1), /判決や刑罰ではなく、自動終了/);
-
-const interimRestrictions = await import('../src/governance/restrictions.js');
-assert.equal(interimRestrictions.governanceActionAllowed('g2', 'burst-active', 'vote', interimNow), false,
-  '一時保全中は裁判所以外の統治操作を開始できない');
-let interimOutsideDeleted = false;
-const interimMessage = {
-  id: 'interim-outside', guildId: 'g2', channelId: 'ordinary-channel',
-  guild: interimGuild,
-  author: { id: 'burst-active', bot: false, send: async () => {} },
-  channel: { isThread: () => false },
-  content: '投稿', attachments: { size: 0 },
-  mentions: { users: { size: 0 }, roles: { size: 0 }, channels: { size: 0 }, everyone: false },
-  delete: async () => { interimOutsideDeleted = true; }
-};
-assert.equal(await interimRestrictions.enforceMessageRestrictions(interimMessage), true);
-assert.equal(interimOutsideDeleted, true, '一時保全中の裁判所以外の投稿を即時削除する');
-assert.equal(await interimRestrictions.enforceMessageRestrictions({
-  ...interimMessage,
-  id: 'interim-own-court',
-  channelId: protectedCase.public_thread_id,
-  channel: { isThread: () => true },
-  delete: async () => { throw new Error('自分の事件での防御権を妨げてはならない'); }
-}), false, '一時保全中も自分の事件では答弁できる');
-governanceDb.endInterimProtection(protectedCase.id, 'released', interimNow + 1);
 governanceDb.updateGovernanceGuild('g2', { enforcement_mode: 'shadow' });
 governanceDb.updateProposal(proposal.id, {
   forum_thread_id: 'public-proposal',
@@ -1492,8 +1374,8 @@ assert.deepEqual(courtForumEveryonePermissionState(), {
 }, '裁判所は全員が閲覧でき、当事者の回答はbotの専用操作だけから受け付ける');
 assert.deepEqual(
   courtActionButtons({ id: 7, status: 'defense' })[0].components.map((button) => button.data.label),
-  ['回答を書く', '証拠を出す', '回答完了'],
-  '高速裁判は当事者の専用操作に絞る'
+  ['回答を書く', '証拠を出す', '回答完了', '取り下げる'],
+  '裁判所では回答と取り下げを当事者の専用操作に絞る'
 );
 assert.deepEqual(
   courtActionButtons({ id: 7, status: 'appeal_window' })[0].components.map((button) => button.data.label),
@@ -1501,6 +1383,11 @@ assert.deepEqual(
   '重大処分の上訴も事件投稿の専用操作から開始する'
 );
 assert.equal(courtActionButtons({ id: 7, status: 'final' }).length, 0, '確定後は回答操作を消す');
+assert.deepEqual(
+  courtActionButtons({ id: 7, status: 'contest_window', guild_id: 'g1' }),
+  [],
+  '処分がまだ無い事件では不服ボタンを出さない'
+);
 const appealPermission = (allowed) => ({ has: (permission) => allowed.includes(permission) });
 assert.equal(appealRestrictedChannelAccessible({
   id: 'voice', parentId: null,
@@ -1687,7 +1574,7 @@ assert.doesNotMatch(procedureHub.content, /順番\s*\d+/, '意味の薄い内部
 assert.doesNotMatch(procedureHub.content, /L-1|C-\d+/, '手続では参照IDを出さない');
 assert.doesNotMatch(procedureHub.content, /Bot権限|AI受付|自律起案|診断・復旧/, '公開手続に技術運用を混ぜない');
 assert.equal(procedureHub.components.length, 2);
-assert.equal(procedureHub.components[1].components[0].data.label, '自分の即時処分を確認');
+assert.equal(procedureHub.components[1].components[0].data.label, '自分が受けた処分を確認');
 let uxVoteProposal = governanceDb.createProposal({
   guildId: 'g1', kind: 'law', source: 'petition', title: '手続カードで投票する法案',
   summary: '議論と投票操作を分離する。', proposerId: 'u', constitutionId: uxConstitution.id,
@@ -1847,7 +1734,7 @@ assert.match(parliamentSource, /runConstitutionalPanel/,
   '事前違憲審査の段階を廃止しても、憲法適合は国会の中で必ず確認する');
 assert.match(intakeSource, /screenJudicialMention/,
   '@裁判は人間の法選択フォームではなく独立AI席の成立法照合から開始する');
-assert.match(intakeSource, /findCaseBySummaryEvent/,
+assert.match(intakeSource, /findCaseByPoliceEvent/,
   '同じ証拠・被申立人・成立法から同じ事件を二重作成しない');
 assert.match(intakeSource, /resumePendingMentionInvestigations/,
   'bot停止で中断したAI調査は保存済み記録から自動再開する');

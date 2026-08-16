@@ -1,15 +1,6 @@
 import { createHash } from 'node:crypto';
 
 export const DAY_MS = 86_400_000;
-export const INTERIM_PROTECTION_LIMITS = Object.freeze({
-  minimumMessages: 5,
-  maximumMessages: 30,
-  minimumWindowSeconds: 10,
-  maximumWindowSeconds: 300,
-  minimumDurationSeconds: 60,
-  maximumDurationSeconds: 900
-});
-
 export const AUTOMATIC_TRIGGER_LIMITS = Object.freeze({
   minimumMessages: 5,
   maximumMessages: 30,
@@ -17,8 +8,9 @@ export const AUTOMATIC_TRIGGER_LIMITS = Object.freeze({
   maximumWindowSeconds: 300
 });
 
-export function summaryProcedure(policy) {
-  return policy?.schemaVersion === 2 ? policy.judiciary?.summaryProcedure ?? null : null;
+// 警察の即時処分と、争われたときだけ開く裁判所を分ける手続。
+export function policeProcedure(policy) {
+  return policy?.schemaVersion === 2 ? policy.judiciary?.policeProcedure ?? null : null;
 }
 
 export function validateAutomaticTrigger(value) {
@@ -44,25 +36,6 @@ export function canonicalJson(value) {
     return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
   }
   return JSON.stringify(value);
-}
-
-export function validateInterimProtectionDefinition(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  if (Object.keys(value).some((key) => !['trigger', 'durationSeconds'].includes(key))) return false;
-  const trigger = value.trigger;
-  if (!trigger || typeof trigger !== 'object' || Array.isArray(trigger)) return false;
-  if (Object.keys(trigger).some((key) => !['type', 'minimumMessages', 'windowSeconds'].includes(key))) return false;
-  const limits = INTERIM_PROTECTION_LIMITS;
-  return trigger.type === 'message_burst'
-    && Number.isInteger(trigger.minimumMessages)
-    && trigger.minimumMessages >= limits.minimumMessages
-    && trigger.minimumMessages <= limits.maximumMessages
-    && Number.isInteger(trigger.windowSeconds)
-    && trigger.windowSeconds >= limits.minimumWindowSeconds
-    && trigger.windowSeconds <= limits.maximumWindowSeconds
-    && Number.isInteger(value.durationSeconds)
-    && value.durationSeconds >= limits.minimumDurationSeconds
-    && value.durationSeconds <= limits.maximumDurationSeconds;
 }
 
 function finite(value, name, { min = 0, max = Infinity } = {}) {
@@ -139,50 +112,39 @@ export function validateConstitutionPolicy(policy, { technicalOnly = false } = {
     throw new Error('答弁・上訴期間は最低1時間必要です。');
   }
   if (policy.schemaVersion === 2) {
-    const procedure = judiciary.summaryProcedure;
+    const procedure = judiciary.policeProcedure;
     if (!procedure || typeof procedure !== 'object' || Array.isArray(procedure)) {
-      throw new Error('summaryProcedureがありません。');
+      throw new Error('policeProcedureがありません。');
     }
     const allowedKeys = new Set([
-      'panelSeats', 'votesRequired', 'trialMilliseconds', 'immediateSanctions',
-      'trialFirstSanctions', 'unlimitedWarningReview'
+      'panelSeats', 'votesRequired', 'contestMilliseconds', 'detentionMaximumSeconds',
+      'immediateSanctions', 'courtFirstSanctions', 'unlimitedWarningContest'
     ]);
     if (Object.keys(procedure).some((key) => !allowedKeys.has(key))) {
-      throw new Error('summaryProcedureに未対応の設定があります。');
+      throw new Error('policeProcedureに未対応の設定があります。');
     }
-    for (const key of ['panelSeats', 'votesRequired', 'trialMilliseconds']) {
-      if (!Number.isInteger(procedure[key])) throw new Error(`summaryProcedure.${key}は整数である必要があります。`);
+    for (const key of ['panelSeats', 'votesRequired', 'contestMilliseconds', 'detentionMaximumSeconds']) {
+      if (!Number.isInteger(procedure[key])) throw new Error(`policeProcedure.${key}は整数である必要があります。`);
     }
     if (procedure.panelSeats < 1 || procedure.panelSeats > 5 || procedure.panelSeats % 2 === 0
       || procedure.votesRequired < 1 || procedure.votesRequired > procedure.panelSeats) {
-      throw new Error('summaryProcedureの席数または必要票が不正です。');
+      throw new Error('policeProcedureの席数または必要票が不正です。');
     }
-    if (!technicalOnly
-      && (judiciary.panelSeats !== procedure.panelSeats || judiciary.guiltyVotesRequired !== procedure.votesRequired)) {
-      throw new Error('v2の通常裁判も即時判定と同じ3席中2席である必要があります。');
-    }
-    if (!technicalOnly && (procedure.panelSeats !== 3 || procedure.votesRequired !== 2)) {
-      throw new Error('v2の即時判定は3席中2席で固定です。');
-    }
-    if (!technicalOnly && procedure.trialMilliseconds !== DAY_MS) {
-      throw new Error('v2の裁判期限は24時間で固定です。');
+    // 拘留は保全なので、不服申立ての期限より長く続けられない。
+    if (procedure.detentionMaximumSeconds * 1000 > procedure.contestMilliseconds) {
+      throw new Error('拘留の上限は不服申立て期間を超えられません。');
     }
     const validSanctionSet = (value) => Array.isArray(value)
       && new Set(value).size === value.length
       && value.every((entry) => ['warning', 'restriction', 'timeout', 'kick', 'ban'].includes(entry));
-    const exactSanctions = (value, expected) => validSanctionSet(value)
-      && value.length === expected.length
-      && value.every((entry, index) => entry === expected[index]);
-    if ((!technicalOnly && (!exactSanctions(procedure.immediateSanctions, ['warning', 'restriction', 'timeout'])
-      || !exactSanctions(procedure.trialFirstSanctions, ['kick', 'ban'])))
-      || (technicalOnly && (!validSanctionSet(procedure.immediateSanctions)
-        || !validSanctionSet(procedure.trialFirstSanctions)
-        || procedure.immediateSanctions.some((entry) => procedure.trialFirstSanctions.includes(entry))))) {
-      throw new Error('v2の即時処分・裁判先行処分の区分が不正です。');
+    // どの処分を警察が打てるかは憲法が決める。コードは重複と未知の種別だけ弾く。
+    if (!validSanctionSet(procedure.immediateSanctions)
+      || !validSanctionSet(procedure.courtFirstSanctions)
+      || procedure.immediateSanctions.some((entry) => procedure.courtFirstSanctions.includes(entry))) {
+      throw new Error('警察の即時処分・裁判所送りの区分が不正です。');
     }
-    if ((!technicalOnly && procedure.unlimitedWarningReview !== true)
-      || (technicalOnly && typeof procedure.unlimitedWarningReview !== 'boolean')) {
-      throw new Error('warningの裁判請求設定が不正です。');
+    if (typeof procedure.unlimitedWarningContest !== 'boolean') {
+      throw new Error('warningの不服申立て設定が不正です。');
     }
   }
   if (judiciary.constitutionalChallengesPerMemberPerDay < 1
@@ -279,7 +241,7 @@ export function requiredApprovals(sanction, policy) {
   if (sanction.type === 'timeout' && sanction.durationSeconds > policy.judiciary.immediateTimeoutMaximumSeconds) {
     return policy.judiciary.timeoutApprovalsAboveSeconds;
   }
-  if (summaryProcedure(policy)) return 0;
+  if (policeProcedure(policy)) return 0;
   return 0;
 }
 

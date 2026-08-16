@@ -564,7 +564,7 @@ async function seed(guild, actorId, runId) {
       status: 'defense',
       defenseUntil: now + FAR_FUTURE,
       allegedAt: now,
-      summaryEventKey: caseKey('interim-protection')
+      policeEventKey: caseKey('interim-protection')
     });
     addCaseEvidence({
       caseId: interimCase.id,
@@ -582,7 +582,7 @@ async function seed(guild, actorId, runId) {
       '答弁',
       '公開ログの件数・時間窓・証拠メッセージ一致を確認します。shadowのため実際の発言制限は行いません。'
     );
-    const interimProtection = await applyInterimProtectionFromLogs(guild, interimCase, now);
+    const interimProtection = await applyDetentionFromLogs(guild, interimCase, now);
     assert.equal(interimProtection?.status, 'simulated');
     assert.equal(interimProtection?.observed_events, 5);
     endInterimProtection(interimCase.id, 'e2e_completed');
@@ -693,7 +693,7 @@ async function seed(guild, actorId, runId) {
       defenseUntil: now + FAR_FUTURE,
       allegedAt: now,
       retryAfter: now + 365 * DAY_MS,
-      summaryEventKey: caseKey('defense-ai')
+      policeEventKey: caseKey('defense-ai')
     });
     defenseCase = updateCase(defenseCase.id, { retry_after: now + 365 * DAY_MS });
     defenseCase = await publishCase(guild, governance, defenseCase, '答弁', '公開答弁・証拠記録のE2Eです。実在memberへの申立てではありません。');
@@ -761,7 +761,7 @@ async function seed(guild, actorId, runId) {
       summary: '【動作確認】違憲審査の公開答弁導線を確認するfixture',
       status: 'defense',
       defenseUntil: now + FAR_FUTURE,
-      summaryEventKey: caseKey('constitutional')
+      policeEventKey: caseKey('constitutional')
     });
     constitutionalCase = updateCase(constitutionalCase.id, { retry_after: now + 365 * DAY_MS });
     constitutionalCase = await publishCase(guild, governance, constitutionalCase, '答弁', '法律・判決・処分・行政行為に対する違憲審査導線のE2Eです。');
@@ -770,7 +770,7 @@ async function seed(guild, actorId, runId) {
     let immediateCase = createCase({
       guildId: guild.id, kind: 'criminal', reporterId, accusedId, lawId: law.id,
       offenseCode: 'E2E_INJECTION', summary: '【動作確認】24時間以内timeoutは即時処理', status: 'final', allegedAt: now,
-      summaryEventKey: caseKey('timeout-immediate')
+      policeEventKey: caseKey('timeout-immediate')
     });
     const immediateSanction = createSanction({
       caseId: immediateCase.id, guildId: guild.id, userId: accusedId, type: 'timeout', durationSeconds: 86_400,
@@ -783,7 +783,7 @@ async function seed(guild, actorId, runId) {
     const warningCase = createCase({
       guildId: guild.id, kind: 'criminal', reporterId, accusedId, lawId: law.id,
       offenseCode: 'E2E_INJECTION', summary: '【動作確認】warning刑のschemaとshadow記録', status: 'final', allegedAt: now,
-      summaryEventKey: caseKey('warning')
+      policeEventKey: caseKey('warning')
     });
     const warningSanction = createSanction({
       caseId: warningCase.id, guildId: guild.id, userId: accusedId, type: 'warning', status: 'simulated',
@@ -794,7 +794,7 @@ async function seed(guild, actorId, runId) {
     const restrictionCase = createCase({
       guildId: guild.id, kind: 'criminal', reporterId, accusedId, lawId: law.id,
       offenseCode: 'E2E_INJECTION', summary: '【動作確認】新しい制限定義とrestriction刑のshadow記録', status: 'final', allegedAt: now,
-      summaryEventKey: caseKey('restriction')
+      policeEventKey: caseKey('restriction')
     });
     const restrictionSanction = createSanction({
       caseId: restrictionCase.id,
@@ -815,7 +815,7 @@ async function seed(guild, actorId, runId) {
     let approvalCase = createCase({
       guildId: guild.id, kind: 'criminal', reporterId, accusedId, lawId: law.id,
       offenseCode: 'E2E_INJECTION', summary: '【動作確認】7日以内timeoutの1人承認とshadow確定', status: 'approval', allegedAt: now,
-      summaryEventKey: caseKey('timeout-one-approval')
+      policeEventKey: caseKey('timeout-one-approval')
     });
     approvalCase = await publishCase(guild, governance, approvalCase, '承認', '2日timeoutのため特別有権者1人の記名承認を確認します。');
     const timeoutSanction = createSanction({
@@ -833,7 +833,7 @@ async function seed(guild, actorId, runId) {
     let kickCase = createCase({
       guildId: guild.id, kind: 'criminal', reporterId, accusedId, lawId: law.id,
       offenseCode: 'E2E_INJECTION', summary: '【動作確認】kick/banの2人承認待ち', status: 'approval', allegedAt: now,
-      summaryEventKey: caseKey('kick-two-approval')
+      policeEventKey: caseKey('kick-two-approval')
     });
     kickCase = await publishCase(guild, governance, kickCase, '承認', 'kickは2人承認が必要です。owner本人の1票だけを記録し、他人の承認は作りません。');
     const kickSanction = createSanction({
@@ -850,7 +850,7 @@ async function seed(guild, actorId, runId) {
     let appealWindowCase = createCase({
       guildId: guild.id, kind: 'criminal', reporterId, accusedId, lawId: law.id,
       offenseCode: 'E2E_INJECTION', summary: '【動作確認】banと3日以上timeoutの上訴受付', status: 'appeal_window', allegedAt: now,
-      summaryEventKey: caseKey('appeal-window')
+      policeEventKey: caseKey('appeal-window')
     });
     appealWindowCase = await publishCase(guild, governance, appealWindowCase, '上訴待ち', 'ban判決の上訴受付fixtureです。実在memberへの処分はありません。');
     const banSanction = createSanction({
@@ -865,7 +865,7 @@ async function seed(guild, actorId, runId) {
     let appealedCase = createCase({
       guildId: guild.id, kind: 'criminal', reporterId, accusedId, lawId: law.id,
       offenseCode: 'E2E_INJECTION', summary: '【動作確認】上訴実行と裁判所限定経路', status: 'appeal_window', allegedAt: now,
-      summaryEventKey: caseKey('appeal-exercised')
+      policeEventKey: caseKey('appeal-exercised')
     });
     appealedCase = await publishCase(guild, governance, appealedCase, '上訴待ち', '上訴操作をshadowで通した後にE2E完了として確定するfixtureです。');
     const appealedSanction = createSanction({
@@ -1002,7 +1002,7 @@ async function cleanup(guild, runId) {
     }
     cleaned.proposals.push(proposal.id);
   }
-  for (let caseRecord of listCases(guild.id, { limit: 500 }).filter((entry) => String(entry.summary_event_key ?? '').startsWith(`${sourceKey}:`)
+  for (let caseRecord of listCases(guild.id, { limit: 500 }).filter((entry) => String(entry.police_event_key ?? '').startsWith(`${sourceKey}:`)
     || caseIds.has(entry.id) || entry.summary.includes(mark))) {
     if (caseRecord.public_thread_id) publicThreadIds.add(caseRecord.public_thread_id);
     endInterimProtection(caseRecord.id, 'e2e_completed');
@@ -1122,7 +1122,7 @@ const [{
   runJudicialPanel,
   screenJudicialMention
 }, {
-  applyInterimProtectionFromLogs,
+  applyDetentionFromLogs,
   appealCase,
   approveCase,
   castAndPublishVote,

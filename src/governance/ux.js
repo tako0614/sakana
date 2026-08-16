@@ -52,11 +52,11 @@ import {
   rejectGovernanceNotification
 } from './notifications.js';
 import { setTrustedMember } from './service.js';
-import { summaryProcedure } from './policy.js';
+import { policeProcedure } from './policy.js';
 import { lawSiteLink } from './lawsite.js';
 
 const EPHEMERAL = MessageFlags.Ephemeral;
-const ACTIVE_CASE_STATUSES = ['filing', 'summary_review', 'summary_active', 'defense', 'deliberation', 'approval', 'appeal_window', 'appeal', 'execution'];
+const ACTIVE_CASE_STATUSES = ['filing', 'police_review', 'contest_window', 'defense', 'deliberation', 'approval', 'appeal_window', 'appeal', 'execution'];
 
 function proposalHandler(proposal) {
   if (proposal.workflow_handler) return proposal.workflow_handler;
@@ -229,7 +229,7 @@ function procedureComponents(governance, supportsImmediateReview) {
   return [
     new ActionRowBuilder().addComponents(...destinations),
     supportsImmediateReview ? new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('gov:review_list:0').setLabel('自分の即時処分を確認').setStyle(ButtonStyle.Primary)
+      new ButtonBuilder().setCustomId('gov:contest_list:0').setLabel('自分が受けた処分を確認').setStyle(ButtonStyle.Primary)
     ) : null
   ].filter(Boolean);
 }
@@ -372,7 +372,7 @@ export async function syncGovernanceActionCards(guild, channel) {
 }
 
 export async function renderGovernanceProcedureHub(guild, governance) {
-  const supportsImmediateReview = Boolean(summaryProcedure(getActiveConstitution(guild.id)?.policy));
+  const supportsImmediateReview = Boolean(policeProcedure(getActiveConstitution(guild.id)?.policy));
 
   const proposals = activeProposals(guild.id, 100);
   const voting = proposals.filter((proposal) => proposalHandler(proposal) === 'public_vote');
@@ -385,7 +385,7 @@ export async function renderGovernanceProcedureHub(guild, governance) {
     content: [
       `# ${guild.name} 手続`,
       '',
-      `法律にしたいことは <#${governance.parliament_forum_id}> へ投稿してください。違反申立てや上訴は <@&${governance.judiciary_role_id}> に自然文で話してください。`,
+      `法律にしたいことは <#${governance.parliament_forum_id}> へ投稿してください。違反の通報・上訴・違憲審査は <@&${governance.judiciary_role_id}> に自然文で話してください。`,
       `国会は${Math.round(intervalMs / 3_600_000)}時間ごとに開き、議会の投稿と公開ログを議題として読みます。${nextAt ? `次の開会: <t:${Math.floor(nextAt / 1000)}:R>` : '次の開会: まもなく'}`,
       '投票と執行承認が始まると、この下に操作カードが出ます。',
       '',

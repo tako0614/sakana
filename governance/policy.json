@@ -64,20 +64,21 @@
       "block_petitions",
       "block_voting"
     ],
-    "summaryProcedure": {
-      "panelSeats": 3,
-      "votesRequired": 2,
-      "trialMilliseconds": 86400000,
+    "policeProcedure": {
+      "panelSeats": 1,
+      "votesRequired": 1,
+      "contestMilliseconds": 86400000,
+      "detentionMaximumSeconds": 86400,
       "immediateSanctions": [
         "warning",
         "restriction",
         "timeout"
       ],
-      "trialFirstSanctions": [
+      "courtFirstSanctions": [
         "kick",
         "ban"
       ],
-      "unlimitedWarningReview": true
+      "unlimitedWarningContest": true
     }
   }
 }

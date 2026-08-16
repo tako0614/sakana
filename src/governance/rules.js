@@ -7,11 +7,11 @@ const HANDLERS = new Set([
   'parliament_agenda',
   'constitutional_panel',
   'public_vote',
-  'summary_review',
+  'police_review',
   'defense_window',
   'judicial_panel',
   'public_approval',
-  'review_window',
+  'contest_window',
   'appeal_window',
   'sanction_execution',
   'terminal'
@@ -98,12 +98,12 @@ function validateElectorates(electorates) {
 }
 
 function validatePanels(panels) {
-  exactKeys(panels, ['parliament', 'constitutional', 'criminal', 'summary'], 'panels');
+  exactKeys(panels, ['parliament', 'constitutional', 'court', 'police'], 'panels');
   const requiredKeys = {
     parliament: ['decision'],
     constitutional: ['constitutional', 'unconstitutional'],
-    criminal: ['responsible'],
-    summary: ['responsible']
+    court: ['responsible'],
+    police: ['responsible']
   };
   for (const [name, panel] of Object.entries(panels)) {
     exactKeys(panel, ['seats', 'required'], `panels.${name}`);
@@ -163,7 +163,7 @@ function validateVotes(votes) {
 function validateSanctions(sanctions) {
   exactKeys(sanctions, [
     'allowed', 'restrictionPrimitives', 'maximumRestriction', 'timeout',
-    'approvals', 'appeals', 'summaryProcedure'
+    'approvals', 'appeals', 'detention', 'police'
   ], 'sanctions');
   const types = ['warning', 'restriction', 'timeout', 'kick', 'ban'];
   if (!Array.isArray(sanctions.allowed) || new Set(sanctions.allowed).size !== sanctions.allowed.length
@@ -190,14 +190,23 @@ function validateSanctions(sanctions) {
     || canonicalJson([...sanctions.appeals.types].sort()) !== canonicalJson(['ban', 'timeout'])) {
     throw new Error('現在のDiscord実行系で上訴対象にできる処分は ban と timeout だけです。');
   }
-  exactKeys(sanctions.summaryProcedure, ['trialDuration', 'immediate', 'trialFirst', 'unlimitedWarningReview'], 'sanctions.summaryProcedure');
-  durationMilliseconds(sanctions.summaryProcedure.trialDuration, 'sanctions.summaryProcedure.trialDuration');
-  for (const key of ['immediate', 'trialFirst']) {
-    if (!Array.isArray(sanctions.summaryProcedure[key])
-      || sanctions.summaryProcedure[key].some((type) => !types.includes(type))) throw new Error(`sanctions.summaryProcedure.${key} が不正です。`);
+  // 拘留は罰ではなく保全なので、種類ではなく上限時間だけを憲法が決める。
+  exactKeys(sanctions.detention, ['maximum'], 'sanctions.detention');
+  const detention = durationMilliseconds(sanctions.detention.maximum, 'sanctions.detention.maximum');
+  if (detention < 60_000) throw new Error('sanctions.detention.maximum は1分以上である必要があります。');
+  if (detention > 86_400_000) throw new Error('拘留は保全なので24時間を超えられません。');
+  exactKeys(sanctions.police, ['contestDuration', 'immediate', 'courtFirst', 'unlimitedWarningContest'], 'sanctions.police');
+  durationMilliseconds(sanctions.police.contestDuration, 'sanctions.police.contestDuration');
+  for (const key of ['immediate', 'courtFirst']) {
+    if (!Array.isArray(sanctions.police[key])
+      || sanctions.police[key].some((type) => !types.includes(type))) throw new Error(`sanctions.police.${key} が不正です。`);
   }
-  if (sanctions.summaryProcedure.unlimitedWarningReview !== true && sanctions.summaryProcedure.unlimitedWarningReview !== false) {
-    throw new Error('unlimitedWarningReviewは真偽値である必要があります。');
+  // 警察が単独で打てる処分と、必ず裁判所へ送る処分は重ならない。
+  if (sanctions.police.immediate.some((type) => sanctions.police.courtFirst.includes(type))) {
+    throw new Error('警察の即時処分と裁判所送りの処分は重複できません。');
+  }
+  if (typeof sanctions.police.unlimitedWarningContest !== 'boolean') {
+    throw new Error('unlimitedWarningContestは真偽値である必要があります。');
   }
 }
 
@@ -252,7 +261,7 @@ function validateWorkflow(name, workflow) {
   if (unreachable.length) throw new Error(`workflows.${name} に到達不能状態があります: ${unreachable.join(', ')}`);
   const waitingHandlers = new Set([
     'parliament_agenda', 'public_vote', 'defense_window', 'public_approval',
-    'review_window', 'appeal_window', 'terminal'
+    'contest_window', 'appeal_window', 'terminal'
   ]);
   const instant = (stateName) => {
     const item = states[stateName];
@@ -345,11 +354,11 @@ export function policyFromGovernanceRules(input) {
   const general = rules.electorates.general;
   const vote = rules.votes.law;
   const constitutional = rules.panels.constitutional;
-  const criminal = rules.panels.criminal;
-  const summary = rules.panels.summary;
+  const court = rules.panels.court;
+  const police = rules.panels.police;
   const sanctions = rules.sanctions;
   const summaryWorkflow = Object.values(rules.workflows.criminalCase.states)
-    .some((state) => state.handler === 'summary_review');
+    .some((state) => state.handler === 'police_review');
   const policy = {
     schemaVersion: summaryWorkflow ? 2 : 1,
     timezoneOffsetMinutes: general.timezoneOffsetMinutes,
@@ -382,8 +391,8 @@ export function policyFromGovernanceRules(input) {
       defenseMilliseconds: durationMilliseconds(rules.workflows.criminalCase.states.defense?.duration ?? rules.workflows.constitutionalCase.states.defense.duration),
       appealMilliseconds: durationMilliseconds(sanctions.appeals.duration),
       constitutionalChallengesPerMemberPerDay: rules.workflows.constitutionalCase.config.petitionsPerMemberPerDay,
-      panelSeats: criminal.seats,
-      guiltyVotesRequired: criminal.required.responsible,
+      panelSeats: court.seats,
+      guiltyVotesRequired: court.required.responsible,
       constitutionalVotesRequired: constitutional.required.constitutional,
       unconstitutionalVotesRequired: constitutional.required.unconstitutional,
       discordMaximumTimeoutSeconds: durationMilliseconds(sanctions.timeout.discordMaximum) / 1000,
@@ -399,13 +408,14 @@ export function policyFromGovernanceRules(input) {
     }
   };
   if (policy.schemaVersion === 2) {
-    policy.judiciary.summaryProcedure = {
-      panelSeats: summary.seats,
-      votesRequired: summary.required.responsible,
-      trialMilliseconds: durationMilliseconds(sanctions.summaryProcedure.trialDuration),
-      immediateSanctions: sanctions.summaryProcedure.immediate,
-      trialFirstSanctions: sanctions.summaryProcedure.trialFirst,
-      unlimitedWarningReview: sanctions.summaryProcedure.unlimitedWarningReview
+    policy.judiciary.policeProcedure = {
+      panelSeats: police.seats,
+      votesRequired: police.required.responsible,
+      contestMilliseconds: durationMilliseconds(sanctions.police.contestDuration),
+      detentionMaximumSeconds: durationMilliseconds(sanctions.detention.maximum) / 1000,
+      immediateSanctions: sanctions.police.immediate,
+      courtFirstSanctions: sanctions.police.courtFirst,
+      unlimitedWarningContest: sanctions.police.unlimitedWarningContest
     };
   }
   return validateConstitutionPolicy(policy, { technicalOnly: true });
@@ -476,6 +486,8 @@ export function governanceRulesSummary(rules) {
   if (rules.votes.law.earlyClose === 'all_ballots_cast' || rules.votes.constitutionalAmendment.earlyClose === 'all_ballots_cast') {
     lines.push('有権者全員の投票で即時開票');
   }
+  lines.push(`警察 ${rules.panels.police.seats}席 / 裁判所 ${rules.panels.court.seats}席`);
+  lines.push(`拘留 最大${rules.sanctions.detention.maximum}`);
   lines.push(`違憲審査 ${rules.panels.constitutional.seats}席`);
   lines.push(`国会の合議 ${rules.panels.parliament.seats}席`);
   return lines.join(' / ');

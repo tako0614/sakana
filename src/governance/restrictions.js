@@ -1,5 +1,5 @@
 import {
-  activeInterimProtections,
+  activeDetentions,
   activeRestrictions,
   getCaseByPublicThread,
   recordRestrictionUsage,
@@ -18,25 +18,25 @@ export function hasRestriction(guildId, userId, primitive, now = Date.now()) {
   return activeRestrictions(guildId, userId, now).some((restriction) => rules(restriction, primitive).length > 0);
 }
 
-export function hasInterimProtection(guildId, userId, now = Date.now()) {
-  return activeInterimProtections(guildId, userId, now).length > 0;
+export function isDetained(guildId, userId, now = Date.now()) {
+  return activeDetentions(guildId, userId, now).length > 0;
 }
 
 export function governanceActionAllowed(guildId, userId, action, now = Date.now()) {
-  if (hasInterimProtection(guildId, userId, now)) return false;
+  if (isDetained(guildId, userId, now)) return false;
   const primitive = action === 'vote' ? 'block_voting' : 'block_petitions';
   return !hasRestriction(guildId, userId, primitive, now);
 }
 
 export function reserveRestrictedAgentCall(guildId, userId, eventId, now = Date.now()) {
-  const protections = activeInterimProtections(guildId, userId, now);
-  if (protections.length > 0) {
+  const detentions = activeDetentions(guildId, userId, now);
+  if (detentions.length > 0) {
     return {
       ok: false,
       used: 0,
       limit: 0,
-      retryAt: Math.min(...protections.map((entry) => entry.ends_at)),
-      reason: 'interim_protection'
+      retryAt: Math.min(...detentions.map((entry) => entry.ends_at)),
+      reason: 'detention'
     };
   }
   const restrictions = activeRestrictions(guildId, userId, now);
@@ -84,26 +84,26 @@ export async function enforceMessageRestrictions(message) {
   if (!message?.guildId || message.author?.bot) return false;
   const now = Date.now();
   const courtCase = message.channel?.isThread?.() ? getCaseByPublicThread(message.channelId) : null;
-  const protections = activeInterimProtections(message.guildId, message.author.id, now);
-  if (protections.length > 0) {
+  const detentions = activeDetentions(message.guildId, message.author.id, now);
+  if (detentions.length > 0) {
+    // 拘留中でも、自分の事件の記録では必ず反論できる。第十条3。
     const ownOpenCase = courtCase
-      && ['defense', 'appeal'].includes(courtCase.status)
       && courtCase.accused_id === message.author.id
-      && protections.some((entry) => entry.case_id === courtCase.id);
+      && detentions.some((entry) => entry.case_id === courtCase.id);
     if (!ownOpenCase) {
-      const protection = protections[0];
-      const reason = '一時保全中は自分の事件投稿だけに発言できます';
+      const protection = detentions[0];
+      const reason = '拘留中は自分の事件記録だけに発言できます';
       const deleted = await message.delete().then(() => true).catch(() => false);
       writeAudit({
         guildId: message.guildId,
         actorType: 'system',
-        action: deleted ? 'interim_protection.message_blocked' : 'interim_protection.enforcement_failed',
-        targetType: 'interim_protection',
+        action: deleted ? 'detention.message_blocked' : 'detention.enforcement_failed',
+        targetType: 'detention',
         targetId: protection.id,
         detail: { caseId: protection.case_id, messageId: message.id, channelId: message.channelId, reason }
       });
       if (deleted) {
-        await message.author.send(`${message.guild?.name ?? 'このコミュニティ'}では一時保全中のため、自分の裁判事件でだけ発言できます。制限は自動終了します。`).catch(() => {});
+        await message.author.send(`${message.guild?.name ?? 'このコミュニティ'}では拘留中のため、自分の事件記録でだけ発言できます。拘留は時間で自動終了します。`).catch(() => {});
       }
       // 削除権限が壊れていても、この投稿を活動資格・AI・統治受付へ流さない。
       return true;
@@ -153,7 +153,7 @@ export async function enforceMessageRestrictions(message) {
 
 export async function enforceReactionRestrictions(reaction, user) {
   if (!reaction?.message?.guildId || user?.bot) return false;
-  if (!hasInterimProtection(reaction.message.guildId, user.id)
+  if (!isDetained(reaction.message.guildId, user.id)
     && !hasRestriction(reaction.message.guildId, user.id, 'block_reactions')) return false;
   const removed = await reaction.users.remove(user.id).then(() => true).catch(() => false);
   if (removed) writeAudit({
@@ -169,7 +169,7 @@ export async function enforceReactionRestrictions(reaction, user) {
 
 export async function enforceVoiceRestrictions(_oldState, newState) {
   if (!newState?.guild?.id || !newState.member || !newState.channelId) return false;
-  if (!hasInterimProtection(newState.guild.id, newState.member.id)
+  if (!isDetained(newState.guild.id, newState.member.id)
     && !hasRestriction(newState.guild.id, newState.member.id, 'block_voice')) return false;
   const disconnected = await newState.disconnect(`${newState.guild?.name ?? 'Community'} governance restriction: voice access blocked`)
     .then(() => true).catch(() => false);
@@ -186,7 +186,7 @@ export async function enforceVoiceRestrictions(_oldState, newState) {
 
 export async function enforceThreadRestrictions(thread) {
   const ownerId = thread?.ownerId;
-  if (!thread?.guildId || !ownerId || (!hasInterimProtection(thread.guildId, ownerId)
+  if (!thread?.guildId || !ownerId || (!isDetained(thread.guildId, ownerId)
     && !hasRestriction(thread.guildId, ownerId, 'block_thread_creation'))) return false;
   const deleted = await thread.delete(`${thread.guild?.name ?? 'Community'} governance restriction: thread creation blocked`)
     .then(() => true).catch(() => false);
