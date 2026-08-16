@@ -42,7 +42,19 @@ END_ID = sp.piece_to_id("<|end|>")
 # 正規化が作った記号は「発言」ではないので、既定でサンプリングから外す。
 # これを許すと `<url>` だけ吐いて終わる返答が実測 38% 出た (外すと 12%)。
 NORMALIZED = ("<file>", "<url>", "<mention>", "<channel>", "<time>", "<code>", "</code>")
-DEFAULT_BAN = [sp.piece_to_id(t) for t in NORMALIZED]
+
+# **窓の構造を作る記号も外す。**これらはプロンプト側が置くもので、モデルが
+# 本文として書くものではない。evex-5 で `草<|hi|>` のように `<|hi|>` が本文に
+# 漏れた — 推論で毎回置いているので「出してよいもの」として学んでいる。
+#
+# `<|end|>` は入れない (会話の終わりとして必要)。話者トークンと役は
+# 呼ぶ側が ownTurns で切るので、ここでは触らない
+STRUCTURE = ("<|conv|>", "<|hi|>", "<|cx|>") + tuple(f"<|c{i}|>" for i in range(64))
+
+DEFAULT_BAN = sorted({
+    sp.piece_to_id(t) for t in NORMALIZED + STRUCTURE
+    if sp.piece_to_id(t) != sp.unk_id()
+})
 
 
 def has_piece(piece):
