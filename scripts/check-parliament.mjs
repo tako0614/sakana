@@ -23,7 +23,10 @@ const compiled = rules.compileConstitution({ content: constitution });
 assert.equal(compiled.rules.workflows.law.initial, 'agenda');
 assert.equal(compiled.rules.workflows.law.states.agenda.handler, 'parliament_agenda');
 assert.equal(compiled.rules.workflows.law.states.agenda.on.deferred, 'agenda');
-assert.equal(compiled.rules.workflows.law.config.maximumDeferrals, 3);
+assert.equal(compiled.rules.parliament.maximumDeferrals, 3);
+assert.equal(compiled.rules.parliament.sessionInterval, '72h');
+assert.deepEqual(compiled.rules.workflows.law.config, {},
+  '国会の量的な値はworkflowではなくparliamentセクションが持つ');
 
 // --- 実行規則の安全弁 ------------------------------------------------------
 const injected = structuredClone(compiled.rules);
@@ -61,7 +64,6 @@ db.bootstrapGovernanceGuild({
   courtChatChannelId: 'court-forum',
   procedureChannelId: 'procedure'
 });
-db.setOperationalSetting(GUILD_ID, 'parliament_scan_enabled', 0, 'owner');
 
 const posts = [];
 const threads = new Map();
@@ -236,7 +238,7 @@ assert.equal(await runParliamentSession(guild, governance, Date.now()), null,
   '間隔を満たさない自動開会は何もしない');
 
 // --- 継続審議の上限 ---------------------------------------------------------
-const maximumDeferrals = compiled.rules.workflows.law.config.maximumDeferrals;
+const maximumDeferrals = compiled.rules.parliament.maximumDeferrals;
 assert.equal(maximumDeferrals, 3);
 db.updateProposal(proposal.id, { deferrals: maximumDeferrals });
 mode = 'defer';

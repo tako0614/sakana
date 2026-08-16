@@ -9,8 +9,10 @@ import { getGovernanceGuild, governanceDatabase, writeAudit } from '../src/gover
 import { syncLawSite } from '../src/governance/lawsite.js';
 import { ensureGovernanceUx } from '../src/governance/ux.js';
 import { canonicalJson, policyHash, sha256 } from '../src/governance/policy.js';
+import { compileConstitution } from '../src/governance/rules.js';
 
-const PROVISIONAL_HASH = 'cb23820a8a9f91f32f66544ebb499c660f7863781e5d65d283f1e081affdf9d2';
+// 統治案件がまだ1件も無い導入直後だけ、初期憲法を差し替えられる。
+// 法律・事件・処分が1件でもあれば、変更は改憲手続にしか通せない。
 const EMPTY_TABLES = [
   'governance_proposals',
   'governance_laws',
@@ -53,9 +55,6 @@ if (governance.status !== 'active' || governance.enforcement_mode !== 'shadow' |
 if (Object.values(counts).some((count) => count !== 0)) {
   throw new Error(`統治案件が既に存在します: ${JSON.stringify(counts)}`);
 }
-if (![PROVISIONAL_HASH, replacementHash].includes(current.content_hash)) {
-  throw new Error(`想定外の現行憲法hashです: ${current.content_hash}`);
-}
 
 const summary = {
   guildId,
@@ -76,23 +75,30 @@ const backupDirectory = resolve('backups');
 mkdirSync(backupDirectory, { recursive: true });
 const databaseBackup = join(backupDirectory, `database-pre-constitution-replacement-${guildId}.sqlite`);
 
-if (current.content_hash === PROVISIONAL_HASH) {
+if (current.content_hash !== replacementHash) {
   if (existsSync(databaseBackup)) throw new Error(`既存のDBバックアップがあります: ${databaseBackup}`);
   await governanceDatabase.backup(databaseBackup);
   governanceDatabase.transaction(() => {
+    // 実行規則も一緒に差し替える。ここを忘れるとbotは古いrules_jsonを読み続ける。
+    const compiled = compileConstitution({ content: documents.constitution });
     const result = governanceDatabase.prepare(`
       UPDATE governance_constitutions
-      SET content = ?, policy_json = ?, content_hash = ?, policy_hash = ?, enacted_by = ?, enacted_at = ?
+      SET content = ?, policy_json = ?, content_hash = ?, policy_hash = ?, enacted_by = ?, enacted_at = ?,
+          source_format = ?, rules_json = ?, rules_hash = ?, compiler_version = ?
       WHERE id = ? AND version = 1 AND content_hash = ?
     `).run(
       documents.constitution,
-      canonicalJson(documents.policy),
+      canonicalJson(compiled.policy),
       replacementHash,
       replacementPolicyHash,
       current.enacted_by,
       Date.now(),
+      compiled.sourceFormat,
+      canonicalJson(compiled.rules),
+      compiled.rulesHash,
+      compiled.compilerVersion,
       current.id,
-      PROVISIONAL_HASH
+      current.content_hash
     );
     if (result.changes !== 1) throw new Error('初期憲法の置換対象が競合しました。');
     writeAudit({
@@ -104,7 +110,7 @@ if (current.content_hash === PROVISIONAL_HASH) {
       targetId: current.id,
       detail: {
         reason: '未承認の仮初期草案を主権者が指定した初期憲法へ置換',
-        previousHash: PROVISIONAL_HASH,
+        previousHash: current.content_hash,
         replacementHash
       }
     });

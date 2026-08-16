@@ -99,18 +99,23 @@ export function validateConstitutionPolicy(policy, { technicalOnly = false } = {
   finite(voting.minimumBallots, 'voting.minimumBallots', { max: 100_000 });
   if (!Number.isInteger(voting.minimumBallots)) throw new Error('voting.minimumBallots は整数である必要があります。');
   if (voting.publicBallots !== true) throw new Error('v1の投票は全記名です。');
-  const legislationKeys = ['voteMilliseconds', 'maximumDeferrals', 'maximumSessionIntervalMilliseconds'];
+  const legislationKeys = [
+    'voteMilliseconds', 'sessionIntervalMilliseconds', 'agendaLimit', 'maximumDeferrals', 'logScan'
+  ];
   const allowedLegislationKeys = new Set(legislationKeys);
   if (Object.keys(legislation).some((key) => !allowedLegislationKeys.has(key))
     || legislationKeys.some((key) => !(key in legislation))) {
     throw new Error('legislationに未対応の設定があります。');
   }
-  for (const key of ['voteMilliseconds', 'maximumSessionIntervalMilliseconds']) {
+  for (const key of ['voteMilliseconds', 'sessionIntervalMilliseconds']) {
     finite(legislation[key], `legislation.${key}`, { min: technicalOnly ? 60_000 : 3_600_000 });
     if (!Number.isInteger(legislation[key])) throw new Error(`legislation.${key} は整数である必要があります。`);
   }
-  finite(legislation.maximumDeferrals, 'legislation.maximumDeferrals', { min: 1, max: technicalOnly ? 20 : 10 });
-  if (!Number.isInteger(legislation.maximumDeferrals)) throw new Error('legislation.maximumDeferrals は整数である必要があります。');
+  for (const key of ['agendaLimit', 'maximumDeferrals']) {
+    finite(legislation[key], `legislation.${key}`, { min: 1, max: 20 });
+    if (!Number.isInteger(legislation[key])) throw new Error(`legislation.${key} は整数である必要があります。`);
+  }
+  if (typeof legislation.logScan !== 'boolean') throw new Error('legislation.logScan は真偽値である必要があります。');
   for (const key of [
     'defenseMilliseconds', 'appealMilliseconds', 'constitutionalChallengesPerMemberPerDay', 'panelSeats', 'guiltyVotesRequired',
     'constitutionalVotesRequired', 'unconstitutionalVotesRequired', 'discordMaximumTimeoutSeconds',
