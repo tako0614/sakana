@@ -1,0 +1,34 @@
+[Unit]
+Description=Sakana mimic evex-5.2 (25.8M / PLE + QK-norm / コーパス v12)
+# **a / b の対照実験の結果、a を evex-5.2 として残した。**
+# 同じコーパス (v12) で違うのは Muon / WSD / 文書内マスク の有無だけ。
+# b は「うん」「あ」のような相槌で終わる率が高く、a は必ず内容のある一文を
+# 返していた。あの 3 つは学習の速さの工夫であって出力の質は上げない、という
+# これまでの結論とも合う。b (8777) は落とした。
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/sakana
+# ファイル名は pack.mjs が置く形に合わせる (ckpt.pt / tok.model / speakers.json)。
+#   LLM_CORPUS_DIR=corpus-v12 node scripts/llm/pack.mjs <ckpt-eN.pt> dist/mimic-v52
+ExecStart=/root/sakana/.venv-llm/bin/python -u src/mimic/server.py \
+  --ckpt /root/sakana/mimic-v52/ckpt.pt \
+  --corpus /root/sakana/mimic-v52 \
+  --port 8776 \
+  --threads 3
+
+Restart=on-failure
+RestartSec=5
+
+# 18.9M の重み (76MB) + torch のランタイム。evex-1/2/3 と ft 系が並ぶので控えめに。
+# 足りずに OOM で落ちるようなら 1800M まで上げる
+MemoryMax=1800M
+CPUWeight=30
+Nice=15
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

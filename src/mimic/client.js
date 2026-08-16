@@ -180,24 +180,16 @@ export const ENDPOINTS = {
     label: process.env.MIMIC_V51_LABEL ?? 'evex-5.1',
     format: process.env.MIMIC_V51_FORMAT ?? 'auto'
   },
-  // **a と b は対照実験。**同じコーパス (v12 = 話者ごとの切り出し + 匿名化緩和)
-  // で、違うのは Muon / WSD / 文書内マスク の有無だけ。
-  //
-  // evex-5 / 5.1 が 4.1 に負けたのは「一度に足した技術群」のせいか、を見る。
-  // **読み比べて決める** — 指標はこれまで評価と一致していない
-  'evex-5.2-a': {
-    url: process.env.MIMIC_V52A_URL ?? 'http://127.0.0.1:8776',
-    timeoutMs: number(process.env.MIMIC_V52A_TIMEOUT_MS, 60_000),
-    maxNewTokens: number(process.env.MIMIC_V52A_MAX_NEW_TOKENS, 200),
-    label: process.env.MIMIC_V52A_LABEL ?? 'evex-5.2-a',
-    format: process.env.MIMIC_V52A_FORMAT ?? 'auto'
-  },
-  'evex-5.2-b': {
-    url: process.env.MIMIC_V52B_URL ?? 'http://127.0.0.1:8777',
-    timeoutMs: number(process.env.MIMIC_V52B_TIMEOUT_MS, 60_000),
-    maxNewTokens: number(process.env.MIMIC_V52B_MAX_NEW_TOKENS, 200),
-    label: process.env.MIMIC_V52B_LABEL ?? 'evex-5.2-b',
-    format: process.env.MIMIC_V52B_FORMAT ?? 'auto'
+  // **a / b の対照実験は終わった。**同じコーパス (v12) で違うのは
+  // Muon / WSD / 文書内マスク の有無だけ、という比較で **a を採った** —
+  // b は「うん」「あ」のような相槌で終わる率が高かった。8776 が a。
+  // 8777 (b) は落としたので、名前も port も 1 本だけ残す
+  'evex-5.2': {
+    url: process.env.MIMIC_V52_URL ?? 'http://127.0.0.1:8776',
+    timeoutMs: number(process.env.MIMIC_V52_TIMEOUT_MS, 60_000),
+    maxNewTokens: number(process.env.MIMIC_V52_MAX_NEW_TOKENS, 200),
+    label: process.env.MIMIC_V52_LABEL ?? 'evex-5.2',
+    format: process.env.MIMIC_V52_FORMAT ?? 'auto'
   }
 };
 
