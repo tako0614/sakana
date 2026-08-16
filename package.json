@@ -5,7 +5,7 @@
   "main": "src/index.js",
   "type": "module",
   "scripts": {
-    "precheck": "node scripts/check-governance.mjs && node scripts/check-parliament.mjs && node scripts/check-judiciary.mjs",
+    "precheck": "node scripts/check-governance.mjs && node scripts/check-parliament.mjs && node scripts/check-judiciary.mjs && node scripts/check-investigation.mjs",
     "start": "node --import tsx src/index.js",
     "chat": ".venv-llm/bin/python scripts/llm/chat.py",
     "web:dev": "npm --prefix web run dev",

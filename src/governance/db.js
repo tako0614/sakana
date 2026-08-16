@@ -1050,6 +1050,36 @@ db.exec(`
 }
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (20, ?)').run(Date.now());
 
+// 席が自分で調べるようになったので、どの席がどのツールを何回叩いて何を見たかを残す。
+// 憲法第十二条3の公開はスレへの要約で満たし、完全な往復はこの表にだけ置く。
+db.exec(`
+  CREATE TABLE IF NOT EXISTS governance_investigation_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ai_call_id INTEGER NOT NULL,
+    guild_id TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    seat INTEGER NOT NULL,
+    step INTEGER NOT NULL,
+    tool TEXT NOT NULL,
+    arguments_json TEXT NOT NULL,
+    result_count INTEGER NOT NULL,
+    result_summary TEXT NOT NULL,
+    result_hash TEXT NOT NULL,
+    error TEXT,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_investigation_call
+    ON governance_investigation_steps(ai_call_id, step);
+`);
+{
+  const columns = new Set(db.pragma('table_info(governance_cases)').map((row) => row.name));
+  // 裁判所が審理中に不利な証拠を足したら答弁をやり直す。その回数の上限を数える。
+  if (!columns.has('redefense_count')) {
+    db.exec('ALTER TABLE governance_cases ADD COLUMN redefense_count INTEGER NOT NULL DEFAULT 0');
+  }
+}
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (21, ?)').run(Date.now());
+
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
 db.prepare("UPDATE governance_outbox SET status = 'error', last_error = 'interrupted before completion' WHERE status = 'running'").run();
@@ -1721,6 +1751,87 @@ export function recentGuildActivity(guildId, since, limit = 500) {
     WHERE guild_id = ? AND created_at >= ? AND content <> ''
     ORDER BY created_at DESC, message_id DESC LIMIT ?
   `).all(String(guildId), Number(since), Number(limit)).reverse();
+}
+
+// 席が LIKE で粗く絞ってから n-gram で並べ替える。governance_activity に FTS は無い。
+export function searchGuildActivity(guildId, since, terms, limit = 500) {
+  const clauses = terms.map(() => 'content LIKE ? ESCAPE \'\\\'').join(' OR ');
+  return db.prepare(`
+    SELECT message_id, channel_id, parent_id, user_id, content_hash, content, created_at
+    FROM governance_activity
+    WHERE guild_id = ? AND created_at >= ? AND content <> ''
+      ${clauses ? `AND (${clauses})` : ''}
+    ORDER BY created_at DESC, message_id DESC LIMIT ?
+  `).all(
+    String(guildId),
+    Number(since),
+    ...terms.map((term) => `%${String(term).replace(/[\\%_]/g, '\\$&')}%`),
+    Number(limit)
+  ).reverse();
+}
+
+export function getActivityMessage(guildId, messageId) {
+  return db.prepare(`
+    SELECT message_id, channel_id, parent_id, user_id, content_hash, content, created_at
+    FROM governance_activity WHERE guild_id = ? AND message_id = ?
+  `).get(String(guildId), String(messageId)) ?? null;
+}
+
+// 既出の投稿の前後を読む。同じ channel_id の中だけを時刻で辿る。
+export function activityContext(guildId, messageId, { before = 5, after = 5 } = {}) {
+  const anchor = getActivityMessage(guildId, messageId);
+  if (!anchor) return [];
+  const earlier = db.prepare(`
+    SELECT message_id, channel_id, parent_id, user_id, content_hash, content, created_at
+    FROM governance_activity
+    WHERE guild_id = ? AND channel_id = ? AND content <> ''
+      AND (created_at < ? OR (created_at = ? AND message_id < ?))
+    ORDER BY created_at DESC, message_id DESC LIMIT ?
+  `).all(
+    String(guildId), String(anchor.channel_id),
+    Number(anchor.created_at), Number(anchor.created_at), String(anchor.message_id),
+    Math.max(0, Number(before))
+  ).reverse();
+  const later = db.prepare(`
+    SELECT message_id, channel_id, parent_id, user_id, content_hash, content, created_at
+    FROM governance_activity
+    WHERE guild_id = ? AND channel_id = ? AND content <> ''
+      AND (created_at > ? OR (created_at = ? AND message_id > ?))
+    ORDER BY created_at ASC, message_id ASC LIMIT ?
+  `).all(
+    String(guildId), String(anchor.channel_id),
+    Number(anchor.created_at), Number(anchor.created_at), String(anchor.message_id),
+    Math.max(0, Number(after))
+  );
+  return [...earlier, anchor, ...later];
+}
+
+export function recordInvestigationStep(input) {
+  db.prepare(`
+    INSERT INTO governance_investigation_steps
+      (ai_call_id, guild_id, purpose, seat, step, tool, arguments_json,
+       result_count, result_summary, result_hash, error, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    Number(input.aiCallId ?? 0),
+    String(input.guildId),
+    String(input.purpose),
+    Number(input.seat ?? 0),
+    Number(input.step),
+    String(input.tool),
+    canonicalJson(input.arguments ?? {}),
+    Number(input.resultCount ?? 0),
+    String(input.resultSummary ?? '').slice(0, 500),
+    sha256(canonicalJson(input.result ?? null)),
+    input.error ? String(input.error).slice(0, 500) : null,
+    Date.now()
+  );
+}
+
+export function listInvestigationSteps(aiCallId) {
+  return db.prepare(
+    'SELECT * FROM governance_investigation_steps WHERE ai_call_id = ? ORDER BY step'
+  ).all(Number(aiCallId));
 }
 
 export function proposalDiscussion(proposalId, since, until, limit = 300) {
@@ -2617,7 +2728,7 @@ export const updateCase = db.transaction((id, patch) => {
     'status', 'public_thread_id', 'private_thread_id', 'defense_until', 'panel_id',
     'verdict_json', 'finalized_at', 'retry_after', 'failure_count', 'last_error', 'alleged_at',
     'constitution_id', 'procedure_version', 'decision_due_at', 'response_completed_at',
-    'police_event_key', 'review_count'
+    'police_event_key', 'review_count', 'redefense_count'
   ]);
   const normalized = { ...patch };
   if ('verdict' in normalized) {

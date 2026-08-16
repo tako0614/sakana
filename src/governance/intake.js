@@ -30,7 +30,8 @@ import {
 } from './db.js';
 import { interpretJudicialRequest, screenJudicialMention } from './llm.js';
 import { postCourtRecord, publicMemberLabel } from './discord.js';
-import { collectInvestigationContext, evidenceLink } from './context.js';
+import { evidenceLink, investigationContextSettings, investigationTargets } from './context.js';
+import { investigationSummary } from './tools.js';
 import { normalizeActivityContent, sha256 } from './policy.js';
 import {
   addEvidenceToCase,
@@ -388,6 +389,9 @@ function acceptedCaseResult(error) {
   return getCase(error.accepted.resultId);
 }
 
+// 席の調査は要約だけ公開する（憲法第九条8・実行規則 investigation.publicRecord）。
+const PANEL_LENS_LABELS = ['textual', 'rights', 'adversarial'];
+
 async function publishJudicialScreeningRecord(guild, investigation, caseRecord, candidate, evidence, panel) {
   if (!caseRecord?.public_thread_id) return false;
   const law = getLaw(candidate.lawId);
@@ -399,9 +403,17 @@ async function publishJudicialScreeningRecord(guild, investigation, caseRecord, 
     `対象となる違反: ${offense?.title ?? candidate.offenseCode}`,
     `事件化を支持したAI席: ${candidate.supportingSeats}/${panel.outputs.length + panel.failedSeats}`,
     ...candidate.elementEvidence.map((entry) => (
-      `- ${entry.element}: ${entry.messageIds.map((id) => links.get(String(id))).filter(Boolean).join('、')}`
+      `- ${entry.element}（${entry.supportingSeats ?? candidate.supportingSeats}席が認定）: ${entry.messageIds.map((id) => links.get(String(id))).filter(Boolean).join('、')}`
     )),
     candidate.reasons?.length ? `事件化の理由: ${candidate.reasons.join(' / ')}` : null,
+    '',
+    ...(panel.traces ?? [])
+      .map(({ seat, trace }) => investigationSummary(trace, {
+        seat,
+        lens: PANEL_LENS_LABELS[(seat - 1) % PANEL_LENS_LABELS.length],
+        maximumSteps: panel.maximumSteps
+      }))
+      .filter(Boolean),
     '',
     'これは事件を開始するための審査です。有罪・処分は成立法に基づく別の司法パネルが判断します。'
   ].filter((line) => line !== null).join('\n'));
@@ -489,12 +501,19 @@ async function runAutomaticJudiciary(message, request, anchor, context, investig
   const laws = listLaws(message.guildId).filter((law) => law.status === 'active');
   const panel = await screenJudicialMention({
     guildId: message.guildId,
-    request: { text: request, authorId: message.author.id, targetUserIds: context.targetUserIds },
+    request: {
+      text: request,
+      authorId: message.author.id,
+      targetUserIds: context.targetUserIds,
+      repliedTo: anchor
+        ? { messageId: anchor.messageId, channelId: anchor.channelId, authorId: anchor.authorId }
+        : null
+    },
     constitution,
     activeLaws: laws,
     recentCases: listCases(message.guildId, { limit: 25 }),
-    messages: context.messages,
-    panel: constitution.rules?.panels?.judicialScreening
+    panel: constitution.rules?.panels?.judicialScreening,
+    investigation: constitution.policy.investigation
   });
   if (panel.outputs.length < panel.required) {
     return { outcome: 'failed_closed', text: '警察の席が必要数そろわなかったため、事件化も処分も行いませんでした。' };
@@ -507,7 +526,10 @@ async function runAutomaticJudiciary(message, request, anchor, context, investig
   const storedCandidates = [];
   const publishedCaseIds = [];
   for (const candidate of candidates) {
-    const selected = context.messages.filter((row) => candidate.evidenceMessageIds.includes(row.messageId));
+    // 席が自分で取得した行だけが候補になる。完全な行はパネルの台帳から引く。
+    const selected = candidate.evidenceMessageIds
+      .map((id) => panel.retrieved.get(String(id)))
+      .filter(Boolean);
     const evidence = await revalidateInvestigationEvidence(message, selected, [candidate.accusedId]);
     const validIds = new Set(evidence.map((row) => row.messageId));
     if (candidate.elementEvidence.some((entry) => entry.messageIds.every((id) => !validIds.has(String(id))))) continue;
@@ -605,7 +627,10 @@ async function runAutomaticJudiciary(message, request, anchor, context, investig
 async function executeAutomaticInvestigation(message, governance, request, investigation, reservation, member, progress) {
   try {
     const anchor = await fetchSourceMessage(message, governance);
-    const context = collectInvestigationContext(message, request, anchor);
+    const context = {
+      settings: investigationContextSettings(message.guildId),
+      targetUserIds: investigationTargets(message, anchor)
+    };
     const result = await runAutomaticJudiciary(
       message, request, anchor, context, investigation, reservation, member
     );
