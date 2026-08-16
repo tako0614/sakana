@@ -36,7 +36,7 @@ import {
   backfillGovernanceActivity,
   castAndPublishVote,
   completeCaseResponse,
-  decideProposalAfterDebate,
+  fileProposalObjection,
   requestSummaryTrial,
   submitCaseAnswer
 } from './service.js';
@@ -317,14 +317,16 @@ export async function handleGovernanceComponent(interaction) {
       await interaction.editReply('上訴を受理しました。回答を追記し、終わったら「回答完了」を押してください。');
       return true;
     }
-    if (customId.startsWith('gov:draft_revise:') && interaction.isModalSubmit()) {
+    if (customId.startsWith('gov:objection_file:') && interaction.isModalSubmit()) {
       const proposalId = Number(customId.split(':')[2]);
       await interaction.deferReply({ flags: EPHEMERAL });
-      const proposal = await decideProposalAfterDebate(
-        interaction.guild, interaction.user, proposalId, 'revise',
+      const { objections, required } = await fileProposalObjection(
+        interaction.guild, interaction.user, proposalId,
         interaction.fields.getTextInputValue('instruction')
       );
-      await interaction.editReply(`指示のとおり調整案を作り、再討議を始めました（第${proposal.revision}版）。`);
+      await interaction.editReply(objections.length >= required
+        ? `調整の指示を記録しました（${objections.length}/${required}件）。締切に調整案を作ります。`
+        : `調整の指示を記録しました（${objections.length}/${required}件）。締切までに${required}件そろえば調整案を作ります。`);
       return true;
     }
     if (customId.startsWith('gov:admin')) return await handleGovernanceUxInteraction(interaction);
@@ -384,21 +386,13 @@ export async function handleGovernanceComponent(interaction) {
         return true;
       }
     }
-    if (action === 'draft') {
-      if (value === 'revise') {
-        const modal = new ModalBuilder().setCustomId(`gov:draft_revise:${id}`).setTitle('条文の調整を指示')
-          .addComponents(new ActionRowBuilder().addComponents(
-            new TextInputBuilder().setCustomId('instruction').setLabel('どう直すか').setStyle(TextInputStyle.Paragraph)
-              .setRequired(true).setMaxLength(2000)
-          ));
-        await interaction.showModal(modal);
-        return true;
-      }
-      await interaction.deferReply({ flags: EPHEMERAL });
-      await decideProposalAfterDebate(interaction.guild, interaction.user, id, value);
-      await interaction.editReply(value === 'finalize'
-        ? '本文を変えずに最終案として固定しました。違憲審査へ進みます。'
-        : 'この案を取り下げました。');
+    if (action === 'objection' && value === 'file') {
+      const modal = new ModalBuilder().setCustomId(`gov:objection_file:${id}`).setTitle('調整を求める')
+        .addComponents(new ActionRowBuilder().addComponents(
+          new TextInputBuilder().setCustomId('instruction').setLabel('どう直すか').setStyle(TextInputStyle.Paragraph)
+            .setRequired(true).setMaxLength(2000)
+        ));
+      await interaction.showModal(modal);
       return true;
     }
     await interaction.deferReply({ flags: EPHEMERAL });

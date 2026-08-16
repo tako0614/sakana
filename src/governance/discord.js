@@ -48,7 +48,7 @@ function proposalStateLabel(state, handler = null) {
     discussion: '議論中',
     revision_discussion: '議論中',
     deliberation: '議論中',
-    proposer_decision: '議論中',
+    objection_window: '議論中',
     constitutional_review: '議論中',
     debate: '議論中',
     voting: '投票中',
@@ -59,7 +59,7 @@ function proposalStateLabel(state, handler = null) {
     draft: '議論中',
     public_discussion: '議論中',
     ai_deliberation: '議論中',
-    proposer_decision: '議論中',
+    objection_window: '議論中',
     constitutional_panel: '議論中',
     public_vote: '投票中',
     terminal: '不成立'
@@ -919,11 +919,9 @@ export function voteButtons(proposalId, disabled = false) {
   )];
 }
 
-export function proposerDecisionButtons(proposalId, disabled = false) {
+export function objectionButtons(proposalId, disabled = false) {
   return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`gov:draft:${proposalId}:finalize`).setLabel('最終案として固定').setStyle(ButtonStyle.Success).setDisabled(disabled),
-    new ButtonBuilder().setCustomId(`gov:draft:${proposalId}:revise`).setLabel('調整を指示').setStyle(ButtonStyle.Primary).setDisabled(disabled),
-    new ButtonBuilder().setCustomId(`gov:draft:${proposalId}:withdraw`).setLabel('取下げ').setStyle(ButtonStyle.Danger).setDisabled(disabled)
+    new ButtonBuilder().setCustomId(`gov:objection:${proposalId}:file`).setLabel('調整を求める').setStyle(ButtonStyle.Primary).setDisabled(disabled)
   )];
 }
 
@@ -958,7 +956,7 @@ function proposalNextAction(proposal) {
   const byStatus = ({
     drafting: '案の公開を待っています。',
     draft: 'この投稿で案を読み、意見を書けます。',
-    proposer_decision: '起案者が、最終案として固定するか調整するかを選んでいます。',
+    objection_window: 'この本文でよくなければ、案件投稿のボタンから調整を求められます。',
     constitutional_review: '投票前の確認中です。',
     debate: 'この投稿で案を読み、意見を書けます。',
     voting: '「手続」の案件カードから投票できます。',

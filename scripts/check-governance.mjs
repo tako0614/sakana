@@ -763,7 +763,7 @@ const {
   approveCase,
   castAndPublishVote,
   completeProposalDebate,
-  decideProposalAfterDebate,
+  fileProposalObjection,
   completeCaseResponse,
   detectAutomaticEnforcement,
   fileAmendment,
@@ -1731,36 +1731,56 @@ const debateThread = {
 };
 const debateGuild = { id: 'g2', name: 'Test Community', channels: { fetch: async () => debateThread } };
 const summarized = await completeProposalDebate(debateGuild, workflowProposal, debateNow);
-assert.equal(summarized.status, 'proposer_decision', 'AIは採否を決めず起案者の選択へ渡す');
+assert.equal(summarized.status, 'objection_window', 'AIは採否を決めず異議の受付へ渡す');
 assert.equal(summarized.revision, 1, 'AI整理の段階では本文を変えない');
 assert.equal(summarized.title, workflowProposal.title);
 assert.match(debatePosts[0].content, /討議の整理/);
 assert.match(debatePosts[0].content, /禁止範囲を明確に限定してほしい/);
 assert.ok(
   debatePosts[0].components?.[0]?.components?.some(
-    (button) => (button.data?.custom_id ?? button.customId) === `gov:draft:${workflowProposal.id}:revise`
+    (button) => (button.data?.custom_id ?? button.customId) === `gov:objection:${workflowProposal.id}:file`
   ),
-  '起案者の選択ボタンを案件投稿へ出す'
+  '調整を求めるボタンを案件投稿へ出す'
 );
 assert.equal(governanceDb.listProposalDeliberations(workflowProposal.id)[0].outcome, 'summarized');
-await assert.rejects(
-  () => decideProposalAfterDebate(debateGuild, { id: 'someone-else' }, workflowProposal.id, 'finalize'),
-  /起案者だけが/,
-  '起案者以外は討議後の扱いを決められない'
+
+// 提案者に特別な地位はない。異議は誰でも1件で、必要数に届いて初めて調整する。
+const firstObjection = await fileProposalObjection(
+  debateGuild, { id: 'r' }, workflowProposal.id, '禁止範囲を狭くしてほしい'
 );
+assert.equal(firstObjection.required, 2);
+assert.equal(firstObjection.objections.length, 1, '提案者の異議も他の構成員と同じ1件');
+const repeated = await fileProposalObjection(
+  debateGuild, { id: 'r' }, workflowProposal.id, '禁止範囲を狭くしてほしい（書き直し）'
+);
+assert.equal(repeated.objections.length, 1, '同じ人が何度出しても1件のまま');
+assert.equal(
+  (await advanceProposal(debateGuild, governanceDb.getProposal(workflowProposal.id), debateNow)).status,
+  'objection_window',
+  '締切前は異議の受付を続ける'
+);
+await fileProposalObjection(debateGuild, { id: 'participant' }, workflowProposal.id, '例外を書いてほしい');
 modelOutput = { ...narrowedBill, title: '調整後の一般規則' };
-const adjusted = await decideProposalAfterDebate(
-  debateGuild, { id: 'r' }, workflowProposal.id, 'revise', '禁止範囲を狭くしてほしい'
+const adjusted = await advanceProposal(
+  debateGuild,
+  governanceDb.updateProposal(workflowProposal.id, { stage_ends_at: debateNow - 1_000 }),
+  debateNow
 );
 assert.equal(adjusted.status, 'revision_discussion');
 assert.equal(adjusted.revision, 2);
 assert.equal(adjusted.title, '調整後の一般規則');
 assert.ok(adjusted.stage_ends_at >= debateNow + policy.legislation.revisionDebateMilliseconds);
-assert.ok(debatePosts.some((payload) => /起案者の指示で調整案を作りました/.test(payload.content)));
-assert.equal(governanceDb.listProposalDeliberations(workflowProposal.id)[1].outcome, 'revised',
-  '起案者の指示による調整を監査記録へ残す');
-assert.equal(governanceDb.listProposalDeliberations(workflowProposal.id)[1].decision.instruction,
-  '禁止範囲を狭くしてほしい');
+assert.ok(debatePosts.some((payload) => /異議が2件そろったため/.test(payload.content)));
+const revisedRecord = governanceDb.listProposalDeliberations(workflowProposal.id)[1];
+assert.equal(revisedRecord.outcome, 'revised', '異議による調整を監査記録へ残す');
+assert.deepEqual(revisedRecord.decision.objections.map((entry) => entry.instruction), [
+  '禁止範囲を狭くしてほしい（書き直し）', '例外を書いてほしい'
+]);
+await assert.rejects(
+  () => fileProposalObjection(debateGuild, { id: 'participant' }, workflowProposal.id, 'まだ直したい'),
+  /異議の受付中ではありません/,
+  '受付が終わった案件には異議を出せない'
+);
 
 let extensionProposal = governanceDb.createProposal({
   guildId: 'g2', source: 'petition', title: '締切直前論点テスト', summary: '応答時間を確保する',
@@ -1842,6 +1862,18 @@ const strayConfigRules = structuredClone(compiledConstitution.rules);
 strayConfigRules.workflows.law.states.discussion.config.autoPass = true;
 assert.throws(() => rulesModule.validateGovernanceRules(strayConfigRules), /未対応の項目があります/,
   '公開討議のschema外フィールドは成立前に拒否する');
+assert.equal(lawStates.objection_window.config.required, 2, '調整には2件の異議が要る');
+assert.equal(lawStates.objection_window.duration, '12h');
+assert.equal(lawStates.deliberation.on.summarized, 'objection_window', 'AI整理は異議受付へ渡すだけ');
+assert.equal(lawStates.objection_window.on.withdrawn, undefined, '提案者が単独で潰せる遷移を持たない');
+const zeroObjectionRules = structuredClone(compiledConstitution.rules);
+zeroObjectionRules.workflows.law.states.objection_window.config.required = 0;
+assert.throws(() => rulesModule.validateGovernanceRules(zeroObjectionRules), /required が不正です/,
+  '異議0件で調整する実行規則は成立させない');
+const danglingObjectionRules = structuredClone(compiledConstitution.rules);
+delete danglingObjectionRules.workflows.law.states.objection_window.on.finalized;
+assert.throws(() => rulesModule.validateGovernanceRules(danglingObjectionRules), /finalized/,
+  '異議が集まらないときの行き先がない実行規則は成立させない');
 const strayEarlyCloseRules = structuredClone(compiledConstitution.rules);
 strayEarlyCloseRules.votes.law.earlyClose = 'when_ai_agrees';
 assert.throws(() => rulesModule.validateGovernanceRules(strayEarlyCloseRules), /earlyClose/,
@@ -1945,10 +1977,10 @@ const decisionThread = {
   send: async (payload) => { decisionPosts.push(payload); return payload; }
 };
 const decisionGuild = { ...quietGuild, channels: { fetch: async () => decisionThread } };
-const createDecisionProposal = (title, stageEndsAt) => governanceDb.updateProposal(governanceDb.createProposal({
-  guildId: 'g2', source: 'petition', title, summary: '討議後の扱いを起案者が決める',
+const createObjectionProposal = (title, stageEndsAt) => governanceDb.updateProposal(governanceDb.createProposal({
+  guildId: 'g2', source: 'petition', title, summary: '異議の数で調整するかを決める',
   proposerId: 'r', constitutionId: governanceDb.getActiveConstitution('g2').id,
-  body: safeBill, status: 'proposer_decision', stageStartedAt: debateNow, stageEndsAt
+  body: safeBill, status: 'objection_window', stageStartedAt: debateNow, stageEndsAt
 }).id, { forum_thread_id: 'decision-thread' });
 
 modelOutput = {
@@ -1956,22 +1988,23 @@ modelOutput = {
   reasons: ['憲法上の権限を拡張しない狭い規則である。'],
   constitutionArticles: ['第一条（主権）']
 };
-const proposerFinalized = await decideProposalAfterDebate(
-  decisionGuild, { id: 'r' }, createDecisionProposal('起案者固定テスト', Date.now() + 6 * 3_600_000).id, 'finalize'
+const unopposed = await advanceProposal(
+  decisionGuild, createObjectionProposal('異議なしテスト', debateNow - 1_000), Date.now()
 );
-assert.equal(proposerFinalized.status, 'voting', '起案者が固定した最終案はそのまま違憲審査と投票へ進む');
-assert.deepEqual(proposerFinalized.body, safeBill, '固定を選んだ本文をAIが書き換えない');
+assert.equal(unopposed.status, 'voting', '異議がなければ本文のまま違憲審査と投票へ進む');
+assert.deepEqual(unopposed.body, safeBill, '異議がない本文をAIが書き換えない');
+assert.ok(decisionPosts.some((payload) => /異議がなかったため/.test(payload.content)));
 
-const withdrawn = await decideProposalAfterDebate(
-  decisionGuild, { id: 'r' }, createDecisionProposal('起案者取下げテスト', Date.now() + 6 * 3_600_000).id, 'withdraw'
+const lonelyProposal = createObjectionProposal('異議1件テスト', Date.now() + 6 * 3_600_000);
+await fileProposalObjection(decisionGuild, { id: 'someone' }, lonelyProposal.id, 'もっと狭くしてほしい');
+const lonelyClosed = await advanceProposal(
+  decisionGuild,
+  governanceDb.updateProposal(lonelyProposal.id, { stage_ends_at: debateNow - 1_000 }),
+  Date.now()
 );
-assert.equal(withdrawn.status, 'remanded', '起案者は討議を受けて取り下げられる');
-
-const decisionExpired = await advanceProposal(
-  decisionGuild, createDecisionProposal('起案者無応答テスト', debateNow - 1_000), Date.now()
-);
-assert.equal(decisionExpired.status, 'voting', '起案者が答えないまま止めず、討議時点の本文を固定する');
-assert.ok(decisionPosts.some((payload) => /起案者の選択期限が過ぎたため/.test(payload.content)));
+assert.equal(lonelyClosed.status, 'voting', '必要数に届かない異議では調整しない');
+assert.deepEqual(lonelyClosed.body, safeBill);
+assert.ok(decisionPosts.some((payload) => /必要な2件に届かなかったため/.test(payload.content)));
 
 const legacyProjectedRules = rulesModule.compileConstitution({ content: constitutionalProse, policy }).rules;
 assert.equal(legacyProjectedRules.workflows.law.states.deliberation.on.finalized, 'constitutional_review');

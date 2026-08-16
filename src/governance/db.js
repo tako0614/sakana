@@ -975,6 +975,21 @@ db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied
 }
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (18, ?)').run(Date.now());
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS governance_proposal_objections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
+    instruction TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (proposal_id, revision, user_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_proposal_objections
+    ON governance_proposal_objections(proposal_id, revision, id);
+`);
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (19, ?)').run(Date.now());
+
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
 db.prepare("UPDATE governance_outbox SET status = 'error', last_error = 'interrupted before completion' WHERE status = 'running'").run();
@@ -2087,6 +2102,28 @@ export function recordProposalDeliberation({ proposalId, revision, outcome, disc
     Date.now()
   );
   return Number(result.lastInsertRowid);
+}
+
+/**
+ * 調整を求める異議。1つの版につき1人1件で、数が実行規則の必要数に達したときだけ
+ * 調整案を作る。誰の異議かは公開記録なので、後から数え直せる形で残す。
+ */
+export function recordProposalObjection({ proposalId, revision, userId, instruction }) {
+  db.prepare(`
+    INSERT INTO governance_proposal_objections (proposal_id, revision, user_id, instruction, created_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(proposal_id, revision, user_id)
+      DO UPDATE SET instruction = excluded.instruction, created_at = excluded.created_at
+  `).run(Number(proposalId), Number(revision), String(userId), String(instruction), Date.now());
+  return listProposalObjections(proposalId, revision);
+}
+
+export function listProposalObjections(proposalId, revision) {
+  return db.prepare(`
+    SELECT * FROM governance_proposal_objections
+    WHERE proposal_id = ? AND revision = ?
+    ORDER BY id
+  `).all(Number(proposalId), Number(revision));
 }
 
 export function listProposalDeliberations(proposalId) {

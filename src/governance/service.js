@@ -54,6 +54,7 @@ import {
   listInvestigationEvidence,
   listOpenCasesForLaw,
   listProposalDeliberations,
+  listProposalObjections,
   listProposals,
   listSanctionsForLaw,
   markActionRunning,
@@ -66,6 +67,7 @@ import {
   recordActivities,
   recordActivity,
   recordProposalDeliberation,
+  recordProposalObjection,
   recordInstrumentRelation,
   recentUserActivity,
   recentGovernanceMessages,
@@ -95,7 +97,7 @@ import {
   postCourtUpdate,
   postCourtRecord,
   postProposalUpdate,
-  proposerDecisionButtons,
+  objectionButtons,
   publicMemberLabel,
   releaseAppealRestriction,
   reviewRequestButtons,
@@ -717,10 +719,10 @@ function debateSummaryText(summary, heading) {
 }
 
 /**
- * AIは討議を要約するだけで採否を決めない。意見が出た案件は起案者の選択待ちへ送り、
+ * AIは討議を要約するだけで採否を決めない。意見が出た案件は異議の受付へ送り、
  * 意見が一件もない案件だけ、そのままの本文を最終案として固定する。
  */
-async function summarizeAndAskProposer(guild, proposal, context) {
+async function summarizeAndOpenObjections(guild, proposal, context) {
   const {
     runtime, constitution, procedure, rows, discussion,
     deliberationTransition, deliberationState, quietClose, now
@@ -784,6 +786,7 @@ async function summarizeAndAskProposer(guild, proposal, context) {
 
   const transition = proposalTransitionFrom(runtime, deliberationState, 'summarized');
   const stageEndsAt = proposalStageEnd(transition, now);
+  const required = Number(transition.target.config.required);
   const waiting = {
     ...proposal,
     status: transition.targetName,
@@ -800,10 +803,10 @@ async function summarizeAndAskProposer(guild, proposal, context) {
     [
       debateSummaryText(summary, '討議の整理'),
       '',
-      `採否は${publicMemberLabel(proposal.proposer_id)}が決めます。下のボタンから「最終案として固定」「調整を指示」「取下げ」を選んでください。`,
-      `期限までに選択がない場合は、この本文のまま最終案として固定します。期限: <t:${Math.floor(stageEndsAt / 1000)}:F>`
+      `この本文のままでよくない人は、下のボタンから調整を求めてください。どう直すかを書いて出します。提案者を含め、誰の異議も同じ1件です。`,
+      `締切までに異議が${required}件そろえば、その指示で調整案を作って再討議します。そろわなければ、この本文が最終案になります。期限: <t:${Math.floor(stageEndsAt / 1000)}:F>`
     ].join('\n'),
-    { state: '討議', components: proposerDecisionButtons(proposal.id), files: [summaryFile] }
+    { state: '討議', components: objectionButtons(proposal.id), files: [summaryFile] }
   );
   if (deliberationTransition) updateProposal(proposal.id, { status: deliberationState });
   const saved = updateProposal(proposal.id, waiting);
@@ -890,9 +893,9 @@ export async function completeProposalDebate(guild, proposal, now = Date.now(), 
     throw new Error('公開討議の次にAI整理を行う実行規則ではありません。');
   }
   const deliberationState = deliberationTransition?.targetName ?? proposal.status;
-  // summarizedを持つ実行規則では、AIは整理までで採否を決めず、起案者が選ぶ。
+  // summarizedを持つ実行規則では、AIは整理までで採否を決めず、異議の数が決める。
   if (runtime.workflow.states[deliberationState]?.on?.summarized) {
-    return summarizeAndAskProposer(guild, proposal, {
+    return summarizeAndOpenObjections(guild, proposal, {
       runtime, constitution, procedure, rows, discussion,
       deliberationTransition, deliberationState, quietClose, now
     });
@@ -1032,56 +1035,84 @@ export async function completeProposalDebate(guild, proposal, now = Date.now(), 
 }
 
 /**
- * 討議の後に条文をどうするかは起案者が決める。AIは指示された内容を条文化するだけで、
- * 採否そのものは持たない。
+ * 提案した時点で法案は提案者から離れる。調整するかどうかは、有権者が出した
+ * 異議の数だけで決まり、AIも提案者も採否を持たない。
  */
-export async function decideProposalAfterDebate(guild, actor, proposalId, choice, instruction = null) {
+export async function fileProposalObjection(guild, actor, proposalId, instruction) {
   const proposal = getProposal(proposalId);
   if (!proposal || proposal.guild_id !== guild.id) throw new Error('案件が見つかりません。');
   const runtime = proposalRuntime(proposal);
-  if (runtime?.state?.handler !== 'proposer_decision') throw new Error('この案件は起案者の選択待ちではありません。');
-  if (String(actor.id) !== String(proposal.proposer_id)) throw new Error('起案者だけが討議後の扱いを選べます。');
-  const now = Date.now();
-  // 起案者が見たのはAI整理に使われた討議そのものなので、記録済みの同じ範囲を渡す。
+  if (runtime?.state?.handler !== 'objection_window') throw new Error('この案件は異議の受付中ではありません。');
+  if (Number(proposal.stage_ends_at ?? 0) <= Date.now()) throw new Error('異議の受付は締め切られています。');
+  if (!governanceActionAllowed(guild.id, actor.id, 'vote')) throw new Error('異議の提出が制裁により停止されています。');
+  const text = String(instruction ?? '').trim();
+  if (!text) throw new Error('どう直すかを書いてください。');
+  const procedure = legislationProcedure(getConstitution(proposal.constitution_id)?.policy ?? runtime.constitution.policy);
+  if (proposal.revision - 1 >= procedure.maximumRevisions) {
+    throw new Error(`調整は${procedure.maximumRevisions}回までです。この案は最終案として投票へ進みます。`);
+  }
+  const objections = recordProposalObjection({
+    proposalId: proposal.id,
+    revision: proposal.revision,
+    userId: actor.id,
+    instruction: text.slice(0, 2_000)
+  });
+  const required = Number(runtime.state.config.required);
+  await postProposalUpdate(
+    guild,
+    proposal,
+    [
+      `${publicMemberLabel(actor.id)} が調整を求めました（${objections.length}/${required}件）。`,
+      `**指示**\n${text.slice(0, 1_000)}`
+    ].join('\n'),
+    { state: '討議', components: objectionButtons(proposal.id) }
+  );
+  writeAudit({
+    guildId: guild.id, actorType: 'member', actorId: actor.id, action: 'proposal.objection',
+    targetType: 'proposal', targetId: proposal.id,
+    detail: { revision: proposal.revision, count: objections.length, required, public: true }
+  });
+  return { proposal, objections, required };
+}
+
+/**
+ * 異議受付の締切。必要数に達していれば集まった指示で調整案を作り、
+ * 達していなければその本文をそのまま最終案にする。
+ */
+async function closeProposalObjections(guild, proposal, now) {
+  const runtime = proposalRuntime(proposal);
+  const required = Number(runtime.state.config.required);
+  const objections = listProposalObjections(proposal.id, proposal.revision);
   const rows = [...listProposalDeliberations(proposal.id)].reverse()
     .find((entry) => entry.outcome === 'summarized')?.discussion ?? [];
+  const instructions = objections.map((objection, index) => ({
+    number: index + 1,
+    instruction: objection.instruction,
+    createdAt: objection.created_at
+  }));
 
-  if (choice === 'withdraw') {
-    const transition = proposalTransitionFrom(runtime, proposal.status, 'withdrawn');
-    const withdrawn = { ...proposal, status: transition.targetName, stage_ends_at: now, retry_after: null, last_error: null };
-    await postProposalUpdate(guild, withdrawn, '起案者が討議を受けてこの案を取り下げました。', { state: '廃案', components: [] });
-    const saved = updateProposal(proposal.id, withdrawn);
-    recordProposalDeliberation({
-      proposalId: proposal.id, revision: proposal.revision, outcome: 'withdrawn',
-      discussion: rows, decision: { actor: 'proposer', choice }
-    });
-    return saved;
-  }
-
-  if (choice === 'finalize') {
+  if (objections.length < required) {
     return finalizeProposalBody(guild, proposal, {
       runtime,
       fromState: proposal.status,
       outcome: 'finalized',
-      note: '起案者が討議の内容を確認し、本文を変えずに最終案として固定しました。ここから違憲審査へ進みます。',
-      decision: { actor: 'proposer', choice },
+      note: objections.length === 0
+        ? '調整を求める異議がなかったため、この本文を最終案として固定し、違憲審査へ進みます。'
+        : `調整を求める異議が${objections.length}件で、必要な${required}件に届かなかったため、この本文を最終案として固定します。`,
+      files: instructions.length
+        ? [{ attachment: Buffer.from(`${JSON.stringify(instructions, null, 2)}\n`), name: '異議.json' }]
+        : [],
+      decision: { objections: instructions.length, required, sustained: false },
       rows,
       now
     });
   }
 
-  if (choice !== 'revise') throw new Error('未対応の選択です。');
-  const text = String(instruction ?? '').trim();
-  if (!text) throw new Error('調整の指示を書いてください。');
-  const procedure = legislationProcedure(getConstitution(proposal.constitution_id)?.policy ?? runtime.constitution.policy);
-  if (proposal.revision - 1 >= procedure.maximumRevisions) {
-    throw new Error(`調整は${procedure.maximumRevisions}回までです。最終案として固定するか、取り下げてください。`);
-  }
   const body = await draftProposalRevision({
     guildId: guild.id,
     proposal,
     discussion: rows.map((row, index) => ({ number: index + 1, content: row.content, createdAt: row.created_at })),
-    instruction: text,
+    instruction: instructions.map((entry) => `${entry.number}. ${entry.instruction}`).join('\n'),
     constitution: runtime.constitution,
     activeLaws: listLaws(guild.id)
   });
@@ -1104,20 +1135,20 @@ export async function decideProposalAfterDebate(guild, actor, proposalId, choice
   await postProposalUpdate(
     guild,
     revised,
-    `起案者の指示で調整案を作りました。最終案ではないため、この投稿でもう一度討議します。締切: <t:${Math.floor(stageEndsAt / 1000)}:F>\n\n**起案者の指示**\n${text.slice(0, 1_000)}`,
+    `調整を求める異議が${objections.length}件そろったため、その指示で調整案を作りました。最終案ではないため、この投稿でもう一度討議します。締切: <t:${Math.floor(stageEndsAt / 1000)}:F>`,
     {
       state: '討議',
       components: [],
       files: [
         ...proposalBodyFiles(revised.kind, revised.body, '調整案'),
-        { attachment: Buffer.from(`${JSON.stringify({ actor: 'proposer', instruction: text }, null, 2)}\n`), name: '調整指示.json' }
+        { attachment: Buffer.from(`${JSON.stringify(instructions, null, 2)}\n`), name: '異議.json' }
       ]
     }
   );
   const saved = updateProposal(proposal.id, revised);
   recordProposalDeliberation({
     proposalId: proposal.id, revision: proposal.revision, outcome: 'revised',
-    discussion: rows, decision: { actor: 'proposer', choice, instruction: text }
+    discussion: rows, decision: { objections: instructions, required, sustained: true }
   });
   return saved;
 }
@@ -2439,18 +2470,9 @@ export async function advanceProposal(guild, proposal, now) {
     throw new Error(`未対応の公開討議phaseです: ${runtime.state.config.phase ?? '(none)'}`);
   }
   if (runtime.state.handler === 'ai_deliberation') return completeProposalDebate(guild, proposal, now);
-  if (runtime.state.handler === 'proposer_decision') {
+  if (runtime.state.handler === 'objection_window') {
     if (proposal.stage_ends_at === null || Number(proposal.stage_ends_at) > now) return proposal;
-    // 起案者が答えないまま止めない。討議どおりの本文をそのまま最終案にする。
-    return finalizeProposalBody(guild, proposal, {
-      runtime,
-      fromState: proposal.status,
-      outcome: 'expired',
-      note: '起案者の選択期限が過ぎたため、討議時点の本文をそのまま最終案として固定し、違憲審査へ進みます。',
-      decision: { actor: 'schedule', choice: 'expired' },
-      rows: [],
-      now
-    });
+    return closeProposalObjections(guild, proposal, now);
   }
   if (runtime.state.handler === 'constitutional_panel') return constitutionalReviewProposal(guild, proposal);
   if (runtime.state.handler === 'public_vote') {
