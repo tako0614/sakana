@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="robots" content="index, follow" />
+    <title>法令検索</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="masthead">
+      <a class="brand" href="#/">法令検索</a>
+      <nav class="brand-nav">
+        <a href="#/">法律</a>
+        <a href="#/constitution">憲法</a>
+      </nav>
+    </header>
+
+    <form class="search" id="search" autocomplete="off">
+      <input type="search" id="query" name="q" placeholder="法令名・本文・条文を検索" aria-label="検索語" />
+      <label class="toggle"><input type="checkbox" id="history" /> 廃止・旧版も含める</label>
+      <button type="submit">検索</button>
+    </form>
+
+    <main id="main" aria-live="polite">
+      <p class="loading">読み込み中…</p>
+    </main>
+
+    <footer class="footnote">
+      <p>成立した法令の公開正本です。討議中の案件は掲載しません。</p>
+    </footer>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

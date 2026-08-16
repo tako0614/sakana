@@ -763,6 +763,7 @@ const {
   approveCase,
   castAndPublishVote,
   completeProposalDebate,
+  decideProposalAfterDebate,
   completeCaseResponse,
   detectAutomaticEnforcement,
   fileAmendment,
@@ -1714,10 +1715,10 @@ governanceDb.recordActivity({
   content: '禁止範囲を狭くしてほしい', createdAt: debateNow - 14_400_000
 });
 modelOutput = {
-  decision: 'revise', summary: '適用範囲を狭くする意見を採用した。',
-  accepted: ['禁止範囲を明確に限定する'], rejected: [], changes: ['適用範囲を限定'],
-  lateMaterialFeedback: false,
-  body: { ...narrowedBill, title: '調整後の一般規則' }
+  summary: '適用範囲を狭くしてほしいという意見が出た。',
+  points: ['禁止範囲を明確に限定してほしい'],
+  materialFeedback: true,
+  lateMaterialFeedback: false
 };
 const debatePosts = [];
 const debateThread = {
@@ -1728,16 +1729,38 @@ const debateThread = {
   fetchStarterMessage: async () => ({ edit: async () => {} }),
   send: async (payload) => { debatePosts.push(payload); return payload; }
 };
-const adjusted = await completeProposalDebate({
-  id: 'g2', name: 'Test Community', channels: { fetch: async () => debateThread }
-}, workflowProposal, debateNow);
+const debateGuild = { id: 'g2', name: 'Test Community', channels: { fetch: async () => debateThread } };
+const summarized = await completeProposalDebate(debateGuild, workflowProposal, debateNow);
+assert.equal(summarized.status, 'proposer_decision', 'AIは採否を決めず起案者の選択へ渡す');
+assert.equal(summarized.revision, 1, 'AI整理の段階では本文を変えない');
+assert.equal(summarized.title, workflowProposal.title);
+assert.match(debatePosts[0].content, /討議の整理/);
+assert.match(debatePosts[0].content, /禁止範囲を明確に限定してほしい/);
+assert.ok(
+  debatePosts[0].components?.[0]?.components?.some(
+    (button) => (button.data?.custom_id ?? button.customId) === `gov:draft:${workflowProposal.id}:revise`
+  ),
+  '起案者の選択ボタンを案件投稿へ出す'
+);
+assert.equal(governanceDb.listProposalDeliberations(workflowProposal.id)[0].outcome, 'summarized');
+await assert.rejects(
+  () => decideProposalAfterDebate(debateGuild, { id: 'someone-else' }, workflowProposal.id, 'finalize'),
+  /起案者だけが/,
+  '起案者以外は討議後の扱いを決められない'
+);
+modelOutput = { ...narrowedBill, title: '調整後の一般規則' };
+const adjusted = await decideProposalAfterDebate(
+  debateGuild, { id: 'r' }, workflowProposal.id, 'revise', '禁止範囲を狭くしてほしい'
+);
 assert.equal(adjusted.status, 'revision_discussion');
 assert.equal(adjusted.revision, 2);
 assert.equal(adjusted.title, '調整後の一般規則');
 assert.ok(adjusted.stage_ends_at >= debateNow + policy.legislation.revisionDebateMilliseconds);
-assert.match(debatePosts[0].content, /調整案を公開します/);
-assert.equal(governanceDb.listProposalDeliberations(workflowProposal.id)[0].outcome, 'revised',
-  '実質変更は調整案を公開して再討議へ戻す');
+assert.ok(debatePosts.some((payload) => /起案者の指示で調整案を作りました/.test(payload.content)));
+assert.equal(governanceDb.listProposalDeliberations(workflowProposal.id)[1].outcome, 'revised',
+  '起案者の指示による調整を監査記録へ残す');
+assert.equal(governanceDb.listProposalDeliberations(workflowProposal.id)[1].decision.instruction,
+  '禁止範囲を狭くしてほしい');
 
 let extensionProposal = governanceDb.createProposal({
   guildId: 'g2', source: 'petition', title: '締切直前論点テスト', summary: '応答時間を確保する',
@@ -1753,9 +1776,9 @@ governanceDb.recordActivity({
   content: '締切直前だが例外を追加してほしい', createdAt: debateNow - 3_600_000
 });
 modelOutput = {
-  decision: 'revise', summary: '締切直前に実質的な例外の論点が出た。',
-  accepted: ['例外の要否を検討する'], rejected: [], changes: ['例外を明確化'],
-  lateMaterialFeedback: true, body: narrowedBill
+  summary: '締切直前に実質的な例外の論点が出た。',
+  points: ['例外の要否を検討してほしい'],
+  materialFeedback: true, lateMaterialFeedback: true
 };
 const extensionPosts = [];
 const extensionThread = {
@@ -1800,10 +1823,11 @@ const voted = await completeProposalDebate({
   }
 }, finalProposal, debateNow);
 assert.equal(voted.status, 'voting');
-assert.ok(finalPosts.some((payload) => /最終案を固定しました/.test(payload.content)));
+assert.ok(finalPosts.some((payload) => /意見がなかったため、この本文を最終案として固定/.test(payload.content)),
+  '意見が一件もない討議は起案者に問わず最終案にする');
 assert.ok(finalPosts.some((payload) => /本文は変更せず投票へ進みます/.test(payload.content)));
 assert.ok(finalPosts.some((payload) => /投票を開始しました/.test(payload.content)));
-assert.equal(governanceDb.listProposalDeliberations(finalProposal.id)[0].outcome, 'finalized');
+assert.equal(governanceDb.listProposalDeliberations(finalProposal.id)[0].outcome, 'uncontested');
 assert.deepEqual(voted.body, safeBill, '最終案固定後の違憲審査と投票で本文を変えない');
 
 const lawStates = compiledConstitution.rules.workflows.law.states;
@@ -1913,6 +1937,46 @@ assert.ok(earlyVotePosts.some((payload) => /締切を待たずに開票します
   '早期開票の理由を案件投稿へ公開する');
 assert.throws(() => governanceDb.castProposalVote(earlyVoteProposal.id, 'voter-1', 'yes'),
   /この投票は受付中ではありません/, '早期開票後は投票を受け付けない');
+
+const decisionPosts = [];
+const decisionThread = {
+  ...debateThread, id: 'decision-thread', locked: false, archived: false,
+  setLocked: async () => {}, setArchived: async () => {},
+  send: async (payload) => { decisionPosts.push(payload); return payload; }
+};
+const decisionGuild = { ...quietGuild, channels: { fetch: async () => decisionThread } };
+const createDecisionProposal = (title, stageEndsAt) => governanceDb.updateProposal(governanceDb.createProposal({
+  guildId: 'g2', source: 'petition', title, summary: '討議後の扱いを起案者が決める',
+  proposerId: 'r', constitutionId: governanceDb.getActiveConstitution('g2').id,
+  body: safeBill, status: 'proposer_decision', stageStartedAt: debateNow, stageEndsAt
+}).id, { forum_thread_id: 'decision-thread' });
+
+modelOutput = {
+  verdict: 'constitutional',
+  reasons: ['憲法上の権限を拡張しない狭い規則である。'],
+  constitutionArticles: ['第一条（主権）']
+};
+const proposerFinalized = await decideProposalAfterDebate(
+  decisionGuild, { id: 'r' }, createDecisionProposal('起案者固定テスト', Date.now() + 6 * 3_600_000).id, 'finalize'
+);
+assert.equal(proposerFinalized.status, 'voting', '起案者が固定した最終案はそのまま違憲審査と投票へ進む');
+assert.deepEqual(proposerFinalized.body, safeBill, '固定を選んだ本文をAIが書き換えない');
+
+const withdrawn = await decideProposalAfterDebate(
+  decisionGuild, { id: 'r' }, createDecisionProposal('起案者取下げテスト', Date.now() + 6 * 3_600_000).id, 'withdraw'
+);
+assert.equal(withdrawn.status, 'remanded', '起案者は討議を受けて取り下げられる');
+
+const decisionExpired = await advanceProposal(
+  decisionGuild, createDecisionProposal('起案者無応答テスト', debateNow - 1_000), Date.now()
+);
+assert.equal(decisionExpired.status, 'voting', '起案者が答えないまま止めず、討議時点の本文を固定する');
+assert.ok(decisionPosts.some((payload) => /起案者の選択期限が過ぎたため/.test(payload.content)));
+
+const legacyProjectedRules = rulesModule.compileConstitution({ content: constitutionalProse, policy }).rules;
+assert.equal(legacyProjectedRules.workflows.law.states.deliberation.on.finalized, 'constitutional_review');
+assert.equal(legacyProjectedRules.workflows.law.states.deliberation.on.summarized, undefined,
+  '旧policy由来の憲法は受付時の手続のまま動かす');
 
 modelOutput = safeBill;
 

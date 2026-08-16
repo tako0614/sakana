@@ -63,7 +63,11 @@ export const governanceConfig = {
   investigationGuildLimit: boundedInteger(process.env.GOVERNANCE_INVESTIGATION_GUILD_LIMIT, 300, 500),
   investigationConversationHours: boundedInteger(process.env.GOVERNANCE_INVESTIGATION_CONVERSATION_HOURS, 24, 720),
   investigationLookbackDays: boundedInteger(process.env.GOVERNANCE_INVESTIGATION_LOOKBACK_DAYS, 7, 30),
-  investigationCaseLimit: boundedInteger(process.env.GOVERNANCE_INVESTIGATION_CASE_LIMIT, 5, 10)
+  investigationCaseLimit: boundedInteger(process.env.GOVERNANCE_INVESTIGATION_CASE_LIMIT, 5, 10),
+  // 法令サイトのorigin。0なら起動しない。tunnelの先に出すのでloopback既定。
+  statuteApiPort: number(process.env.STATUTE_HTTP_PORT, 0),
+  statuteApiHost: firstNonEmpty(process.env.STATUTE_HTTP_HOST, '127.0.0.1'),
+  statuteApiToken: firstNonEmpty(process.env.STATUTE_HTTP_TOKEN, '')
 };
 
 export function communityDisplayName(value) {

@@ -178,6 +178,20 @@ client.once(Events.ClientReady, (readyClient) => {
     console.error('Catch-up failed:', error);
   });
 
+  if (governanceConfig.enabled && governanceConfig.statuteApiPort > 0) {
+    // 法令サイトのorigin。Cloudflare Tunnel がこのloopbackを拾う。
+    import('./governance/http.js').then(({ startStatuteServer }) => {
+      startStatuteServer({
+        port: governanceConfig.statuteApiPort,
+        host: governanceConfig.statuteApiHost,
+        token: governanceConfig.statuteApiToken
+      });
+      console.log(`Statute API listening on ${governanceConfig.statuteApiHost}:${governanceConfig.statuteApiPort}`);
+    }).catch((error) => {
+      console.error('Statute API failed to start:', error);
+    });
+  }
+
   if (governanceConfig.enabled) {
     const run = () => runGovernanceScheduler(readyClient).catch((error) => {
       console.error('Governance scheduler failed:', error);

@@ -7,6 +7,7 @@ const HANDLERS = new Set([
   'draft',
   'public_discussion',
   'ai_deliberation',
+  'proposer_decision',
   'proposal_relation_review',
   'constitutional_panel',
   'public_vote',
@@ -227,9 +228,16 @@ function validateWorkflow(name, workflow) {
     if (state.duration !== null) durationMilliseconds(state.duration, `workflows.${name}.states.${stateName}.duration`);
     object(state.config, `workflows.${name}.states.${stateName}.config`);
     object(state.on, `workflows.${name}.states.${stateName}.on`);
-    if (['public_discussion', 'public_vote', 'defense_window', 'appeal_window'].includes(state.handler)
+    if (['public_discussion', 'public_vote', 'defense_window', 'appeal_window', 'proposer_decision'].includes(state.handler)
       && (state.duration === null || durationMilliseconds(state.duration) === 0)) {
       throw new Error(`${state.handler} には0より長い期間が必要です。`);
+    }
+    // 起案者が答えないまま止まらないよう、無応答の行き先を必ず持たせる。
+    if (state.handler === 'proposer_decision') {
+      exactKeys(state.config, [], `workflows.${name}.states.${stateName}.config`);
+      for (const outcome of ['finalized', 'revised', 'withdrawn', 'expired']) {
+        if (!state.on[outcome]) throw new Error(`proposer_decision には ${outcome} の遷移が必要です。`);
+      }
     }
     if (state.handler === 'public_discussion') {
       exactKeys(state.config, ['phase'], `workflows.${name}.states.${stateName}.config`, ['quietClose']);
@@ -270,7 +278,7 @@ function validateWorkflow(name, workflow) {
   if (unreachable.length) throw new Error(`workflows.${name} に到達不能状態があります: ${unreachable.join(', ')}`);
   const waitingHandlers = new Set([
     'public_discussion', 'public_vote', 'defense_window', 'public_approval',
-    'review_window', 'appeal_window', 'terminal'
+    'review_window', 'appeal_window', 'proposer_decision', 'terminal'
   ]);
   const instant = (stateName) => {
     const item = states[stateName];
@@ -316,8 +324,22 @@ function validateLegislativeWorkflow(name, workflow) {
     const deliberationName = requireTransition(workflow, publishedName, 'expired', 'ai_deliberation');
     requireTransition(workflow, publishedName, 'extended', 'public_discussion', 'initial');
     const deliberation = workflow.states[deliberationName];
-    const revisionName = requireTransition(workflow, deliberationName, 'revised', 'public_discussion', 'revision');
-    constitutionalName = requireTransition(workflow, deliberationName, 'finalized', 'constitutional_panel');
+    let revisionName;
+    if (deliberation.on.summarized) {
+      // 人間主導: AI整理は起案者の選択へ渡すだけで、条文の採否は起案者が決める。
+      const decisionName = requireTransition(workflow, deliberationName, 'summarized', 'proposer_decision');
+      constitutionalName = requireTransition(workflow, deliberationName, 'uncontested', 'constitutional_panel');
+      revisionName = requireTransition(workflow, decisionName, 'revised', 'public_discussion', 'revision');
+      requireTransition(workflow, decisionName, 'withdrawn', 'terminal');
+      for (const outcome of ['finalized', 'expired']) {
+        if (requireTransition(workflow, decisionName, outcome, 'constitutional_panel') !== constitutionalName) {
+          throw new Error(`workflows.${name} の起案者の選択は討議と同じ違憲審査へ進む必要があります。`);
+        }
+      }
+    } else {
+      revisionName = requireTransition(workflow, deliberationName, 'revised', 'public_discussion', 'revision');
+      constitutionalName = requireTransition(workflow, deliberationName, 'finalized', 'constitutional_panel');
+    }
     requireTransition(workflow, deliberationName, 'remanded', 'terminal');
     requireTransition(workflow, revisionName, 'expired', 'ai_deliberation');
     requireTransition(workflow, revisionName, 'extended', 'public_discussion', 'revision');

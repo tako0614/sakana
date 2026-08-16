@@ -53,6 +53,7 @@ import {
   listLaws,
   listInvestigationEvidence,
   listOpenCasesForLaw,
+  listProposalDeliberations,
   listProposals,
   listSanctionsForLaw,
   markActionRunning,
@@ -94,6 +95,7 @@ import {
   postCourtUpdate,
   postCourtRecord,
   postProposalUpdate,
+  proposerDecisionButtons,
   publicMemberLabel,
   releaseAppealRestriction,
   reviewRequestButtons,
@@ -107,6 +109,8 @@ import {
   deliberateProposal,
   draftAmendment,
   draftBill,
+  draftProposalRevision,
+  summarizeProposalDebate,
   reviewLegislativeRelation,
   runConstitutionalPanel,
   runJudicialPanel
@@ -704,6 +708,145 @@ function proposalBodyFiles(kind, body, label) {
   ];
 }
 
+function debateSummaryText(summary, heading) {
+  return [
+    `## ${heading}`,
+    summary.summary,
+    ...(summary.points.length ? ['**出た論点**', ...summary.points.map((point) => `- ${point}`)] : [])
+  ].join('\n').slice(0, 2_000);
+}
+
+/**
+ * AIは討議を要約するだけで採否を決めない。意見が出た案件は起案者の選択待ちへ送り、
+ * 意見が一件もない案件だけ、そのままの本文を最終案として固定する。
+ */
+async function summarizeAndAskProposer(guild, proposal, context) {
+  const {
+    runtime, constitution, procedure, rows, discussion,
+    deliberationTransition, deliberationState, quietClose, now
+  } = context;
+  const summary = discussion.length > 0
+    ? await summarizeProposalDebate({ guildId: guild.id, proposal, discussion, constitution })
+    : {
+        summary: quietClose
+          ? '実行規則の無風期間が過ぎるまで意見が投稿されなかったため、討議を締め切りました。'
+          : '討議期間中に意見は投稿されませんでした。',
+        points: [],
+        materialFeedback: false,
+        lateMaterialFeedback: false
+      };
+  const summaryFile = {
+    attachment: Buffer.from(`${JSON.stringify(summary, null, 2)}\n`),
+    name: '討議整理.json'
+  };
+
+  if (runtime.state.handler === 'public_discussion'
+    && procedure.extendOnLateMaterialFeedback
+    && summary.lateMaterialFeedback
+    && Number(proposal.debate_extensions ?? 0) < procedure.maximumDebateExtensions) {
+    const transition = proposalTransition(proposal, 'extended');
+    const stageEndsAt = now + procedure.debateExtensionMilliseconds;
+    const extended = {
+      ...proposal,
+      status: transition.targetName,
+      stage_ends_at: stageEndsAt,
+      debate_extensions: Number(proposal.debate_extensions ?? 0) + 1,
+      retry_after: null,
+      failure_count: 0,
+      last_error: null
+    };
+    await postProposalUpdate(
+      guild,
+      extended,
+      `${debateSummaryText(summary, '討議を延長します')}\n\n締切直前に実質的な論点が出たため、応答時間を確保します。新しい締切: <t:${Math.floor(stageEndsAt / 1000)}:F>`,
+      { state: '討議', files: [summaryFile] }
+    );
+    const saved = updateProposal(proposal.id, extended);
+    recordProposalDeliberation({
+      proposalId: proposal.id, revision: proposal.revision, outcome: 'extended',
+      discussion: rows, decision: summary
+    });
+    return saved;
+  }
+
+  if (discussion.length === 0) {
+    return finalizeProposalBody(guild, proposal, {
+      runtime,
+      fromState: deliberationState,
+      outcome: 'uncontested',
+      note: `${debateSummaryText(summary, '討議の整理')}\n\n意見がなかったため、この本文を最終案として固定し、違憲審査へ進みます。`,
+      files: [summaryFile],
+      decision: summary,
+      rows,
+      now
+    });
+  }
+
+  const transition = proposalTransitionFrom(runtime, deliberationState, 'summarized');
+  const stageEndsAt = proposalStageEnd(transition, now);
+  const waiting = {
+    ...proposal,
+    status: transition.targetName,
+    stage_started_at: now,
+    stage_ends_at: stageEndsAt,
+    debate_extensions: 0,
+    retry_after: null,
+    failure_count: 0,
+    last_error: null
+  };
+  await postProposalUpdate(
+    guild,
+    waiting,
+    [
+      debateSummaryText(summary, '討議の整理'),
+      '',
+      `採否は${publicMemberLabel(proposal.proposer_id)}が決めます。下のボタンから「最終案として固定」「調整を指示」「取下げ」を選んでください。`,
+      `期限までに選択がない場合は、この本文のまま最終案として固定します。期限: <t:${Math.floor(stageEndsAt / 1000)}:F>`
+    ].join('\n'),
+    { state: '討議', components: proposerDecisionButtons(proposal.id), files: [summaryFile] }
+  );
+  if (deliberationTransition) updateProposal(proposal.id, { status: deliberationState });
+  const saved = updateProposal(proposal.id, waiting);
+  recordProposalDeliberation({
+    proposalId: proposal.id, revision: proposal.revision, outcome: 'summarized',
+    discussion: rows, decision: summary
+  });
+  return saved;
+}
+
+async function finalizeProposalBody(guild, proposal, {
+  runtime, fromState, outcome, note, files = [], decision, rows, body = null, now = Date.now()
+}) {
+  // outcomeは実行規則の遷移名と監査記録の結果名を兼ねる (uncontested / finalized / expired)。
+  const transition = proposalTransitionFrom(runtime, fromState, outcome);
+  const finalBody = body ?? proposal.body;
+  const finalProposal = {
+    ...proposal,
+    title: finalBody.title,
+    summary: finalBody.summary,
+    body: finalBody,
+    status: transition.targetName,
+    stage_started_at: now,
+    stage_ends_at: null,
+    debate_extensions: 0,
+    retry_after: null,
+    failure_count: 0,
+    last_error: null
+  };
+  await postProposalUpdate(guild, finalProposal, note, {
+    state: '違憲審査',
+    files: [...proposalBodyFiles(finalProposal.kind, finalProposal.body, '最終案'), ...files]
+  });
+  if (fromState !== proposal.status) updateProposal(proposal.id, { status: fromState });
+  const saved = updateProposal(proposal.id, finalProposal);
+  recordProposalDeliberation({
+    proposalId: proposal.id, revision: proposal.revision, outcome, discussion: rows, decision
+  });
+  return transition.target.handler === 'constitutional_panel'
+    ? constitutionalReviewProposal(guild, saved)
+    : saved;
+}
+
 function deliberationText(decision, heading) {
   const section = (label, values) => values.length
     ? [`**${label}**`, ...values.map((value) => `- ${value}`)]
@@ -740,6 +883,20 @@ export async function completeProposalDebate(guild, proposal, now = Date.now(), 
     createdAt: row.created_at,
     late: row.created_at >= lateBoundary
   }));
+  const deliberationTransition = runtime.state.handler === 'public_discussion'
+    ? proposalTransition(proposal, 'expired')
+    : null;
+  if (deliberationTransition && deliberationTransition.target.handler !== 'ai_deliberation') {
+    throw new Error('公開討議の次にAI整理を行う実行規則ではありません。');
+  }
+  const deliberationState = deliberationTransition?.targetName ?? proposal.status;
+  // summarizedを持つ実行規則では、AIは整理までで採否を決めず、起案者が選ぶ。
+  if (runtime.workflow.states[deliberationState]?.on?.summarized) {
+    return summarizeAndAskProposer(guild, proposal, {
+      runtime, constitution, procedure, rows, discussion,
+      deliberationTransition, deliberationState, quietClose, now
+    });
+  }
   const decision = discussion.length > 0
     ? await deliberateProposal({
         guildId: guild.id,
@@ -793,14 +950,6 @@ export async function completeProposalDebate(guild, proposal, now = Date.now(), 
     });
     return saved;
   }
-
-  const deliberationTransition = runtime.state.handler === 'public_discussion'
-    ? proposalTransition(proposal, 'expired')
-    : null;
-  if (deliberationTransition && deliberationTransition.target.handler !== 'ai_deliberation') {
-    throw new Error('公開討議の次にAI整理を行う実行規則ではありません。');
-  }
-  const deliberationState = deliberationTransition?.targetName ?? proposal.status;
 
   if (decision.decision === 'revise') {
     if (proposal.revision - 1 >= procedure.maximumRevisions) {
@@ -869,16 +1018,84 @@ export async function completeProposalDebate(guild, proposal, now = Date.now(), 
     return saved;
   }
 
-  const finalBody = decision.body ?? proposal.body;
-  const transition = proposalTransitionFrom(runtime, deliberationState, 'finalized');
-  const finalProposal = {
+  return finalizeProposalBody(guild, proposal, {
+    runtime,
+    fromState: deliberationState,
+    outcome: 'finalized',
+    note: `${deliberationText(decision, '最終案を固定しました')}\n\nここから本文は変更せず、違憲審査へ進みます。`,
+    files: [{ attachment: Buffer.from(`${JSON.stringify(publicDecision, null, 2)}\n`), name: '討議整理.json' }],
+    decision: publicDecision,
+    body: decision.body ?? null,
+    rows,
+    now
+  });
+}
+
+/**
+ * 討議の後に条文をどうするかは起案者が決める。AIは指示された内容を条文化するだけで、
+ * 採否そのものは持たない。
+ */
+export async function decideProposalAfterDebate(guild, actor, proposalId, choice, instruction = null) {
+  const proposal = getProposal(proposalId);
+  if (!proposal || proposal.guild_id !== guild.id) throw new Error('案件が見つかりません。');
+  const runtime = proposalRuntime(proposal);
+  if (runtime?.state?.handler !== 'proposer_decision') throw new Error('この案件は起案者の選択待ちではありません。');
+  if (String(actor.id) !== String(proposal.proposer_id)) throw new Error('起案者だけが討議後の扱いを選べます。');
+  const now = Date.now();
+  // 起案者が見たのはAI整理に使われた討議そのものなので、記録済みの同じ範囲を渡す。
+  const rows = [...listProposalDeliberations(proposal.id)].reverse()
+    .find((entry) => entry.outcome === 'summarized')?.discussion ?? [];
+
+  if (choice === 'withdraw') {
+    const transition = proposalTransitionFrom(runtime, proposal.status, 'withdrawn');
+    const withdrawn = { ...proposal, status: transition.targetName, stage_ends_at: now, retry_after: null, last_error: null };
+    await postProposalUpdate(guild, withdrawn, '起案者が討議を受けてこの案を取り下げました。', { state: '廃案', components: [] });
+    const saved = updateProposal(proposal.id, withdrawn);
+    recordProposalDeliberation({
+      proposalId: proposal.id, revision: proposal.revision, outcome: 'withdrawn',
+      discussion: rows, decision: { actor: 'proposer', choice }
+    });
+    return saved;
+  }
+
+  if (choice === 'finalize') {
+    return finalizeProposalBody(guild, proposal, {
+      runtime,
+      fromState: proposal.status,
+      outcome: 'finalized',
+      note: '起案者が討議の内容を確認し、本文を変えずに最終案として固定しました。ここから違憲審査へ進みます。',
+      decision: { actor: 'proposer', choice },
+      rows,
+      now
+    });
+  }
+
+  if (choice !== 'revise') throw new Error('未対応の選択です。');
+  const text = String(instruction ?? '').trim();
+  if (!text) throw new Error('調整の指示を書いてください。');
+  const procedure = legislationProcedure(getConstitution(proposal.constitution_id)?.policy ?? runtime.constitution.policy);
+  if (proposal.revision - 1 >= procedure.maximumRevisions) {
+    throw new Error(`調整は${procedure.maximumRevisions}回までです。最終案として固定するか、取り下げてください。`);
+  }
+  const body = await draftProposalRevision({
+    guildId: guild.id,
+    proposal,
+    discussion: rows.map((row, index) => ({ number: index + 1, content: row.content, createdAt: row.created_at })),
+    instruction: text,
+    constitution: runtime.constitution,
+    activeLaws: listLaws(guild.id)
+  });
+  const transition = proposalTransitionFrom(runtime, proposal.status, 'revised');
+  const stageEndsAt = proposalStageEnd(transition, now);
+  const revised = {
     ...proposal,
-    title: finalBody.title,
-    summary: finalBody.summary,
-    body: finalBody,
+    title: body.title,
+    summary: body.summary,
+    body,
     status: transition.targetName,
+    revision: proposal.revision + 1,
     stage_started_at: now,
-    stage_ends_at: null,
+    stage_ends_at: stageEndsAt,
     debate_extensions: 0,
     retry_after: null,
     failure_count: 0,
@@ -886,28 +1103,23 @@ export async function completeProposalDebate(guild, proposal, now = Date.now(), 
   };
   await postProposalUpdate(
     guild,
-    finalProposal,
-    `${deliberationText(decision, '最終案を固定しました')}\n\nここから本文は変更せず、違憲審査へ進みます。`,
+    revised,
+    `起案者の指示で調整案を作りました。最終案ではないため、この投稿でもう一度討議します。締切: <t:${Math.floor(stageEndsAt / 1000)}:F>\n\n**起案者の指示**\n${text.slice(0, 1_000)}`,
     {
-      state: '違憲審査',
+      state: '討議',
+      components: [],
       files: [
-        ...proposalBodyFiles(finalProposal.kind, finalProposal.body, '最終案'),
-        { attachment: Buffer.from(`${JSON.stringify(publicDecision, null, 2)}\n`), name: '討議整理.json' }
+        ...proposalBodyFiles(revised.kind, revised.body, '調整案'),
+        { attachment: Buffer.from(`${JSON.stringify({ actor: 'proposer', instruction: text }, null, 2)}\n`), name: '調整指示.json' }
       ]
     }
   );
-  if (deliberationTransition) updateProposal(proposal.id, { status: deliberationState });
-  const saved = updateProposal(proposal.id, finalProposal);
+  const saved = updateProposal(proposal.id, revised);
   recordProposalDeliberation({
-    proposalId: proposal.id,
-    revision: proposal.revision,
-    outcome: 'finalized',
-    discussion: rows,
-    decision: publicDecision
+    proposalId: proposal.id, revision: proposal.revision, outcome: 'revised',
+    discussion: rows, decision: { actor: 'proposer', choice, instruction: text }
   });
-  return transition.target.handler === 'constitutional_panel'
-    ? constitutionalReviewProposal(guild, saved)
-    : saved;
+  return saved;
 }
 
 async function constitutionalReviewProposal(guild, proposal) {
@@ -2227,6 +2439,19 @@ export async function advanceProposal(guild, proposal, now) {
     throw new Error(`未対応の公開討議phaseです: ${runtime.state.config.phase ?? '(none)'}`);
   }
   if (runtime.state.handler === 'ai_deliberation') return completeProposalDebate(guild, proposal, now);
+  if (runtime.state.handler === 'proposer_decision') {
+    if (proposal.stage_ends_at === null || Number(proposal.stage_ends_at) > now) return proposal;
+    // 起案者が答えないまま止めない。討議どおりの本文をそのまま最終案にする。
+    return finalizeProposalBody(guild, proposal, {
+      runtime,
+      fromState: proposal.status,
+      outcome: 'expired',
+      note: '起案者の選択期限が過ぎたため、討議時点の本文をそのまま最終案として固定し、違憲審査へ進みます。',
+      decision: { actor: 'schedule', choice: 'expired' },
+      rows: [],
+      now
+    });
+  }
   if (runtime.state.handler === 'constitutional_panel') return constitutionalReviewProposal(guild, proposal);
   if (runtime.state.handler === 'public_vote') {
     if (proposal.stage_ends_at !== null && Number(proposal.stage_ends_at) <= now) {

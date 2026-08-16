@@ -1,0 +1,14 @@
+{
+  "name": "sakana-statutes",
+  "private": true,
+  "type": "module",
+  "description": "成立した法令だけを読むための公開サイト。Cloudflare Workersで配信し、/api だけを自宅鯖のoriginへ中継する。",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.20.0"
+  }
+}

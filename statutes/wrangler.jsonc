@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sakana-statutes",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-06-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    // Cloudflare Tunnel の公開hostname。tokenは wrangler secret put ORIGIN_TOKEN で入れる。
+    "ORIGIN_URL": "https://statutes-origin.example.com"
+  }
+}

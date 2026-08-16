@@ -36,6 +36,7 @@ import {
   backfillGovernanceActivity,
   castAndPublishVote,
   completeCaseResponse,
+  decideProposalAfterDebate,
   requestSummaryTrial,
   submitCaseAnswer
 } from './service.js';
@@ -316,6 +317,16 @@ export async function handleGovernanceComponent(interaction) {
       await interaction.editReply('上訴を受理しました。回答を追記し、終わったら「回答完了」を押してください。');
       return true;
     }
+    if (customId.startsWith('gov:draft_revise:') && interaction.isModalSubmit()) {
+      const proposalId = Number(customId.split(':')[2]);
+      await interaction.deferReply({ flags: EPHEMERAL });
+      const proposal = await decideProposalAfterDebate(
+        interaction.guild, interaction.user, proposalId, 'revise',
+        interaction.fields.getTextInputValue('instruction')
+      );
+      await interaction.editReply(`指示のとおり調整案を作り、再討議を始めました（第${proposal.revision}版）。`);
+      return true;
+    }
     if (customId.startsWith('gov:admin')) return await handleGovernanceUxInteraction(interaction);
     if (interaction.isButton() && customId.startsWith('gov:setup:')) {
       const [, , sessionId, action] = customId.split(':');
@@ -372,6 +383,23 @@ export async function handleGovernanceComponent(interaction) {
         await interaction.editReply('回答を締め切り、判定を開始しました。');
         return true;
       }
+    }
+    if (action === 'draft') {
+      if (value === 'revise') {
+        const modal = new ModalBuilder().setCustomId(`gov:draft_revise:${id}`).setTitle('条文の調整を指示')
+          .addComponents(new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('instruction').setLabel('どう直すか').setStyle(TextInputStyle.Paragraph)
+              .setRequired(true).setMaxLength(2000)
+          ));
+        await interaction.showModal(modal);
+        return true;
+      }
+      await interaction.deferReply({ flags: EPHEMERAL });
+      await decideProposalAfterDebate(interaction.guild, interaction.user, id, value);
+      await interaction.editReply(value === 'finalize'
+        ? '本文を変えずに最終案として固定しました。違憲審査へ進みます。'
+        : 'この案を取り下げました。');
+      return true;
     }
     await interaction.deferReply({ flags: EPHEMERAL });
     if (action === 'vote') {
