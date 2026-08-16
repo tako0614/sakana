@@ -30,6 +30,7 @@ import {
 import { sha256 } from './policy.js';
 import { buildLegislativeCandidates, exactActiveProposalMatch } from './relation.js';
 import { compileConstitution, governanceRulesSummary } from './rules.js';
+import { investigationSummary } from './tools.js';
 import { openProposalVote, publicPanelOutputs, retryPatch } from './service.js';
 
 const AGENDA_DISCUSSION_LIMIT = 300;
@@ -188,6 +189,19 @@ function decisionSummary(decision) {
   };
 }
 
+// 席の調査は要約だけ公開する（憲法第九条8・実行規則 investigation.publicRecord）。
+const PANEL_LENS_LABELS = ['textual', 'rights', 'adversarial'];
+
+function investigationLines(decision) {
+  return (decision.traces ?? [])
+    .map(({ seat, trace }) => investigationSummary(trace, {
+      seat,
+      lens: PANEL_LENS_LABELS[(seat - 1) % PANEL_LENS_LABELS.length],
+      maximumSteps: decision.maximumSteps
+    }))
+    .filter(Boolean);
+}
+
 function decisionFile(proposal, decision, extra = {}) {
   return {
     attachment: Buffer.from(`${JSON.stringify({
@@ -200,22 +214,39 @@ function decisionFile(proposal, decision, extra = {}) {
   };
 }
 
-async function deferAgendaItem(guild, proposal, decision, extra = {}) {
+// 継続審議でも、国会は書けるところまで条文を書いて出す。人間は白紙にではなく
+// たたき台に対して直しを言えばよい。draft が null になるのは席が割れて方向すら
+// 定まらなかったときだけ。
+async function deferAgendaItem(guild, proposal, decision, extra = {}, draft = null) {
   const deferrals = Number(proposal.deferrals ?? 0) + 1;
   const updated = updateProposal(proposal.id, {
     deferrals,
     stage_started_at: Date.now(),
+    ...(draft ? { body: draft.body } : {}),
     retry_after: null,
     failure_count: 0,
     last_error: null
   });
+  const files = [decisionFile(proposal, decision, extra)];
+  if (draft) {
+    files.push(
+      { attachment: Buffer.from(draft.fullDraft), name: draft.amendment ? 'たたき台-改正案.md' : 'たたき台-法律案.md' },
+      {
+        attachment: Buffer.from(`${JSON.stringify(draft.structured, null, 2)}\n`),
+        name: draft.amendment ? '憲法実行規則.json' : '執行定義.json'
+      }
+    );
+  }
   await postProposalUpdate(guild, updated, [
     `## 継続審議 (${deferrals}回目)`,
-    '国会は今回この議題の結論を出しませんでした。次の国会まで、このスレで討論できます。',
+    draft
+      ? '国会はいまの時点で書けるたたき台を出しました。まだ投票にはかけません。次の国会まで、このスレで直したいところを書いてください。'
+      : '国会は今回この議題の結論を出しませんでした。次の国会まで、このスレで討論できます。',
     decision.question ? `\n**聞きたいこと**: ${decision.question}` : null,
-    decision.reasons.length ? `\n理由:\n${decision.reasons.map((line) => `- ${line}`).join('\n')}` : null
-  ].filter(Boolean).join('\n'), { state: '議論中', files: [decisionFile(proposal, decision, extra)] });
-  return { proposalId: proposal.id, title: proposal.title, decision: 'defer', deferrals };
+    decision.reasons.length ? `\n理由:\n${decision.reasons.map((line) => `- ${line}`).join('\n')}` : null,
+    ...investigationLines(decision).map((line) => `\n${line}`)
+  ].filter(Boolean).join('\n'), { state: '議論中', files });
+  return { proposalId: proposal.id, title: proposal.title, decision: 'defer', deferrals, drafted: Boolean(draft) };
 }
 
 async function rejectAgendaItem(guild, proposal, decision) {
@@ -229,16 +260,40 @@ async function rejectAgendaItem(guild, proposal, decision) {
   await postProposalUpdate(guild, updated, [
     '## 不採択',
     '国会はこの議題を法律にしないと決めました。',
-    decision.reasons.length ? `\n理由:\n${decision.reasons.map((line) => `- ${line}`).join('\n')}` : null
+    decision.reasons.length ? `\n理由:\n${decision.reasons.map((line) => `- ${line}`).join('\n')}` : null,
+    ...investigationLines(decision).map((line) => `\n${line}`)
   ].filter(Boolean).join('\n'), { state: '不成立', files: [decisionFile(proposal, decision)] });
   return { proposalId: proposal.id, title: proposal.title, decision: 'reject' };
 }
 
-async function legislateAgendaItem(guild, governance, constitution, proposal, decision) {
+function draftArtifacts(body, amendment) {
+  return {
+    body,
+    amendment,
+    fullDraft: amendment
+      ? `# ${body.title}\n\n${body.content}\n\n実行手続: ${governanceRulesSummary(body.rules)}`
+      : `# ${body.title}\n\n${body.text}\n\n## Provisions\n\n\`\`\`json\n${JSON.stringify(body.provisions, null, 2)}\n\`\`\``,
+    structured: amendment ? body.rules : body.provisions
+  };
+}
+
+// 継続審議で条文だけ書く経路。憲法適合の確認は投票へ進むときにだけ行い、
+// ここでは「いま書けるもの」をそのまま公開する。
+async function draftForDeferral(guild, constitution, proposal, decision) {
+  if (!decision.relation) return null;
+  try {
+    const { body, amendment } = await draftAgendaBody(guild, constitution, proposal, decision);
+    return draftArtifacts(body, amendment);
+  } catch (error) {
+    // たたき台が書けなくても継続審議そのものは成立させる。
+    console.error(`Parliament draft for deferral failed (proposal ${proposal.id}):`, error?.message ?? error);
+    return null;
+  }
+}
+
+async function draftAgendaBody(guild, constitution, proposal, decision) {
   const amendment = decision.relation === 'amend_constitution';
-  let current = amendment && proposal.kind !== 'amendment'
-    ? setProposalKind(proposal.id, 'amendment')
-    : proposal;
+  const current = proposal;
   const laws = listLaws(guild.id, { activeOnly: true, limit: 200 });
   let amendmentTarget = null;
   if (decision.relation === 'amend_law') {
@@ -277,6 +332,15 @@ async function legislateAgendaItem(guild, governance, constitution, proposal, de
       activeLaws: laws,
       policy: constitution.policy
     });
+  return { body, amendment, amendmentTarget };
+}
+
+async function legislateAgendaItem(guild, governance, constitution, proposal, decision) {
+  const amendment = decision.relation === 'amend_constitution';
+  let current = amendment && proposal.kind !== 'amendment'
+    ? setProposalKind(proposal.id, 'amendment')
+    : proposal;
+  const { body, amendmentTarget } = await draftAgendaBody(guild, constitution, current, decision);
   // 事前違憲審査の段階は廃止したが、憲法適合性は国会の中で必ず確認する。
   const review = await runConstitutionalPanel({
     guildId: guild.id,
@@ -309,7 +373,7 @@ async function legislateAgendaItem(guild, governance, constitution, proposal, de
         `条文案の憲法適合を確認できませんでした (合憲 ${constitutional}/${constitution.policy.judiciary.panelSeats})。`,
         ...concerns
       ]
-    }, reviewSummary);
+    }, reviewSummary, draftArtifacts(body, amendment));
   }
   current = updateProposal(current.id, {
     title: body.title.slice(0, 100),
@@ -323,15 +387,13 @@ async function legislateAgendaItem(guild, governance, constitution, proposal, de
     failure_count: 0,
     last_error: null
   });
-  const fullDraft = amendment
-    ? `# ${body.title}\n\n${body.content}\n\n実行手続: ${governanceRulesSummary(body.rules)}`
-    : `# ${body.title}\n\n${body.text}\n\n## Provisions\n\n\`\`\`json\n${JSON.stringify(body.provisions, null, 2)}\n\`\`\``;
-  const structured = amendment ? body.rules : body.provisions;
+  const { fullDraft, structured } = draftArtifacts(body, amendment);
   await postProposalUpdate(guild, current, [
     '## 国会が条文をまとめました',
     amendment ? '憲法改正案として投票にかけます。' : '法律案として投票にかけます。',
     decision.reasons.length ? `\n理由:\n${decision.reasons.map((line) => `- ${line}`).join('\n')}` : null,
-    `\n合憲 ${constitutional}/${constitution.policy.judiciary.panelSeats}`
+    `\n合憲 ${constitutional}/${constitution.policy.judiciary.panelSeats}`,
+    ...investigationLines(decision).map((line) => `\n${line}`)
   ].filter(Boolean).join('\n'), {
     files: [
       decisionFile(current, decision, reviewSummary),
@@ -398,7 +460,8 @@ async function processAgendaItem(guild, governance, constitution, input) {
     activeLaws,
     candidates,
     panel: rules.panels.parliament,
-    allowDefer
+    allowDefer,
+    investigation: constitution.policy.investigation
   });
   // AI席が必要数そろわないのは政治的な結論ではない。継続審議の回数を消費させず、
   // 次の国会でもう一度かける。
@@ -413,7 +476,12 @@ async function processAgendaItem(guild, governance, constitution, input) {
     decision: decisionSummary(decision)
   });
   if (decision.decision === 'reject') return rejectAgendaItem(guild, proposal, decision);
-  if (decision.decision === 'defer') return deferAgendaItem(guild, proposal, decision);
+  if (decision.decision === 'defer') {
+    return deferAgendaItem(
+      guild, proposal, decision, {},
+      await draftForDeferral(guild, constitution, proposal, decision)
+    );
+  }
   return legislateAgendaItem(guild, governance, constitution, proposal, decision);
 }
 

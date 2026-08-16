@@ -3,6 +3,19 @@ import { canonicalJson, sha256, validateConstitutionPolicy } from './policy.js';
 export const GOVERNANCE_RULES_SCHEMA = 'sakana.governance-rules/v1';
 export const GOVERNANCE_RULES_COMPILER_VERSION = 1;
 
+// 席が使える調査手段の実装一覧。tools.js が import 時に自分の登録内容と突き合わせる
+// （rules.js → tools.js → db.js → rules.js の循環を避けるため、正本をここに置く）。
+export const IMPLEMENTED_TOOLS = Object.freeze([
+  'read_case_record',
+  'read_cases',
+  'read_channel',
+  'read_context',
+  'read_law',
+  'read_precedent',
+  'read_user_messages',
+  'search_messages'
+]);
+
 const HANDLERS = new Set([
   'parliament_agenda',
   'constitutional_panel',
@@ -98,12 +111,14 @@ function validateElectorates(electorates) {
 }
 
 function validatePanels(panels) {
-  exactKeys(panels, ['parliament', 'constitutional', 'court', 'police'], 'panels');
+  exactKeys(panels, ['parliament', 'constitutional', 'court', 'police', 'judicialScreening'], 'panels');
   const requiredKeys = {
     parliament: ['decision'],
     constitutional: ['constitutional', 'unconstitutional'],
     court: ['responsible'],
-    police: ['responsible']
+    police: ['responsible'],
+    // 事件化するかどうかを独立に調べて決める席。処分そのものは police が決める。
+    judicialScreening: ['decision']
   };
   for (const [name, panel] of Object.entries(panels)) {
     exactKeys(panel, ['seats', 'required'], `panels.${name}`);
@@ -314,12 +329,38 @@ function validateLegislativeWorkflow(name, workflow) {
   if (agendaStates.length !== 1) throw new Error(`workflows.${name} の議題stateは一つだけです。`);
 }
 
+// 憲法第十五条3。席が使える調査手段は実行規則が列挙したものだけで、AIの解釈で
+// 増やせない。コードは「実装があるか」しか見ない。何を許すかは憲法が決める。
+function validateInvestigation(investigation) {
+  exactKeys(investigation, ['maximumSteps', 'tools', 'publicRecord', 'maximumRedefense'], 'investigation');
+  const roles = ['police', 'court', 'parliament'];
+  exactKeys(investigation.maximumSteps, roles, 'investigation.maximumSteps');
+  for (const role of roles) {
+    integer(investigation.maximumSteps[role], `investigation.maximumSteps.${role}`, { min: 1, max: 20 });
+  }
+  exactKeys(investigation.tools, roles, 'investigation.tools');
+  for (const role of roles) {
+    const tools = investigation.tools[role];
+    if (!Array.isArray(tools) || new Set(tools).size !== tools.length) {
+      throw new Error(`investigation.tools.${role} が不正です。`);
+    }
+    for (const name of tools) {
+      if (!IMPLEMENTED_TOOLS.includes(name)) throw new Error(`未実装の調査手段があります: ${name}`);
+    }
+  }
+  if (!['summary', 'full'].includes(investigation.publicRecord)) {
+    throw new Error('investigation.publicRecord は summary または full です。');
+  }
+  integer(investigation.maximumRedefense, 'investigation.maximumRedefense', { min: 0, max: 3 });
+}
+
 export function validateGovernanceRules(input) {
-  const rules = exactKeys(input, ['$schema', 'electorates', 'panels', 'parliament', 'votes', 'sanctions', 'workflows'], 'governance-rules');
+  const rules = exactKeys(input, ['$schema', 'electorates', 'panels', 'parliament', 'investigation', 'votes', 'sanctions', 'workflows'], 'governance-rules');
   if (rules.$schema !== GOVERNANCE_RULES_SCHEMA) throw new Error('未対応のgovernance-rules schemaです。');
   validateElectorates(rules.electorates);
   validatePanels(rules.panels);
   validateParliament(rules.parliament);
+  validateInvestigation(rules.investigation);
   validateVotes(rules.votes);
   validateSanctions(rules.sanctions);
   exactKeys(rules.workflows, ['law', 'constitutionalAmendment', 'criminalCase', 'constitutionalCase'], 'workflows');
@@ -405,6 +446,16 @@ export function policyFromGovernanceRules(input) {
       maximumRestrictionSeconds: durationMilliseconds(sanctions.maximumRestriction) / 1000,
       allowedSanctions: sanctions.allowed,
       restrictionPrimitives: sanctions.restrictionPrimitives
+    },
+    investigation: {
+      maximumSteps: { ...rules.investigation.maximumSteps },
+      tools: {
+        police: [...rules.investigation.tools.police],
+        court: [...rules.investigation.tools.court],
+        parliament: [...rules.investigation.tools.parliament]
+      },
+      publicRecord: rules.investigation.publicRecord,
+      maximumRedefense: rules.investigation.maximumRedefense
     }
   };
   if (policy.schemaVersion === 2) {

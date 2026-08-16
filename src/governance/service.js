@@ -109,8 +109,12 @@ import {
 import { governanceActionAllowed, reserveRestrictedAgentCall } from './restrictions.js';
 import { notifyCaseParty } from './notifications.js';
 import { publishInstrument, syncLawSite } from './lawsite.js';
+import { investigationSummary } from './tools.js';
 
 import { closeGovernanceVote, compileConstitution, durationMilliseconds, workflowFor } from './rules.js';
+
+// 席の調査は要約だけ公開する（憲法第九条8・実行規則 investigation.publicRecord）。
+const PANEL_LENS_LABELS = ['textual', 'rights', 'adversarial'];
 
 const RETRY_BASE_MS = 5 * 60_000;
 const RETRY_MAX_MS = 60 * 60_000;
@@ -174,6 +178,8 @@ export function publicPanelOutputs(outputs, evidenceOrder = new Map()) {
       elementFindings = [],
       lawId: _lawId,
       offenseCode: _offenseCode,
+      // 追加候補の生のmessage idは、証拠として採ったときに別途公開される。
+      newRecordIds: _newRecordIds,
       ...publicOutput
     } = output;
     return {
@@ -744,6 +750,14 @@ async function finishPoliceReview(guild, caseRecord) {
     `有効な違反認定: ${panel.outputs.filter((entry) => entry.verdict === 'responsible').length}/${procedure.panelSeats}`,
     `無効・失敗席: ${panel.failedSeats}`,
     '',
+    ...(panel.traces ?? [])
+      .map(({ seat, trace }) => investigationSummary(trace, {
+        seat,
+        lens: PANEL_LENS_LABELS[(seat - 1) % PANEL_LENS_LABELS.length],
+        maximumSteps: panel.maximumSteps
+      }))
+      .filter(Boolean),
+    '',
     '```json',
     JSON.stringify({
       outputs: publicPanelOutputs(panel.outputs, new Map(evidence.map((entry, index) => [entry.id, index + 1])))
@@ -859,7 +873,14 @@ async function publishDecisionRecord(guild, caseRecord, phase, panel) {
   await postCourtUpdate(guild, caseRecord, [
     `判決記録（${phaseLabel}）`,
     ...publicLawDetails(law, caseRecord.offense_code),
-    ...publicLines
+    ...publicLines,
+    ...(panel.traces ?? [])
+      .map(({ seat, trace }) => investigationSummary(trace, {
+        seat,
+        lens: PANEL_LENS_LABELS[(seat - 1) % PANEL_LENS_LABELS.length],
+        maximumSteps: panel.maximumSteps
+      }))
+      .filter(Boolean)
   ].join('\n'));
 
   await postCourtRecord(guild, caseRecord, '構成要件ごとの判断・理由・採用証拠を添付します。', {
@@ -1081,6 +1102,56 @@ async function beginCaseApproval(guild, caseRecord, sanction, text) {
   return true;
 }
 
+// 憲法第六条6。裁判所が審理中に見つけた不利な記録は、その場で認定に使わず、
+// 事件記録へ公開したうえで答弁期間をやり直す。上限に達したら二度と開かない。
+async function admitDiscoveredEvidence(guild, caseRecord, panel, policy) {
+  const room = CASE_EVIDENCE_LIMIT - listCaseEvidence(caseRecord.id).length;
+  if (room <= 0) return null;
+  const existing = new Set(listCaseEvidence(caseRecord.id).map((row) => String(row.message_id)));
+  const added = [];
+  for (const row of panel.newEvidence.slice(0, room)) {
+    if (existing.has(String(row.messageId))) continue;
+    addCaseEvidence({
+      caseId: caseRecord.id,
+      submittedBy: guild.client.user.id,
+      messageId: row.messageId,
+      channelId: row.channelId,
+      authorId: row.authorId,
+      content: row.content,
+      contentHash: row.contentHash,
+      occurredAt: row.occurredAt
+    });
+    added.push(row);
+  }
+  if (!added.length) return null;
+  const until = Date.now() + policy.judiciary.defenseMilliseconds;
+  const reopened = updateCase(caseRecord.id, {
+    status: 'defense',
+    defense_until: until,
+    redefense_count: Number(caseRecord.redefense_count ?? 0) + 1,
+    panel_id: panel.panelId
+  });
+  writeAudit({
+    guildId: guild.id,
+    actorType: 'system',
+    action: 'case.evidence_discovered',
+    targetType: 'case',
+    targetId: caseRecord.id,
+    detail: { messageIds: added.map((row) => row.messageId), redefenseCount: reopened.redefense_count }
+  });
+  await ensureEvidenceDisclosures(guild, reopened);
+  await postCourtUpdate(guild, reopened, [
+    `審理の中で、事件記録に無い記録が${added.length}件見つかりました。`,
+    'この記録は本人へ示すまで判断に使いません。反論の機会をやり直します。',
+    `<t:${Math.floor(until / 1000)}:F>までに回答してください。回答完了ボタンを押せばすぐ判定します。`,
+    Number(reopened.redefense_count) >= (policy.investigation?.maximumRedefense ?? 0)
+      ? '（やり直しはこれが最後です。以後は示された証拠だけで判断します。）'
+      : null
+  ].filter(Boolean).join('\n'), { state: '答弁' });
+  await notifyCaseParty(guild, reopened, 'defense', until);
+  return reopened;
+}
+
 async function adjudicateCriminalCase(guild, caseRecord, phase = 'initial') {
   const governance = getGovernanceGuild(guild.id);
   const constitution = constitutionForCase(caseRecord);
@@ -1106,6 +1177,10 @@ async function adjudicateCriminalCase(guild, caseRecord, phase = 'initial') {
       }
     } : {})
   };
+  // 憲法第六条6。やり直しの上限に達していない間だけ、席は事件記録に無い記録を
+  // 追加候補として挙げられる。上限後は既に示された証拠だけで判断する。
+  const maximumRedefense = policy.investigation?.maximumRedefense ?? 0;
+  const allowNewEvidence = Number(caseRecord.redefense_count ?? 0) < maximumRedefense;
   const panel = await runJudicialPanel({
     guildId: guild.id,
     caseRecord: panelCase,
@@ -1115,8 +1190,13 @@ async function adjudicateCriminalCase(guild, caseRecord, phase = 'initial') {
     // 編集前の主張は監査履歴に残すが、判決入力には各Discord投稿の最新正本だけを使う。
     submissions: listCurrentCaseSubmissions(caseRecord.id),
     policy,
-    phase
+    phase,
+    allowNewEvidence
   });
+  if (allowNewEvidence && panel.newEvidence?.length) {
+    const reopened = await admitDiscoveredEvidence(guild, caseRecord, panel, policy);
+    if (reopened) return reopened;
+  }
   caseRecord = updateCase(caseRecord.id, {
     panel_id: panel.panelId,
     verdict: { phase, verdict: panel.verdict, sanction: panel.sanction, panelId: panel.panelId }
@@ -1672,7 +1752,7 @@ async function syncRetriedIntake(guild, resultType, result) {
   });
 }
 
-async function advanceCase(guild, caseRecord, now) {
+export async function advanceCase(guild, caseRecord, now = Date.now()) {
   if (caseRecord.retry_after && caseRecord.retry_after > now) return;
   if (caseRecord.status === 'police_review') {
     await finishPoliceReview(guild, caseRecord);

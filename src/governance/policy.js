@@ -31,11 +31,20 @@ export function sha256(value) {
 }
 
 export function canonicalJson(value) {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  if (value && typeof value === 'object') {
-    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  // JSON.stringify と同じ扱いにする: 配列の undefined は null、objectの
+  // undefined な値はキーごと落とす。素通しすると "undefined" という
+  // 不正なJSONになり、モデルへ渡すDATAも入力hashも壊れる。
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => (entry === undefined ? 'null' : canonicalJson(entry))).join(',')}]`;
   }
-  return JSON.stringify(value);
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort()
+      .filter((key) => value[key] !== undefined && typeof value[key] !== 'function')
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(',')}}`;
+  }
+  const encoded = JSON.stringify(value);
+  return encoded === undefined ? 'null' : encoded;
 }
 
 function finite(value, name, { min = 0, max = Infinity } = {}) {
@@ -182,7 +191,43 @@ export function validateConstitutionPolicy(policy, { technicalOnly = false } = {
     || judiciary.restrictionPrimitives.some((value) => !primitives.has(value))) {
     throw new Error('許可されていない制限制御があります。');
   }
+  // 席の調査手数は警察手続と同じ世代の規則なので、schemaVersion 2 でだけ要求する。
+  if (policy.schemaVersion === 2) validateInvestigationPolicy(policy.investigation);
   return policy;
+}
+
+// 席の調査手数と公開粒度。値そのものは憲法が決めるので、ここは形と技術上限だけを見る。
+export function validateInvestigationPolicy(investigation) {
+  if (!investigation) throw new Error('憲法policyにinvestigationがありません。');
+  const roles = ['police', 'court', 'parliament'];
+  const allowed = new Set(['maximumSteps', 'tools', 'publicRecord', 'maximumRedefense']);
+  if (Object.keys(investigation).some((key) => !allowed.has(key))
+    || [...allowed].some((key) => !(key in investigation))) {
+    throw new Error('investigationに未対応の設定があります。');
+  }
+  for (const key of ['maximumSteps', 'tools']) {
+    if (Object.keys(investigation[key]).sort().join(',') !== [...roles].sort().join(',')) {
+      throw new Error(`investigation.${key} は police/court/parliament の3つです。`);
+    }
+  }
+  for (const role of roles) {
+    finite(investigation.maximumSteps[role], `investigation.maximumSteps.${role}`, { min: 1, max: 20 });
+    if (!Number.isInteger(investigation.maximumSteps[role])) {
+      throw new Error(`investigation.maximumSteps.${role} は整数である必要があります。`);
+    }
+    const tools = investigation.tools[role];
+    if (!Array.isArray(tools) || new Set(tools).size !== tools.length) {
+      throw new Error(`investigation.tools.${role} が不正です。`);
+    }
+  }
+  if (!['summary', 'full'].includes(investigation.publicRecord)) {
+    throw new Error('investigation.publicRecord は summary または full です。');
+  }
+  finite(investigation.maximumRedefense, 'investigation.maximumRedefense', { min: 0, max: 3 });
+  if (!Number.isInteger(investigation.maximumRedefense)) {
+    throw new Error('investigation.maximumRedefense は整数である必要があります。');
+  }
+  return investigation;
 }
 
 export function policyHash(policy) {
