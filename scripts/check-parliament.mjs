@@ -322,4 +322,15 @@ assert.equal(blocked.status, agendaState, '違憲の疑いがある草案は投�
 assert.equal(blocked.deferrals, 1, '継続審議として次の国会へ送る');
 assert.ok(posts.some((post) => String(post.content).includes('憲法適合を確認できませんでした')));
 
+// --- 旧憲法のまま新コードが起動した場合 --------------------------------------
+const legacyRules = structuredClone(compiled.rules);
+delete legacyRules.panels.parliament;
+db.governanceDatabase.prepare('UPDATE governance_constitutions SET rules_json = ? WHERE guild_id = ?')
+  .run(JSON.stringify(legacyRules), GUILD_ID);
+await assert.rejects(
+  runParliamentSession(guild, db.getGovernanceGuild(GUILD_ID), Date.now(), { manual: true }),
+  /統治DBを作り直して/,
+  '旧手続のままの憲法では議題を作らずに止まる'
+);
+
 console.log('check-parliament: ok');

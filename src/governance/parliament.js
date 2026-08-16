@@ -428,6 +428,12 @@ async function processAgendaItem(guild, governance, constitution, input) {
 export async function runParliamentSession(guild, governance, now = Date.now(), { manual = false } = {}) {
   const constitution = getActiveConstitution(guild.id);
   if (!constitution) return null;
+  // 旧手続のまま新コードが起動した窓（デプロイ〜統治DBの作り直しの間）では、
+  // 解釈できない実行規則の上で議題を作らない。scripts/reset-governance-guild.mjs で
+  // 作り直してから /governance を実行する。
+  if (!constitutionRules(constitution).panels?.parliament) {
+    throw new Error('現行憲法が国会の実行規則を持っていません。統治DBを作り直してから /governance で導入し直してください。');
+  }
   if (!manual) {
     if (governance.session_retry_after && governance.session_retry_after > now) return null;
     if (governance.last_session_at && now - governance.last_session_at < sessionIntervalMilliseconds(guild.id, constitution)) {
