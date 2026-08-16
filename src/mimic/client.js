@@ -149,6 +149,25 @@ export const ENDPOINTS = {
     maxNewTokens: number(process.env.MIMIC_V41_MAX_NEW_TOKENS, 200),
     label: process.env.MIMIC_V41_LABEL ?? 'evex-4.1',
     format: process.env.MIMIC_V41_FORMAT ?? 'auto'
+  },
+  // **形が初めて変わった世代。**25.8M だが、増えたのは PLE の引き表なので
+  // 行列積は 18.88M 世代とほぼ同じ (1 トークン 113 → 117 MFLOP)。
+  //
+  //   PLE (Gemma 3n)  トークンごと・層ごとの補助ベクトル。容量 +36% / 計算 +3%
+  //   QK-norm         q/k を RoPE の前に RMSNorm
+  //   Muon            行列 14.75M を直交化して更新。埋め込みは AdamW
+  //   WSD             段1 を一定・段2 を減衰相に。途中の重みから分岐できる
+  //   文書内マスク     1024 の窓に約 7 会話入るので、前の会話を見せない
+  //   <|hi|>          リアクションが付いた発言の印。推論では常に置く
+  //
+  // **語彙が別物** (corpus-v10 は `<|hi|>` のぶんずれている) ので、
+  // mimic-v5/ の tok.model と対で動かすこと
+  'evex-5': {
+    url: process.env.MIMIC_V5_URL ?? 'http://127.0.0.1:8774',
+    timeoutMs: number(process.env.MIMIC_V5_TIMEOUT_MS, 60_000),
+    maxNewTokens: number(process.env.MIMIC_V5_MAX_NEW_TOKENS, 200),
+    label: process.env.MIMIC_V5_LABEL ?? 'evex-5',
+    format: process.env.MIMIC_V5_FORMAT ?? 'auto'
   }
 };
 
