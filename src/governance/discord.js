@@ -49,6 +49,8 @@ function proposalStateLabel(state, handler = null) {
     revision_discussion: '議論中',
     deliberation: '議論中',
     objection_window: '議論中',
+    council: '議論中',
+    enactment_hold: '議論中',
     constitutional_review: '議論中',
     debate: '議論中',
     voting: '投票中',
@@ -60,6 +62,8 @@ function proposalStateLabel(state, handler = null) {
     public_discussion: '議論中',
     ai_deliberation: '議論中',
     objection_window: '議論中',
+    council_decision: '議論中',
+    enactment_hold: '議論中',
     constitutional_panel: '議論中',
     public_vote: '投票中',
     terminal: '不成立'
@@ -919,6 +923,37 @@ export function voteButtons(proposalId, disabled = false) {
   )];
 }
 
+export function enactmentHoldButtons(proposalId, disabled = false) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`gov:hold:${proposalId}:object`).setLabel('この改正に異議').setStyle(ButtonStyle.Danger).setDisabled(disabled)
+  )];
+}
+
+export function lawSuspensionButtons(lawId, disabled = false) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`gov:suspend:${lawId}:request`).setLabel('この法律の停止を求める').setStyle(ButtonStyle.Danger).setDisabled(disabled)
+  )];
+}
+
+/**
+ * 国会の会議録。1回の開会を1投稿にまとめ、議題と採否を議会Forumへ残す。
+ */
+export async function createParliamentRecordThread(guild, governance, { name, content, files = [] }) {
+  const forum = await guild.channels.fetch(governance.parliament_forum_id);
+  if (!forum?.threads) throw new Error('議会Forumが見つかりません。');
+  const thread = await forum.threads.create({
+    name: String(name).slice(0, 100),
+    autoArchiveDuration: 10_080,
+    message: {
+      content: String(content).slice(0, 2_000),
+      files,
+      allowedMentions: { parse: [] }
+    },
+    reason: `${guild.name} parliament session record`
+  });
+  return { threadId: thread.id };
+}
+
 export function objectionButtons(proposalId, disabled = false) {
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`gov:objection:${proposalId}:file`).setLabel('調整を求める').setStyle(ButtonStyle.Primary).setDisabled(disabled)
@@ -957,6 +992,8 @@ function proposalNextAction(proposal) {
     drafting: '案の公開を待っています。',
     draft: 'この投稿で案を読み、意見を書けます。',
     objection_window: 'この本文でよくなければ、案件投稿のボタンから調整を求められます。',
+    council: '国会の席が成立を判定しています。',
+    enactment_hold: '可決済みです。施行前の保留期間で、必要数の異議があれば成立しません。',
     constitutional_review: '投票前の確認中です。',
     debate: 'この投稿で案を読み、意見を書けます。',
     voting: '「手続」の案件カードから投票できます。',

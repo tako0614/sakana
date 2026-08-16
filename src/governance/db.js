@@ -980,15 +980,60 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     proposal_id INTEGER NOT NULL,
     revision INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'revision',
     user_id TEXT NOT NULL,
     instruction TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    UNIQUE (proposal_id, revision, user_id)
+    UNIQUE (proposal_id, revision, kind, user_id)
   );
   CREATE INDEX IF NOT EXISTS idx_gov_proposal_objections
-    ON governance_proposal_objections(proposal_id, revision, id);
+    ON governance_proposal_objections(proposal_id, revision, kind, id);
 `);
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (19, ?)').run(Date.now());
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS governance_parliament_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    opened_at INTEGER NOT NULL,
+    closed_at INTEGER,
+    record_json TEXT NOT NULL,
+    thread_id TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_parliament_sessions
+    ON governance_parliament_sessions(guild_id, opened_at);
+
+  CREATE TABLE IF NOT EXISTS governance_parliament_opinions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_message_id TEXT,
+    status TEXT NOT NULL,
+    session_id INTEGER,
+    decision_json TEXT,
+    created_at INTEGER NOT NULL,
+    decided_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_parliament_opinions
+    ON governance_parliament_opinions(guild_id, status, created_at);
+
+  CREATE TABLE IF NOT EXISTS governance_law_suspensions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    law_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (law_id, user_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_law_suspensions
+    ON governance_law_suspensions(guild_id, law_id, id);
+`);
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (20, ?)').run(Date.now());
 
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
@@ -2105,25 +2150,112 @@ export function recordProposalDeliberation({ proposalId, revision, outcome, disc
 }
 
 /**
+ * 定期国会。開会から閉会までの議題と採否を1行に残し、会議録として公開する。
+ */
+export function createParliamentSession(guildId, record = {}) {
+  const now = Date.now();
+  const result = db.prepare(`
+    INSERT INTO governance_parliament_sessions (guild_id, opened_at, record_json) VALUES (?, ?, ?)
+  `).run(String(guildId), now, canonicalJson(record));
+  return getParliamentSession(Number(result.lastInsertRowid));
+}
+
+export function getParliamentSession(id) {
+  const row = db.prepare('SELECT * FROM governance_parliament_sessions WHERE id = ?').get(Number(id));
+  return row ? { ...row, record: parseJson(row.record_json, {}) } : null;
+}
+
+export function closeParliamentSession(id, record, threadId = null) {
+  db.prepare('UPDATE governance_parliament_sessions SET closed_at = ?, record_json = ?, thread_id = ? WHERE id = ?')
+    .run(Date.now(), canonicalJson(record), threadId, Number(id));
+  return getParliamentSession(id);
+}
+
+export function listParliamentSessions(guildId, { limit = 20 } = {}) {
+  return db.prepare(`
+    SELECT * FROM governance_parliament_sessions WHERE guild_id = ? ORDER BY opened_at DESC LIMIT ?
+  `).all(String(guildId), Number(limit)).map((row) => ({ ...row, record: parseJson(row.record_json, {}) }));
+}
+
+/**
+ * 国会へ出す意見。受け取った時点では案件にならず、次の開会で採否を決める。
+ */
+export function recordParliamentOpinion({
+  guildId, userId, kind, title, summary, source, sourceMessageId = null
+}) {
+  const result = db.prepare(`
+    INSERT INTO governance_parliament_opinions
+      (guild_id, user_id, kind, title, summary, source, source_message_id, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+  `).run(
+    String(guildId), String(userId), String(kind), String(title), String(summary),
+    String(source), sourceMessageId === null ? null : String(sourceMessageId), Date.now()
+  );
+  return getParliamentOpinion(Number(result.lastInsertRowid));
+}
+
+export function getParliamentOpinion(id) {
+  const row = db.prepare('SELECT * FROM governance_parliament_opinions WHERE id = ?').get(Number(id));
+  return row ? { ...row, decision: parseJson(row.decision_json, null) } : null;
+}
+
+export function listParliamentOpinions(guildId, { status = 'pending', limit = 100 } = {}) {
+  const rows = status
+    ? db.prepare(`
+        SELECT * FROM governance_parliament_opinions
+        WHERE guild_id = ? AND status = ? ORDER BY id LIMIT ?
+      `).all(String(guildId), String(status), Number(limit))
+    : db.prepare('SELECT * FROM governance_parliament_opinions WHERE guild_id = ? ORDER BY id DESC LIMIT ?')
+      .all(String(guildId), Number(limit));
+  return rows.map((row) => ({ ...row, decision: parseJson(row.decision_json, null) }));
+}
+
+export function settleParliamentOpinion(id, { status, sessionId, decision }) {
+  db.prepare(`
+    UPDATE governance_parliament_opinions
+    SET status = ?, session_id = ?, decision_json = ?, decided_at = ?
+    WHERE id = ?
+  `).run(String(status), sessionId === null ? null : Number(sessionId), canonicalJson(decision ?? {}), Date.now(), Number(id));
+  return getParliamentOpinion(id);
+}
+
+/**
+ * 施行済みの法律を止める要求。1法律1人1件で、必要数に達したらその法律を停止し、
+ * 次の国会で維持するか廃止するかを決める。AIだけで成立させる手続の唯一の制動。
+ */
+export function recordLawSuspension({ guildId, lawId, userId, reason }) {
+  db.prepare(`
+    INSERT INTO governance_law_suspensions (guild_id, law_id, user_id, reason, created_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(law_id, user_id) DO UPDATE SET reason = excluded.reason, created_at = excluded.created_at
+  `).run(String(guildId), Number(lawId), String(userId), String(reason), Date.now());
+  return listLawSuspensions(lawId);
+}
+
+export function listLawSuspensions(lawId) {
+  return db.prepare('SELECT * FROM governance_law_suspensions WHERE law_id = ? ORDER BY id').all(Number(lawId));
+}
+
+/**
  * 調整を求める異議。1つの版につき1人1件で、数が実行規則の必要数に達したときだけ
  * 調整案を作る。誰の異議かは公開記録なので、後から数え直せる形で残す。
  */
-export function recordProposalObjection({ proposalId, revision, userId, instruction }) {
+export function recordProposalObjection({ proposalId, revision, userId, instruction, kind = 'revision' }) {
   db.prepare(`
-    INSERT INTO governance_proposal_objections (proposal_id, revision, user_id, instruction, created_at)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(proposal_id, revision, user_id)
+    INSERT INTO governance_proposal_objections (proposal_id, revision, kind, user_id, instruction, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(proposal_id, revision, kind, user_id)
       DO UPDATE SET instruction = excluded.instruction, created_at = excluded.created_at
-  `).run(Number(proposalId), Number(revision), String(userId), String(instruction), Date.now());
-  return listProposalObjections(proposalId, revision);
+  `).run(Number(proposalId), Number(revision), String(kind), String(userId), String(instruction), Date.now());
+  return listProposalObjections(proposalId, revision, kind);
 }
 
-export function listProposalObjections(proposalId, revision) {
+export function listProposalObjections(proposalId, revision, kind = 'revision') {
   return db.prepare(`
     SELECT * FROM governance_proposal_objections
-    WHERE proposal_id = ? AND revision = ?
+    WHERE proposal_id = ? AND revision = ? AND kind = ?
     ORDER BY id
-  `).all(Number(proposalId), Number(revision));
+  `).all(Number(proposalId), Number(revision), String(kind));
 }
 
 export function listProposalDeliberations(proposalId) {

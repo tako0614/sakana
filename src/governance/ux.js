@@ -224,7 +224,7 @@ function deadline(value, prefix = '締切') {
   return value ? ` / ${prefix} <t:${Math.floor(Number(value) / 1000)}:R>` : '';
 }
 
-function procedureComponents(governance, supportsImmediateReview) {
+function procedureComponents(governance, supportsImmediateReview, supportsSuspension) {
   const link = (label, channelId) => new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link)
     .setURL(`https://discord.com/channels/${governance.guild_id}/${channelId}`);
   const destinations = [
@@ -235,9 +235,14 @@ function procedureComponents(governance, supportsImmediateReview) {
   ].filter(Boolean);
   return [
     new ActionRowBuilder().addComponents(...destinations),
-    supportsImmediateReview ? new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('gov:review_list:0').setLabel('自分の即時処分を確認').setStyle(ButtonStyle.Primary)
-    ) : null
+    supportsImmediateReview || supportsSuspension ? new ActionRowBuilder().addComponents(...[
+      supportsImmediateReview
+        ? new ButtonBuilder().setCustomId('gov:review_list:0').setLabel('自分の即時処分を確認').setStyle(ButtonStyle.Primary)
+        : null,
+      supportsSuspension
+        ? new ButtonBuilder().setCustomId('gov:suspend_list:0').setLabel('現行法の停止を求める').setStyle(ButtonStyle.Danger)
+        : null
+    ].filter(Boolean)) : null
   ].filter(Boolean);
 }
 
@@ -379,7 +384,10 @@ export async function syncGovernanceActionCards(guild, channel) {
 }
 
 export async function renderGovernanceProcedureHub(guild, governance) {
-  const supportsImmediateReview = Boolean(summaryProcedure(getActiveConstitution(guild.id)?.policy));
+  const constitution = getActiveConstitution(guild.id);
+  const supportsImmediateReview = Boolean(summaryProcedure(constitution?.policy));
+  // AI席だけで成立させる憲法では、施行後の停止が唯一の制動なので入口を常設する。
+  const suspensionRequired = constitution?.rules?.workflows?.law?.config?.suspensionRequired ?? null;
   const voting = activeProposals(guild.id, 100).filter((proposal) => proposalHandler(proposal) === 'public_vote');
   const approvals = listCases(guild.id, { statuses: ['approval'], limit: 20 });
   return {
@@ -388,12 +396,15 @@ export async function renderGovernanceProcedureHub(guild, governance) {
       '',
       `法律や改憲の提案は <@&${governance.legislature_role_id}>、違反申立てや上訴は <@&${governance.judiciary_role_id}> に自然文で話してください。`,
       '投票と執行承認が始まると、この下に操作カードが出ます。本文と議論は議会・裁判所、現行法は法令集にあります。',
+      suspensionRequired
+        ? `国会が成立させた法律は、${suspensionRequired}人が停止を求めると直ちに止まり、次の国会で維持か廃止を決めます。`
+        : null,
       '',
       voting.length || approvals.length
         ? `いま操作できる案件: 投票 ${voting.length}件 / 承認 ${approvals.length}件`
         : 'いま操作できる案件はありません。'
     ].filter(Boolean).join('\n').slice(0, 1_900),
-    components: procedureComponents(governance, supportsImmediateReview),
+    components: procedureComponents(governance, supportsImmediateReview, Boolean(suspensionRequired)),
     allowedMentions: { parse: [] }
   };
 }

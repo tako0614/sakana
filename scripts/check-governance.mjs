@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { ChannelType as ForumChannelType } from 'discord.js';
 import { spawnSync } from 'node:child_process';
 import { readFileSync, rmSync } from 'node:fs';
 import Database from 'better-sqlite3';
@@ -35,6 +36,9 @@ assert.equal(compiledConstitution.rules.votes.constitutionalAmendment.duration, 
 assert.equal(compiledConstitution.rules.panels.proposalRelation.seats, 3);
 assert.deepEqual(compiledConstitution.policy, policy, '憲法内rulesから現行挙動と等価なpolicy projectionを作る');
 assert.match(rulesModule.governanceRulesSummary(compiledConstitution.rules), /草案討議 12h \(無風は6hで打ち切り\)/);
+assert.match(rulesModule.governanceRulesSummary(compiledConstitution.rules),
+  /成立判定 3席 \(必要 2席\) \/ 施行後の停止 2人 \/ 改憲の保留 12h \/ 異議 2人/,
+  '成立の決め方と制動を法令集の要約に出す');
 const injectedRules = structuredClone(compiledConstitution.rules);
 injectedRules.workflows.law.states.drafting.handler = 'eval_user_text';
 assert.throws(() => rulesModule.validateGovernanceRules(injectedRules), /未対応のworkflow handler/,
@@ -403,14 +407,54 @@ assert.equal(await updateRetriedIntakeMessage(retriedGuild, 'proposal', {
   id: 77, title: '迅速裁判', forum_thread_id: 'parliament-thread'
 }), false, '再試行完了メッセージは一度だけ更新する');
 
+// 投票機構そのものは、記名投票を選んだ憲法で確認する。初期憲法はAI席の
+// 成立判定へ移ったので、同じschemaで投票段階へ差し替えた憲法を組み立てて使う。
+function voteFlowRules() {
+  const rules = structuredClone(compiledConstitution.rules);
+  for (const key of ['law', 'constitutionalAmendment']) {
+    const workflow = rules.workflows[key];
+    delete workflow.states.council;
+    delete workflow.states.enactment_hold;
+    delete workflow.config.suspensionRequired;
+    workflow.states.voting = {
+      handler: 'public_vote',
+      duration: rules.votes[key].duration,
+      config: { vote: key },
+      on: { passed: 'enacted', rejected: 'rejected' }
+    };
+    workflow.states.constitutional_review.on.passed = 'voting';
+  }
+  return rules;
+}
+const voteFlowConstitution = `${constitutionalProse}\n\`\`\`governance-rules\n${JSON.stringify(voteFlowRules())}\n\`\`\`\n`;
+governanceDb.bootstrapGovernanceGuild({
+  guildId: 'gv',
+  enactedBy: 'owner',
+  trustedRoleId: 'trusted-role-v',
+  appealRoleId: 'appeal-role-v',
+  categoryId: 'category-v',
+  parliamentForumId: 'parliament-v',
+  courtForumId: 'court-v',
+  courtChatChannelId: 'court-chat-v',
+  statuteForumId: 'statutes-v',
+  procedureChannelId: 'procedure-v',
+  enforcementMode: 'shadow',
+  constitution: voteFlowConstitution,
+  policy
+});
+const voteConstitution = governanceDb.getActiveConstitution('gv');
+assert.equal(voteConstitution.rules.workflows.law.states.voting.handler, 'public_vote',
+  '同じschemaで記名投票の手続も表現できる');
+assert.equal(voteConstitution.rules.workflows.law.states.council, undefined);
+assert.equal(voteConstitution.rules.votes.law.earlyClose, 'all_ballots_cast');
 let proposal = governanceDb.createProposal({
-  guildId: 'g1',
+  guildId: 'gv',
   kind: 'law',
   source: 'petition',
   title: 'test',
   summary: 'test',
   proposerId: 'u1',
-  constitutionId: activeConstitution.id,
+  constitutionId: voteConstitution.id,
   status: 'draft'
 });
 const proposalWorkflow = governanceDb.getWorkflowInstance('proposal', proposal.id);
@@ -763,6 +807,8 @@ const {
   approveCase,
   castAndPublishVote,
   completeProposalDebate,
+  fileEnactmentObjection,
+  fileLawSuspension,
   fileProposalObjection,
   completeCaseResponse,
   detectAutomaticEnforcement,
@@ -770,6 +816,7 @@ const {
   filePetition,
   reconcileProposalQueues,
   resumeProposalQueues,
+  runParliamentSession,
   recordGovernanceMessage,
   recordCourtSubmission,
   recordCourtSubmissionEdit,
@@ -827,11 +874,16 @@ await handleGovernanceIntakeComponent({
 }, conflictingAmendmentIntake.id, 'confirm');
 assert.equal(appendedAmendmentComment, null,
   '別内容の後発改憲を先行案へ勝手に混ぜない');
-assert.match(parallelAmendmentReply, /審議待ち/);
-assert.match(parallelAmendmentEdit.content, /審議待ちとして受理/,
-  '確認待ち中に先行改憲ができても後発案を待機として明示する');
-const queuedFromIntake = governanceDb.getProposal(governanceDb.getGovernanceIntake(conflictingAmendmentIntake.id).result_id);
-assert.equal(queuedFromIntake.workflow_status, 'queued');
+assert.match(parallelAmendmentReply, /国会への意見として受け付けました/,
+  'AI席が成立を決める憲法では、依頼はその場で案件にせず次の国会の議題候補にする');
+assert.match(parallelAmendmentEdit.content, /国会への意見/);
+const opinionFromIntake = governanceDb.getParliamentOpinion(
+  governanceDb.getGovernanceIntake(conflictingAmendmentIntake.id).result_id
+);
+assert.equal(opinionFromIntake.status, 'pending');
+assert.equal(opinionFromIntake.kind, 'amendment');
+assert.equal(opinionFromIntake.user_id, 'u2', '意見は依頼した本人の記録として残す');
+const queuedFromIntake = queuedAmendment;
 const exactQueuedCount = governanceDb.listProposals('g1', { limit: 500 }).length;
 const exactQueuedIntake = governanceDb.createGovernanceIntake({
   guildId: 'g1', branch: 'legislature', action: 'amendment', requesterId: 'u2',
@@ -1450,7 +1502,9 @@ let capturedRequest;
 globalThis.fetch = async (_url, options) => {
   capturedRequest = JSON.parse(options.body);
   const rawData = capturedRequest.messages[1].content.replace(/^DATA \(untrusted JSON\):\n/, '');
-  const responseOutput = typeof modelOutput === 'function' ? modelOutput(JSON.parse(rawData)) : modelOutput;
+  const responseOutput = typeof modelOutput === 'function'
+    ? modelOutput(JSON.parse(rawData), capturedRequest)
+    : modelOutput;
   return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(responseOutput) } }] }), {
     status: 200,
     headers: { 'content-type': 'application/json' }
@@ -1468,6 +1522,26 @@ const {
   runJudicialPanel,
   screenJudicialMention
 } = await import('../src/governance/llm.js');
+/**
+ * 1回の遷移で整理・違憲審査・成立判定と用途が変わるので、instructionで振り分ける。
+ */
+function byPurpose(map) {
+  return (data, request) => {
+    const instruction = String(request?.messages?.[0]?.content ?? '');
+    for (const [pattern, output] of map) {
+      if (pattern.test(instruction)) return typeof output === 'function' ? output(data) : output;
+    }
+    throw new Error(`未登録のAI用途です: ${instruction.slice(0, 120)}`);
+  };
+}
+const CONSTITUTIONAL_PASS = {
+  verdict: 'constitutional',
+  reasons: ['憲法上の権限を拡張しない狭い規則である。'],
+  constitutionArticles: ['第一条（主権）']
+};
+const COUNCIL_ENACT = { verdict: 'enact', reasons: ['執行できる範囲に収まっている。'] };
+const COUNCIL_REJECT = { verdict: 'reject', reasons: ['禁止の範囲が広すぎる。'] };
+const NO_UNREFLECTED = { unreflectedPoints: [], reasons: ['論点は本文に反映されている。'] };
 const safeBill = {
   title: '一般規則',
   summary: '狭い一般規則',
@@ -1822,33 +1896,69 @@ let finalProposal = governanceDb.createProposal({
   stageEndsAt: debateNow
 });
 finalProposal = governanceDb.updateProposal(finalProposal.id, { forum_thread_id: 'final-debate-thread' });
-modelOutput = {
-  verdict: 'constitutional',
-  reasons: ['憲法上の権限を拡張しない狭い規則である。'],
-  constitutionArticles: ['第一条（主権）']
-};
+modelOutput = byPurpose([
+  [/Independently review the target/, CONSTITUTIONAL_PASS],
+  [/Decide whether this finalized proposal/, COUNCIL_ENACT]
+]);
 const finalPosts = [];
 const finalThread = {
-  ...debateThread, id: 'final-debate-thread',
+  ...debateThread, id: 'final-debate-thread', locked: false, archived: false,
+  setLocked: async () => {}, setArchived: async () => {},
   send: async (payload) => { finalPosts.push(payload); return payload; }
 };
-const voted = await completeProposalDebate({
+const statuteForumStub = {
+  type: ForumChannelType.GuildForum,
+  availableTags: [
+    { id: 'current-law', name: '現行法' }, { id: 'repealed-law', name: '廃止' },
+    { id: 'current-constitution', name: '現行憲法' }, { id: 'old-constitution', name: '旧憲法' },
+    { id: 'suspended-law', name: '停止' }, { id: 'unconstitutional-law', name: '違憲' }
+  ],
+  threads: { create: async () => ({ ...finalThread, id: 'statute-thread', send: async () => ({ id: 'detail' }) }) }
+};
+const enactmentGuild = {
   id: 'g2', name: 'Test Community',
-  channels: { fetch: async () => finalThread },
+  channels: { fetch: async (id) => (id === 'statutes-2' ? statuteForumStub : finalThread) },
   roles: { cache: new Map([['trusted-g2', { name: '貴族院' }]]) },
   members: {
     fetch: async () => new Map([['voter', {
       id: 'voter', user: { bot: false }, roles: { cache: { has: () => false } }
     }]])
-  }
-}, finalProposal, debateNow);
-assert.equal(voted.status, 'voting');
+  },
+  client: { user: { id: 'bot' } }
+};
+const councilEnacted = await completeProposalDebate(enactmentGuild, finalProposal, debateNow);
+assert.equal(councilEnacted.status, 'enacted', 'AI席の必要票で成立し、記名投票は経由しない');
 assert.ok(finalPosts.some((payload) => /意見がなかったため、この本文を最終案として固定/.test(payload.content)),
-  '意見が一件もない討議は起案者に問わず最終案にする');
-assert.ok(finalPosts.some((payload) => /本文は変更せず投票へ進みます/.test(payload.content)));
-assert.ok(finalPosts.some((payload) => /投票を開始しました/.test(payload.content)));
+  '意見が一件もない討議は誰にも問わず最終案にする');
+assert.ok(finalPosts.some((payload) => /本文は変更せず成立判定へ進みます/.test(payload.content)));
+assert.ok(finalPosts.some((payload) => /国会の成立判定: 賛成 3\/3席/.test(payload.content)));
 assert.equal(governanceDb.listProposalDeliberations(finalProposal.id)[0].outcome, 'uncontested');
-assert.deepEqual(voted.body, safeBill, '最終案固定後の違憲審査と投票で本文を変えない');
+assert.equal(governanceDb.listProposalDeliberations(finalProposal.id).at(-1).outcome, 'council_enact');
+assert.deepEqual(councilEnacted.body, safeBill, '最終案固定後の違憲審査と成立判定で本文を変えない');
+const enactedLaw = governanceDb.listLaws('g2', { limit: 50 })
+  .find((law) => law.proposal_id === finalProposal.id);
+assert.ok(enactedLaw, '成立した法律を法令として登録する');
+
+// 必要票に届かない成立判定は、法律を作らずそこで終わる。
+let rejectedProposal = governanceDb.createProposal({
+  guildId: 'g2', source: 'petition', title: '成立否決テスト', summary: '席が必要票に達しない',
+  proposerId: 'r', constitutionId: governanceDb.getActiveConstitution('g2').id,
+  body: safeBill, status: 'discussion',
+  stageStartedAt: debateNow - policy.legislation.initialDebateMilliseconds,
+  stageEndsAt: debateNow
+});
+rejectedProposal = governanceDb.updateProposal(rejectedProposal.id, { forum_thread_id: 'final-debate-thread' });
+modelOutput = byPurpose([
+  [/Independently review the target/, CONSTITUTIONAL_PASS],
+  [/Decide whether this finalized proposal/, COUNCIL_REJECT]
+]);
+const councilRejected = await completeProposalDebate(enactmentGuild, rejectedProposal, debateNow);
+assert.equal(councilRejected.status, 'rejected');
+assert.equal(
+  governanceDb.listLaws('g2', { limit: 50 }).some((law) => law.proposal_id === rejectedProposal.id),
+  false,
+  '否決された案から法律を作らない'
+);
 
 const lawStates = compiledConstitution.rules.workflows.law.states;
 assert.equal(lawStates.discussion.config.quietClose, '6h');
@@ -1897,22 +2007,21 @@ let quietProposal = governanceDb.createProposal({
   stageEndsAt: debateNow + 5 * 3_600_000
 });
 quietProposal = governanceDb.updateProposal(quietProposal.id, { forum_thread_id: 'quiet-debate-thread' });
-modelOutput = {
-  verdict: 'constitutional',
-  reasons: ['憲法上の権限を拡張しない狭い規則である。'],
-  constitutionArticles: ['第一条（主権）']
+modelOutput = byPurpose([
+  [/Independently review the target/, CONSTITUTIONAL_PASS],
+  [/Decide whether this finalized proposal/, COUNCIL_ENACT]
+]);
+const quietThread = {
+  ...debateThread, id: 'quiet-debate-thread', locked: false, archived: false,
+  setLocked: async () => {}, setArchived: async () => {},
+  send: async (payload) => { quietPosts.push(payload); return payload; }
 };
 const quietAdvanced = await advanceProposal({
   ...quietGuild,
-  channels: {
-    fetch: async () => ({
-      ...debateThread, id: 'quiet-debate-thread',
-      send: async (payload) => { quietPosts.push(payload); return payload; }
-    })
-  }
+  client: { user: { id: 'bot' } },
+  channels: { fetch: async (id) => (id === 'statutes-2' ? statuteForumStub : quietThread) }
 }, quietProposal, debateNow);
-assert.equal(quietAdvanced.status, 'voting', '意見が一件も付かない討議は無風期間の経過で締切前に締める');
-assert.equal(Number(quietAdvanced.stage_ends_at) > debateNow, true);
+assert.equal(quietAdvanced.status, 'enacted', '意見が一件も付かない討議は無風期間の経過で締切前に締める');
 assert.ok(quietPosts.some((payload) => /無風期間/.test(payload.content)),
   '早じまいの理由を案件投稿へ公開する');
 
@@ -1936,8 +2045,8 @@ const livelyAdvanced = await advanceProposal({
 assert.equal(livelyAdvanced.status, 'discussion', '意見が一件でも付いた討議は締切まで開いたままにする');
 
 let earlyVoteProposal = governanceDb.createProposal({
-  guildId: 'g2', source: 'petition', title: '全員投票テスト', summary: '有権者全員の投票で締切前に開票する',
-  proposerId: 'r', constitutionId: governanceDb.getActiveConstitution('g2').id,
+  guildId: 'gv', source: 'petition', title: '全員投票テスト', summary: '有権者全員の投票で締切前に開票する',
+  proposerId: 'r', constitutionId: voteConstitution.id,
   body: safeBill, status: 'voting',
   stageStartedAt: debateNow,
   stageEndsAt: Date.now() + 6 * 3_600_000
@@ -1954,7 +2063,7 @@ const earlyVoteThread = {
   setLocked: async () => {}, setArchived: async () => {},
   send: async (payload) => { earlyVotePosts.push(payload); return payload; }
 };
-const earlyVoteGuild = { ...quietGuild, channels: { fetch: async () => earlyVoteThread } };
+const earlyVoteGuild = { ...quietGuild, id: 'gv', channels: { fetch: async () => earlyVoteThread } };
 assert.equal(
   (await advanceProposal(earlyVoteGuild, governanceDb.getProposal(earlyVoteProposal.id), Date.now())).status,
   'voting',
@@ -1976,24 +2085,27 @@ const decisionThread = {
   setLocked: async () => {}, setArchived: async () => {},
   send: async (payload) => { decisionPosts.push(payload); return payload; }
 };
-const decisionGuild = { ...quietGuild, channels: { fetch: async () => decisionThread } };
+const decisionGuild = {
+  ...quietGuild,
+  client: { user: { id: 'bot' } },
+  channels: { fetch: async (id) => (id === 'statutes-2' ? statuteForumStub : decisionThread) }
+};
 const createObjectionProposal = (title, stageEndsAt) => governanceDb.updateProposal(governanceDb.createProposal({
   guildId: 'g2', source: 'petition', title, summary: '異議の数で調整するかを決める',
   proposerId: 'r', constitutionId: governanceDb.getActiveConstitution('g2').id,
   body: safeBill, status: 'objection_window', stageStartedAt: debateNow, stageEndsAt
 }).id, { forum_thread_id: 'decision-thread' });
 
-modelOutput = {
-  verdict: 'constitutional',
-  reasons: ['憲法上の権限を拡張しない狭い規則である。'],
-  constitutionArticles: ['第一条（主権）']
-};
+modelOutput = byPurpose([
+  [/Independently review the target/, CONSTITUTIONAL_PASS],
+  [/Decide whether this finalized proposal/, COUNCIL_ENACT]
+]);
 const unopposed = await advanceProposal(
   decisionGuild, createObjectionProposal('異議なしテスト', debateNow - 1_000), Date.now()
 );
-assert.equal(unopposed.status, 'voting', '異議がなければ本文のまま違憲審査と投票へ進む');
+assert.equal(unopposed.status, 'enacted', '異議がなければ本文のまま違憲審査と成立判定へ進む');
 assert.deepEqual(unopposed.body, safeBill, '異議がない本文をAIが書き換えない');
-assert.ok(decisionPosts.some((payload) => /異議がなかったため/.test(payload.content)));
+assert.ok(decisionPosts.some((payload) => /調整を求める異議がなく/.test(payload.content)));
 
 const lonelyProposal = createObjectionProposal('異議1件テスト', Date.now() + 6 * 3_600_000);
 await fileProposalObjection(decisionGuild, { id: 'someone' }, lonelyProposal.id, 'もっと狭くしてほしい');
@@ -2002,7 +2114,7 @@ const lonelyClosed = await advanceProposal(
   governanceDb.updateProposal(lonelyProposal.id, { stage_ends_at: debateNow - 1_000 }),
   Date.now()
 );
-assert.equal(lonelyClosed.status, 'voting', '必要数に届かない異議では調整しない');
+assert.equal(lonelyClosed.status, 'enacted', '必要数に届かない異議では調整しない');
 assert.deepEqual(lonelyClosed.body, safeBill);
 assert.ok(decisionPosts.some((payload) => /必要な2件に届かなかったため/.test(payload.content)));
 
@@ -2010,6 +2122,243 @@ const legacyProjectedRules = rulesModule.compileConstitution({ content: constitu
 assert.equal(legacyProjectedRules.workflows.law.states.deliberation.on.finalized, 'constitutional_review');
 assert.equal(legacyProjectedRules.workflows.law.states.deliberation.on.summarized, undefined,
   '旧policy由来の憲法は受付時の手続のまま動かす');
+
+// --- 反映漏れ検査: 人間が誰も動かなくても、席が同じ論点を未反映と認めれば調整へ ---
+let reflectionProposal = governanceDb.createProposal({
+  guildId: 'g2', source: 'petition', title: '反映漏れテスト', summary: '席が未反映と認めた論点だけを直す',
+  proposerId: 'r', constitutionId: governanceDb.getActiveConstitution('g2').id,
+  body: safeBill, status: 'objection_window', stageStartedAt: debateNow, stageEndsAt: debateNow - 1_000
+});
+reflectionProposal = governanceDb.updateProposal(reflectionProposal.id, { forum_thread_id: 'decision-thread' });
+governanceDb.recordProposalDeliberation({
+  proposalId: reflectionProposal.id,
+  revision: 1,
+  outcome: 'summarized',
+  discussion: [{ content: '例外を書いてほしい', created_at: debateNow - 3_600_000 }],
+  decision: {
+    summary: '例外の要否が論点になった。',
+    points: ['未成年の扱いを例外にしてほしい', '施行日を明示してほしい'],
+    materialFeedback: true,
+    lateMaterialFeedback: false
+  }
+});
+modelOutput = byPurpose([
+  // 1席目と2席目は論点1を未反映と認め、3席目は認めない。必要票は2。
+  [/Check which of the supplied discussion points/, (() => {
+    let seat = 0;
+    return () => {
+      seat += 1;
+      return seat <= 2
+        ? { unreflectedPoints: [1], reasons: ['未成年の扱いが本文に無い。'] }
+        : { unreflectedPoints: [], reasons: ['本文で足りている。'] };
+    };
+  })()],
+  [/Rewrite one published proposal/, { ...narrowedBill, title: '例外を加えた一般規則' }]
+]);
+const reflectionRevised = await advanceProposal(decisionGuild, reflectionProposal, Date.now());
+assert.equal(reflectionRevised.status, 'revision_discussion',
+  '異議が集まらなくても、席が未反映と認めた論点は調整して再討議へ戻す');
+assert.equal(reflectionRevised.title, '例外を加えた一般規則');
+assert.ok(decisionPosts.some((payload) => /討議の論点1が本文に入っていない/.test(payload.content)));
+const reflectionRecord = governanceDb.listProposalDeliberations(reflectionProposal.id).at(-1);
+assert.equal(reflectionRecord.decision.source, 'reflection');
+assert.deepEqual(reflectionRecord.decision.points.map((entry) => entry.number), [1],
+  '必要票に達した論点だけを調整の対象にする');
+
+// 必要票に届かない未反映の指摘では調整しない。
+let singleSeatProposal = governanceDb.createProposal({
+  guildId: 'g2', source: 'petition', title: '反映漏れ1席テスト', summary: '1席だけの指摘では動かさない',
+  proposerId: 'r', constitutionId: governanceDb.getActiveConstitution('g2').id,
+  body: safeBill, status: 'objection_window', stageStartedAt: debateNow, stageEndsAt: debateNow - 1_000
+});
+singleSeatProposal = governanceDb.updateProposal(singleSeatProposal.id, { forum_thread_id: 'decision-thread' });
+governanceDb.recordProposalDeliberation({
+  proposalId: singleSeatProposal.id, revision: 1, outcome: 'summarized',
+  discussion: [{ content: '例外を書いてほしい', created_at: debateNow - 3_600_000 }],
+  decision: { summary: '論点1件。', points: ['例外を書いてほしい'], materialFeedback: true, lateMaterialFeedback: false }
+});
+modelOutput = byPurpose([
+  [/Check which of the supplied discussion points/, (() => {
+    let seat = 0;
+    return () => {
+      seat += 1;
+      return seat === 1
+        ? { unreflectedPoints: [1], reasons: ['入っていない。'] }
+        : { unreflectedPoints: [], reasons: ['入っている。'] };
+    };
+  })()],
+  [/Independently review the target/, CONSTITUTIONAL_PASS],
+  [/Decide whether this finalized proposal/, COUNCIL_ENACT]
+]);
+const singleSeatClosed = await advanceProposal(decisionGuild, singleSeatProposal, Date.now());
+assert.equal(singleSeatClosed.status, 'enacted', '1席の指摘だけでは本文を動かさない');
+assert.deepEqual(singleSeatClosed.body, safeBill);
+const unreflectedRules = structuredClone(compiledConstitution.rules);
+unreflectedRules.workflows.law.states.objection_window.config.reflectionPanel = 'council';
+assert.throws(() => rulesModule.validateGovernanceRules(unreflectedRules), /reflectionPanel/,
+  '未反映の必要票を持たないpanelは反映漏れ検査に使えない');
+
+// --- 改憲の保留: AI席が可決しても、施行前に人間が止められる ---
+const holdConstitution = governanceDb.getActiveConstitution('g2');
+const holdBody = {
+  title: '保留テスト改憲案',
+  summary: '施行前の保留を確認する。',
+  content: `${holdConstitution.content}\n\n<!-- 保留テスト -->\n`,
+  policy: null
+};
+const createHoldProposal = (title) => governanceDb.updateProposal(governanceDb.createProposal({
+  guildId: 'g2', kind: 'amendment', source: 'petition', title, summary: '施行前の保留を確認する。',
+  proposerId: 'r', constitutionId: holdConstitution.id, body: holdBody, status: 'council',
+  targetType: 'constitution', targetId: holdConstitution.id, targetHash: holdConstitution.content_hash
+}).id, { forum_thread_id: 'decision-thread' });
+
+modelOutput = byPurpose([[/Decide whether this finalized proposal/, COUNCIL_ENACT]]);
+const heldAmendment = await advanceProposal(decisionGuild, createHoldProposal('保留テスト改憲案'), Date.now());
+assert.equal(heldAmendment.status, 'enactment_hold',
+  'AI席が可決した改憲は、施行の前に保留期間へ入る');
+assert.equal(governanceDb.getActiveConstitution('g2').id, holdConstitution.id,
+  '保留中は憲法を差し替えない');
+assert.ok(decisionPosts.some((payload) => /施行の前に保留期間を置きます/.test(payload.content)));
+const firstVeto = await fileEnactmentObjection(decisionGuild, { id: 'member-1' }, heldAmendment.id, '権利が狭まる');
+assert.equal(firstVeto.vetoed, false, '1人の異議では止まらない');
+assert.equal(governanceDb.getProposal(heldAmendment.id).status, 'enactment_hold');
+const secondVeto = await fileEnactmentObjection(decisionGuild, { id: 'member-2' }, heldAmendment.id, '説明が足りない');
+assert.equal(secondVeto.vetoed, true);
+assert.equal(governanceDb.getProposal(heldAmendment.id).status, 'rejected',
+  '必要数の異議がそろえばAI席の可決を止める');
+assert.equal(governanceDb.getActiveConstitution('g2').id, holdConstitution.id);
+await assert.rejects(
+  () => fileEnactmentObjection(decisionGuild, { id: 'member-3' }, heldAmendment.id, '追加'),
+  /保留期間ではありません/
+);
+
+const expiringHold = await advanceProposal(decisionGuild, createHoldProposal('保留満了テスト改憲案'), Date.now());
+assert.equal(expiringHold.status, 'enactment_hold');
+const enactedAmendment = await advanceProposal(
+  decisionGuild,
+  governanceDb.updateProposal(expiringHold.id, { stage_ends_at: Date.now() - 1_000 }),
+  Date.now()
+);
+assert.equal(enactedAmendment.status, 'enacted');
+assert.equal(governanceDb.getActiveConstitution('g2').version, holdConstitution.version + 1,
+  '保留期間に異議がなければ施行する');
+assert.ok(decisionPosts.some((payload) => /保留期間に異議がなかったため/.test(payload.content)));
+governanceDb.updateProposal(enactedAmendment.id, { status: 'enacted' });
+
+const noBrakeRules = structuredClone(compiledConstitution.rules);
+delete noBrakeRules.workflows.law.config.suspensionRequired;
+assert.throws(() => rulesModule.validateGovernanceRules(noBrakeRules), /suspensionRequired/,
+  'AI席で成立させる法律の手続は、施行後の停止を必ず持つ');
+const noHoldRules = structuredClone(compiledConstitution.rules);
+noHoldRules.workflows.constitutionalAmendment.states.council.on.passed = 'enacted';
+assert.throws(() => rulesModule.validateGovernanceRules(noHoldRules), /enactment_hold/,
+  'AI席で成立させる改憲は、施行前の保留を必ず持つ');
+const zeroHoldRules = structuredClone(compiledConstitution.rules);
+zeroHoldRules.workflows.constitutionalAmendment.states.enactment_hold.config.required = 0;
+assert.throws(() => rulesModule.validateGovernanceRules(zeroHoldRules), /required が不正です/);
+
+// --- 施行後の停止: AI席だけで成立させる手続で、人間が持つ唯一の制動 ---
+const suspensionLaw = governanceDb.enactLaw({
+  guildId: 'g2', proposalId: finalProposal.id, code: 'LAW-SUSPEND-1', title: '停止テスト法',
+  text: '停止の対象にする。', provisions: safeBill.provisions,
+  constitutionId: governanceDb.getActiveConstitution('g2').id, effectiveAt: Date.now() - 1_000
+});
+const suspensionGuild = {
+  id: 'g2', name: 'Test Community', client: { user: { id: 'bot' } },
+  channels: { fetch: async (id) => (id === 'statutes-2' ? statuteForumStub : decisionThread) }
+};
+const firstRequest = await fileLawSuspension(suspensionGuild, { id: 'member-1' }, suspensionLaw.id, '広すぎる');
+assert.equal(firstRequest.required, 2);
+assert.equal(firstRequest.suspended, false, '1人の請求では止めない');
+assert.equal(governanceDb.getLaw(suspensionLaw.id).status, 'active');
+const repeatedRequest = await fileLawSuspension(suspensionGuild, { id: 'member-1' }, suspensionLaw.id, '書き直し');
+assert.equal(repeatedRequest.suspensions.length, 1, '同じ人が何度出しても1件のまま');
+const secondRequest = await fileLawSuspension(suspensionGuild, { id: 'member-2' }, suspensionLaw.id, '定義が曖昧');
+assert.equal(secondRequest.suspended, true);
+assert.equal(governanceDb.getLaw(suspensionLaw.id).status, 'suspended',
+  '必要数に達した時点で法律を止める');
+await assert.rejects(
+  () => fileLawSuspension(suspensionGuild, { id: 'member-3' }, suspensionLaw.id, '追加'),
+  /現行ではありません/,
+  '停止済みの法律に重ねて請求させない'
+);
+
+// --- 定期国会: 意見の採否と停止中の法律の再審 ---
+const sessionOpinions = [
+  governanceDb.recordParliamentOpinion({
+    guildId: 'g2', userId: 'member-1', kind: 'petition', title: '連続投稿を止めたい',
+    summary: '短時間の連続投稿を制限してほしい。', source: 'mention'
+  }),
+  governanceDb.recordParliamentOpinion({
+    guildId: 'g2', userId: 'member-2', kind: 'petition', title: 'あああ',
+    summary: 'とくに内容のない意見。', source: 'mention'
+  })
+];
+const sessionPosts = [];
+const parliamentForumStub = {
+  id: 'parliament-2',
+  availableTags: [{ id: 'debating', name: '議論中' }, { id: 'waiting', name: '待機' }],
+  threads: {
+    create: async (payload) => {
+      sessionPosts.push(payload);
+      return {
+        id: `session-thread-${sessionPosts.length}`,
+        isThread: () => true,
+        setAppliedTags: async () => {},
+        fetchStarterMessage: async () => ({ id: 'starter', edit: async () => {} }),
+        send: async () => ({ id: 'message' })
+      };
+    }
+  }
+};
+governanceDb.updateGovernanceGuild('g2', { last_weekly_scan_at: 0 });
+modelOutput = byPurpose([
+  [/Decide which of the supplied opinions/, {
+    assessments: [
+      { number: 1, adopt: true, reason: '制限の対象がはっきりしている。' },
+      { number: 2, adopt: false, reason: '何を禁止するのかが書かれていない。' }
+    ]
+  }],
+  [/Classify whether one proposed legislative request/, {
+    relation: 'new', targetType: null, targetId: null, reasons: ['関連する現行法はない。'], materialDifferences: []
+  }],
+  [/Decide whether this suspended law/, { verdict: 'repeal', reasons: ['範囲が広すぎる。'] }],
+  [/Draft one narrowly scoped, general, prospective law/, { ...safeBill, title: '連続投稿を止めたい' }]
+]);
+const sessionChannels = {
+  cache: new Map(),
+  fetch: async (id) => {
+    if (id === undefined) return sessionChannels.cache;
+    if (id === 'parliament-2') return parliamentForumStub;
+    if (id === 'statutes-2') return statuteForumStub;
+    return decisionThread;
+  }
+};
+await runParliamentSession({
+  id: 'g2', name: 'Test Community', client: { user: { id: 'bot' } },
+  channels: sessionChannels,
+  roles: { everyone: { id: 'g2' } },
+  members: { fetch: async () => new Map() }
+}, governanceDb.getGovernanceGuild('g2'), Date.now());
+assert.equal(governanceDb.getParliamentOpinion(sessionOpinions[0].id).status, 'adopted');
+assert.equal(governanceDb.getParliamentOpinion(sessionOpinions[1].id).status, 'rejected',
+  '内容のない意見は棄却する');
+assert.match(
+  governanceDb.getParliamentOpinion(sessionOpinions[1].id).decision.reasons[0],
+  /何を禁止するのか/,
+  '棄却した意見にも理由を残す'
+);
+assert.ok(
+  governanceDb.listProposals('g2', { limit: 100 }).some((entry) => entry.title === '連続投稿を止めたい'),
+  '採用した意見だけを草案へ回す'
+);
+assert.equal(governanceDb.getLaw(suspensionLaw.id).status, 'repealed',
+  '停止中の法律は次の国会で維持か廃止を決める');
+const sessionRecordPost = sessionPosts.find((payload) => /# 国会 第\d+回/.test(payload.message.content));
+assert.ok(sessionRecordPost, '会議録を議会Forumへ公開する');
+assert.match(sessionRecordPost.message.content, /棄却/);
+assert.equal(sessionRecordPost.message.files[0].name, '会議録.json');
+assert.equal(governanceDb.listParliamentSessions('g2')[0].closed_at > 0, true, '会議録を閉じて残す');
 
 modelOutput = safeBill;
 
@@ -2686,9 +3035,10 @@ assert.doesNotMatch(procedureHub.content, /L-1|C-\d+/, '手続では参照IDを�
 assert.doesNotMatch(procedureHub.content, /Bot権限|AI受付|自律起案|診断・復旧/, '公開手続に技術運用を混ぜない');
 assert.equal(procedureHub.components.length, 2);
 assert.equal(procedureHub.components[1].components[0].data.label, '自分の即時処分を確認');
+// 投票カードは、記名投票を選んだ憲法の案件にだけ出る。
 let uxVoteProposal = governanceDb.createProposal({
   guildId: 'g1', kind: 'law', source: 'petition', title: '手続カードで投票する法案',
-  summary: '議論と投票操作を分離する。', proposerId: 'u', constitutionId: uxConstitution.id,
+  summary: '議論と投票操作を分離する。', proposerId: 'u', constitutionId: voteConstitution.id,
   status: 'voting', voteScope: 'all', stageEndsAt: Date.now() + 86_400_000
 });
 uxVoteProposal = governanceDb.updateProposal(uxVoteProposal.id, { forum_thread_id: 'vote-thread' });

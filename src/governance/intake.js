@@ -56,6 +56,9 @@ import {
   fileConstitutionalChallenge,
   fileCriminalCase,
   filePetition,
+  nextParliamentSessionAt,
+  parliamentOpinionMode,
+  submitParliamentOpinion,
   reserveGovernanceIntakeAttempt
 } from './service.js';
 
@@ -502,6 +505,17 @@ async function appendToExistingDiscussion(interaction, intake, proposal, reasons
   };
 }
 
+function parliamentOpinionText(guildId, title) {
+  const at = nextParliamentSessionAt(guildId);
+  return [
+    `「${title}」を国会への意見として受け付けました。`,
+    at
+      ? `次の国会 <t:${Math.floor(at / 1000)}:R> で、議題にするかどうかを席が決めます。`
+      : '次の国会で、議題にするかどうかを席が決めます。',
+    '採用されれば草案が公開され、討議に入ります。採用しない場合も理由を公開します。'
+  ].join('\n');
+}
+
 async function handleLegislature(message, governance, request) {
   const constitution = getActiveConstitution(message.guildId);
   let output = await interpretLegislativeRequest({
@@ -804,6 +818,25 @@ async function runAutomaticLegislature(message, governance, request, context, in
   }
   const official = { id: message.client.user.id };
   const source = `mention_investigation:${investigation.id}`;
+  if (parliamentOpinionMode(message.guildId)) {
+    const opinion = submitParliamentOpinion(message.guild, { id: message.author.id }, {
+      kind: normalized.intent,
+      title: normalized.title,
+      summary: normalized.summary,
+      source,
+      sourceMessageId: message.id
+    });
+    const currentInvestigation = updateMentionInvestigation(investigation.id, {
+      outcome: 'opinion', result_type: 'opinion', result_id: String(opinion.id), result: storedResult
+    });
+    await publishLegislativeInvestigationRecord(message.guild, currentInvestigation, null).catch(() => {});
+    return {
+      outcome: 'opinion',
+      resultType: 'opinion',
+      resultId: opinion.id,
+      text: parliamentOpinionText(message.guildId, normalized.title)
+    };
+  }
   try {
     const proposal = normalized.intent === 'amendment'
       ? await fileAmendment(message.guild, official, {
@@ -1317,6 +1350,16 @@ async function executeIntake(interaction, intake) {
         '同じ題名の案件がすでに進行中です。'
       ]);
     }
+  }
+  if (['petition', 'amendment'].includes(intake.action) && parliamentOpinionMode(interaction.guildId)) {
+    const opinion = submitParliamentOpinion(interaction.guild, member, {
+      kind: intake.action,
+      title: payload.title,
+      summary: payload.summary,
+      source: 'mention',
+      sourceMessageId: intake.source_message_id
+    });
+    return { type: 'opinion', id: opinion.id, text: parliamentOpinionText(interaction.guildId, payload.title) };
   }
   if (intake.action === 'petition') {
     const result = await filePetition(interaction.guild, member, {
