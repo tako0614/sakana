@@ -107,10 +107,18 @@ QUALITY = "<|hi|>" if has_piece("<|hi|>") else None
 
 blob = torch.load(args.ckpt, map_location="cpu", weights_only=False)
 saved = blob["config"]
-cfg = Config(
-    vocab_size=saved["vocab_size"], n_layers=saved["n_layers"], d_model=saved["d_model"],
-    n_heads=saved["n_heads"], context=saved["context"], dropout=0.0, attn_dropout=0.0,
-)
+
+# **項目を手で並べない。**Config に増えたもの (evex-5 の ple / d_ple / qk_norm) を
+# 書き忘れると、既定値でモデルを組んでしまい `Unexpected key(s) in state_dict` で
+# 落ちる。実際に evex-5 を載せたときに落ちた。
+#
+# チェックポイントに入っているものを全部渡し、dropout だけ推論用に 0 で上書きする。
+# Config に無いキーは無視する (古い世代に余分な項目が入っていても読める)
+cfg = Config(**{
+    **{k: v for k, v in saved.items() if k in Config.__dataclass_fields__},
+    "dropout": 0.0,
+    "attn_dropout": 0.0,
+})
 model = MicroLM(cfg)
 model.load_state_dict(blob["model"])
 model.eval()
