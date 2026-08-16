@@ -26,8 +26,7 @@ import {
   createGovernanceSurfaces,
   governancePermissionReport,
   postAuthorityChange,
-  reviewRequestButtons,
-  syncStatuteBook
+  reviewRequestButtons
 } from './discord.js';
 import { policyHash, sha256 } from './policy.js';
 import {
@@ -40,6 +39,7 @@ import {
   submitCaseAnswer
 } from './service.js';
 import { handleGovernanceIntakeComponent } from './intake.js';
+import { syncLawSite } from './lawsite.js';
 import { ensureGovernanceUx, handleGovernanceUxInteraction, renderGovernanceOperationsPanel } from './ux.js';
 
 const EPHEMERAL = MessageFlags.Ephemeral;
@@ -218,11 +218,10 @@ async function executeSetup(interaction, sessionId) {
       return 0;
     });
     const constitution = result.constitution;
-    await syncStatuteBook(interaction.guild, result.guild, { verifyExisting: true })
-      .catch((error) => warnings.push(`法令集掲載: ${error.message}`));
+    syncLawSite(interaction.guild, { verifyExisting: true });
     const ux = await ensureGovernanceUx(interaction.guild, getGovernanceGuild(interaction.guildId));
     if (constitution) {
-      await postAuthorityChange(interaction.guild, ux.governance, '統治機能を開始', `初期憲法 v${constitution.version} を法令集へ掲載しました。`)
+      await postAuthorityChange(interaction.guild, ux.governance, '統治機能を開始', `初期憲法 v${constitution.version} を公開しました。`)
         .catch((error) => warnings.push(`運営変更の掲載: ${error.message}`));
     }
     updateGovernanceSetupSession(claimed.id, { status: 'completed', last_error: null });

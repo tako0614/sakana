@@ -23,14 +23,9 @@
     "publicBallots": true
   },
   "legislation": {
-    "initialDebateMilliseconds": 43200000,
-    "revisionDebateMilliseconds": 21600000,
     "voteMilliseconds": 43200000,
-    "maximumRevisions": 2,
-    "extendOnLateMaterialFeedback": true,
-    "lateFeedbackWindowMilliseconds": 7200000,
-    "debateExtensionMilliseconds": 10800000,
-    "maximumDebateExtensions": 1
+    "maximumDeferrals": 3,
+    "maximumSessionIntervalMilliseconds": 604800000
   },
   "judiciary": {
     "defenseMilliseconds": 86400000,

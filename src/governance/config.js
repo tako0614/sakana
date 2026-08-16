@@ -50,8 +50,12 @@ export const governanceConfig = {
   maxOutputTokens: number(process.env.GOVERNANCE_MAX_OUTPUT_TOKENS, 8000),
   httpTimeoutMs: number(process.env.GOVERNANCE_HTTP_TIMEOUT_MS, 120_000),
   maxConcurrent: Math.max(1, Math.floor(number(process.env.GOVERNANCE_MAX_CONCURRENT, 3))),
-  weeklyScanEnabled: flag(process.env.GOVERNANCE_WEEKLY_SCAN, true),
-  weeklyDraftLimit: number(process.env.GOVERNANCE_WEEKLY_DRAFT_LIMIT, 3),
+  parliamentScanEnabled: flag(process.env.GOVERNANCE_PARLIAMENT_SCAN, true),
+  parliamentIntervalHours: boundedInteger(process.env.GOVERNANCE_PARLIAMENT_INTERVAL_HOURS, 72, 168),
+  parliamentAgendaLimit: boundedInteger(process.env.GOVERNANCE_PARLIAMENT_AGENDA_LIMIT, 5, 20),
+  lawSiteUrl: firstNonEmpty(process.env.GOVERNANCE_LAW_API_URL).replace(/\/+$/, ''),
+  lawSiteToken: firstNonEmpty(process.env.GOVERNANCE_LAW_API_TOKEN),
+  lawSitePublicUrl: firstNonEmpty(process.env.GOVERNANCE_LAW_SITE_URL).replace(/\/+$/, ''),
   schedulerIntervalMs: number(process.env.GOVERNANCE_SCHEDULER_INTERVAL_MS, 60_000),
   generalDailyCalls: number(process.env.GOVERNANCE_GENERAL_DAILY_CALLS, 20),
   trustedDailyCalls: number(process.env.GOVERNANCE_TRUSTED_DAILY_CALLS, 200),
@@ -101,8 +105,9 @@ export function isGovernanceOperator(member) {
 }
 
 export const OPERATIONAL_SETTING_DEFAULTS = Object.freeze({
-  weekly_scan_enabled: governanceConfig.weeklyScanEnabled ? 1 : 0,
-  weekly_draft_limit: governanceConfig.weeklyDraftLimit,
+  parliament_scan_enabled: governanceConfig.parliamentScanEnabled ? 1 : 0,
+  parliament_interval_hours: governanceConfig.parliamentIntervalHours,
+  parliament_agenda_limit: governanceConfig.parliamentAgendaLimit,
   general_daily_calls: governanceConfig.generalDailyCalls,
   trusted_daily_calls: governanceConfig.trustedDailyCalls,
   notification_everyone_daily_limit: governanceConfig.notificationEveryoneDailyLimit,
@@ -120,10 +125,16 @@ export function parseOperationalSetting(key, raw) {
   if (!(key in OPERATIONAL_SETTING_DEFAULTS)) return { ok: false, error: '変更できない設定です。' };
   const value = Number(raw);
   if (!Number.isInteger(value) || value < 0) return { ok: false, error: '0以上の整数を指定してください。' };
-  if (key === 'weekly_scan_enabled' && ![0, 1].includes(value)) {
+  if (key === 'parliament_scan_enabled' && ![0, 1].includes(value)) {
     return { ok: false, error: '自律起案の有効・無効は 0 または 1 です。' };
   }
-  if (key === 'weekly_draft_limit' && value > 10) return { ok: false, error: '自律起案の週最大件数は10以下です。' };
+  if (key === 'parliament_agenda_limit' && (value < 1 || value > 20)) {
+    return { ok: false, error: '1回の国会で扱う議題は1-20件です。' };
+  }
+  // 上限は憲法のmaximumSessionIntervalでも別に検査する。ここは技術上限だけ。
+  if (key === 'parliament_interval_hours' && (value < 1 || value > 168)) {
+    return { ok: false, error: '国会の間隔は1-168時間です。' };
+  }
   if (key.endsWith('_daily_calls') && value > 10_000) return { ok: false, error: 'AI受付回数は10000以下です。' };
   const investigationMaximums = {
     investigation_conversation_limit: 100,

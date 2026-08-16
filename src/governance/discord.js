@@ -7,27 +7,19 @@ import {
   PermissionFlagsBits
 } from 'discord.js';
 import { governanceCategoryName } from './config.js';
-import { governanceRulesSummary } from './rules.js';
 import {
   getCaseInterimProtection,
   getCaseSanction,
   getConstitution,
   getGovernanceGuild,
   getLaw,
-  getProposal,
-  getStatutePublication,
   listCases,
-  listConstitutions,
-  listLaws,
   listProposals,
-  updateGovernanceGuild,
-  upsertStatutePublication
+  updateGovernanceGuild
 } from './db.js';
 
-const PARLIAMENT_TAGS = ['待機', '議論中', '投票中', '成立', '不成立'];
-const PARLIAMENT_TOPIC = '法案と改憲案を、提案から結論まで1案件1投稿で記録します。';
-const STATUTE_TAGS = ['現行憲法', '旧憲法', '現行法', '停止', '違憲', '廃止'];
-const STATUTE_TOPIC = '現行憲法と法律の公開正本です。1法令1投稿で、旧法令も状態付きで保存します。';
+const PARLIAMENT_TAGS = ['議題', '議論中', '投票中', '成立', '不成立'];
+const PARLIAMENT_TOPIC = '作りたい法律や直したい制度をここへ投稿します。定期的に開く国会がすべての投稿を議題として読みます。';
 const COURT_TAGS = ['回答待ち', '判断中', '処分中', '処分確定', '取消', '責任なし', '棄却', '合憲', '違憲', '判断不能'];
 export const COURT_TOPIC = '申立てから結論までを1事件1投稿で記録します。答弁・証拠・上訴も同じ投稿で扱います。';
 export const GOVERNANCE_PROCEDURE_NAME = '手続';
@@ -43,25 +35,15 @@ function proposalHandler(proposal) {
 function proposalStateLabel(state, handler = null) {
   if (PARLIAMENT_TAGS.includes(state)) return state;
   return ({
-    drafting: '議論中',
-    draft: '議論中',
-    discussion: '議論中',
-    revision_discussion: '議論中',
-    deliberation: '議論中',
-    constitutional_review: '議論中',
-    debate: '議論中',
+    agenda: '議題',
     voting: '投票中',
     enacted: '成立',
-    rejected: '不成立',
-    remanded: '不成立'
+    rejected: '不成立'
   })[state] ?? ({
-    draft: '議論中',
-    public_discussion: '議論中',
-    ai_deliberation: '議論中',
-    constitutional_panel: '議論中',
+    parliament_agenda: '議題',
     public_vote: '投票中',
     terminal: '不成立'
-  })[handler] ?? '議論中';
+  })[handler] ?? '議題';
 }
 
 function caseStateLabel(state) {
@@ -315,44 +297,6 @@ function courtForumOverwrites(guild) {
   ];
 }
 
-function statuteForumOverwrites(guild) {
-  const everyone = everyoneForumOverwrite(guild, { discuss: false });
-  return [
-    {
-      ...everyone,
-      deny: [...everyone.deny, PermissionFlagsBits.AddReactions]
-    },
-    botOverwrite(guild)
-  ];
-}
-
-export function statuteForumEveryonePermissionState() {
-  return {
-    ViewChannel: true,
-    ReadMessageHistory: true,
-    SendMessages: false,
-    SendMessagesInThreads: false,
-    CreatePublicThreads: false,
-    CreatePrivateThreads: false,
-    AddReactions: false
-  };
-}
-
-function statuteForumBotPermissionState() {
-  return {
-    ViewChannel: true,
-    SendMessages: true,
-    SendMessagesInThreads: true,
-    CreatePublicThreads: true,
-    CreatePrivateThreads: true,
-    AttachFiles: true,
-    ReadMessageHistory: true,
-    ManageChannels: true,
-    ManageThreads: true,
-    ManageMessages: true
-  };
-}
-
 function permissionStateMatches(channel, id, state) {
   const overwrite = channel.permissionOverwrites.cache.get(id);
   if (!overwrite) return false;
@@ -362,25 +306,6 @@ function permissionStateMatches(channel, id, state) {
       ? overwrite.allow.has(permission) && !overwrite.deny.has(permission)
       : overwrite.deny.has(permission) && !overwrite.allow.has(permission);
   });
-}
-
-async function reconcileStatuteForumPermissions(forum, guild) {
-  const everyoneState = statuteForumEveryonePermissionState();
-  if (!permissionStateMatches(forum, guild.id, everyoneState)) {
-    await forum.permissionOverwrites.edit(
-      guild.id,
-      everyoneState,
-      { reason: '法令集を公開読み取り専用に同期' }
-    );
-  }
-  const botState = statuteForumBotPermissionState();
-  if (!permissionStateMatches(forum, guild.members.me.id, botState)) {
-    await forum.permissionOverwrites.edit(
-      guild.members.me.id,
-      botState,
-      { reason: '法令集のbot公開権限を同期' }
-    );
-  }
 }
 
 async function reconcileCourtForumPermissions(forum, guild) {
@@ -398,19 +323,6 @@ async function reconcileCourtForumPermissions(forum, guild) {
   }
 }
 
-async function createStatuteForum(guild, categoryId) {
-  return guild.channels.create({
-    name: '法令集',
-    type: ChannelType.GuildForum,
-    parent: categoryId,
-    topic: STATUTE_TOPIC,
-    availableTags: STATUTE_TAGS.map((name) => ({ name, moderated: true })),
-    defaultAutoArchiveDuration: 10_080,
-    permissionOverwrites: statuteForumOverwrites(guild),
-    reason: 'Governance public statute book'
-  });
-}
-
 async function createMentionRole(guild, name, { assignToBot = true } = {}) {
   const role = await guild.roles.create({
     name,
@@ -425,21 +337,16 @@ async function createMentionRole(guild, name, { assignToBot = true } = {}) {
 
 export async function ensureGovernanceMentionRoles(guild, governance) {
   await guild.roles.fetch();
-  let legislature = governance.legislature_role_id
-    ? guild.roles.cache.get(governance.legislature_role_id)
-    : null;
+  // 立法の入口はForumへの投稿になったので、mention roleは裁判だけ維持する。
   let judiciary = governance.judiciary_role_id
     ? guild.roles.cache.get(governance.judiciary_role_id)
     : null;
-  if (!legislature) legislature = await createMentionRole(guild, '立法');
   if (!judiciary) judiciary = await createMentionRole(guild, '裁判');
-  for (const role of [legislature, judiciary]) {
-    if (!role.mentionable) await role.setMentionable(true, 'Governance address roles must be mentionable');
-    if (!guild.members.me.roles.cache.has(role.id)) {
-      await guild.members.me.roles.add(role, 'Restore governance conversational address');
-    }
+  if (!judiciary.mentionable) await judiciary.setMentionable(true, 'Governance address roles must be mentionable');
+  if (!guild.members.me.roles.cache.has(judiciary.id)) {
+    await guild.members.me.roles.add(judiciary, 'Restore governance conversational address');
   }
-  return { legislatureRoleId: legislature.id, judiciaryRoleId: judiciary.id };
+  return { judiciaryRoleId: judiciary.id };
 }
 
 export function governancePermissionReport(guild) {
@@ -493,12 +400,9 @@ export async function createGovernanceSurfaces(guild, { resources = {}, onProgre
     hoist: false,
     reason: `${guild.name} governance appeal restriction`
   }));
-  const legislatureRole = await role('legislatureRoleId', () => createMentionRole(guild, '立法', { assignToBot: false }));
   const judiciaryRole = await role('judiciaryRoleId', () => createMentionRole(guild, '裁判', { assignToBot: false }));
-  for (const mentionRole of [legislatureRole, judiciaryRole]) {
-    if (!guild.members.me.roles.cache.has(mentionRole.id)) {
-      await guild.members.me.roles.add(mentionRole, 'Restore governance conversational address during setup');
-    }
+  if (!guild.members.me.roles.cache.has(judiciaryRole.id)) {
+    await guild.members.me.roles.add(judiciaryRole, 'Restore governance conversational address during setup');
   }
   const category = await channel('categoryId', ChannelType.GuildCategory, () => guild.channels.create({
     name: governanceCategoryName(guild.name),
@@ -525,7 +429,6 @@ export async function createGovernanceSurfaces(guild, { resources = {}, onProgre
     permissionOverwrites: courtForumOverwrites(guild),
     reason: `${guild.name} governance court`
   }));
-  const statuteForum = await channel('statuteForumId', ChannelType.GuildForum, () => createStatuteForum(guild, category.id));
   const procedure = await channel('procedureChannelId', ChannelType.GuildText, () => createGovernanceProcedureChannel(guild, category.id));
   if (state.courtChatChannelId && state.courtChatChannelId !== court.id) {
     const legacy = await guild.channels.fetch(state.courtChatChannelId).catch(() => null);
@@ -536,14 +439,12 @@ export async function createGovernanceSurfaces(guild, { resources = {}, onProgre
   await syncAppealRoleOverwrites(guild, appealRole.id, court.id);
   return {
     appealRoleId: appealRole.id,
-    legislatureRoleId: legislatureRole.id,
     judiciaryRoleId: judiciaryRole.id,
     categoryId: category.id,
     parliamentForumId: parliament.id,
     courtForumId: court.id,
     // DB互換用の旧column。公開裁判所Forumと同じIDを保存し、別channelは作らない。
     courtChatChannelId: court.id,
-    statuteForumId: statuteForum.id,
     procedureChannelId: procedure.id,
     legacyGuideChannelId: resources.guideChannelId ?? '',
     legacyGazetteChannelId: resources.gazetteChannelId ?? '',
@@ -563,19 +464,6 @@ export async function ensureGovernanceParliamentForum(guild, governance) {
     await forum.setAvailableTags(tags, '議会の公開状態を簡潔に同期');
   }
   return forum;
-}
-
-export async function ensureGovernanceStatuteForum(guild, governance) {
-  const existing = governance.statute_forum_id
-    ? await guild.channels.fetch(governance.statute_forum_id).catch(() => null)
-    : null;
-  if (existing?.type === ChannelType.GuildForum) {
-    if (existing.topic !== STATUTE_TOPIC) await existing.setTopic(STATUTE_TOPIC, '法令集の説明を同期');
-    await reconcileStatuteForumPermissions(existing, guild);
-    return existing;
-  }
-  if (!governance.category_id) throw new Error('統治カテゴリがないため法令集を作成できません。');
-  return createStatuteForum(guild, governance.category_id);
 }
 
 export async function ensureGovernanceCourtForum(guild, governance) {
@@ -656,214 +544,6 @@ export async function retireGovernanceCourtChat(guild, governance) {
   return { removed, retained };
 }
 
-export function statutePublicationState(instrumentType, status) {
-  if (instrumentType === 'constitution') return status === 'active' ? '現行憲法' : '旧憲法';
-  return ({
-    active: '現行法',
-    superseded: '廃止',
-    suspended: '停止',
-    unconstitutional: '違憲',
-    repealed: '廃止'
-  })[status] ?? '廃止';
-}
-
-function statuteDocument(instrumentType, instrument) {
-  if (instrumentType === 'constitution') {
-    const state = statutePublicationState(instrumentType, instrument.status);
-    const headings = [...instrument.content.matchAll(/^#{1,3}\s+(.+)$/gm)]
-      .slice(0, 6)
-      .map((match) => match[1]);
-    return {
-      title: `憲法 v${instrument.version}`,
-      state,
-      hash: instrument.content_hash,
-      content: [
-        `# 憲法 v${instrument.version}`,
-        `状態: ${state}`,
-        `公布: <t:${Math.floor(instrument.enacted_at / 1000)}:F>`,
-        '',
-        headings.length > 0 ? `主な構成: ${headings.join(' / ')}` : 'コミュニティの最高規範です。',
-        '',
-        '全文は、この投稿を開いた先で確認できます。'
-      ].join('\n').slice(0, 2_000),
-      detailContent: [
-        `## 憲法 v${instrument.version} 詳細`,
-        '全文を添付します。'
-      ].join('\n'),
-      files: [
-        { attachment: Buffer.from(instrument.content), name: `constitution-v${instrument.version}.md` },
-        { attachment: Buffer.from(`${JSON.stringify(instrument.rules ?? instrument.policy, null, 2)}\n`), name: `constitution-rules-v${instrument.version}.json` }
-      ]
-    };
-  }
-  const state = statutePublicationState(instrumentType, instrument.status);
-  const full = [
-    `# ${instrument.title} v${instrument.version ?? 1}`,
-    '',
-    instrument.text,
-    '',
-    '## Provisions',
-    '',
-    '```json',
-    JSON.stringify(instrument.provisions, null, 2),
-    '```'
-  ].join('\n');
-  return {
-    title: `${instrument.title} v${instrument.version ?? 1}`,
-    state,
-    hash: instrument.content_hash,
-    content: [
-      `# ${instrument.title} v${instrument.version ?? 1}`,
-      `状態: ${state}`,
-      `施行: <t:${Math.floor(instrument.effective_at / 1000)}:F>`,
-      '',
-      instrument.text.split(/\n+/).find((line) => line.trim() && !line.trim().startsWith('#'))?.slice(0, 500)
-        ?? '成立した法律です。',
-      '',
-      '全文は、この投稿を開いた先で確認できます。'
-    ].join('\n').slice(0, 2_000),
-    detailContent: `## ${instrument.title} v${instrument.version ?? 1} 詳細\n全文を添付します。`,
-    files: [{ attachment: Buffer.from(full), name: '法律全文.md' }]
-  };
-}
-
-async function applyStatuteState(thread, forum, state, content) {
-  const stateTag = tagId(forum, state);
-  if (!stateTag) throw new Error(`法令集の状態tagがありません: ${state}`);
-  const wasArchived = Boolean(thread.archived);
-  if (wasArchived) await thread.setArchived(false, '法令状態の同期');
-  const starter = await thread.fetchStarterMessage();
-  if (starter) await starter.edit({ content, attachments: [], allowedMentions: { parse: [] } });
-  await thread.setAppliedTags([stateTag], `法令状態: ${state}`);
-  if (wasArchived) await thread.setArchived(true, '法令状態の同期完了');
-}
-
-async function publishStatute(guild, forum, instrumentType, instrument, document) {
-  const stateTag = tagId(forum, document.state);
-  if (!stateTag) throw new Error(`法令集の状態tagがありません: ${document.state}`);
-  const thread = await forum.threads.create({
-    name: document.title.slice(0, 100),
-    appliedTags: [stateTag],
-    autoArchiveDuration: 10_080,
-    message: {
-      content: document.content,
-      allowedMentions: { parse: [] }
-    },
-    reason: `Publish ${instrumentType} ${instrument.id}`
-  });
-  const starter = await thread.fetchStarterMessage();
-  const detail = await thread.send({
-    content: document.detailContent,
-    files: document.files,
-    allowedMentions: { parse: [] }
-  });
-  return upsertStatutePublication({
-    guildId: guild.id,
-    instrumentType,
-    instrumentId: instrument.id,
-    forumThreadId: thread.id,
-    forumMessageId: starter?.id ?? thread.id,
-    detailMessageId: detail.id,
-    publicationStatus: document.state,
-    contentHash: document.hash
-  });
-}
-
-export async function syncStatuteBook(guild, governance, { verifyExisting = false } = {}) {
-  const forum = await guild.channels.fetch(governance.statute_forum_id).catch(() => null);
-  if (forum?.type !== ChannelType.GuildForum) throw new Error('法令集Forumが見つかりません。');
-  const instruments = [
-    ...listConstitutions(guild.id, { limit: 100 }).map((instrument) => ({ instrumentType: 'constitution', instrument })),
-    ...listLaws(guild.id, { activeOnly: false, limit: 500 }).map((instrument) => ({ instrumentType: 'law', instrument }))
-  ].filter(({ instrumentType, instrument }) => {
-    if (String(instrument.title ?? '').startsWith('[E2E:')) return false;
-    if (instrumentType !== 'law' || instrument.status !== 'repealed') return true;
-    return !String(getProposal(instrument.proposal_id)?.source ?? '').startsWith('live_e2e:');
-  });
-  let changed = 0;
-  for (const { instrumentType, instrument } of instruments) {
-    const document = statuteDocument(instrumentType, instrument);
-    const publication = getStatutePublication(guild.id, instrumentType, instrument.id);
-    if (publication
-      && publication.publication_status === document.state
-      && publication.content_hash === document.hash
-      && !verifyExisting) continue;
-    const thread = publication
-      ? await guild.channels.fetch(publication.forum_thread_id).catch(() => null)
-      : null;
-    if (!thread?.isThread?.() || thread.parentId !== forum.id || publication?.content_hash !== document.hash) {
-      await publishStatute(guild, forum, instrumentType, instrument, document);
-      changed += 1;
-      continue;
-    }
-    let detail = publication.detail_message_id
-      ? await thread.messages.fetch(publication.detail_message_id).catch(() => null)
-      : null;
-    if (verifyExisting) {
-      const starter = await thread.fetchStarterMessage().catch(() => null);
-      const attachmentNames = [...(detail?.attachments?.values?.() ?? [])].map((attachment) => attachment.name);
-      const expectedNames = document.files.map((file) => file.name);
-      const displayTitle = document.title.slice(0, 100);
-      const rename = thread.name !== displayTitle;
-      const refreshStarter = starter?.content !== document.content || starter?.attachments?.size > 0;
-      const refreshDetail = detail && (detail.content !== document.detailContent
-        || JSON.stringify(attachmentNames) !== JSON.stringify(expectedNames));
-      const reopen = Boolean(thread.archived && (rename || refreshStarter || refreshDetail));
-      if (reopen) await thread.setArchived(false, '法令表示の同期');
-      if (rename) {
-        await thread.setName(displayTitle, '法令名の表示を同期');
-        changed += 1;
-      }
-      if (refreshStarter) {
-        await starter?.edit({ content: document.content, attachments: [], allowedMentions: { parse: [] } });
-        changed += 1;
-      }
-      if (refreshDetail) {
-        await detail.edit({
-          content: document.detailContent,
-          attachments: [],
-          files: document.files,
-          allowedMentions: { parse: [] }
-        });
-        changed += 1;
-      }
-      if (reopen) await thread.setArchived(true, '法令表示の同期完了');
-    }
-    if (!detail) {
-      const wasArchived = Boolean(thread.archived);
-      if (wasArchived) await thread.setArchived(false, '法令詳細の同期');
-      detail = await thread.send({ content: document.detailContent, files: document.files, allowedMentions: { parse: [] } });
-      if (wasArchived) await thread.setArchived(true, '法令詳細の同期完了');
-      changed += 1;
-    }
-    if (publication.publication_status !== document.state) {
-      await applyStatuteState(thread, forum, document.state, document.content);
-      upsertStatutePublication({
-        guildId: guild.id,
-        instrumentType,
-        instrumentId: instrument.id,
-        forumThreadId: thread.id,
-        forumMessageId: publication.forum_message_id,
-        detailMessageId: detail.id,
-        publicationStatus: document.state,
-        contentHash: document.hash
-      });
-      changed += 1;
-    } else if (publication.detail_message_id !== detail.id) {
-      upsertStatutePublication({
-        guildId: guild.id,
-        instrumentType,
-        instrumentId: instrument.id,
-        forumThreadId: thread.id,
-        forumMessageId: publication.forum_message_id,
-        detailMessageId: detail.id,
-        publicationStatus: document.state,
-        contentHash: document.hash
-      });
-    }
-  }
-  return changed;
-}
 
 export async function syncAppealRoleOverwrites(guild, roleId, courtForumId, { strict = false } = {}) {
   await guild.channels.fetch();
@@ -944,23 +624,15 @@ export function reviewRequestButtons(guildId, sanctionId, disabled = false) {
 }
 
 function proposalNextAction(proposal) {
-  if (proposal.workflow_status === 'queued') return '先行する同種案件の終了を待っています。';
   const byStatus = ({
-    drafting: '案の公開を待っています。',
-    draft: 'この投稿で案を読み、意見を書けます。',
-    constitutional_review: '投票前の確認中です。',
-    debate: 'この投稿で案を読み、意見を書けます。',
+    agenda: 'この投稿で討論できます。次の国会が読みます。',
     voting: '「手続」の案件カードから投票できます。',
     enacted: '成立しました。現行本文は法令集にあります。',
-    rejected: '成立しませんでした。',
-    remanded: '成立しませんでした。'
+    rejected: '成立しませんでした。'
   })[proposal.status];
   if (byStatus) return byStatus;
   return ({
-    draft: '案の公開を待っています。',
-    public_discussion: 'この投稿で案を読み、意見を書けます。',
-    ai_deliberation: '寄せられた意見を反映しています。',
-    constitutional_panel: '投票前の確認中です。',
+    parliament_agenda: 'この投稿で討論できます。次の国会が読みます。',
     public_vote: '「手続」の案件カードから投票できます。',
     terminal: '結論が確定しました。'
   })[proposalHandler(proposal)] ?? 'この投稿で経過を確認できます。';
@@ -969,18 +641,20 @@ function proposalNextAction(proposal) {
 function proposalStarterContent(proposal, nextAction = proposalNextAction(proposal), displayState = proposal.status) {
   const governance = getGovernanceGuild(proposal.guild_id);
   const voting = proposalHandler(proposal) === 'public_vote';
+  const deferrals = Number(proposal.deferrals ?? 0);
   return [
     `# ${proposal.title}`,
     '',
     proposal.summary,
     '',
-    `状態: **${proposal.workflow_status === 'queued' ? '待機' : proposalStateLabel(displayState, proposalHandler(proposal))}**`,
+    `状態: **${proposalStateLabel(displayState, proposalHandler(proposal))}**`,
+    deferrals > 0 ? `継続審議: ${deferrals}回` : null,
     proposalDeadline(proposal) ? `期限: ${proposalDeadline(proposal)}` : null,
     `いま必要なこと: ${oneLine(nextAction)}`,
     voting && governance?.procedure_channel_id
       ? `[手続で投票](https://discord.com/channels/${proposal.guild_id}/${governance.procedure_channel_id})`
       : null,
-    '案、議論、結論はこの投稿にまとまります。'
+    '討論、国会の判断、結論はこの投稿にまとまります。'
   ].filter(Boolean).join('\n').slice(0, 2_000);
 }
 
@@ -1038,35 +712,20 @@ function courtStarterContent(caseRecord, nextAction = courtNextAction(caseRecord
   ].filter(Boolean).join('\n').slice(0, 2_000);
 }
 
-export async function createProposalPost(guild, governance, proposal) {
+// 公開ログから国会が自分で立てた議題。人間が立てたスレと同じ扱いで討論に開く。
+export async function createAgendaPost(guild, governance, proposal) {
   const forum = await guild.channels.fetch(governance.parliament_forum_id);
   if (!forum?.threads) throw new Error('議会Forumが見つかりません。');
-  const stageTag = tagId(
-    forum,
-    proposal.workflow_status === 'queued' ? '待機' : '議論中'
-  );
-  const body = proposal.body;
-  const fullDraft = proposal.kind === 'amendment'
-    ? `# ${body.title}\n\n${body.content}\n\n実行手続: ${body.rules ? governanceRulesSummary(body.rules) : 'legacy policy'}`
-    : `# ${body.title}\n\n${body.text}\n\n## Provisions\n\n\`\`\`json\n${JSON.stringify(body.provisions, null, 2)}\n\`\`\``;
-  const structuredDraft = proposal.kind === 'amendment' ? (body.rules ?? body.policy) : body.provisions;
-  const structuredName = proposal.kind === 'amendment' ? 'rules' : 'provisions';
+  const stageTag = tagId(forum, proposalStateLabel(proposal.status, 'parliament_agenda'));
   const thread = await forum.threads.create({
     name: proposal.title.slice(0, 100),
     appliedTags: stageTag ? [stageTag] : [],
     autoArchiveDuration: 10_080,
     message: {
       content: proposalStarterContent(proposal),
-      files: [
-        { attachment: Buffer.from(fullDraft), name: '草案全文.md' },
-        {
-          attachment: Buffer.from(`${JSON.stringify(structuredDraft, null, 2)}\n`),
-          name: `${structuredName === 'rules' ? '憲法実行規則' : '執行定義'}.json`
-        }
-      ],
       allowedMentions: { parse: [] }
     },
-    reason: `${guild.name} governance proposal ${proposal.id}`
+    reason: `${guild.name} governance agenda ${proposal.id}`
   });
   const starter = await thread.fetchStarterMessage();
   return { threadId: thread.id, messageId: starter?.id ?? thread.id };

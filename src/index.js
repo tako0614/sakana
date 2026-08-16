@@ -317,7 +317,7 @@ async function handleMessageCreate(message) {
     return;
   }
 
-  // @立法 / @裁判 は一般agentより先に、権限を持たない構造化受付へ渡す。
+  // @裁判 は一般agentより先に、権限を持たない構造化受付へ渡す。
   // role mentionを一般会話の文脈として解釈させると、統治操作との境界が曖昧になる。
   if (governanceConfig.enabled && await handleGovernanceMention(message)) {
     return;

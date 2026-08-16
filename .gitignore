@@ -1,6 +1,9 @@
 node_modules/
 .venv/
 .env
+# Worker のローカルD1状態と secret。secretはwrangler側へ入れる
+.wrangler/
+.dev.vars
 __pycache__/
 .pytest_cache/
 npm-debug.log*

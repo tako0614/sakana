@@ -21,29 +21,6 @@ export function summaryProcedure(policy) {
   return policy?.schemaVersion === 2 ? policy.judiciary?.summaryProcedure ?? null : null;
 }
 
-export function usesDeliberativeLegislation(policy) {
-  return Number.isInteger(policy?.legislation?.initialDebateMilliseconds);
-}
-
-export function legislationProcedure(policy) {
-  const legislation = policy?.legislation ?? {};
-  const modern = usesDeliberativeLegislation(policy);
-  return {
-    initialDebateMilliseconds: modern
-      ? legislation.initialDebateMilliseconds
-      : legislation.debateMilliseconds ?? legislation.draftMilliseconds,
-    revisionDebateMilliseconds: modern
-      ? legislation.revisionDebateMilliseconds
-      : legislation.debateMilliseconds ?? legislation.draftMilliseconds,
-    voteMilliseconds: legislation.voteMilliseconds,
-    maximumRevisions: modern ? legislation.maximumRevisions : 2,
-    extendOnLateMaterialFeedback: modern ? legislation.extendOnLateMaterialFeedback : true,
-    lateFeedbackWindowMilliseconds: modern ? legislation.lateFeedbackWindowMilliseconds : 10_800_000,
-    debateExtensionMilliseconds: modern ? legislation.debateExtensionMilliseconds : 21_600_000,
-    maximumDebateExtensions: modern ? legislation.maximumDebateExtensions : 1
-  };
-}
-
 export function validateAutomaticTrigger(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   if (Object.keys(value).some((key) => !['type', 'minimumMessages', 'windowSeconds'].includes(key))) return false;
@@ -122,37 +99,18 @@ export function validateConstitutionPolicy(policy, { technicalOnly = false } = {
   finite(voting.minimumBallots, 'voting.minimumBallots', { max: 100_000 });
   if (!Number.isInteger(voting.minimumBallots)) throw new Error('voting.minimumBallots は整数である必要があります。');
   if (voting.publicBallots !== true) throw new Error('v1の投票は全記名です。');
-  const modernLegislation = Number.isInteger(legislation.initialDebateMilliseconds);
-  const modernLegislationKeys = [
-    'initialDebateMilliseconds', 'revisionDebateMilliseconds', 'voteMilliseconds',
-    'maximumRevisions', 'extendOnLateMaterialFeedback', 'lateFeedbackWindowMilliseconds',
-    'debateExtensionMilliseconds', 'maximumDebateExtensions'
-  ];
-  const legacyLegislationKeys = ['draftMilliseconds', 'debateMilliseconds', 'voteMilliseconds'];
-  const allowedLegislationKeys = new Set(modernLegislation ? modernLegislationKeys : legacyLegislationKeys);
-  if (Object.keys(legislation).some((key) => !allowedLegislationKeys.has(key))) {
+  const legislationKeys = ['voteMilliseconds', 'maximumDeferrals', 'maximumSessionIntervalMilliseconds'];
+  const allowedLegislationKeys = new Set(legislationKeys);
+  if (Object.keys(legislation).some((key) => !allowedLegislationKeys.has(key))
+    || legislationKeys.some((key) => !(key in legislation))) {
     throw new Error('legislationに未対応の設定があります。');
   }
-  const durationKeys = modernLegislation
-    ? modernLegislationKeys.filter((key) => key.endsWith('Milliseconds'))
-    : legacyLegislationKeys;
-  for (const key of durationKeys) {
+  for (const key of ['voteMilliseconds', 'maximumSessionIntervalMilliseconds']) {
     finite(legislation[key], `legislation.${key}`, { min: technicalOnly ? 60_000 : 3_600_000 });
     if (!Number.isInteger(legislation[key])) throw new Error(`legislation.${key} は整数である必要があります。`);
   }
-  if (modernLegislation) {
-    for (const key of ['maximumRevisions', 'maximumDebateExtensions']) {
-      finite(legislation[key], `legislation.${key}`, { max: technicalOnly ? 20 : 10 });
-      if (!Number.isInteger(legislation[key])) throw new Error(`legislation.${key} は整数である必要があります。`);
-    }
-    if (legislation.extendOnLateMaterialFeedback !== true && legislation.extendOnLateMaterialFeedback !== false) {
-      throw new Error('legislation.extendOnLateMaterialFeedback は真偽値である必要があります。');
-    }
-    if (legislation.lateFeedbackWindowMilliseconds > legislation.initialDebateMilliseconds
-      || legislation.lateFeedbackWindowMilliseconds > legislation.revisionDebateMilliseconds) {
-      throw new Error('締切直前の論点判定期間が討議期間を超えています。');
-    }
-  }
+  finite(legislation.maximumDeferrals, 'legislation.maximumDeferrals', { min: 1, max: technicalOnly ? 20 : 10 });
+  if (!Number.isInteger(legislation.maximumDeferrals)) throw new Error('legislation.maximumDeferrals は整数である必要があります。');
   for (const key of [
     'defenseMilliseconds', 'appealMilliseconds', 'constitutionalChallengesPerMemberPerDay', 'panelSeats', 'guiltyVotesRequired',
     'constitutionalVotesRequired', 'unconstitutionalVotesRequired', 'discordMaximumTimeoutSeconds',
@@ -306,33 +264,6 @@ export function evaluateEligibility({ joinedAt, now = Date.now(), dailyUniqueCou
     oldEnough,
     messages,
     activeDays
-  };
-}
-
-export function closeVote({ kind, yes, no, abstain, electorate, trustedNo, trustedTotal, scope = 'all' }, policy) {
-  const decisive = yes + no;
-  const threshold = kind === 'amendment'
-    ? policy.voting.amendmentYesRatio
-    : policy.voting.lawYesRatio;
-  const ratioPassed = decisive > 0 && (kind === 'amendment'
-    ? yes / decisive >= threshold
-    : yes / decisive > threshold);
-  const ballots = yes + no + abstain;
-  const quorumNeeded = Math.max(
-    policy.voting.minimumBallots,
-    Math.ceil(Math.max(0, electorate) * policy.voting.quorumRatio)
-  );
-  const quorumPassed = ballots >= quorumNeeded;
-  const trustedNeeded = trustedTotal > 0 ? Math.ceil(trustedTotal * policy.voting.trustedVetoRatio) : Infinity;
-  const vetoed = scope === 'all' && trustedTotal > 0 && trustedNo >= trustedNeeded;
-  return {
-    passed: ratioPassed && quorumPassed && !vetoed,
-    ratioPassed,
-    quorumPassed,
-    vetoed,
-    threshold,
-    quorumNeeded,
-    trustedNeeded: Number.isFinite(trustedNeeded) ? trustedNeeded : 0
   };
 }
 
