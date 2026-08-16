@@ -8,7 +8,7 @@ import {
 } from 'discord.js';
 import { governanceCategoryName } from './config.js';
 import {
-  getCaseInterimProtection,
+  getCaseDetention,
   getCaseSanction,
   getConstitution,
   getGovernanceGuild,
@@ -21,7 +21,7 @@ import {
 const PARLIAMENT_TAGS = ['議題', '議論中', '投票中', '成立', '不成立'];
 const PARLIAMENT_TOPIC = '作りたい法律や直したい制度をここへ投稿します。定期的に開く国会がすべての投稿を議題として読みます。';
 const COURT_TAGS = ['回答待ち', '判断中', '処分中', '処分確定', '取消', '責任なし', '棄却', '合憲', '違憲', '判断不能'];
-export const COURT_TOPIC = '申立てから結論までを1事件1投稿で記録します。答弁・証拠・上訴も同じ投稿で扱います。';
+export const COURT_TOPIC = '警察の処分が争われた事件と、警察が実行できない処分の事件だけを審理します。答弁・証拠・上訴も同じ投稿で扱います。';
 export const GOVERNANCE_PROCEDURE_NAME = '手続';
 export const GOVERNANCE_PROCEDURE_TOPIC = 'いま投票・執行承認できる案件だけを表示します。本文と議論は議会・裁判所にあります。';
 
@@ -49,8 +49,8 @@ function proposalStateLabel(state, handler = null) {
 function caseStateLabel(state) {
   return ({
     filing: '回答待ち',
-    summary_review: '判断中',
-    summary_active: '処分中',
+    police_review: '警察が確認中',
+    contest_window: '処分中・不服申立て可',
     defense: '回答待ち',
     deliberation: '判断中',
     approval: '判断中',
@@ -90,6 +90,10 @@ function courtDeadline(caseRecord) {
 
 function courtAccessState(caseRecord) {
   const live = getGovernanceGuild(caseRecord.guild_id)?.enforcement_mode === 'live';
+  const detention = getCaseDetention(caseRecord.id);
+  if (detention?.status === 'active' && detention.ends_at > Date.now()) {
+    return `拘留中（<t:${Math.floor(detention.ends_at / 1000)}:R>まで）。この事件記録では発言できます`;
+  }
   if (caseRecord.procedure_version === 2 && caseRecord.status === 'appeal_window') {
     const sanction = getCaseSanction(caseRecord.id);
     if (live && sanction?.type === 'timeout' && sanction.review_requested_at) {
@@ -100,15 +104,9 @@ function courtAccessState(caseRecord) {
   if (caseRecord.status === 'appeal') return live
     ? '被申立人はこの事件投稿だけ（上訴中）'
     : '通常（上訴中・実執行停止中）';
-  const protection = getCaseInterimProtection(caseRecord.id);
   if (caseRecord.procedure_version === 2 && caseRecord.status === 'defense') {
     return '全員閲覧可・当事者はボタンから回答';
   }
-  if (protection?.status === 'active' && protection.ends_at > Date.now() && live) {
-    return `被申立人はこの事件投稿だけ（一時保全・<t:${Math.floor(protection.ends_at / 1000)}:R>まで）`;
-  }
-  if (protection?.status === 'active' && protection.ends_at > Date.now()) return '通常（実執行停止中）';
-  if (protection?.status === 'simulated') return '通常（一時保全の条件はshadowで確認済み・実制限なし）';
   return '通常（正式な主張として記録するのは当事者だけ）';
 }
 
@@ -197,6 +195,36 @@ export async function createGovernanceProcedureChannel(guild, categoryId) {
     topic: GOVERNANCE_PROCEDURE_TOPIC,
     permissionOverwrites: governanceProcedureOverwrites(guild),
     reason: `${guild.name} governance procedure hub`
+  });
+}
+
+// 警察の処分の公開先。裁判所は争われた事件だけを扱うので、ここが取締りの記録になる。
+export async function ensureGovernanceEnforcementThread(guild, governance, procedureMessage = null) {
+  let thread = governance.enforcement_thread_id
+    ? await guild.channels.fetch(governance.enforcement_thread_id).catch(() => null)
+    : null;
+  if (thread?.isThread?.()) return thread;
+  const channel = await guild.channels.fetch(governance.procedure_channel_id).catch(() => null);
+  if (!channel?.isTextBased?.()) throw new Error('手続channelが見つかりません。');
+  const starter = procedureMessage
+    ?? await channel.messages.fetch(governance.procedure_message_id).catch(() => null);
+  if (!starter) throw new Error('手続の案内messageが見つかりません。');
+  thread = await channel.threads.create({
+    name: '執行記録',
+    autoArchiveDuration: 10_080,
+    reason: `${guild.name} governance enforcement log`
+  });
+  updateGovernanceGuild(guild.id, { enforcement_thread_id: thread.id });
+  return thread;
+}
+
+export async function postEnforcementRecord(guild, governance, text, { files = [], components = [] } = {}) {
+  const thread = await ensureGovernanceEnforcementThread(guild, governance);
+  return thread.send({
+    content: String(text).slice(0, 2000),
+    files,
+    components,
+    allowedMentions: { parse: [] }
   });
 }
 
@@ -341,7 +369,7 @@ export async function ensureGovernanceMentionRoles(guild, governance) {
   let judiciary = governance.judiciary_role_id
     ? guild.roles.cache.get(governance.judiciary_role_id)
     : null;
-  if (!judiciary) judiciary = await createMentionRole(guild, '裁判');
+  if (!judiciary) judiciary = await createMentionRole(guild, '通報');
   if (!judiciary.mentionable) await judiciary.setMentionable(true, 'Governance address roles must be mentionable');
   if (!guild.members.me.roles.cache.has(judiciary.id)) {
     await guild.members.me.roles.add(judiciary, 'Restore governance conversational address');
@@ -400,7 +428,7 @@ export async function createGovernanceSurfaces(guild, { resources = {}, onProgre
     hoist: false,
     reason: `${guild.name} governance appeal restriction`
   }));
-  const judiciaryRole = await role('judiciaryRoleId', () => createMentionRole(guild, '裁判', { assignToBot: false }));
+  const judiciaryRole = await role('judiciaryRoleId', () => createMentionRole(guild, '通報', { assignToBot: false }));
   if (!guild.members.me.roles.cache.has(judiciaryRole.id)) {
     await guild.members.me.roles.add(judiciaryRole, 'Restore governance conversational address during setup');
   }
@@ -613,11 +641,11 @@ function withoutDecisionRows(components = [], actions = ['vote', 'approve']) {
   }));
 }
 
-export function reviewRequestButtons(guildId, sanctionId, disabled = false) {
+export function contestButtons(guildId, sanctionId, disabled = false) {
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`gov:review:${guildId}:${sanctionId}`)
-      .setLabel('裁判を求める')
+      .setCustomId(`gov:contest:${guildId}:${sanctionId}`)
+      .setLabel('裁判所の審理を求める')
       .setStyle(ButtonStyle.Primary)
       .setDisabled(disabled)
   )];
@@ -660,9 +688,9 @@ function proposalStarterContent(proposal, nextAction = proposalNextAction(propos
 
 function courtNextAction(caseRecord) {
   return ({
-    filing: '裁判の準備中です。',
-    summary_review: '成立法に照らして判断しています。',
-    summary_active: '被処分者は「裁判を求める」から争えます。',
+    filing: '裁判所の準備中です。',
+    police_review: '警察が成立法に照らして確認しています。',
+    contest_window: '被処分者は下のボタンから裁判所の審理を求められます。',
     defense: '当事者は下のボタンから回答します。',
     deliberation: '回答を締め切り、判断しています。',
     approval: '特別有権者は「手続」の案件カードから承認します。',
@@ -908,11 +936,22 @@ export function courtActionButtons(caseRecord) {
       new ButtonBuilder().setCustomId(`gov:court:${caseRecord.id}:appeal`).setLabel('上訴する').setStyle(ButtonStyle.Primary)
     )];
   }
+  // 警察の処分に不服がある間は、事件記録からも直接争えるようにする。
+  if (caseRecord.status === 'contest_window') {
+    const sanction = getCaseSanction(caseRecord.id);
+    return sanction
+      ? [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`gov:contest:${caseRecord.guild_id}:${sanction.id}`)
+          .setLabel('裁判所の審理を求める').setStyle(ButtonStyle.Primary)
+      )]
+      : [];
+  }
   if (!['defense', 'appeal'].includes(caseRecord.status)) return [];
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`gov:court:${caseRecord.id}:answer`).setLabel('回答を書く').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`gov:court:${caseRecord.id}:evidence`).setLabel('証拠を出す').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`gov:court:${caseRecord.id}:complete`).setLabel('回答完了').setStyle(ButtonStyle.Success)
+    new ButtonBuilder().setCustomId(`gov:court:${caseRecord.id}:complete`).setLabel('回答完了').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`gov:court:${caseRecord.id}:withdraw`).setLabel('取り下げる').setStyle(ButtonStyle.Danger)
   )];
 }
 

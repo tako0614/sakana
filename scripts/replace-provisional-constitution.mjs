@@ -13,12 +13,13 @@ import { compileConstitution } from '../src/governance/rules.js';
 
 // 統治案件がまだ1件も無い導入直後だけ、初期憲法を差し替えられる。
 // 法律・事件・処分が1件でもあれば、変更は改憲手続にしか通せない。
+// 法的な結果がまだ一つも無いときだけ差し替えられる。運用記録 (行政行為や監査) は
+// 旧憲法下の事実として残しておいてよいので、ここでは数えない。
 const EMPTY_TABLES = [
   'governance_proposals',
   'governance_laws',
   'governance_cases',
-  'governance_sanctions',
-  'governance_administrative_acts'
+  'governance_sanctions'
 ];
 
 function argument(name) {

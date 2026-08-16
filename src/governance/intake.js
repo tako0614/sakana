@@ -11,7 +11,7 @@ import {
   createGovernanceIntake,
   createMentionInvestigation,
   findAcceptedMentionInvestigationForCase,
-  findCaseBySummaryEvent,
+  findCaseByPoliceEvent,
   findGovernanceIntakeByResult,
   findMentionInvestigationByResult,
   getActiveConstitution,
@@ -51,7 +51,7 @@ function roleMentioned(message, roleId) {
 export function governanceMentionBranch(message, governance = getGovernanceGuild(message?.guildId)) {
   // 他のAI botはコミュニティ参加者として発議できるが、統治bot自身の出力では再帰発火させない。
   if (!governance || (message?.author?.bot && message.author.id === message.client?.user?.id)) return null;
-  // 立法の入口は議会Forumへの投稿になったので、mentionで受けるのは司法だけ。
+  // 立法の入口は議会Forumへの投稿。mentionで受けるのは通報と司法手続だけ。
   return roleMentioned(message, governance.judiciary_role_id) ? 'judiciary' : null;
 }
 
@@ -278,7 +278,7 @@ export async function updateRetriedMentionInvestigationMessage(guild, resultType
     const ready = caseIds.every((caseId) => {
       const currentCase = getCase(caseId);
       return currentCase?.public_thread_id && !currentCase.retry_after
-        && !['filing', 'summary_review'].includes(currentCase.status);
+        && !['filing', 'police_review'].includes(currentCase.status);
     });
     updateMentionInvestigation(investigation.id, {
       result: { ...investigation.result, publishedCaseIds: [...published] },
@@ -359,7 +359,7 @@ function reservationMessage(reservation) {
 
 function caseStatusText(caseRecord, guildId) {
   const status = ({
-    filing: '受付中', summary_review: 'AI判定中', summary_active: '即時処分中・裁判請求可',
+    filing: '受付中', police_review: '警察が確認中', contest_window: '処分中・不服申立て可',
     defense: '答弁期間', deliberation: '審理中', approval: '執行承認待ち',
     appeal_window: '上訴受付中', appeal: '上訴審理中', execution: '執行処理中', final: '確定',
     overturned: '取消', acquitted: '責任なし', dismissed: '棄却',
@@ -464,7 +464,7 @@ async function runProceduralJudiciary(message, request, anchor, investigation, r
     }
   }
   if (output.intent === 'evidence') {
-    if (!anchor) return { outcome: 'unclear', text: '追加する投稿へ返信して、もう一度 @裁判 を呼んでください。' };
+    if (!anchor) return { outcome: 'unclear', text: '追加する投稿へ返信して、もう一度 @通報 を呼んでください。' };
     const caseRecord = getCase(output.caseId);
     if (!caseRecord || caseRecord.guild_id !== message.guildId) throw new Error('事件が見つかりません。');
     await assertEvidenceVisibleTo(message.guild, anchor, [caseRecord.reporter_id, caseRecord.accused_id]);
@@ -497,7 +497,7 @@ async function runAutomaticJudiciary(message, request, anchor, context, investig
     panel: constitution.rules?.panels?.judicialScreening
   });
   if (panel.outputs.length < panel.required) {
-    return { outcome: 'failed_closed', text: '独立したAI席が必要数そろわなかったため、事件化も処分も行いませんでした。' };
+    return { outcome: 'failed_closed', text: '警察の席が必要数そろわなかったため、事件化も処分も行いませんでした。' };
   }
   const candidates = panel.candidates.slice(0, context.settings.caseLimit);
   if (!candidates.length) {
@@ -513,14 +513,14 @@ async function runAutomaticJudiciary(message, request, anchor, context, investig
     if (candidate.elementEvidence.some((entry) => entry.messageIds.every((id) => !validIds.has(String(id))))) continue;
     const accused = await message.guild.members.fetch(candidate.accusedId).catch(() => null);
     if (!accused || accused.user?.bot) continue;
-    const summaryEventKey = `ai-screen:${sha256([
+    const policeEventKey = `ai-screen:${sha256([
       message.guildId,
       candidate.accusedId,
       candidate.lawId,
       candidate.offenseCode,
       ...evidence.map((row) => row.messageId).sort()
     ].join('|'))}`;
-    const duplicate = findCaseBySummaryEvent(message.guildId, summaryEventKey);
+    const duplicate = findCaseByPoliceEvent(message.guildId, policeEventKey);
     if (duplicate) {
       results.push({ caseRecord: duplicate, candidate, evidence, duplicate: true });
       continue;
@@ -553,7 +553,7 @@ async function runAutomaticJudiciary(message, request, anchor, context, investig
         evidences: evidence,
         eventId: message.id,
         attemptReserved: true,
-        summaryEventKey,
+        policeEventKey,
         official: true
       });
       results.push({ caseRecord, candidate, evidence, duplicate: false });
@@ -593,7 +593,7 @@ async function runAutomaticJudiciary(message, request, anchor, context, investig
       omittedCandidates: Math.max(0, panel.candidates.length - candidates.length)
     },
     text: [
-      `${results.length}件を成立法に基づく裁判へ移しました。`,
+      `${results.length}件を成立法に基づいて警察が受理しました。`,
       ...links,
       panel.candidates.length > candidates.length
         ? `安全上限により、残り${panel.candidates.length - candidates.length}件は今回事件化していません。`
@@ -705,7 +705,7 @@ export async function handleGovernanceMention(message) {
   const request = stripAddressMentions(message.content, governance, message.client.user?.id);
   if (!request) {
     await message.reply({
-      content: '審査してほしい内容を書いてください。違反申立てなら対象発言へ返信してください。',
+      content: '通報したい内容を書いてください。違反の通報なら対象発言へ返信してください。上訴・取り下げ・違憲審査もここです。',
       allowedMentions: NO_MENTIONS
     });
     return true;
@@ -732,7 +732,7 @@ export async function handleGovernanceMention(message) {
   });
   await message.channel.sendTyping().catch(() => {});
   const progress = await message.reply({
-    content: '公開記録と成立法を独立したAI席で照合しています。根拠がそろった場合だけ裁判へ移します。',
+    content: '警察が公開記録と成立法を照合しています。根拠がそろった場合だけ処分または送検に移します。',
     allowedMentions: NO_MENTIONS
   });
   updateMentionInvestigation(investigation.id, { response_message_id: progress.id });

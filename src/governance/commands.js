@@ -18,7 +18,7 @@ import {
   getGovernanceGuild,
   getGovernanceSetupSession,
   getResumableGovernanceSetup,
-  listReviewableSanctions,
+  listContestableSanctions,
   recordGovernanceSurfaceMigration,
   updateGovernanceSetupSession
 } from './db.js';
@@ -26,7 +26,7 @@ import {
   createGovernanceSurfaces,
   governancePermissionReport,
   postAuthorityChange,
-  reviewRequestButtons
+  contestButtons
 } from './discord.js';
 import { policyHash, sha256 } from './policy.js';
 import {
@@ -35,7 +35,8 @@ import {
   backfillGovernanceActivity,
   castAndPublishVote,
   completeCaseResponse,
-  requestSummaryTrial,
+  requestTrial,
+  withdrawContest,
   submitCaseAnswer
 } from './service.js';
 import { handleGovernanceIntakeComponent } from './intake.js';
@@ -46,12 +47,12 @@ const EPHEMERAL = MessageFlags.Ephemeral;
 const SETUP_TTL_MS = 15 * 60_000;
 
 function reviewListPayload(guildId, userId, offset = 0) {
-  const sanctions = listReviewableSanctions(guildId, userId);
+  const sanctions = listContestableSanctions(guildId, userId);
   const pageSize = 4;
   const start = Math.max(0, Math.min(Number(offset) || 0, Math.max(0, sanctions.length - 1)));
   const page = sanctions.slice(start, start + pageSize);
   if (!page.length) {
-    return { content: 'いま裁判を求められる即時処分はありません。', components: [], flags: EPHEMERAL };
+    return { content: 'いま争える即時処分はありません。', components: [], flags: EPHEMERAL };
   }
   const lines = page.map((sanction, index) => {
     const caseRecord = getCase(sanction.case_id);
@@ -59,22 +60,22 @@ function reviewListPayload(guildId, userId, offset = 0) {
     return `${index + 1}. ${type}: ${String(caseRecord?.summary ?? '理由は裁判所を参照').replace(/\s+/g, ' ').slice(0, 180)}`;
   });
   const rows = page.map((sanction, index) => {
-    const row = reviewRequestButtons(guildId, sanction.id)[0];
-    row.components[0].setLabel(`${index + 1}の裁判を求める`);
+    const row = contestButtons(guildId, sanction.id)[0];
+    row.components[0].setLabel(`${index + 1}の審理を求める`);
     return row;
   });
   const navigation = new ActionRowBuilder();
   if (start > 0) {
-    navigation.addComponents(new ButtonBuilder().setCustomId(`gov:review_list:${Math.max(0, start - pageSize)}`)
+    navigation.addComponents(new ButtonBuilder().setCustomId(`gov:contest_list:${Math.max(0, start - pageSize)}`)
       .setLabel('前へ').setStyle(ButtonStyle.Secondary));
   }
   if (start + pageSize < sanctions.length) {
-    navigation.addComponents(new ButtonBuilder().setCustomId(`gov:review_list:${start + pageSize}`)
+    navigation.addComponents(new ButtonBuilder().setCustomId(`gov:contest_list:${start + pageSize}`)
       .setLabel('次へ').setStyle(ButtonStyle.Secondary));
   }
   if (navigation.components.length) rows.push(navigation);
   return {
-    content: ['# 自分の即時処分', '', ...lines, '', '処分ごとに一度だけ、本人が裁判を求められます。'].join('\n'),
+    content: ['# 自分が受けた警察の処分', '', ...lines, '', '処分ごとに一度だけ、本人が裁判所の審理を求められます。'].join('\n'),
     components: rows,
     flags: EPHEMERAL
   };
@@ -276,7 +277,7 @@ export async function handleGovernanceComponent(interaction) {
   const customId = interaction.customId ?? '';
   if (!customId.startsWith('gov:')) return false;
   try {
-    if (customId.startsWith('gov:review_list:') && interaction.isButton()) {
+    if (customId.startsWith('gov:contest_list:') && interaction.isButton()) {
       requireGuild(interaction);
       const offset = Number(customId.split(':')[2]);
       const payload = reviewListPayload(interaction.guildId, interaction.user.id, offset);
@@ -287,7 +288,7 @@ export async function handleGovernanceComponent(interaction) {
       else await interaction.reply(payload);
       return true;
     }
-    if (customId.startsWith('gov:review:') && interaction.isButton()) {
+    if (customId.startsWith('gov:contest:') && interaction.isButton()) {
       const [, , guildId, rawSanctionId] = customId.split(':');
       const guild = interaction.client.guilds.cache.get(guildId)
         ?? await interaction.client.guilds.fetch(guildId).catch(() => null);
@@ -295,8 +296,8 @@ export async function handleGovernanceComponent(interaction) {
       const member = await guild.members.fetch(interaction.user.id).catch(() => null);
       if (!member) throw new Error('対象サーバーのメンバーではありません。');
       await interaction.deferReply(interaction.inGuild?.() ? { flags: EPHEMERAL } : {});
-      const result = await requestSummaryTrial(guild, member, Number(rawSanctionId));
-      await interaction.editReply(`裁判を開始しました。期限: <t:${Math.floor(result.defense_until / 1000)}:F>\n[裁判を開く](https://discord.com/channels/${guild.id}/${result.public_thread_id})`);
+      const result = await requestTrial(guild, member, Number(rawSanctionId));
+      await interaction.editReply(`裁判所の審理を始めました。期限: <t:${Math.floor(result.defense_until / 1000)}:F>\n[事件記録を開く](https://discord.com/channels/${guild.id}/${result.public_thread_id})`);
       return true;
     }
     if (customId.startsWith('gov:court_answer:') && interaction.isModalSubmit()) {
@@ -360,9 +361,15 @@ export async function handleGovernanceComponent(interaction) {
       }
       if (value === 'evidence') {
         await interaction.reply({
-          content: '証拠にしたい公開メッセージへ返信し、「@裁判 この事件へ証拠として追加」と送ってください。',
+          content: '証拠にしたい公開メッセージへ返信し、「@通報 この事件へ証拠として追加」と送ってください。',
           flags: EPHEMERAL
         });
+        return true;
+      }
+      if (value === 'withdraw') {
+        await interaction.deferReply({ flags: EPHEMERAL });
+        await withdrawContest(interaction.guild, member, id);
+        await interaction.editReply('申立てを取り下げ、処分を確定しました。');
         return true;
       }
       if (value === 'complete') {

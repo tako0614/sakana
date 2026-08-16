@@ -621,7 +621,7 @@ db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied
     ['procedure_version', 'INTEGER NOT NULL DEFAULT 1'],
     ['decision_due_at', 'INTEGER'],
     ['response_completed_at', 'INTEGER'],
-    ['summary_event_key', 'TEXT'],
+    ['police_event_key', 'TEXT'],
     ['review_count', 'INTEGER NOT NULL DEFAULT 0']
   ]) {
     if (!caseColumns.has(name)) db.exec(`ALTER TABLE governance_cases ADD COLUMN ${name} ${definition}`);
@@ -635,8 +635,8 @@ db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied
   }
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_gov_case_summary_event
-    ON governance_cases(guild_id, summary_event_key)
-    WHERE summary_event_key IS NOT NULL
+    ON governance_cases(guild_id, police_event_key)
+    WHERE police_event_key IS NOT NULL
   `);
   // 施行途中の事件は、その後に憲法が改正されても受付時の手続を維持する。
   // v12導入前の行には当時の現行憲法を一度だけ固定する。
@@ -1024,6 +1024,32 @@ db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied
 }
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (19, ?)').run(Date.now());
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS governance_detentions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL UNIQUE,
+    guild_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    duration_seconds INTEGER NOT NULL,
+    started_at INTEGER NOT NULL,
+    ends_at INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    released_at INTEGER,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_gov_detention_active
+    ON governance_detentions(guild_id, user_id, status, ends_at);
+`);
+{
+  const columns = new Set(db.pragma('table_info(governance_guilds)').map((row) => row.name));
+  // 警察の処分は裁判所ではなく手続の執行記録へ公開する。裁判所は争われた事件だけを持つ。
+  if (!columns.has('enforcement_thread_id')) {
+    db.exec("ALTER TABLE governance_guilds ADD COLUMN enforcement_thread_id TEXT NOT NULL DEFAULT ''");
+  }
+}
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (20, ?)').run(Date.now());
+
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
 db.prepare("UPDATE governance_outbox SET status = 'error', last_error = 'interrupted before completion' WHERE status = 'running'").run();
@@ -1231,7 +1257,7 @@ export function updateGovernanceGuild(guildId, patch) {
     'parliament_forum_id', 'court_forum_id', 'court_chat_channel_id', 'statute_forum_id',
     'procedure_channel_id', 'procedure_message_id', 'operations_thread_id',
     'active_constitution_id', 'last_session_at', 'session_retry_after',
-    'session_failure_count', 'session_last_error'
+    'session_failure_count', 'session_last_error', 'enforcement_thread_id'
   ]);
   const entries = Object.entries(patch).filter(([key]) => allowed.has(key));
   if (entries.length === 0) return getGovernanceGuild(guildId);
@@ -2499,7 +2525,7 @@ export function createCase(input) {
     INSERT INTO governance_cases
       (guild_id, kind, reporter_id, accused_id, law_id, offense_code, challenged_type, challenged_id,
       summary, status, defense_until, alleged_at, constitution_id, procedure_version,
-      decision_due_at, summary_event_key, created_at, updated_at)
+      decision_due_at, police_event_key, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     input.guildId, input.kind ?? 'criminal', input.reporterId, input.accusedId ?? null,
@@ -2507,7 +2533,7 @@ export function createCase(input) {
     input.challengedId === null || input.challengedId === undefined ? null : String(input.challengedId),
     input.summary, input.status ?? 'filed', input.defenseUntil ?? null,
     input.allegedAt ?? null, input.constitutionId ?? null, input.procedureVersion ?? 1,
-    input.decisionDueAt ?? null, input.summaryEventKey ?? null,
+    input.decisionDueAt ?? null, input.policeEventKey ?? null,
     now, now
   );
   const created = getCase(Number(result.lastInsertRowid));
@@ -2553,17 +2579,17 @@ export function listCases(guildId, { statuses = null, limit = 25 } = {}) {
     .all(guildId, limit).map(hydrateCase);
 }
 
-export function findCaseBySummaryEvent(guildId, summaryEventKey) {
+export function findCaseByPoliceEvent(guildId, policeEventKey) {
   return hydrateCase(db.prepare(`
-    SELECT * FROM governance_cases WHERE guild_id = ? AND summary_event_key = ? LIMIT 1
-  `).get(String(guildId), String(summaryEventKey)));
+    SELECT * FROM governance_cases WHERE guild_id = ? AND police_event_key = ? LIMIT 1
+  `).get(String(guildId), String(policeEventKey)));
 }
 
-export function findRecentSummaryCase(guildId, userId, lawId, offenseCode, since) {
+export function findRecentPoliceCase(guildId, userId, lawId, offenseCode, since) {
   return hydrateCase(db.prepare(`
     SELECT * FROM governance_cases
     WHERE guild_id = ? AND accused_id = ? AND law_id = ? AND offense_code = ?
-      AND procedure_version = 2 AND summary_event_key IS NOT NULL AND created_at >= ?
+      AND procedure_version = 2 AND police_event_key IS NOT NULL AND created_at >= ?
     ORDER BY id DESC LIMIT 1
   `).get(String(guildId), String(userId), Number(lawId), String(offenseCode), Number(since)));
 }
@@ -2591,7 +2617,7 @@ export const updateCase = db.transaction((id, patch) => {
     'status', 'public_thread_id', 'private_thread_id', 'defense_until', 'panel_id',
     'verdict_json', 'finalized_at', 'retry_after', 'failure_count', 'last_error', 'alleged_at',
     'constitution_id', 'procedure_version', 'decision_due_at', 'response_completed_at',
-    'summary_event_key', 'review_count'
+    'police_event_key', 'review_count'
   ]);
   const normalized = { ...patch };
   if ('verdict' in normalized) {
@@ -2772,7 +2798,7 @@ export function listSanctions(guildId, statuses = null) {
     .map((row) => ({ ...row, profile: parseJson(row.profile_json, null) }));
 }
 
-export function listReviewableSanctions(guildId, userId) {
+export function listContestableSanctions(guildId, userId) {
   return db.prepare(`
     SELECT s.* FROM governance_sanctions s
     JOIN governance_cases c ON c.id = s.case_id
@@ -2849,6 +2875,54 @@ export function deactivateRestrictionForSanction(sanctionId, status = 'reversed'
     UPDATE governance_active_restrictions SET status = ?
     WHERE sanction_id = ? AND status = 'active'
   `).run(status, sanctionId).changes;
+}
+
+// 拘留は罰ではない保全なので、刑ではなく事件へ紐づけて時間だけを持つ。
+export function createDetention({ caseId, guildId, userId, reason, durationSeconds, startedAt, endsAt, status }) {
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO governance_detentions
+      (case_id, guild_id, user_id, reason, duration_seconds, started_at, ends_at, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    Number(caseId), String(guildId), String(userId), String(reason).slice(0, 500),
+    Number(durationSeconds), Number(startedAt), Number(endsAt), String(status), now
+  );
+  return getCaseDetention(caseId);
+}
+
+export function getCaseDetention(caseId) {
+  return db.prepare('SELECT * FROM governance_detentions WHERE case_id = ?').get(Number(caseId)) ?? null;
+}
+
+export function activeDetentions(guildId, userId, now = Date.now()) {
+  return db.prepare(`
+    SELECT * FROM governance_detentions
+    WHERE guild_id = ? AND user_id = ? AND status = 'active' AND ends_at > ?
+  `).all(String(guildId), String(userId), Number(now));
+}
+
+export function releaseDetention(caseId, now = Date.now()) {
+  db.prepare("UPDATE governance_detentions SET status = 'released', released_at = ? WHERE case_id = ? AND status = 'active'")
+    .run(Number(now), Number(caseId));
+  return getCaseDetention(caseId);
+}
+
+export function expireDetentions(now = Date.now()) {
+  const rows = db.prepare("SELECT * FROM governance_detentions WHERE status = 'active' AND ends_at <= ?").all(Number(now));
+  if (rows.length) {
+    db.prepare("UPDATE governance_detentions SET status = 'expired', released_at = ? WHERE status = 'active' AND ends_at <= ?")
+      .run(Number(now), Number(now));
+  }
+  return rows;
+}
+
+// 拘留された時間は、同じ事件で後から科す期間処分の刑期から差し引く。
+export function detainedSeconds(caseId, now = Date.now()) {
+  const row = getCaseDetention(caseId);
+  if (!row) return 0;
+  const until = row.released_at ?? Math.min(now, row.ends_at);
+  return Math.max(0, Math.floor((until - row.started_at) / 1000));
 }
 
 export function createInterimProtection(input) {

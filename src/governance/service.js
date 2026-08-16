@@ -11,33 +11,35 @@ import {
   createAdministrativeAct,
   createAppeal,
   createCase,
-  createInterimProtection,
+  createDetention,
   createSanction,
   deactivateRestrictionForSanction,
   enactConstitution,
   enactLaw,
   enqueueAction,
+  expireDetentions,
   expireRestrictions,
-  expireInterimProtections,
   expireGovernanceIntakes,
   failAction,
-  findCaseBySummaryEvent,
+  findCaseByPoliceEvent,
   findOpenConstitutionalCase,
-  findRecentSummaryCase,
+  findRecentPoliceCase,
   getActiveConstitution,
   getAdministrativeAct,
   getAppeal,
   getCase,
   getCaseByPublicThread,
+  getCaseDetention,
   getCaseSanction,
   getGovernanceGuild,
-  getCaseInterimProtection,
   getConstitution,
   getLaw,
   getCurrentLawVersion,
   getOperationalSetting,
   getProposal,
+  detainedSeconds,
   getSanction,
+  releaseDetention,
   getSanctionDefinition,
   listCaseApprovals,
   listCaseEvidence,
@@ -73,6 +75,7 @@ import {
   writeAudit
 } from './db.js';
 import {
+  postEnforcementRecord,
   applyAppealRestriction,
   createCourtCaseThread,
   executeDiscordSanction,
@@ -83,7 +86,7 @@ import {
   postProposalUpdate,
   publicMemberLabel,
   releaseAppealRestriction,
-  reviewRequestButtons,
+  contestButtons,
   syncAppealRoleOverwrites,
   ensureGovernanceMentionRoles,
   syncGovernanceRecordUi
@@ -99,9 +102,8 @@ import {
   normalizeActivityContent,
   requiredApprovals,
   sha256,
-  summaryProcedure,
+  policeProcedure,
   validateAutomaticTrigger,
-  validateInterimProtectionDefinition,
   validateRestrictionDefinition
 } from './policy.js';
 import { governanceActionAllowed, reserveRestrictedAgentCall } from './restrictions.js';
@@ -220,7 +222,7 @@ function constitutionForCase(caseRecord) {
 }
 
 function caseProcedure(caseRecord) {
-  return summaryProcedure(constitutionForCase(caseRecord)?.policy);
+  return policeProcedure(constitutionForCase(caseRecord)?.policy);
 }
 
 function governanceSurface(channel, governance) {
@@ -537,20 +539,20 @@ export async function fileCriminalCase(guild, reporter, input) {
     lawId: law.id,
     offenseCode: offense.code,
     summary: input.summary,
-    status: summaryProcedure(policy) ? 'summary_review' : 'filing',
+    status: policeProcedure(policy) ? 'police_review' : 'filing',
     defenseUntil: null,
     allegedAt: evidenceRows.at(-1).occurredAt,
     constitutionId: constitution.id,
-    procedureVersion: summaryProcedure(policy) ? 2 : 1,
-    summaryEventKey: input.summaryEventKey ?? null,
+    procedureVersion: policeProcedure(policy) ? 2 : 1,
+    policeEventKey: input.policeEventKey ?? null,
     reporterType: input.official ? 'ai' : 'member'
   });
   for (const evidence of evidenceRows) {
     addCaseEvidence({ caseId: caseRecord.id, submittedBy: reporter.id, ...evidence });
   }
   try {
-    return summaryProcedure(policy)
-      ? await finishSummaryReview(guild, caseRecord)
+    return policeProcedure(policy)
+      ? await finishPoliceReview(guild, caseRecord)
       : await finishCaseFiling(guild, caseRecord);
   } catch (error) {
     updateCase(caseRecord.id, retryPatch(getCase(caseRecord.id), error));
@@ -572,7 +574,7 @@ function profileForSanction(law, sanction, policy) {
   return definition.profile;
 }
 
-async function notifySummarySanction(guild, caseRecord, sanction) {
+async function notifyPoliceSanction(guild, caseRecord, sanction) {
   const member = await guild.members.fetch(sanction.user_id).catch(() => null);
   if (!member) return false;
   const label = sanction.type === 'warning'
@@ -589,26 +591,93 @@ async function notifySummarySanction(guild, caseRecord, sanction) {
       'この処分に異議がある場合は「裁判を求める」を押してください。',
       sanction.type === 'warning' ? '警告は期限なく一度だけ裁判を求められます。' : '処分が続いている間、一度だけ裁判を求められます。'
     ].join('\n').slice(0, 1_900),
-    components: reviewRequestButtons(guild.id, sanction.id),
+    components: contestButtons(guild.id, sanction.id),
     allowedMentions: { parse: [] }
   }).then(() => true).catch(() => false);
   updateSanction(sanction.id, { notice_delivered: delivered ? 1 : 0 });
   return delivered;
 }
 
-async function continueSummarySanction(guild, caseRecord, sanction, procedure) {
-  const trialFirst = procedure.trialFirstSanctions.includes(sanction.type);
-  if (trialFirst) {
+function sanctionLabel(sanction) {
+  const name = ({
+    warning: '警告', restriction: '機能制限', timeout: 'タイムアウト', kick: 'キック', ban: '参加禁止'
+  })[sanction?.type] ?? '処分';
+  const seconds = Number(sanction?.duration_seconds ?? sanction?.durationSeconds ?? 0);
+  if (!seconds) return name;
+  if (seconds % 86_400 === 0) return `${name} ${seconds / 86_400}日`;
+  if (seconds % 3_600 === 0) return `${name} ${seconds / 3_600}時間`;
+  return `${name} ${Math.ceil(seconds / 60)}分`;
+}
+
+// 拘留は罰ではなく審理を確保する保全。裁判所へ送った事件の答弁期間だけ、
+// 憲法が定める上限の範囲で置く。経過時間は後の期間処分から差し引く。
+async function detainForCourt(guild, caseRecord, procedure) {
+  const { governance } = requireGovernance(guild.id);
+  if (getCaseDetention(caseRecord.id)) return null;
+  const now = Date.now();
+  const seconds = Math.min(
+    procedure.detentionMaximumSeconds,
+    Math.max(0, Math.floor(((caseRecord.defense_until ?? now) - now) / 1000))
+  );
+  if (seconds <= 0) return null;
+  const detention = createDetention({
+    caseId: caseRecord.id,
+    guildId: guild.id,
+    userId: caseRecord.accused_id,
+    reason: caseRecord.summary,
+    durationSeconds: seconds,
+    startedAt: now,
+    endsAt: now + seconds * 1000,
+    status: governance.enforcement_mode === 'live' ? 'active' : 'simulated'
+  });
+  writeAudit({
+    guildId: guild.id,
+    actorType: 'system',
+    action: 'detention.started',
+    targetType: 'case',
+    targetId: caseRecord.id,
+    detail: { userId: caseRecord.accused_id, durationSeconds: seconds, mode: governance.enforcement_mode }
+  });
+  await postEnforcementRecord(guild, governance, [
+    '## 拘留',
+    `対象: ${publicMemberLabel(caseRecord.accused_id, '動作確認用アカウント')}`,
+    `期間: ${Math.round(seconds / 60)}分（<t:${Math.floor(detention.ends_at / 1000)}:R>まで）`,
+    '罰ではなく、裁判所の審理を確保するための保全です。拘留中も自分の事件記録では反論できます。',
+    governance.enforcement_mode === 'live' ? null : '（記録のみ・実際の制限はかけていません）'
+  ].filter(Boolean).join('\n'));
+  return detention;
+}
+
+export async function releaseCaseDetention(guild, caseId) {
+  const detention = getCaseDetention(caseId);
+  if (!detention || detention.status !== 'active') return null;
+  const released = releaseDetention(caseId);
+  writeAudit({
+    guildId: guild.id,
+    actorType: 'system',
+    action: 'detention.released',
+    targetType: 'case',
+    targetId: caseId,
+    detail: { userId: detention.user_id, detainedSeconds: detainedSeconds(caseId) }
+  });
+  return released;
+}
+
+async function continuePoliceSanction(guild, caseRecord, sanction, procedure) {
+  const courtFirst = procedure.courtFirstSanctions.includes(sanction.type);
+  if (courtFirst) {
     if (caseRecord.status === 'defense' || caseRecord.public_thread_id) return caseRecord;
+    // 追放・参加禁止は警察が実行できない。裁判所へ送り、その審理の間だけ拘留する。
     let current = updateCase(caseRecord.id, { status: 'filing', review_count: 1 });
     current = await finishCaseFiling(guild, current);
-    await postCourtUpdate(guild, current, `${sanction.type}は裁判前に実行しません。本人の回答を待ち、<t:${Math.floor(current.defense_until / 1000)}:F>までに判定します。`, { state: '答弁' });
+    await detainForCourt(guild, current, procedure);
+    await postCourtUpdate(guild, current, `${sanctionLabel(sanction)}は警察が実行できません。裁判所が審理し、本人の回答を待って<t:${Math.floor(current.defense_until / 1000)}:F>までに判定します。`, { state: '答弁' });
     return current;
   }
   if (sanction.status === 'reviewable') {
     return updateCase(caseRecord.id, sanction.type === 'warning'
       ? { status: 'final', finalized_at: caseRecord.finalized_at ?? Date.now() }
-      : { status: 'summary_active' });
+      : { status: 'contest_window' });
   }
   if (sanction.required_approvals > 0) {
     if (caseRecord.status === 'approval') return caseRecord;
@@ -621,7 +690,7 @@ async function continueSummarySanction(guild, caseRecord, sanction, procedure) {
     return getCase(caseRecord.id);
   }
   if (caseRecord.status !== 'execution') {
-    if (!sanction.notice_delivered) await notifySummarySanction(guild, caseRecord, sanction);
+    if (!sanction.notice_delivered) await notifyPoliceSanction(guild, caseRecord, sanction);
     queueExecution(caseRecord, getSanction(sanction.id));
   }
   await processGovernanceOutbox(guild.client);
@@ -640,11 +709,11 @@ export async function ensurePublicCaseRecord(guild, caseRecord) {
   return current;
 }
 
-async function finishSummaryReview(guild, caseRecord) {
+async function finishPoliceReview(guild, caseRecord) {
   requireGovernance(guild.id);
   const constitution = constitutionForCase(caseRecord);
   const policy = constitution?.policy;
-  const procedure = summaryProcedure(policy);
+  const procedure = policeProcedure(policy);
   if (!procedure) return finishCaseFiling(guild, caseRecord);
   let current = getCase(caseRecord.id);
   const law = getLaw(current.law_id);
@@ -652,7 +721,7 @@ async function finishSummaryReview(guild, caseRecord) {
   const offense = law.provisions.offenses?.find((entry) => entry.code === current.offense_code);
   if (!offense) throw new Error('犯罪構成要件が法律にありません。');
   const existingSanction = getCaseSanction(current.id);
-  if (existingSanction) return continueSummarySanction(guild, current, existingSanction, procedure);
+  if (existingSanction) return continuePoliceSanction(guild, current, existingSanction, procedure);
   const evidence = listCaseEvidence(current.id);
   const panel = await runJudicialPanel({
     guildId: guild.id,
@@ -662,13 +731,13 @@ async function finishSummaryReview(guild, caseRecord) {
     evidence,
     submissions: [],
     policy,
-    phase: 'summary'
+    phase: 'police'
   });
   current = updateCase(current.id, {
     panel_id: panel.panelId,
-    verdict: { phase: 'summary', verdict: panel.verdict, sanction: panel.sanction, panelId: panel.panelId }
+    verdict: { phase: 'police', verdict: panel.verdict, sanction: panel.sanction, panelId: panel.panelId }
   });
-  const summaryAudit = [
+  const policeAudit = [
     `対象: ${publicMemberLabel(current.accused_id, '動作確認用アカウント')}`,
     `申立内容: ${current.summary}`,
     ...publicLawDetails(law, current.offense_code),
@@ -681,22 +750,19 @@ async function finishSummaryReview(guild, caseRecord) {
     }, null, 2),
     '```'
   ].join('\n');
+  const { governance } = requireGovernance(guild.id);
   if (panel.verdict !== 'responsible' || !panel.sanction) {
     current = updateCase(current.id, { status: 'acquitted', finalized_at: Date.now() });
-    current = await ensurePublicCaseRecord(guild, current);
-    await postCourtUpdate(guild, current, '成立法の必要票に達しなかったため、処分せず終了しました。', {
-      state: '責任なし',
-      files: [{ attachment: Buffer.from(summaryAudit), name: '判断詳細.md' }]
-    });
+    await postEnforcementRecord(guild, governance, [
+      '## 不受理',
+      `対象: ${publicMemberLabel(current.accused_id, '動作確認用アカウント')}`,
+      ...publicLawDetails(law, current.offense_code),
+      '成立法の必要票に達しなかったため、処分せず終えました。'
+    ].join('\n'), { files: [{ attachment: Buffer.from(policeAudit), name: '警察の判断.md' }] });
     return current;
   }
   const profile = profileForSanction(law, panel.sanction, policy);
-  const trialFirst = procedure.trialFirstSanctions.includes(panel.sanction.type);
-  current = await ensurePublicCaseRecord(guild, current);
-  await postCourtUpdate(guild, current, `成立法に照らした${procedure.panelSeats}席中${procedure.votesRequired}席以上の判断により、${panel.sanction.type}を選びました。`, {
-    state: '判断中',
-    files: [{ attachment: Buffer.from(summaryAudit), name: '判断詳細.md' }]
-  });
+  const trialFirst = procedure.courtFirstSanctions.includes(panel.sanction.type);
   const sanction = createSanction({
     caseId: current.id,
     guildId: guild.id,
@@ -710,19 +776,19 @@ async function finishSummaryReview(guild, caseRecord) {
     appealable: isAppealable(panel.sanction, policy),
     restrictionStartedAt: trialFirst ? null : Date.now()
   });
-  return continueSummarySanction(guild, current, sanction, procedure);
+  return continuePoliceSanction(guild, current, sanction, procedure);
 }
 
 async function finishCaseFiling(guild, caseRecord) {
   const { governance } = requireGovernance(guild.id);
   const constitution = constitutionForCase(caseRecord);
   const policy = constitution.policy;
-  const procedure = summaryProcedure(policy);
+  const procedure = policeProcedure(policy);
   let current = getCase(caseRecord.id);
   const thread = await createCourtCaseThread(guild, governance, current, {
     onPartial: (patch) => { current = updateCase(current.id, patch); }
   });
-  const defenseUntil = Date.now() + (procedure?.trialMilliseconds ?? policy.judiciary.defenseMilliseconds);
+  const defenseUntil = Date.now() + (procedure?.contestMilliseconds ?? policy.judiciary.defenseMilliseconds);
   current = updateCase(current.id, {
     status: 'defense',
     public_thread_id: thread.publicThreadId,
@@ -735,87 +801,7 @@ async function finishCaseFiling(guild, caseRecord) {
   await ensureEvidenceDisclosures(guild, current);
   await postCourtUpdate(guild, current, `答弁期限: <t:${Math.floor(defenseUntil / 1000)}:F>`, { state: '答弁' });
   await notifyCaseParty(guild, current, 'defense', defenseUntil);
-  if (!procedure) await applyInterimProtectionFromLogs(guild, current);
   return current;
-}
-
-export async function applyInterimProtectionFromLogs(guild, caseRecord, now = Date.now()) {
-  const { governance } = requireGovernance(guild.id);
-  const current = getCase(caseRecord.id);
-  if (!current || current.guild_id !== guild.id || current.kind !== 'criminal' || current.status !== 'defense') return null;
-  const existing = getCaseInterimProtection(current.id);
-  if (existing) return existing;
-  const law = getLaw(current.law_id);
-  if (!law || law.guild_id !== guild.id || law.status !== 'active') return null;
-  const offense = law.provisions.offenses?.find((entry) => entry.code === current.offense_code);
-  const definition = offense?.interimProtection;
-  if (!validateInterimProtectionDefinition(definition)) return null;
-  if (governance.enforcement_mode === 'live') {
-    const member = guild.members?.fetch
-      ? await guild.members.fetch(current.accused_id).catch(() => null)
-      : null;
-    if (!member || member.id === guild.ownerId || member.permissions?.has?.(PermissionFlagsBits.Administrator)) return null;
-  }
-
-  const evidence = listCaseEvidence(current.id).find((entry) => (
-    entry.author_id === current.accused_id && entry.message_id && entry.channel_id && entry.occurred_at
-  ));
-  if (!evidence) return null;
-  const trigger = definition.trigger;
-  const occurredAt = Number(evidence.occurred_at);
-  const windowMs = trigger.windowSeconds * 1000;
-  // 過去ログだけで現在の発言権を奪わない。申立て時点でも同じburst window内にある場合だけ評価する。
-  if (occurredAt > now + 30_000 || now - occurredAt > windowMs) return null;
-  const messages = recentUserActivity(
-    guild.id,
-    current.accused_id,
-    evidence.channel_id,
-    occurredAt - windowMs,
-    occurredAt,
-    100
-  );
-  if (!messages.some((message) => message.message_id === evidence.message_id)
-    || messages.length < trigger.minimumMessages) return null;
-
-  const status = governance.enforcement_mode === 'live' ? 'active' : 'simulated';
-  const protection = createInterimProtection({
-    caseId: current.id,
-    guildId: guild.id,
-    userId: current.accused_id,
-    lawId: law.id,
-    offenseCode: offense.code,
-    triggerType: trigger.type,
-    minimumEvents: trigger.minimumMessages,
-    observedEvents: messages.length,
-    windowSeconds: trigger.windowSeconds,
-    durationSeconds: definition.durationSeconds,
-    evidenceMessageId: evidence.message_id,
-    evidenceChannelId: evidence.channel_id,
-    startedAt: now,
-    endsAt: now + definition.durationSeconds * 1000,
-    status
-  });
-  writeAudit({
-    guildId: guild.id,
-    actorType: 'system',
-    action: status === 'active' ? 'interim_protection.started' : 'interim_protection.simulated',
-    targetType: 'interim_protection',
-    targetId: protection.id,
-    detail: {
-      caseId: current.id,
-      lawId: law.id,
-      offenseCode: offense.code,
-      evidenceMessageId: evidence.message_id,
-      observedEvents: messages.length,
-      minimumEvents: trigger.minimumMessages,
-      windowSeconds: trigger.windowSeconds,
-      durationSeconds: definition.durationSeconds
-    }
-  });
-  await postCourtUpdate(guild, current, status === 'active'
-    ? `一時保全を開始しました。直近${trigger.windowSeconds}秒の公開ログ${messages.length}件を確認し、<t:${Math.floor(protection.ends_at / 1000)}:T>まで被申立人の投稿先をこの事件に限ります。これは判決や刑罰ではなく、自動終了します。`
-    : `一時保全の条件をshadowで確認しました。直近${trigger.windowSeconds}秒の公開ログ${messages.length}件が基準${trigger.minimumMessages}件を満たしましたが、実際の発言制限は行っていません。`);
-  return protection;
 }
 
 export async function addEvidenceToCase(guild, member, caseId, evidence) {
@@ -921,7 +907,7 @@ export async function fileConstitutionalChallenge(guild, reporter, input) {
     status: 'filing',
     defenseUntil: null,
     constitutionId: constitution.id,
-    procedureVersion: summaryProcedure(policy) ? 2 : 1,
+    procedureVersion: policeProcedure(policy) ? 2 : 1,
     reporterType: input.official ? 'ai' : 'member'
   });
   addCaseEvidence({ caseId: caseRecord.id, submittedBy: reporter.id, content: input.reason, occurredAt: Date.now() });
@@ -1046,7 +1032,7 @@ export async function recordCourtSubmissionEdit(message) {
 
 async function beginAppealWindow(guild, caseRecord, sanction) {
   const policy = constitutionForCase(caseRecord).policy;
-  const procedure = summaryProcedure(policy);
+  const procedure = policeProcedure(policy);
   const now = Date.now();
   sanction = updateSanction(sanction.id, {
     status: 'pending_appeal',
@@ -1059,6 +1045,11 @@ async function beginAppealWindow(guild, caseRecord, sanction) {
 }
 
 function queueExecution(caseRecord, sanction) {
+  // 拘留していた時間は刑期から差し引く。第十条4。
+  const detained = detainedSeconds(caseRecord.id);
+  if (detained > 0 && sanction.duration_seconds && !sanction.restriction_started_at) {
+    updateSanction(sanction.id, { restriction_started_at: Date.now() - detained * 1000 });
+  }
   updateSanction(sanction.id, { status: 'queued' });
   updateCase(caseRecord.id, { status: 'execution' });
   enqueueAction({
@@ -1094,7 +1085,7 @@ async function adjudicateCriminalCase(guild, caseRecord, phase = 'initial') {
   const governance = getGovernanceGuild(guild.id);
   const constitution = constitutionForCase(caseRecord);
   const policy = constitution.policy;
-  const procedure = summaryProcedure(policy);
+  const procedure = policeProcedure(policy);
   const currentLaw = getLaw(caseRecord.law_id);
   if (!currentLaw || currentLaw.status !== 'active') throw new Error('適用法が現在有効ではありません。');
   const evidence = listCaseEvidence(caseRecord.id);
@@ -1421,7 +1412,7 @@ export async function approveCase(interaction, caseId, decision) {
     `${publicMemberLabel(member.id)} が執行を${decision === 'approve' ? '承認' : '拒否'}しました${oldLabel ? ` (変更前: ${oldLabel})` : ''}。承認 ${approvals}/${sanction.required_approvals}`
   );
   if (decision === 'approve' && approvals >= sanction.required_approvals) {
-    const procedure = summaryProcedure(policy);
+    const procedure = policeProcedure(policy);
     const appealWindowAlreadyOffered = Boolean(procedure && sanction.appeal_deadline);
     if (sanction.appealable && !getAppeal(caseId) && !appealWindowAlreadyOffered) {
       await beginAppealWindow(interaction.guild, caseRecord, sanction);
@@ -1443,7 +1434,7 @@ export async function appealCase(guild, member, caseId, grounds) {
   const now = Date.now();
   const submissionsUntil = now + policy.judiciary.defenseMilliseconds;
   updateCase(caseId, { status: 'appeal', retry_after: submissionsUntil, last_error: null });
-  if (!summaryProcedure(policy)) updateSanction(sanction.id, { restriction_started_at: now });
+  if (!policeProcedure(policy)) updateSanction(sanction.id, { restriction_started_at: now });
   enqueueAction({
     guildId: guild.id,
     actionType: 'appeal_restrict',
@@ -1457,14 +1448,14 @@ export async function appealCase(guild, member, caseId, grounds) {
   return getCase(caseId);
 }
 
-export async function requestSummaryTrial(guild, member, sanctionId) {
+export async function requestTrial(guild, member, sanctionId) {
   const sanction = getSanction(sanctionId);
   if (!sanction || sanction.guild_id !== guild.id) throw new Error('処分が見つかりません。');
   if (sanction.user_id !== member.id) throw new Error('処分を受けた本人だけが裁判を求められます。');
   const caseRecord = getCase(sanction.case_id);
   const constitution = constitutionForCase(caseRecord);
   const policy = constitution?.policy;
-  const procedure = summaryProcedure(policy);
+  const procedure = policeProcedure(policy);
   if (!procedure || caseRecord.procedure_version !== 2) throw new Error('この処分は簡易裁判の対象ではありません。');
   if (Number(caseRecord.review_count ?? 0) !== 0 || sanction.review_requested_at) {
     throw new Error('この処分の裁判請求は既に使われています。');
@@ -1482,7 +1473,7 @@ export async function requestSummaryTrial(guild, member, sanctionId) {
     status: 'filing',
     review_count: 1,
     response_completed_at: null,
-    decision_due_at: now + procedure.trialMilliseconds
+    decision_due_at: now + procedure.contestMilliseconds
   });
   if (sanction.type === 'timeout') {
     enqueueAction({
@@ -1501,10 +1492,50 @@ export async function requestSummaryTrial(guild, member, sanctionId) {
   return current;
 }
 
+// 不服申立ては判決が出るまでいつでも取り下げられる。取り下げた時点で処分が確定する。
+export async function withdrawContest(guild, member, caseId) {
+  const caseRecord = getCase(caseId);
+  if (!caseRecord || caseRecord.guild_id !== guild.id) throw new Error('事件が見つかりません。');
+  if (caseRecord.accused_id !== member.id) throw new Error('申立てた本人だけが取り下げられます。');
+  if (!['defense', 'appeal'].includes(caseRecord.status)) throw new Error('いま取り下げられる申立てはありません。');
+  const sanction = getCaseSanction(caseId);
+  if (!sanction) throw new Error('対象の処分がありません。');
+  const appealing = caseRecord.status === 'appeal';
+  await releaseCaseDetention(guild, caseId);
+  if (appealing) updateAppeal(caseId, { status: 'withdrawn', decided_at: Date.now() });
+  const current = updateCase(caseId, { response_completed_at: Date.now(), retry_after: null, last_error: null });
+  await postCourtUpdate(guild, current, `${publicMemberLabel(member.id)} が${appealing ? '上訴' : '審理の請求'}を取り下げました。処分をそのまま確定します。`, {
+    state: '確定'
+  });
+  writeAudit({
+    guildId: guild.id,
+    actorType: 'member',
+    actorId: member.id,
+    action: appealing ? 'appeal.withdrawn' : 'contest.withdrawn',
+    targetType: 'case',
+    targetId: caseId,
+    detail: { sanctionId: sanction.id }
+  });
+  // 既に始まっている即時処分は、取り下げでそのまま確定する。まだ執行していない
+  // 送検事件だけを執行へ回す。
+  const applied = ['reviewable', 'executed', 'simulated'].includes(sanction.status);
+  if (applied) {
+    const { governance } = requireGovernance(guild.id);
+    updateSanction(sanction.id, {
+      status: governance.enforcement_mode === 'live' ? 'executed' : 'simulated'
+    });
+    updateCase(caseId, { status: 'final', finalized_at: Date.now() });
+  } else {
+    queueExecution(getCase(caseId), getSanction(sanction.id));
+    await processGovernanceOutbox(guild.client);
+  }
+  return getCase(caseId);
+}
+
 export async function detectAutomaticEnforcement(message) {
   if (!message?.guildId || message.author?.bot) return null;
   const { constitution } = requireGovernance(message.guildId);
-  const procedure = summaryProcedure(constitution.policy);
+  const procedure = policeProcedure(constitution.policy);
   if (!procedure || !publicChannel(message, getGovernanceGuild(message.guildId))) return null;
   for (const law of listLaws(message.guildId).filter((entry) => entry.status === 'active')) {
     if (Number(message.createdTimestamp) < Number(law.effective_at)) continue;
@@ -1521,11 +1552,11 @@ export async function detectAutomaticEnforcement(message) {
         100
       );
       if (recent.length < trigger.minimumMessages) continue;
-      if (findRecentSummaryCase(message.guildId, message.author.id, law.id, offense.code, message.createdTimestamp - windowMs)) continue;
+      if (findRecentPoliceCase(message.guildId, message.author.id, law.id, offense.code, message.createdTimestamp - windowMs)) continue;
       const triggerEvidence = recent.slice(-trigger.minimumMessages);
       const first = triggerEvidence[0];
       const eventKey = `auto:${law.id}:${offense.code}:${message.author.id}:${message.channelId}:${first.message_id}:${message.id}`;
-      if (findCaseBySummaryEvent(message.guildId, eventKey)) continue;
+      if (findCaseByPoliceEvent(message.guildId, eventKey)) continue;
       const reporter = { id: message.guild?.client?.user?.id ?? 'system' };
       return fileCriminalCase(message.guild, reporter, {
         accused: message.member ?? { id: message.author.id },
@@ -1540,7 +1571,7 @@ export async function detectAutomaticEnforcement(message) {
           occurredAt: entry.created_at
         })),
         attemptReserved: true,
-        summaryEventKey: eventKey
+        policeEventKey: eventKey
       });
     }
   }
@@ -1643,13 +1674,13 @@ async function syncRetriedIntake(guild, resultType, result) {
 
 async function advanceCase(guild, caseRecord, now) {
   if (caseRecord.retry_after && caseRecord.retry_after > now) return;
-  if (caseRecord.status === 'summary_review') {
-    await finishSummaryReview(guild, caseRecord);
+  if (caseRecord.status === 'police_review') {
+    await finishPoliceReview(guild, caseRecord);
     return;
   }
   if (caseRecord.status === 'filing') {
-    if (caseRecord.procedure_version === 2 && caseRecord.summary_event_key && !getCaseSanction(caseRecord.id)) {
-      await finishSummaryReview(guild, caseRecord);
+    if (caseRecord.procedure_version === 2 && caseRecord.police_event_key && !getCaseSanction(caseRecord.id)) {
+      await finishPoliceReview(guild, caseRecord);
     } else {
       await finishCaseFiling(guild, caseRecord);
     }
@@ -1703,7 +1734,7 @@ const verifiedRecordUiGuilds = new Set();
 const verifiedIntakeUiGuilds = new Set();
 
 function finalizeElapsedSummarySanctions(guildId, now) {
-  for (const caseRecord of listCases(guildId, { statuses: ['summary_active'], limit: 100 })) {
+  for (const caseRecord of listCases(guildId, { statuses: ['contest_window'], limit: 100 })) {
     const sanction = getCaseSanction(caseRecord.id);
     if (!sanction) continue;
     const elapsed = sanction.type === 'warning'
@@ -1725,7 +1756,7 @@ export async function runGovernanceScheduler(client) {
       lastPruneAt = now;
     }
     expireRestrictions(now);
-    const expiredProtections = expireInterimProtections(now);
+    const expiredDetentions = expireDetentions(now);
     const expiredIntakes = expireGovernanceIntakes(now);
     if (expiredIntakes.length > 0) {
       const { updateExpiredIntakeMessages } = await import('./intake.js');
@@ -1737,19 +1768,14 @@ export async function runGovernanceScheduler(client) {
       const guild = client.guilds.cache.get(governance.guild_id) ?? await client.guilds.fetch(governance.guild_id).catch(() => null);
       if (!guild) continue;
       finalizeElapsedSummarySanctions(guild.id, now);
-      for (const protection of expiredProtections.filter((entry) => entry.guild_id === guild.id)) {
-        const caseRecord = getCase(protection.case_id);
-        if (caseRecord?.public_thread_id) {
-          await postCourtUpdate(guild, caseRecord, '一時保全は期限どおり自動終了しました。被申立人の発言状態は通常に戻っています。')
-            .catch((error) => console.error(`Failed to publish interim protection expiry ${protection.id}:`, error));
-        }
+      for (const detention of expiredDetentions.filter((entry) => entry.guild_id === guild.id)) {
         writeAudit({
           guildId: guild.id,
           actorType: 'system',
-          action: 'interim_protection.expired',
-          targetType: 'interim_protection',
-          targetId: protection.id,
-          detail: { caseId: protection.case_id, endedAt: now }
+          action: 'detention.expired',
+          targetType: 'case',
+          targetId: detention.case_id,
+          detail: { userId: detention.user_id, endedAt: now }
         });
       }
       let currentGovernance = governance;
@@ -1804,12 +1830,12 @@ export async function runGovernanceScheduler(client) {
           console.error(`Failed to advance proposal ${proposal.id}:`, error);
         }
       }
-      const cases = listCases(guild.id, { statuses: ['filing', 'summary_review', 'defense', 'deliberation', 'appeal_window', 'appeal'], limit: 100 });
+      const cases = listCases(guild.id, { statuses: ['filing', 'police_review', 'defense', 'deliberation', 'appeal_window', 'appeal'], limit: 100 });
       for (const caseRecord of cases) {
         try {
           await advanceCase(guild, caseRecord, now);
           const current = getCase(caseRecord.id);
-          if (current && !current.retry_after && !['filing', 'summary_review'].includes(current.status)) {
+          if (current && !current.retry_after && !['filing', 'police_review'].includes(current.status)) {
             await syncRetriedIntake(guild, 'case', current);
           }
         } catch (error) {
@@ -1961,7 +1987,7 @@ export async function processGovernanceOutbox(client) {
         updateCase(sanction.case_id, reviewable
           ? (sanction.type === 'warning'
             ? { status: 'final', finalized_at: Date.now() }
-            : { status: 'summary_active' })
+            : { status: 'contest_window' })
           : { status: 'final', finalized_at: Date.now() });
         createAdministrativeAct({
           guildId: guild.id,
@@ -1978,16 +2004,23 @@ export async function processGovernanceOutbox(client) {
           }
         });
         const executionLabel = governance.enforcement_mode === 'live' ? '実執行' : '記録のみ';
-        let publicCase = await ensurePublicCaseRecord(guild, getCase(sanction.case_id));
-        publicCase = getCase(publicCase.id);
-        await postCourtUpdate(
-          guild,
-          publicCase,
-          reviewable
-            ? `即時処分を${executionLabel}として記録しました。本人は裁判を求められます。`
-            : `裁判で確定した処分を${executionLabel}として処理しました。`,
-          { state: publicCase.status }
-        );
+        const publicCase = getCase(sanction.case_id);
+        if (publicCase.public_thread_id) {
+          // 裁判所へ来た事件だけが事件投稿を持つ。警察止まりの処分は執行記録へ。
+          await postCourtUpdate(guild, publicCase, `裁判で確定した処分を${executionLabel}として処理しました。`, {
+            state: publicCase.status
+          });
+        } else {
+          await postEnforcementRecord(guild, governance, [
+            `## ${reviewable ? '即時処分' : '処分の確定'}`,
+            `対象: ${publicMemberLabel(publicCase.accused_id, '動作確認用アカウント')}`,
+            `処分: ${sanctionLabel(getSanction(sanction.id))}`,
+            `理由: ${publicCase.summary}`,
+            `${executionLabel}として記録しました。${reviewable ? '本人は期限内に裁判所の審理を求められます。' : ''}`
+          ].join('\n'), {
+            components: reviewable ? contestButtons(guild.id, sanction.id) : []
+          });
+        }
       } else if (action.action_type === 'sanction_reverse') {
         const execution = parseExecutionDetail(sanction.execution_detail);
         await reverseDiscordSanction(guild, governance, sanction, {
