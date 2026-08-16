@@ -190,11 +190,12 @@ globalThis.fetch = async (url, init) => {
           reasons: ['現行法ですでに扱える。']
         }
         : {
+          // 継続審議でも条文の方向まで出す。人間は白紙ではなくたたき台を直す。
           decision: 'defer',
-          relation: null,
+          relation: 'new',
           targetType: null,
           targetId: null,
-          instruction: null,
+          instruction: '短時間の連投に一般的な上限を定める。',
           question: null,
           reasons: ['判断材料が足りない。']
         };
@@ -230,6 +231,10 @@ assert.equal(proposal.proposer_id, 'member-1');
 assert.ok(posts.some((post) => String(post.content).includes('継続審議 (1回目)')));
 assert.ok(posts.some((post) => String(post.content).includes('何件までなら許容できますか')),
   '次の国会まで何を聞きたいかを公開する');
+assert.ok(posts.some((post) => (post.files ?? []).some((file) => file.name === 'たたき台-法律案.md')),
+  '継続審議でも条文のたたき台を出す');
+assert.ok(db.getProposal(db.getProposalByForumThread(memberThread.id).id).body,
+  'たたき台は提案に保存して次の国会が読み直せるようにする');
 assert.ok(db.getGovernanceGuild(GUILD_ID).last_session_at, '開会時刻を記録する');
 
 // --- 周期を待たない開会は起きない -------------------------------------------

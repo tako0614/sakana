@@ -38,7 +38,7 @@
     "constitutionalVotesRequired": 3,
     "unconstitutionalVotesRequired": 2,
     "discordMaximumTimeoutSeconds": 2419200,
-    "maximumTimeoutSeconds": 604800,
+    "maximumTimeoutSeconds": 2419200,
     "immediateTimeoutMaximumSeconds": 86400,
     "timeoutApprovalsAboveSeconds": 1,
     "kickApprovals": 2,
@@ -80,5 +80,40 @@
       ],
       "unlimitedWarningContest": true
     }
+  },
+  "investigation": {
+    "maximumSteps": {
+      "police": 8,
+      "court": 12,
+      "parliament": 12
+    },
+    "tools": {
+      "police": [
+        "search_messages",
+        "read_user_messages",
+        "read_context",
+        "read_law",
+        "read_cases"
+      ],
+      "court": [
+        "search_messages",
+        "read_user_messages",
+        "read_context",
+        "read_law",
+        "read_cases",
+        "read_precedent",
+        "read_case_record"
+      ],
+      "parliament": [
+        "search_messages",
+        "read_channel",
+        "read_context",
+        "read_law",
+        "read_cases",
+        "read_precedent"
+      ]
+    },
+    "publicRecord": "summary",
+    "maximumRedefense": 1
   }
 }

@@ -499,11 +499,8 @@ function investigationSettingsModal(guildId) {
     .setCustomId('gov:admin_modal:investigation')
     .setTitle('AI調査範囲')
     .addComponents(
-      new ActionRowBuilder().addComponents(input('investigation_conversation_limit', '同じ会話から読む件数（最大100）', getOperationalSetting(guildId, 'investigation_conversation_limit'))),
-      new ActionRowBuilder().addComponents(input('investigation_actor_limit', '対象者から読む合計件数（最大200）', getOperationalSetting(guildId, 'investigation_actor_limit'))),
-      new ActionRowBuilder().addComponents(input('investigation_guild_limit', 'サーバー全体から読む件数（最大500）', getOperationalSetting(guildId, 'investigation_guild_limit'))),
-      new ActionRowBuilder().addComponents(input('investigation_conversation_hours', '同じ会話を遡る時間（最大720）', getOperationalSetting(guildId, 'investigation_conversation_hours'))),
-      new ActionRowBuilder().addComponents(input('investigation_lookback_days', '全体を遡る日数（最大30）', getOperationalSetting(guildId, 'investigation_lookback_days')))
+      new ActionRowBuilder().addComponents(input('investigation_lookback_days', '席が既定で遡る日数（最大90）', getOperationalSetting(guildId, 'investigation_lookback_days'))),
+      new ActionRowBuilder().addComponents(input('investigation_case_limit', '1回の通報で事件化する上限（最大10）', getOperationalSetting(guildId, 'investigation_case_limit')))
     );
 }
 
@@ -594,13 +591,7 @@ export async function handleGovernanceUxInteraction(interaction) {
     return true;
   }
   if (interaction.isModalSubmit() && customId === 'gov:admin_modal:investigation') {
-    const keys = [
-      'investigation_conversation_limit',
-      'investigation_actor_limit',
-      'investigation_guild_limit',
-      'investigation_conversation_hours',
-      'investigation_lookback_days'
-    ];
+    const keys = ['investigation_lookback_days', 'investigation_case_limit'];
     const updates = [];
     for (const key of keys) {
       const parsed = parseOperationalSetting(key, interaction.fields.getTextInputValue(key));
