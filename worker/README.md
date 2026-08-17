@@ -8,7 +8,9 @@ botは差分だけをHTTPで押し込み、公開ページとJSONはこのWorker
 ## いまの配置
 
 - Worker: `https://sakana-laws.shoutatomiyama0614.workers.dev`
-- D1: `sakana-laws` (`a7a062b4-750f-46bd-b1b6-1663e6537efe`, APAC) — `0001_init.sql` 適用済み
+- D1: `sakana-laws` (`a7a062b4-750f-46bd-b1b6-1663e6537efe`, APAC) — `0001_init.sql` 適用済み。
+  沿革を並べるための`root_id`を足したので、`npm run migrate`で`0002_root_id.sql`を当てます。
+  既存行の`root_id`は自分自身になりますが、botが再起動時に全件を押し直すと正しい系列に揃います
 - secret `GOVERNANCE_LAW_API_TOKEN` 設定済み。bot側の同名env varと同じ値にします
 
 ## 作り直す / 別アカウントへ置く
@@ -28,7 +30,7 @@ npm run deploy
 ## ローカルで動かす
 
 ```bash
-npm run migrate:local
+npm run migrate:local          # 0002_root_id.sql まで適用する
 npm run dev
 curl -X POST http://127.0.0.1:8787/v1/instruments \
   -H 'authorization: Bearer <token>' -H 'content-type: application/json' \
@@ -42,6 +44,18 @@ open 'http://127.0.0.1:8787/?guild=1'
 `wrangler dev --local` はローカルの`.wrangler/state`を使うので、secretは`.dev.vars`に
 `GOVERNANCE_LAW_API_TOKEN=...`と書きます（このファイルはコミットしません）。
 
+## 画面
+
+読むための画面はWorkerがD1から組み立てます（ビルド無し・JS無し）。
+
+- **一覧**: 憲法と法律を分けて並べ、現行を先に置く。検索はGETフォームなのでJSを切っていても動く
+- **法令**: 題名・状態・施行日・版、目次、本文、条文（`#a-<条番号>`のアンカー付き）、違反と処分、機能制限の定義、沿革、本文hash
+- **憲法**: 題名、目次（各条へのリンク）、条文、実行規則（JSONは折りたたみ）
+- 旧版を開くと現行版への案内を出す。法令本文はすべてescapeして出すのでHTMLとして解釈しない
+
+描画は`src/render.js`にD1もfetchも触らない純関数として置き、`node scripts/check-lawsite.mjs`で
+検査します。
+
 ## API
 
 | method | path | 認証 | 内容 |
@@ -49,7 +63,9 @@ open 'http://127.0.0.1:8787/?guild=1'
 | POST | `/v1/instruments` | Bearer | 1件のupsert。`(guildId, type, instrumentId)`が主キーなので何度送っても同じ |
 | GET | `/v1/laws?guild=<id>` | なし | 現行の憲法・法律の一覧。`&history=1`で旧版・廃止・違憲も |
 | GET | `/v1/laws/<code>?guild=<id>` | なし | 1法令の全文と執行定義 |
-| GET | `/?guild=<id>` | なし | 人が読む一覧ページ |
+| GET | `/?guild=<id>` | なし | 一覧。`&q=`で全文検索、`&type=law\|constitution`で種類、`&history=1`で旧版・廃止も |
+| GET | `/law/<instrumentId>?guild=<id>` | なし | 法律1件。本文・条文・違反と処分・機能制限の定義・沿革 |
+| GET | `/constitution/<instrumentId>?guild=<id>` | なし | 憲法1件。条文と実行規則を分けて表示 |
 
 bot側は `GOVERNANCE_LAW_API_URL`（このWorkerのorigin）、`GOVERNANCE_LAW_API_TOKEN`、
 `GOVERNANCE_LAW_SITE_URL`（公開ページのorigin。手続チャンネルのリンクに使う）を設定します。

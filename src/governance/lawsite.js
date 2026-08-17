@@ -37,6 +37,7 @@ function instrumentPayload(guildId, instrumentType, instrument) {
       guildId: String(guildId),
       type: 'constitution',
       instrumentId: String(instrument.id),
+      rootId: 'constitution',
       code: `CONSTITUTION-V${instrument.version}`,
       title: `憲法 v${instrument.version}`,
       version: Number(instrument.version),
@@ -52,7 +53,9 @@ function instrumentPayload(guildId, instrumentType, instrument) {
   return {
     guildId: String(guildId),
     type: 'law',
+    // 改正で版が変わっても同じ法令として沿革を並べる。
     instrumentId: String(instrument.id),
+    rootId: String(instrument.root_law_id ?? instrument.id),
     code: instrument.code,
     title: instrument.title,
     version: Number(instrument.version ?? 1),

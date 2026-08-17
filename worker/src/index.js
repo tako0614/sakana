@@ -1,4 +1,10 @@
-const STATUS_ORDER = ['active', 'suspended', 'unconstitutional', 'superseded', 'repealed'];
+import {
+  renderConstitution,
+  renderLaw,
+  renderList,
+  renderMessage,
+  matchesQuery
+} from './render.js';
 
 function json(value, init = {}) {
   return new Response(JSON.stringify(value), {
@@ -40,10 +46,10 @@ function integer(value, name) {
   return parsed;
 }
 
-function validateInstrument(body) {
+export function validateInstrument(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('本文がJSON objectではありません。');
   const allowed = new Set([
-    'guildId', 'type', 'instrumentId', 'code', 'title', 'version', 'status',
+    'guildId', 'type', 'instrumentId', 'rootId', 'code', 'title', 'version', 'status',
     'publicationStatus', 'text', 'provisions', 'contentHash', 'effectiveAt', 'endedAt'
   ]);
   const unknown = Object.keys(body).filter((key) => !allowed.has(key));
@@ -53,6 +59,10 @@ function validateInstrument(body) {
     guildId: text(body.guildId, 'guildId', 32),
     type: body.type,
     instrumentId: text(String(body.instrumentId), 'instrumentId', 64),
+    // 改正で版が変わっても同じ法令として並べるための系列ID。旧botはrootIdを送らない。
+    rootId: body.rootId === null || body.rootId === undefined
+      ? text(String(body.instrumentId), 'instrumentId', 64)
+      : text(String(body.rootId), 'rootId', 64),
     code: text(body.code, 'code', 100),
     title: text(body.title, 'title', 200),
     version: integer(body.version, 'version'),
@@ -71,10 +81,11 @@ function validateInstrument(body) {
 async function upsertInstrument(env, value) {
   await env.LAWS.prepare(`
     INSERT INTO instruments
-      (guild_id, type, instrument_id, code, title, version, status, publication_status,
+      (guild_id, type, instrument_id, root_id, code, title, version, status, publication_status,
        text, provisions_json, content_hash, effective_at, ended_at, updated_at)
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
     ON CONFLICT (guild_id, type, instrument_id) DO UPDATE SET
+      root_id = excluded.root_id,
       code = excluded.code,
       title = excluded.title,
       version = excluded.version,
@@ -87,7 +98,7 @@ async function upsertInstrument(env, value) {
       ended_at = excluded.ended_at,
       updated_at = excluded.updated_at
   `).bind(
-    value.guildId, value.type, value.instrumentId, value.code, value.title, value.version,
+    value.guildId, value.type, value.instrumentId, value.rootId, value.code, value.title, value.version,
     value.status, value.publicationStatus, value.text, value.provisionsJson, value.contentHash,
     value.effectiveAt, value.endedAt, Date.now()
   ).run();
@@ -97,6 +108,7 @@ function publicRow(row) {
   return {
     type: row.type,
     id: row.instrument_id,
+    rootId: row.root_id ?? row.instrument_id,
     code: row.code,
     title: row.title,
     version: row.version,
@@ -123,59 +135,25 @@ async function listInstruments(env, guildId, { type = null, includeHistory = fal
   return results ?? [];
 }
 
-function escapeHtml(value) {
-  return String(value ?? '').replace(/[&<>"']/g, (character) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  })[character]);
+async function versionsOf(env, guildId, row) {
+  const rootId = row.root_id ?? row.instrument_id;
+  const { results } = await env.LAWS.prepare(
+    'SELECT * FROM instruments WHERE guild_id = ?1 AND type = ?2 AND COALESCE(root_id, instrument_id) = ?3 ORDER BY version'
+  ).bind(guildId, row.type, rootId).all();
+  return results ?? [];
 }
 
-function page(guildId, rows) {
-  const ordered = [...rows].sort((left, right) => {
-    const rank = STATUS_ORDER.indexOf(left.status) - STATUS_ORDER.indexOf(right.status);
-    return rank || Number(right.effective_at) - Number(left.effective_at);
+async function findInstrument(env, guildId, type, instrumentId) {
+  return env.LAWS.prepare(
+    'SELECT * FROM instruments WHERE guild_id = ?1 AND type = ?2 AND instrument_id = ?3'
+  ).bind(guildId, type, instrumentId).first();
+}
+
+function html(body, status = 200) {
+  return new Response(body, {
+    status,
+    headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }
   });
-  const items = ordered.map((row) => `
-    <details${row.status === 'active' ? ' open' : ''}>
-      <summary>
-        <span class="tag tag-${escapeHtml(row.status)}">${escapeHtml(row.publication_status)}</span>
-        <strong>${escapeHtml(row.title)}</strong>
-        <span class="meta">v${escapeHtml(row.version)} / 施行 ${new Date(Number(row.effective_at)).toISOString().slice(0, 10)}</span>
-      </summary>
-      <pre>${escapeHtml(row.text)}</pre>
-    </details>`).join('\n');
-  return `<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>法令集</title>
-<style>
-  :root { color-scheme: light dark; --fg: #1a1a1a; --bg: #fbfbfb; --muted: #666; --line: #ddd; }
-  @media (prefers-color-scheme: dark) { :root { --fg: #eee; --bg: #17181a; --muted: #9aa; --line: #333; } }
-  body { margin: 0 auto; padding: 2rem 1rem 4rem; max-width: 48rem; background: var(--bg); color: var(--fg);
-         font-family: system-ui, "Hiragino Sans", "Noto Sans JP", sans-serif; line-height: 1.7; }
-  h1 { font-size: 1.4rem; margin-bottom: .25rem; }
-  p.lead { color: var(--muted); margin-top: 0; }
-  details { border-top: 1px solid var(--line); padding: .75rem 0; }
-  summary { cursor: pointer; display: flex; gap: .5rem; align-items: baseline; flex-wrap: wrap; }
-  .meta { color: var(--muted); font-size: .85rem; }
-  .tag { font-size: .75rem; border: 1px solid var(--line); border-radius: 999px; padding: .05rem .5rem; color: var(--muted); }
-  .tag-active { border-color: currentColor; color: #2a7; }
-  pre { white-space: pre-wrap; word-break: break-word; background: color-mix(in srgb, var(--fg) 5%, transparent);
-        padding: 1rem; border-radius: .5rem; font-size: .9rem; }
-  footer { margin-top: 2rem; color: var(--muted); font-size: .85rem; }
-</style>
-</head>
-<body>
-<h1>法令集</h1>
-<p class="lead">このコミュニティで成立している憲法と法律の公開正本です。</p>
-${items || '<p>まだ公開された法令はありません。</p>'}
-<footer>
-  <a href="/v1/laws?guild=${encodeURIComponent(guildId)}">JSON</a> ·
-  <a href="/?guild=${encodeURIComponent(guildId)}&amp;history=1">旧版・廃止も表示</a>
-</footer>
-</body>
-</html>`;
 }
 
 export default {
@@ -219,12 +197,35 @@ export default {
 
     if (request.method === 'GET' && url.pathname === '/') {
       if (!guildId) return new Response('guild を指定してください。', { status: 400 });
-      const rows = await listInstruments(env, guildId, {
-        includeHistory: url.searchParams.get('history') === '1'
-      });
-      return new Response(page(guildId, rows), {
-        headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }
-      });
+      const query = url.searchParams.get('q') ?? '';
+      const type = ['law', 'constitution'].includes(url.searchParams.get('type'))
+        ? url.searchParams.get('type')
+        : '';
+      const history = url.searchParams.get('history') === '1';
+      const rows = await listInstruments(env, guildId, { type: type || null, includeHistory: history });
+      return html(renderList({
+        guildId,
+        rows: rows.filter((row) => matchesQuery(row, query)),
+        query,
+        type,
+        history
+      }));
+    }
+
+    const viewMatch = url.pathname.match(/^\/(law|constitution)\/([^/]+)$/);
+    if (request.method === 'GET' && viewMatch) {
+      if (!guildId) return new Response('guild を指定してください。', { status: 400 });
+      const [, type, rawId] = viewMatch;
+      const row = await findInstrument(env, guildId, type, decodeURIComponent(rawId));
+      if (!row) {
+        return html(renderMessage({
+          guildId, title: '見つかりません - 法令集', message: 'その法令は公開されていません。'
+        }), 404);
+      }
+      const versions = await versionsOf(env, guildId, row);
+      return html(type === 'constitution'
+        ? renderConstitution({ guildId, row, versions })
+        : renderLaw({ guildId, row, versions }));
     }
 
     return json({ error: 'not found' }, { status: 404 });
