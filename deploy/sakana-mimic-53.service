@@ -1,0 +1,38 @@
+[Unit]
+Description=Sakana mimic evex-5.3 (25.8M / PLE + QK-norm / コーパス v13 + 話者マスク)
+# **5.2 との違いは段2 のデータとマスクだけ。**段1 は 5.2 のものを使い回したので、
+# 初期値・語彙・形・最適化・学習率まで同じ。読み比べれば原因が絞れる。
+#
+#   話者ごとの切り出し  296,324本 → 867,353本 (上限 2,500 を外し、底上げを 8 倍に)
+#   損失               切り出しでは**対象の人の発言だけ**に流す (78.2%)
+#
+# 本人のトークンの方が本物の発言を当てられる割合 (368 件):
+#   5.2  全体 72.3% / 下位 65.6%      5.3  全体 75.0% / 下位 68.0%
+# 逐語コピーは両方 0.0%。噛み合いは 30.0% → 25.0% で下がっている
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/sakana
+# ファイル名は pack.mjs が置く形に合わせる (ckpt.pt / tok.model / speakers.json)。
+#   LLM_CORPUS_DIR=corpus-v13 node scripts/llm/pack.mjs <ckpt-eN.pt> dist/mimic-v53
+ExecStart=/root/sakana/.venv-llm/bin/python -u src/mimic/server.py \
+  --ckpt /root/sakana/mimic-v53/ckpt.pt \
+  --corpus /root/sakana/mimic-v53 \
+  --port 8778 \
+  --threads 3
+
+Restart=on-failure
+RestartSec=5
+
+# 18.9M の重み (76MB) + torch のランタイム。evex-1/2/3 と ft 系が並ぶので控えめに。
+# 足りずに OOM で落ちるようなら 1800M まで上げる
+MemoryMax=1800M
+CPUWeight=30
+Nice=15
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

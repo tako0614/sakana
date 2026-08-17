@@ -190,6 +190,16 @@ export const ENDPOINTS = {
     maxNewTokens: number(process.env.MIMIC_V52_MAX_NEW_TOKENS, 200),
     label: process.env.MIMIC_V52_LABEL ?? 'evex-5.2',
     format: process.env.MIMIC_V52_FORMAT ?? 'auto'
+  },
+  // **5.2 と読み比べるために並べる。**違うのは段2 のデータとマスクだけで、
+  // 段1 は 5.2 のものを使い回しているので**それ以外の条件が完全に同じ**。
+  // 話者ごとの切り出しを 2.9 倍にして、対象の人の発言だけを損失に入れた
+  'evex-5.3': {
+    url: process.env.MIMIC_V53_URL ?? 'http://127.0.0.1:8778',
+    timeoutMs: number(process.env.MIMIC_V53_TIMEOUT_MS, 60_000),
+    maxNewTokens: number(process.env.MIMIC_V53_MAX_NEW_TOKENS, 200),
+    label: process.env.MIMIC_V53_LABEL ?? 'evex-5.3',
+    format: process.env.MIMIC_V53_FORMAT ?? 'auto'
   }
 };
 
