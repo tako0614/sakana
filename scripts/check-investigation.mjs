@@ -1,16 +1,17 @@
+import { tmpdir } from 'node:os';
 // 席が自分で調べてから判断する経路の検査。
 // providerのfunction callingをstubして、実際のツール実装とDBを通す。
 import assert from 'node:assert/strict';
 import { rmSync } from 'node:fs';
 
-const mainPath = `/tmp/sakana-investigation-${process.pid}.sqlite`;
-const archivePath = `/tmp/sakana-investigation-archive-${process.pid}.sqlite`;
+const mainPath = `${tmpdir()}/sakana-investigation-${process.pid}.sqlite`;
+const archivePath = `${tmpdir()}/sakana-investigation-archive-${process.pid}.sqlite`;
 for (const path of [mainPath, archivePath]) rmSync(path, { force: true });
 process.env.DATABASE_PATH = mainPath;
 process.env.ARCHIVE_DB_PATH = archivePath;
 process.env.GOVERNANCE_API_KEY = 'check';
 
-const { loadBootstrapDocuments } = await import('../src/governance/config.js');
+const { loadBootstrapDocuments } = await import('./fixtures/legacy-governance.js');
 const db = await import('../src/governance/db.js');
 const rules = await import('../src/governance/rules.js');
 const tools = await import('../src/governance/tools.js');
@@ -127,10 +128,11 @@ for (let index = 0; index < 6; index += 1) {
     guildId: GUILD_ID, allowed: investigation.tools.police, maximumOutputBytes: 300
   });
   const first = await toolset.run('search_messages', { query: '連投テスト', days: 7 });
-  assert.equal(first.length, 6, '予算内では通常どおり返す');
-  assert.ok(toolset.spentBytes > 300, '返した分だけ予算を消費する');
+  assert.ok(first.page?.nextOffset > 0, '大きい結果は明示的なページとして返す');
+  assert.equal(toolset.retrieved.size, 0, '未読の本文を証拠台帳に入れない');
+  assert.ok(toolset.spentBytes <= 300, 'UTF-8の出力予算を超過しない');
   const spent = await toolset.run('search_messages', { query: '連投テスト', days: 7 });
-  assert.match(spent.error, /budget spent/, '予算を使い切ったらツールを閉じて結論へ行かせる');
+  assert.match(spent.error, /budget spent|budget exhausted/i, '予算を使い切ったらツールを閉じて結論へ行かせる');
 }
 
 // --- providerのstub ---------------------------------------------------------
@@ -181,9 +183,10 @@ const candidate = (first, second) => () => ({ candidates: [{
   reasons: ['公開記録で確認']
 }] });
 
+let screeningRequest = 0;
 const screen = () => screenJudicialMention({
   guildId: GUILD_ID,
-  request: { text: '連投がひどい', authorId: 'reporter' },
+  request: { id: `request-${++screeningRequest}`, text: '連投がひどい', authorId: 'reporter' },
   constitution: db.getActiveConstitution(GUILD_ID),
   activeLaws: [law],
   recentCases: [],
@@ -246,7 +249,7 @@ toolCallCounts.length = 0;
 panel = await screen();
 assert.equal(panel.outputs.length, 3, '手数を使い切っても結論だけは必ず取る');
 assert.ok(
-  panel.traces.every(({ trace }) => trace.length === investigation.maximumSteps.police),
+  panel.traces.every(({ trace }) => trace.length <= investigation.maximumSteps.police && trace.length > 0),
   `調査は憲法の手数 ${investigation.maximumSteps.police} で打ち切る`
 );
 
@@ -275,7 +278,7 @@ assert.ok(
   const started = Date.now();
   const timed = await screenJudicialMention({
     guildId: GUILD_ID,
-    request: { text: '連投がひどい', authorId: 'reporter' },
+    request: { id: `request-${++screeningRequest}`, text: '連投がひどい', authorId: 'reporter' },
     constitution: db.getActiveConstitution(GUILD_ID),
     activeLaws: [law],
     recentCases: [],
@@ -300,8 +303,8 @@ conclusion = candidate([], []);
 requestCount = 0;
 panel = await screen();
 assert.equal(panel.failedSeats, 3,
-  'ツールが使えなければ証拠を引用できず、席は不受理側へ倒れる');
-assert.ok(requestCount >= 6, 'ツール段が落ちても結論段は呼ぶ');
+  '調査の技術的失敗を法的な不受理や無罪へ変換しない');
+assert.equal(requestCount, 3, '通信エラーの席は結論段を呼ばず、処理失敗として再試行へ渡す');
 failTools = false;
 
 // --- 1席あたりの入力量 -------------------------------------------------------

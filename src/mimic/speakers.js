@@ -17,6 +17,7 @@ import path from 'node:path';
 
 import { db } from '../db.js';
 import { db as archive } from '../archive/db.js';
+import { buildSearch } from '../archive/search.js';
 
 // evex-1 の tokenizer と対のもの。
 //
@@ -103,21 +104,10 @@ export function learnedSpeakers() {
 // 例は「その人の連続した独り言」ではなく、実際のやり取りの形で見せたい。
 // 学習データは会話の流れなので、単発を並べただけだと分布から外れる。
 // ただ会話ごと引くと重いので、まず本人の発言を取ってから前後を足す形にする。
-const selectOwn = archive.prepare(`
-  SELECT message_id, channel_id, content, extra, created_at
-    FROM messages
-   WHERE author_id = @author_id
-     AND deleted = 0
-     AND is_bot = 0
-     AND LENGTH(content) >= @min_chars
-   ORDER BY created_at DESC
-   LIMIT @limit
-`);
-
 const selectBefore = archive.prepare(`
   SELECT author_id, author_name, content, extra, created_at
     FROM messages
-   WHERE channel_id = @channel_id
+   WHERE guild_id = @guild_id AND channel_id = @channel_id
      AND created_at < @created_at
      AND deleted = 0
      AND is_bot = 0
@@ -132,12 +122,15 @@ const selectBefore = archive.prepare(`
  * 4文字未満は「草」「w」で口調の情報が無く、200文字超は1件で例が埋まる。
  * 直近を優先するのは、今の口癖と今の話題が乗る方が似て見えるから。
  */
-export function exampleTurns(userId, { limit = 8, minChars = 4, maxChars = 200 } = {}) {
-  if (hasOptedOut(userId)) return [];
+export function exampleTurns(userId, { guildId, channelScope, limit = 8, minChars = 4, maxChars = 200 } = {}) {
+  if (!guildId || !channelScope || hasOptedOut(userId)) return [];
 
   let own = [];
   try {
-    own = selectOwn.all({ author_id: String(userId), min_chars: minChars, limit: limit * 3 });
+    const visible = buildSearch({ guildId, channelScope, extra: [{ key: 'from', value: String(userId) }] });
+    own = archive.prepare(`SELECT m.message_id, m.channel_id, m.content, m.extra, m.created_at
+      FROM messages m WHERE ${visible.where} AND m.is_bot = 0 AND LENGTH(m.content) >= ?
+      ORDER BY m.created_at DESC LIMIT ?`).all(...visible.params, minChars, limit * 3);
   } catch (error) {
     console.error('mimic: 実発言の取得に失敗:', error.message);
     return [];
@@ -152,7 +145,7 @@ export function exampleTurns(userId, { limit = 8, minChars = 4, maxChars = 200 }
     // 「話しかけられて答える」という学習時の形に近づく
     let prior = null;
     try {
-      prior = selectBefore.get({ channel_id: row.channel_id, created_at: row.created_at });
+      prior = selectBefore.get({ guild_id: guildId, channel_id: row.channel_id, created_at: row.created_at });
     } catch {
       prior = null;
     }

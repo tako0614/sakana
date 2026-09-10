@@ -1,3 +1,4 @@
+import { tmpdir } from 'node:os';
 // 使用量の上限の検証 (npm run check から呼ぶ)。
 //
 // 「ドルで決めてトークンで数える」の変換と、管理者の素通り、個別付与、移動窓を固定する。
@@ -5,7 +6,7 @@
 
 import { rmSync } from 'node:fs';
 
-const checkDatabasePath = `/tmp/sakana-limits-check-${process.pid}.sqlite`;
+const checkDatabasePath = `${tmpdir()}/sakana-limits-check-${process.pid}.sqlite`;
 process.env.DATABASE_PATH = checkDatabasePath;
 for (const suffix of ['', '-wal', '-shm']) rmSync(`${checkDatabasePath}${suffix}`, { force: true });
 process.on('exit', () => {

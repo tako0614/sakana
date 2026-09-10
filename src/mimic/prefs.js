@@ -4,21 +4,15 @@
 // 「3 番のエンジン」みたいな読めない設定になるので、素直に別の表を持つ。
 
 import { db } from '../db.js';
+import { migrateGuildPreference, requireGuildId } from './scope.js';
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS agent_engine (
-    user_id    TEXT PRIMARY KEY,
-    engine     TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
-  );
-`);
-
-const getStmt = db.prepare('SELECT engine FROM agent_engine WHERE user_id = ?');
+migrateGuildPreference(db, 'agent_engine', 'engine');
+const getStmt = db.prepare('SELECT engine FROM agent_engine WHERE guild_id = ? AND user_id = ?');
 const setStmt = db.prepare(`
-  INSERT INTO agent_engine (user_id, engine, updated_at) VALUES (?, ?, ?)
-  ON CONFLICT(user_id) DO UPDATE SET engine = excluded.engine, updated_at = excluded.updated_at
+  INSERT INTO agent_engine (guild_id, user_id, engine, updated_at) VALUES (?, ?, ?, ?)
+  ON CONFLICT(guild_id, user_id) DO UPDATE SET engine = excluded.engine, updated_at = excluded.updated_at
 `);
-const countStmt = db.prepare('SELECT engine, COUNT(*) n FROM agent_engine GROUP BY engine');
+const countStmt = db.prepare('SELECT engine, COUNT(*) n FROM agent_engine WHERE guild_id = ? GROUP BY engine');
 
 /**
  * 選べるエンジン。
@@ -114,24 +108,25 @@ export const DEFAULT_ENGINE = 'deepseek';
 // 選び直しを強いるのも筋が違うので、後継に読み替える
 const RENAMED = { 'evex-5.2-a': 'evex-5.2', 'evex-5.2-b': 'evex-5.2' };
 
-export function engineFor(userId) {
-  const row = getStmt.get(String(userId));
+export function engineFor(userId, guildId) {
+  const row = getStmt.get(requireGuildId(guildId), String(userId));
   const engine = RENAMED[row?.engine] ?? row?.engine;
   return ENGINES[engine] ? engine : DEFAULT_ENGINE;
 }
 
-export function setEngine(userId, engine) {
+export function setEngine(userId, engine, guildId) {
+  requireGuildId(guildId);
   const target = RENAMED[engine] ?? engine;
   if (!ENGINES[target]) return false;
-  setStmt.run(String(userId), target, Date.now());
+  setStmt.run(guildId, String(userId), target, Date.now());
   return true;
 }
 
 /** 誰がどれを使っているかの内訳。/model の表示に出す。 */
-export function engineCounts() {
+export function engineCounts(guildId) {
   // 読み替えたぶんも足す。素の行のままだと消したエンジンの人が数から消える
   const counts = new Map();
-  for (const row of countStmt.all()) {
+  for (const row of countStmt.all(requireGuildId(guildId))) {
     const key = RENAMED[row.engine] ?? row.engine;
     counts.set(key, (counts.get(key) ?? 0) + row.n);
   }

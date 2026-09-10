@@ -39,7 +39,7 @@ export function buildSystemPrompt(ctx, toolset) {
     '- 名前は表示名をそのまま使う (`<@123...>` は通知が飛ぶので使わない)。誰の発言かは取り違えない。',
     '',
     '## 誰の話か / どの話か',
-    '- `←自分の発言` と付いている行はあなたが前に書いたもの。他人の発言として扱わない。',
+    '- author.identity が「あなた自身の発言」の行はあなたが前に書いたもの。他人の発言として扱わない。',
     '  自分の発言は根拠にしない (引用番号も付けない)。会話の流れとしてだけ読む。',
     '- 話しかけてきた人は user メッセージの冒頭に書いてある。答えはその人に向けて書く。',
     '- 二人称 (お前・君・自分・あなた) は話しかけてきた人にだけ使う。',
@@ -49,12 +49,14 @@ export function buildSystemPrompt(ctx, toolset) {
     '- チャンネルでは複数の話題が同時に流れている。答えるのは1つだけ。',
     '  「いま答えるべき話」があるならそれだけが本題。「参考」の側は誰が何を話しているかの',
     '  背景で、答えの材料にしない。混ぜて1つの答えにしない。',
-    '  行末の `↩N` がその番号への返信なので、繋がりはそこで見る。',
+    '  各行は discord.message.v1。reference.kind=reply だけが返信。reference.ref/messageId が宛先で、時系列・メンション・転送は返信ではない。',
+    '  reference.availability が not_fetched / unavailable / deleted の場合、返信先の発言内容や意図を推定で補わない。',
+    '  body.complete=false は抜粋。forwarded / embeds / 添付の内容は送信者自身の発言とは限らない。thread と channel の境界も守る。',
     '',
     '## 動き方',
     '- 直近の会話は最初から渡してある。それで答えられるなら道具を呼ばずに答える。',
     '- 呼ぶのは特定の事実が足りないと分かったときだけ。網羅しようとしない。',
-    '- 2〜3手で出なければ「出ない」と書く。語を当てずっぽうに変えて撃ち続けない。',
+    '- 足りない事実を明確にして調べ、答えに必要な情報が揃ったら終える。予算内で取れなかった事実は不明と書く。',
     '- 会話全体を毎往復送り直すので、条件が複数あるなら1往復でまとめて呼ぶ。',
     '',
     '## 書き方',
@@ -128,7 +130,7 @@ const BACKGROUND_WITH_CHAIN = 10;
  * 最初のユーザーメッセージ。ここで直近の会話も一緒に渡してしまう。
  * ツールを1往復減らせるので、結果的にトークンが減る。
  */
-export function buildUserContent({ ctx, prompt, extras, recent, replyChain, refs }) {
+export function buildUserContent({ ctx, prompt, extras, recent, replyChain, requestMessage, refs }) {
   const sections = [];
   const selfId = ctx.client?.user?.id;
 
@@ -219,6 +221,14 @@ export function buildUserContent({ ctx, prompt, extras, recent, replyChain, refs
   // 中身は読めないが、存在を知らないまま的外れな話をするよりはるかにいい。
   const ask = [prompt || fallback];
   if (extras) ask.push(`(この発言に貼られているもの: ${extras}。中身は見えない)`);
+
+  if (requestMessage) {
+    if (requestMessage.referenceState && requestMessage.structure?.reference) {
+      requestMessage.structure.replyChainState = requestMessage.referenceState;
+      requestMessage.structure.reference.availability = requestMessage.referenceState;
+    }
+    sections.push('## 依頼メッセージの構造\n' + formatMessages([requestMessage], { refs, selfId, bodyChars: Infinity }));
+  }
 
   sections.push([
     hasChain ? '## 依頼 (上の「いま答えるべき話」の続きとして答える)' : '## 依頼',

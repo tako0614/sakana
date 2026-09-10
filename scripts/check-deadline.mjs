@@ -47,7 +47,7 @@ globalThis.fetch = async (_url, init) => {
 
 const run = (over = {}) => {
   calls = [];
-  return runAgent({ system: 's', userContent: 'u', toolset, ...over });
+  return runAgent({ guildId: 'deadline-test', system: 's', userContent: 'u', toolset, ...over });
 };
 
 // --- 締め切り前は今までどおり ---

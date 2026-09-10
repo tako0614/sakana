@@ -10,7 +10,7 @@ export const AUTOMATIC_TRIGGER_LIMITS = Object.freeze({
 
 // 警察の即時処分と、争われたときだけ開く裁判所を分ける手続。
 export function policeProcedure(policy) {
-  return policy?.schemaVersion === 2 ? policy.judiciary?.policeProcedure ?? null : null;
+  return policy?.schemaVersion >= 2 ? policy.judiciary?.policeProcedure ?? null : null;
 }
 
 export function validateAutomaticTrigger(value) {
@@ -52,9 +52,9 @@ function finite(value, name, { min = 0, max = Infinity } = {}) {
 }
 
 export function validateConstitutionPolicy(policy, { technicalOnly = false } = {}) {
-  if (!policy || ![1, 2].includes(policy.schemaVersion)) throw new Error('未対応の憲法policyです。');
+  if (!policy || ![1, 2, 3].includes(policy.schemaVersion)) throw new Error('未対応の憲法policyです。');
   const { eligibility, voting, legislation, judiciary } = policy;
-  if (!eligibility || !voting || !legislation || !judiciary) throw new Error('憲法policyの必須区分がありません。');
+  if (!eligibility || (policy.schemaVersion < 3 && !voting) || !legislation || !judiciary) throw new Error('憲法policyの必須区分がありません。');
 
   finite(policy.timezoneOffsetMinutes, 'timezoneOffsetMinutes', { min: -720, max: 840 });
   for (const key of ['memberAgeDays', 'windowDays', 'minimumMessages', 'minimumActiveDays', 'perDayCap', 'minimumVisibleCharacters']) {
@@ -67,33 +67,35 @@ export function validateConstitutionPolicy(policy, { technicalOnly = false } = {
   if (eligibility.minimumMessages > eligibility.windowDays * eligibility.perDayCap) {
     throw new Error('message要件が集計期間と日次上限では到達不能です。');
   }
-  if (!['all', 'trusted'].includes(voting.defaultScope)) throw new Error('voting.defaultScope が不正です。');
-  if (!Array.isArray(voting.allowedScopes)
-    || voting.allowedScopes.length < 1
-    || new Set(voting.allowedScopes).size !== voting.allowedScopes.length
-    || voting.allowedScopes.some((scope) => !['all', 'trusted'].includes(scope))
-    || !voting.allowedScopes.includes(voting.defaultScope)) {
-    throw new Error('voting.allowedScopes が不正です。');
-  }
-  for (const key of ['lawYesRatio', 'amendmentYesRatio', 'trustedVetoRatio', 'quorumRatio']) {
-    finite(voting[key], `voting.${key}`, { max: 1 });
-  }
-  finite(voting.minimumBallots, 'voting.minimumBallots', { max: 100_000 });
-  if (!Number.isInteger(voting.minimumBallots)) throw new Error('voting.minimumBallots は整数である必要があります。');
-  if (voting.publicBallots !== true) throw new Error('v1の投票は全記名です。');
+  if (voting) {
+    if (!['all', 'trusted'].includes(voting.defaultScope)) throw new Error('voting.defaultScope が不正です。');
+    if (!Array.isArray(voting.allowedScopes)
+      || voting.allowedScopes.length < 1
+      || new Set(voting.allowedScopes).size !== voting.allowedScopes.length
+      || voting.allowedScopes.some((scope) => !['all', 'trusted'].includes(scope))
+      || !voting.allowedScopes.includes(voting.defaultScope)) {
+      throw new Error('voting.allowedScopes が不正です。');
+    }
+    for (const key of ['lawYesRatio', 'amendmentYesRatio', 'trustedVetoRatio', 'quorumRatio']) {
+      finite(voting[key], `voting.${key}`, { max: 1 });
+    }
+    finite(voting.minimumBallots, 'voting.minimumBallots', { max: 100_000 });
+    if (!Number.isInteger(voting.minimumBallots)) throw new Error('voting.minimumBallots は整数である必要があります。');
+    if (voting.publicBallots !== true) throw new Error('v1の投票は全記名です。');
+  } else if (policy.schemaVersion < 3) throw new Error('投票規則がありません。');
   const legislationKeys = [
-    'voteMilliseconds', 'sessionIntervalMilliseconds', 'agendaLimit', 'maximumDeferrals', 'logScan'
+    ...(policy.schemaVersion < 3 ? ['voteMilliseconds', 'maximumDeferrals'] : []), 'sessionIntervalMilliseconds', 'agendaLimit', 'logScan'
   ];
   const allowedLegislationKeys = new Set(legislationKeys);
   if (Object.keys(legislation).some((key) => !allowedLegislationKeys.has(key))
     || legislationKeys.some((key) => !(key in legislation))) {
     throw new Error('legislationに未対応の設定があります。');
   }
-  for (const key of ['voteMilliseconds', 'sessionIntervalMilliseconds']) {
+  for (const key of (policy.schemaVersion < 3 ? ['voteMilliseconds', 'sessionIntervalMilliseconds'] : ['sessionIntervalMilliseconds'])) {
     finite(legislation[key], `legislation.${key}`, { min: technicalOnly ? 60_000 : 3_600_000 });
     if (!Number.isInteger(legislation[key])) throw new Error(`legislation.${key} は整数である必要があります。`);
   }
-  for (const key of ['agendaLimit', 'maximumDeferrals']) {
+  for (const key of ['agendaLimit', ...(policy.schemaVersion < 3 ? ['maximumDeferrals'] : [])]) {
     finite(legislation[key], `legislation.${key}`, { min: 1, max: 20 });
     if (!Number.isInteger(legislation[key])) throw new Error(`legislation.${key} は整数である必要があります。`);
   }
@@ -120,7 +122,7 @@ export function validateConstitutionPolicy(policy, { technicalOnly = false } = {
     || judiciary.appealMilliseconds < (technicalOnly ? 60_000 : 3_600_000)) {
     throw new Error('答弁・上訴期間は最低1時間必要です。');
   }
-  if (policy.schemaVersion === 2) {
+  if (policy.schemaVersion >= 2) {
     const procedure = judiciary.policeProcedure;
     if (!procedure || typeof procedure !== 'object' || Array.isArray(procedure)) {
       throw new Error('policeProcedureがありません。');
@@ -165,8 +167,8 @@ export function validateConstitutionPolicy(policy, { technicalOnly = false } = {
     throw new Error('違憲審査の必要票は1以上です。');
   }
   if (judiciary.guiltyVotesRequired > judiciary.panelSeats
-    || judiciary.constitutionalVotesRequired > judiciary.panelSeats
-    || judiciary.unconstitutionalVotesRequired > judiciary.panelSeats) {
+    || judiciary.constitutionalVotesRequired > (judiciary.constitutionalPanelSeats ?? judiciary.panelSeats)
+    || judiciary.unconstitutionalVotesRequired > (judiciary.constitutionalPanelSeats ?? judiciary.panelSeats)) {
     throw new Error('panelの必要票が席数を超えています。');
   }
   if (judiciary.discordMaximumTimeoutSeconds > 2_419_200) throw new Error('Discordのtimeout上限を超えています。');
@@ -192,7 +194,7 @@ export function validateConstitutionPolicy(policy, { technicalOnly = false } = {
     throw new Error('許可されていない制限制御があります。');
   }
   // 席の調査手数は警察手続と同じ世代の規則なので、schemaVersion 2 でだけ要求する。
-  if (policy.schemaVersion === 2) validateInvestigationPolicy(policy.investigation);
+  if (policy.schemaVersion >= 2) validateInvestigationPolicy(policy.investigation);
   return policy;
 }
 

@@ -482,6 +482,64 @@ function definitionsSection(provisions) {
   </section>`).join('')}`;
 }
 
+const PROCEDURE_LABELS = {
+  parliament_agenda: '議題の検討', legislation_draft: '起草・改稿', ai_ratification: 'AIによる採択',
+  constitutional_panel: '憲法審査', public_vote: '人間の公開投票', law_enactment: '公示・成立',
+  police_review: '警察の判断', case_filing: '事件の受付', defense_window: '答弁期間',
+  judicial_panel: '裁判所の判断', human_approval: '人間の執行承認', appeal_window: '上訴期間',
+  sanction_execution: '処分の執行', contest_window: '不服申立て期間', agent_task: '調査・記録・提案',
+  notice: '通知', wait: '待機', terminal: '終了'
+};
+const LEGAL_LABELS = {
+  institution: '機関', procedure: '手続', regulation: '規律', binding: '職務の割当て',
+  records: '記録', parliament: '国会', investigation: '調査', sanctions: '処分', votes: '投票',
+  law: '通常法', constitutionalAmendment: '憲法改正', defaultScope: '標準の投票資格', allowedScopes: '認める投票資格',
+  duration: '期間', earlyClose: '早期開票', yesRatio: '賛成割合', comparison: '成立の比較条件',
+  quorumRatio: '定足数の割合', minimumBallots: '最低投票数', publicBallots: '公開投票',
+  trustedVeto: '特別有権者の拒否', noRatio: '拒否となる反対割合', enabledForScope: '適用する投票範囲',
+  denominator: '割合の分母', approvals: '執行の承認人数', timeoutAboveImmediate: '即時上限を超える発言停止',
+  kick: '追放', ban: '参加禁止', approve: '採択', responsible: '責任あり', decision: '判断',
+  constitutional: '合憲', unconstitutional: '違憲', propose: '提案', record: '記録',
+  scope: '承認資格', rejectVotes: '執行を取りやめる拒否票数', excludeParties: '当事者を承認者から除外',
+  all: '全員', trusted: '特別有権者', administrators: 'Discord管理者', operators: '統治運営者', designated: '指定ユーザー・ロール',
+  users: '指定ユーザー', roles: '指定ロール', humanVeto: '人間の拒否権', veto: '独立した拒否権', gt: 'を超える', gte: '以上',
+  all_ballots_cast: '全員の投票で開票', never: '期限まで待つ', decisive_cast_ballots: '有効な賛否票',
+  maximumVisits: '実施回数の上限', institutionId: '担当機関'
+};
+
+function legalValue(value, key = '') {
+  if (Array.isArray(value)) return `<ul class="plain">${value.map((entry) => `<li>${legalValue(entry, key)}</li>`).join('')}</ul>`;
+  if (value && typeof value === 'object') return `<dl>${Object.entries(value).map(([name, entry]) => `<dt>${escapeHtml(LEGAL_LABELS[name] ?? name)}</dt><dd>${legalValue(entry, name)}</dd>`).join('')}</dl>`;
+  if (typeof value === 'boolean') return value ? 'あり' : 'なし';
+  if (typeof value === 'number' && ['yesRatio', 'quorumRatio', 'noRatio'].includes(key)) return value === 2 / 3 ? '3分の2' : `${value * 100}%`;
+  const duration = typeof value === 'string' ? /^(\d+)(m|h|d)$/.exec(value) : null;
+  return escapeHtml(duration ? `${duration[1]}${({ m: '分', h: '時間', d: '日' })[duration[2]]}` : LEGAL_LABELS[value] ?? value);
+}
+
+function governanceSection(provisions) {
+  const definitions = provisions?.governance;
+  if (!Array.isArray(definitions) || !definitions.length) return '';
+  return `<h2 class="section" id="governance">統治機関・手続・投票と承認</h2>${definitions.map((definition) => {
+    const value = definition.value ?? {};
+    let description = '';
+    if (definition.kind === 'institution') description = `<p>${escapeHtml(value.mandate)}</p><p>AI ${escapeHtml(value.seats)}席 / 判断に必要な票数</p>${legalValue(value.required)}`;
+    else if (definition.kind === 'procedure') {
+      const states = value.states ?? {};
+      const stageName = (key) => `${PROCEDURE_LABELS[states[key]?.handler] ?? key}（${key}）`;
+      description = `<p>${escapeHtml(value.mandate)}</p><p>開始: ${escapeHtml(stageName(value.initial))}</p>
+        ${value.trigger ? `<div>開始条件: ${legalValue(value.trigger)}</div>` : ''}
+        <table class="laws"><thead><tr><th scope="col">段階</th><th scope="col">期間・条件</th><th scope="col">次の段階</th></tr></thead><tbody>${Object.entries(states).map(([key, state]) => `<tr>
+          <th scope="row">${escapeHtml(stageName(key))}</th>
+          <td>${state.duration ? legalValue(state.duration) : '期間の指定なし'}${legalValue(state.config)}</td>
+          <td>${Object.entries(state.on ?? {}).map(([outcome, target]) => `${escapeHtml(LEGAL_LABELS[outcome] ?? outcome)} → ${escapeHtml(stageName(target))}`).join('<br>') || '終了'}</td>
+        </tr>`).join('')}</tbody></table>`;
+    } else description = legalValue(value);
+    return `<section class="offense"><h3>${escapeHtml(value.name ?? LEGAL_LABELS[definition.key] ?? definition.key)}</h3>
+      <p class="label">${escapeHtml(LEGAL_LABELS[definition.kind] ?? definition.kind)} / 根拠条項 ${escapeHtml(definition.article)}</p>
+      ${description}<details class="rules"><summary>実行定義の原文</summary><pre class="json">${escapeHtml(JSON.stringify(definition, null, 2))}</pre></details></section>`;
+  }).join('')}`;
+}
+
 function tabs(entries) {
   if (entries.length < 2) return '';
   return `<div class="tabs">${entries.map((entry) => `<a href="#${entry.id}">${escapeHtml(entry.label)}</a>`).join('')}</div>`;
@@ -500,7 +558,8 @@ export function renderLaw({ guildId, row, versions = [] }) {
   const sections = [
     toc.length ? { id: 'articles', label: '条文' } : null,
     provisions?.offenses?.length ? { id: 'offenses', label: '違反と処分' } : null,
-    provisions?.sanctionDefinitions?.length ? { id: 'definitions', label: '機能制限の定義' } : null
+    provisions?.sanctionDefinitions?.length ? { id: 'definitions', label: '機能制限の定義' } : null,
+    provisions?.governance?.length ? { id: 'governance', label: '統治機関・手続・投票と承認' } : null
   ].filter(Boolean);
   return layout({
     title: `${row.title} - 法令集`,
@@ -521,6 +580,7 @@ export function renderLaw({ guildId, row, versions = [] }) {
     ${body}
     ${offencesSection(provisions)}
     ${definitionsSection(provisions)}
+    ${governanceSection(provisions)}
     <p class="hash">本文hash: ${escapeHtml(row.content_hash)}</p>
     <p class="actions"><a href="/v1/laws/${encodeURIComponent(row.code)}?guild=${encodeURIComponent(guildId)}">この法令のJSON</a></p>
   </main>

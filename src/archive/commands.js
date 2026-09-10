@@ -907,6 +907,7 @@ const contextCommand = {
     const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
     const range = interaction.options.getInteger('range') ?? 4;
     const result = getContext(messageId, {
+      guildId: interaction.guildId,
       before: range,
       after: range,
       channelScope: getChannelScope(interaction.guild, member)

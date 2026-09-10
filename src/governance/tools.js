@@ -1,6 +1,6 @@
 // 統治AIの席が自分で調べるための読み取り専用ツール。
 //
-// 母集団は governance_activity と統治DBだけで、Discord APIもアーカイブDBも触らない。
+// 母集団は公開活動の記録・権限を確認したアーカイブ・統治DB。
 // 席が挙げた証拠は最終的に revalidateInvestigationEvidence がDiscordから再取得して
 // ハッシュ照合するので、ここで返すのは「どれを見に行くか」を決めるための索引にすぎない。
 //
@@ -22,10 +22,13 @@ import {
 } from './db.js';
 import { contextRelevance } from './context.js';
 import { IMPLEMENTED_TOOLS } from './rules.js';
+import { archiveEnvelope } from '../conversation/message.js';
+import { db as archive } from '../archive/db.js';
+import { hasConversationClient, publicMemoryChannels } from '../conversation/memory.js';
+import { normalizeActivityContent, sha256 } from './policy.js';
 
 const DAY_MS = 86_400_000;
-// ツールループは毎リクエストでmessages配列を丸ごと再送するので、返す量は手数の
-// 二乗で効く。索引として使える最小限まで絞る。全文が要るものは別の経路で読む。
+// 一覧の要約だけを短くする。証拠本文・条文には適用せずページで全文を返す。
 const CONTENT_LIMIT = 240;
 const DEFAULT_LOOKBACK_DAYS = 30;
 const MAXIMUM_LOOKBACK_DAYS = 90;
@@ -42,15 +45,15 @@ function since(context, days) {
   return Date.now() - boundedInteger(days, fallback, 1, MAXIMUM_LOOKBACK_DAYS) * DAY_MS;
 }
 
-// 席へ見せる形。content は索引用に切り詰め、content_hash は見せない（席は引用IDだけを返す）。
-// 完全な行は retrieved 側に残し、証拠化のときの改ざん検知に使う。
+// 席に渡す原文と状態。全文が届いた場合だけ同じ内容を引用台帳へ入れる。
 function messageView(row) {
   return {
     id: String(row.message_id),
     channelId: String(row.channel_id),
     authorId: String(row.user_id),
-    content: String(row.content ?? '').slice(0, CONTENT_LIMIT),
-    at: Number(row.created_at)
+    content: String(row.content ?? ''),
+    at: Number(row.created_at),
+    conversation: row.conversation ?? archiveEnvelope({ ...row, author_id: row.user_id })
   };
 }
 
@@ -61,7 +64,8 @@ function evidenceRow(row) {
     authorId: String(row.user_id),
     content: String(row.content ?? ''),
     contentHash: String(row.content_hash),
-    occurredAt: Number(row.created_at)
+    occurredAt: Number(row.created_at),
+    ...(row.source ? { source: row.source } : {})
   };
 }
 
@@ -170,7 +174,7 @@ const TOOLS = {
       required: []
     },
     run(context, args) {
-      const constitution = getActiveConstitution(context.guildId);
+      const constitution = context.constitution ?? getActiveConstitution(context.guildId);
       if (!constitution) return { error: 'no active constitution' };
       const content = String(constitution.content ?? '');
       const sections = content.split(/^## /m).slice(1)
@@ -182,7 +186,7 @@ const TOOLS = {
       const found = sections.find((entry) => entry.heading === heading)
         ?? sections.find((entry) => entry.heading.includes(heading));
       if (!found) return { error: `unknown heading: ${heading}`, headings: sections.map((entry) => entry.heading) };
-      return { version: constitution.version, heading: found.heading, text: found.body.slice(0, 4000) };
+      return { version: constitution.version, heading: found.heading, text: found.body };
     }
   },
   read_law: {
@@ -298,14 +302,15 @@ const TOOLS = {
           id: String(row.message_id ?? row.id),
           channelId: String(row.channel_id ?? ''),
           authorId: String(row.author_id ?? ''),
-          content: String(row.content ?? '').slice(0, CONTENT_LIMIT),
+          content: String(row.content ?? ''),
           contentHash: String(row.content_hash ?? ''),
-          at: Number(row.occurred_at ?? 0)
+          at: Number(row.occurred_at ?? 0),
+          conversation: row.conversation_json ? JSON.parse(row.conversation_json) : { metadata: 'legacy_incomplete' }
         })),
         submissions: listCurrentCaseSubmissions(caseId).map((row) => ({
           authorId: row.author_id,
           kind: row.kind,
-          content: String(row.content ?? '').slice(0, CONTENT_LIMIT)
+          content: String(row.content ?? '')
         }))
       };
     }
@@ -329,7 +334,9 @@ export function toolDefinitions(allowed) {
       function: {
         name,
         description: TOOLS[name].description,
-        parameters: TOOLS[name].parameters
+        parameters: { ...TOOLS[name].parameters, properties: { ...TOOLS[name].parameters.properties,
+          offset: { type: 'integer', description: 'For a paged result, repeat the same arguments with nextOffset until complete. Offsets count JSON characters.' }
+        } }
       }
     }));
 }
@@ -349,17 +356,55 @@ function summarize(name, args, result) {
 }
 
 // 席ごとに1つ作る。retrieved はその席が実際に見たIDの台帳で、引用の検算に使う。
-export function buildToolset({ guildId, allowed, caseId = null, maximumOutputBytes = 10 * 1024 }) {
+export function buildToolset({ guildId, allowed, caseId = null, constitution = null, maximumOutputBytes = 10 * 1024, onStep }) {
   const context = {
     guildId: String(guildId),
     caseId,
+    constitution,
     defaultLookbackDays: getOperationalSetting(String(guildId), 'investigation_lookback_days')
   };
   const permitted = new Set(allowed.filter((name) => name in TOOLS));
   const retrieved = new Map();
   const trace = [];
   let spentBytes = 0;
+  const pages = new Map();
+  const record = (entry) => { trace.push(entry); onStep?.(entry); };
   return {
+    readOnly: true,
+    call(name, args) { return this.run(name, args); },
+    exhausted: () => spentBytes >= maximumOutputBytes,
+    checkpoint: () => ({ trace, retrieved: [...retrieved], spentBytes, pages: [...pages] }),
+    assertCurrent() {
+      const publicChannels = new Set(publicMemoryChannels(guildId));
+      const invalid = (message) => Object.assign(new Error(message), { code: 'AGENT_CONTEXT_INVALIDATED' });
+      for (const row of retrieved.values()) {
+        if (row.source !== 'atom_memory' && row.source !== 'archive') continue;
+        if (hasConversationClient() && !publicChannels.has(String(row.channelId))) throw invalid('Investigative source is no longer public');
+        const source = archive.prepare('SELECT content, deleted FROM messages WHERE guild_id = ? AND message_id = ?')
+          .get(String(guildId), row.messageId);
+        if (!source || source.deleted || source.content !== row.content) throw invalid('Investigative source changed; the record must be refreshed');
+      }
+    },
+    restore(saved) {
+      if (!saved) return;
+      trace.splice(0, trace.length, ...saved.trace);
+      for (const [id, row] of saved.retrieved) retrieved.set(id, row);
+      for (const [id, entry] of saved.pages ?? []) pages.set(id, entry);
+      spentBytes = saved.spentBytes;
+    },
+    observeMemory(envelope, bytes = Buffer.byteLength(JSON.stringify(envelope))) {
+      if (!envelope.body?.complete || envelope.state?.deleted) return false;
+      if (!retrieved.has(String(envelope.id))) {
+        if (spentBytes + bytes > maximumOutputBytes) return false;
+        spentBytes += bytes;
+        record({ step: trace.length + 1, tool: 'search_messages', arguments: { source: 'atom_memory', messageId: envelope.id },
+          count: 1, detail: '構造化した原文の参照', error: null, result: envelope });
+      }
+      retrieved.set(String(envelope.id), { messageId: String(envelope.id), channelId: envelope.location.channelId,
+        authorId: envelope.author.id, content: envelope.body.text, contentHash: sha256(normalizeActivityContent(envelope.body.text)), occurredAt: envelope.state.createdAt,
+        source: 'atom_memory' });
+      return true;
+    },
     definitions: toolDefinitions([...permitted]),
     retrieved,
     trace,
@@ -374,12 +419,12 @@ export function buildToolset({ guildId, allowed, caseId = null, maximumOutputByt
       // 最悪ケースを固定する。予算を使い切ったらツールを閉じて結論へ行かせる。
       if (spentBytes >= maximumOutputBytes) {
         const error = 'investigation output budget spent; stop calling tools and answer now';
-        trace.push({ step, tool: String(name), arguments: rawArguments, count: 0, detail: '予算切れ', error });
+        record({ step, tool: String(name), arguments: rawArguments, count: 0, detail: '予算切れ', error });
         return { error };
       }
       if (!permitted.has(name)) {
         const error = `tool not permitted by the constitution: ${name}`;
-        trace.push({ step, tool: String(name), arguments: rawArguments, count: 0, detail: '許可外', error });
+        record({ step, tool: String(name), arguments: rawArguments, count: 0, detail: '許可外', error });
         return { error };
       }
       let args;
@@ -387,38 +432,55 @@ export function buildToolset({ guildId, allowed, caseId = null, maximumOutputByt
         args = typeof rawArguments === 'string' ? JSON.parse(rawArguments || '{}') : (rawArguments ?? {});
       } catch {
         const error = 'arguments must be a JSON object';
-        trace.push({ step, tool: name, arguments: rawArguments, count: 0, detail: '引数不正', error });
+        record({ step, tool: name, arguments: rawArguments, count: 0, detail: '引数不正', error });
         return { error };
       }
-      let raw;
-      try {
-        raw = TOOLS[name].run(context, args);
-      } catch (error) {
-        const message = String(error?.message ?? error).slice(0, 200);
-        trace.push({ step, tool: name, arguments: args, count: 0, detail: '失敗', error: message });
-        return { error: message };
-      }
-      // 発言を返すツールだけ、完全な行を retrieved へ積む。モデルへは切り詰めた形を返す。
-      const view = TOOLS[name].rows && Array.isArray(raw) ? raw.map(messageView) : raw;
+      let raw = TOOLS[name].run(context, args);
+      // Prefer the full archived source only within currently public channels.
       if (TOOLS[name].rows && Array.isArray(raw)) {
-        for (const row of raw) retrieved.set(String(row.message_id), evidenceRow(row));
+        const channels = new Set(publicMemoryChannels(guildId));
+        if (hasConversationClient()) raw = raw.filter((row) => channels.has(String(row.channel_id)));
+        raw = raw.map((row) => {
+          if (!channels.has(String(row.channel_id))) return row;
+          const source = archive.prepare('SELECT * FROM messages WHERE guild_id = ? AND message_id = ? AND deleted = 0')
+            .get(String(guildId), String(row.message_id));
+          return source ? { ...row, source: 'archive', content: source.content, content_hash: sha256(normalizeActivityContent(source.content)), conversation: archiveEnvelope(source) } : row;
+        });
       }
-      // 事件記録から読んだ証拠は既に採用済みなので、そのまま引用できる。
-      for (const row of raw?.evidence ?? []) {
-        if (row?.id) {
-          retrieved.set(String(row.id), {
-            messageId: String(row.id),
-            channelId: String(row.channelId ?? ''),
-            authorId: String(row.authorId ?? ''),
-            content: String(row.content ?? ''),
-            contentHash: String(row.contentHash ?? ''),
-            occurredAt: Number(row.at ?? 0)
-          });
+      const fullView = TOOLS[name].rows && Array.isArray(raw) ? raw.map(messageView) : raw;
+      const serialized = JSON.stringify(fullView ?? null);
+      const remaining = Math.max(0, maximumOutputBytes - spentBytes);
+      const pageBytes = Math.min(6000, remaining);
+      let view = fullView;
+      let fullyObserved = Buffer.byteLength(serialized) <= pageBytes;
+      if (!fullyObserved) {
+        const offset = boundedInteger(args.offset, 0, 0, serialized.length);
+        const identity = sha256(serialized);
+        let end = Math.min(serialized.length, offset + pageBytes);
+        const page = () => ({ page: { encoding: 'json_fragment', documentHash: identity, offset, nextOffset: end < serialized.length ? end : null,
+          totalCharacters: serialized.length, content: serialized.slice(offset, end) } });
+        view = page();
+        while (end > offset && Buffer.byteLength(JSON.stringify(view)) > pageBytes) { end -= 1; view = page(); }
+        if (end === offset) { spentBytes = maximumOutputBytes; return { error: 'Output budget exhausted; remaining content was not observed' }; }
+        const ranges = [...(pages.get(identity) ?? []), [offset, end]].sort((a, b) => a[0] - b[0]);
+        let through = 0;
+        for (const [start, finish] of ranges) { if (start > through) break; through = Math.max(through, finish); }
+        pages.set(identity, ranges);
+        fullyObserved = through >= serialized.length;
+      }
+      // Only complete, actually delivered records can become newly cited evidence.
+      if (fullyObserved) {
+        if (TOOLS[name].rows && Array.isArray(raw)) {
+          for (const row of raw) retrieved.set(String(row.message_id), evidenceRow(row));
+        }
+        for (const row of raw?.evidence ?? []) {
+          if (row?.id) retrieved.set(String(row.id), { messageId: String(row.id), channelId: String(row.channelId ?? ''),
+            authorId: String(row.authorId ?? ''), content: String(row.content ?? ''), contentHash: String(row.contentHash ?? ''), occurredAt: Number(row.at ?? 0) });
         }
       }
-      spentBytes += JSON.stringify(view ?? null).length;
+      spentBytes += Buffer.byteLength(JSON.stringify(view ?? null));
       const { count, detail } = summarize(name, args, view);
-      trace.push({ step, tool: name, arguments: args, count, detail, error: null, result: view });
+      record({ step, tool: name, arguments: args, count, detail, error: null, result: view });
       return view;
     }
   };

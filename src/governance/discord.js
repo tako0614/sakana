@@ -41,6 +41,10 @@ function proposalStateLabel(state, handler = null) {
     rejected: '不成立'
   })[state] ?? ({
     parliament_agenda: '議題',
+    legislation_draft: '議論中',
+    ai_ratification: '議論中',
+    constitutional_panel: '議論中',
+    law_enactment: '議論中',
     public_vote: '投票中',
     terminal: '不成立'
   })[handler] ?? '議題';
@@ -419,9 +423,7 @@ export function governancePermissionReport(guild) {
     ['SendMessages', PermissionFlagsBits.SendMessages],
     ['AttachFiles', PermissionFlagsBits.AttachFiles],
     ['MoveMembers', PermissionFlagsBits.MoveMembers],
-    ['ModerateMembers', PermissionFlagsBits.ModerateMembers],
-    ['KickMembers', PermissionFlagsBits.KickMembers],
-    ['BanMembers', PermissionFlagsBits.BanMembers]
+    ['ModerateMembers', PermissionFlagsBits.ModerateMembers]
   ];
   const missing = required.filter(([, permission]) => !me?.permissions?.has(permission)).map(([name]) => name);
   return { ok: missing.length === 0, missing };
@@ -899,7 +901,11 @@ async function syncRecordThread(thread, { name, content, components, state, remo
   if (wasArchived) await thread.setArchived(false, '公開表示を同期');
   if (thread.name !== name) await thread.setName(name, '内部番号を使わない表示へ同期');
   const starter = await thread.fetchStarterMessage().catch(() => null);
-  if (starter) await starter.edit({ content, components, allowedMentions: { parse: [] } });
+  // Member-authored agenda starters remain the member's original submission.
+  // Drafts, decisions and buttons are published in the bot's own follow-up posts.
+  if (starter?.author?.id === thread.client?.user?.id && starter?.author?.id) {
+    await starter.edit({ content, components, allowedMentions: { parse: [] } });
+  }
   if (removeActions.length) await removeOldDecisionRows(thread, removeActions);
   if (state) await setForumState(thread, state);
   if (closed) await closeRecordThread(thread);
@@ -1053,17 +1059,27 @@ export async function applyAppealRestriction(guild, governance, userId) {
 }
 
 export async function releaseAppealRestriction(guild, governance, userId, fallbackChannelIds = []) {
-  const member = await guild.members.fetch(userId).catch(() => null);
-  if (member) await member.roles.remove(governance.appeal_role_id, `${guild.name} governance appeal ended`).catch(() => {});
-  for (const channelId of fallbackChannelIds) {
-    const channel = await guild.channels.fetch(channelId).catch(() => null);
-    await channel?.permissionOverwrites?.delete(userId, `${guild.name} governance appeal fallback cleanup`).catch(() => {});
-  }
+  const absent = (...codes) => (error) => { if (codes.includes(Number(error.code))) return null; throw error; };
+  const results = await Promise.allSettled([
+    (async () => {
+      const member = await guild.members.fetch(userId).catch(absent(10007));
+      if (member && governance.appeal_role_id) await member.roles.remove(governance.appeal_role_id,
+        `${guild.name} governance appeal ended`).catch(absent(10007, 10011));
+    })(),
+    ...[...new Set(fallbackChannelIds)].map(async (channelId) => {
+      const channel = await guild.channels.fetch(channelId).catch(absent(10003));
+      if (channel) await channel.permissionOverwrites.delete(userId,
+        `${guild.name} governance appeal fallback cleanup`).catch(absent(10003, 10009));
+    })
+  ]);
+  const failures = results.filter((result) => result.status === 'rejected').map((result) => result.reason);
+  if (failures.length) throw new AggregateError(failures, `制限解除が未完了です: ${failures.map((error) => error.message).join('; ')}`);
 }
 
-export async function executeDiscordSanction(guild, sanction) {
-  const member = await guild.members.fetch(sanction.user_id).catch(() => null);
-  if (sanction.type === 'kick' && !member) return { type: 'kick', alreadyAbsent: true };
+export async function executeDiscordSanction(guild, sanction, { beforeEffect = () => {} } = {}) {
+  if (['ban', 'kick'].includes(sanction.type)) throw new Error('ban・kickは管理者がDiscordで手動執行します。');
+  const member = await guild.members.fetch(sanction.user_id).catch((error) => { if (Number(error.code) === 10007) return null; throw error; });
+  beforeEffect();
   if (sanction.type === 'warning' && !member) return { type: 'warning', delivered: false };
   if (sanction.type !== 'ban' && !member) throw new Error('対象メンバーがサーバーにいません。');
   if (member && (member.id === guild.ownerId || member.permissions.has(PermissionFlagsBits.Administrator))) {
@@ -1085,16 +1101,6 @@ export async function executeDiscordSanction(guild, sanction) {
     if (remaining === 0) return { type: 'timeout', remainingSeconds: 0, creditedSeconds: credited };
     await member.timeout(remaining * 1000, reason);
     return { type: 'timeout', remainingSeconds: remaining, creditedSeconds: credited };
-  }
-  if (sanction.type === 'kick') {
-    if (!member.kickable) throw new Error('Discord role hierarchyにより対象をkickできません。');
-    await member.kick(reason);
-    return { type: 'kick' };
-  }
-  if (sanction.type === 'ban') {
-    if (member && !member.bannable) throw new Error('Discord role hierarchyにより対象をbanできません。');
-    await guild.members.ban(sanction.user_id, { reason, deleteMessageSeconds: 0 });
-    return { type: 'ban' };
   }
   if (sanction.type === 'restriction') return { type: 'restriction' };
   throw new Error(`未対応の制裁です: ${sanction.type}`);

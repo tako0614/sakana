@@ -1,12 +1,8 @@
-// ツール出力の整形。
-//
-// ここがトークン消費の大部分を決めるので、徹底して詰める:
-//   - スノーフレーク (19桁) はモデルに見せず、短い参照番号 [3] に置き換える
-//   - <@123...> ではなく表示名を出す (安いし、誤爆メンションも防げる)
-//   - 空白と改行は1つに畳む
-//   - 本文は既定 300 文字で切る
+// Discord sources use structured JSON lines. Short citation numbers remain a
+// presentation convenience; author ids, reply targets and source state are explicit.
 
 import { TZ_OFFSET_HOURS } from '../archive/query.js';
+import { archiveStructure, discordStructure, messageEnvelope } from '../conversation/message.js';
 
 const TZ_OFFSET_MS = TZ_OFFSET_HOURS * 3_600_000;
 
@@ -192,13 +188,14 @@ export function fromArchiveRow(row, channelName) {
     authorId: row.author_id,
     authorName: row.author_name || 'unknown',
     isBot: Boolean(row.is_bot),
-    content: row.content || row.extra || '',
+    content: row.content ?? '',
     createdAt: row.created_at,
     editedAt: row.edited_at,
     deleted: Boolean(row.deleted),
     reactionCount: row.reaction_count ?? 0,
     replyTo: row.reply_to ?? null,
-    attachmentCount: row.attachment_count ?? 0
+    attachmentCount: row.attachment_count ?? 0,
+    structure: archiveStructure(row)
   };
 }
 
@@ -245,14 +242,15 @@ export function fromDiscordMessage(message, channelName) {
       ?? message.author?.username
       ?? 'unknown',
     isBot: Boolean(message.author?.bot),
-    content: message.content || describeExtras(message),
+    content: message.content ?? '',
     createdAt: message.createdTimestamp,
     editedAt: message.editedTimestamp ?? null,
     deleted: false,
     reactionCount: [...(message.reactions?.cache?.values() ?? [])]
       .reduce((sum, reaction) => sum + (reaction.count ?? 0), 0),
     replyTo: message.reference?.messageId ?? null,
-    attachmentCount: message.attachments?.size ?? 0
+    attachmentCount: message.attachments?.size ?? 0,
+    structure: discordStructure(message)
   };
 }
 
@@ -275,60 +273,32 @@ export function fromRawMessage(raw, guildId, channelName) {
     createdAt: raw.timestamp ? Date.parse(raw.timestamp) : Date.now(),
     editedAt: raw.edited_timestamp ? Date.parse(raw.edited_timestamp) : null,
     deleted: false,
-    reactionCount: 0,
+    reactionCount: Array.isArray(raw.reactions) ? raw.reactions.reduce((sum, reaction) => sum + (reaction.count ?? 0), 0) : null,
     replyTo: raw.referenced_message?.id ?? raw.message_reference?.message_id ?? null,
-    attachmentCount: raw.attachments?.length ?? 0
+    attachmentCount: raw.attachments?.length ?? 0,
+    structure: discordStructure(raw)
   };
 }
 
 /**
- * メッセージ列を1行1件で書き出す。
- *   3) [08/10 14:32 たこ #general] 本文… ⭐2 ↩1
+ * メッセージ列を1行1件の構造化JSONで書き出す。本文の改行はJSON内に保つ。
  */
 export function formatMessages(
   messages,
   { refs, showChannel = false, bodyChars = 300, tailOf = null, selfId = null } = {}
 ) {
-  const now = Date.now();
-  const lines = [];
-
-  for (const message of messages) {
-    const ref = refs ? refs.add(message) : null;
-    const head = [shortTime(message.createdAt, now), message.authorName];
-    if (showChannel && message.channelName) head.push(`#${message.channelName}`);
-
-    // 自分の発言だと分かるようにする。`bot` の印だけでは「何かの bot」でしかなく、
-    // モデルは自分の過去の回答を第三者の発言として読んでいた
-    // (自分の回答を根拠として引用したり、自分の結論に反論したりする)。
-    // 表示名はサーバーごとのニックネームで変わるので、ID で判定する。
-    // 「自分」だと誰の自分か曖昧になる。プロンプトはモデルに二人称で語りかけているので、
-    // そこと揃えて「あなた自身」にする (check-answer.mjs がこの文言を見ている)。
-    if (selfId && message.authorId === selfId) head.push('←あなた自身の発言');
-    else if (message.isBot) head.push('bot');
-
-    const tail = [];
-    // 呼び出し側が行末に足したいもの (意味検索の近さ順位など)
-    const extra = tailOf ? tailOf(message) : null;
-    if (extra) tail.push(extra);
-    if (message.reactionCount > 0) tail.push(`⭐${message.reactionCount}`);
-    if (message.editedAt) tail.push('編集済');
-    if (message.deleted) tail.push('削除済');
-    if (message.attachmentCount > 0) tail.push(`添付${message.attachmentCount}`);
-
-    // 返信先が同じ結果セットに居るときだけ番号で示す。会話の噛み合いを見るのに要る。
-    if (message.replyTo && refs) {
-      const parent = refs.byMessageId.get(message.replyTo);
-      if (parent) tail.push(`↩${parent.ref}`);
-      else tail.push('↩');
-    }
-
-    const body = truncate(message.content, bodyChars) || '(本文なし)';
-    const prefix = ref ? `${ref}) ` : '- ';
-
-    lines.push(`${prefix}[${head.join(' ')}] ${body}${tail.length ? ` ${tail.join(' ')}` : ''}`);
-  }
-
-  return lines.join('\n');
+  // Allocate references first: a reply can appear before its parent in search results.
+  for (const message of messages) refs?.add(message);
+  return messages.map((message) => {
+    const ref = refs?.add(message);
+    const envelope = messageEnvelope(message, {
+      lookup: (id) => refs?.byMessageId.get(id), selfId, bodyChars
+    });
+    if (!showChannel) delete envelope.location.channelName;
+    const note = tailOf?.(message);
+    if (note) envelope.contextNote = note;
+    return `${ref ? `${ref}) ` : ''}${JSON.stringify(envelope)}`;
+  }).join('\n');
 }
 
 /** そのテキストがコードブロックを開いたまま終わっているか。 */

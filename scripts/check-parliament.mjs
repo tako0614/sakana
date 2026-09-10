@@ -1,409 +1,73 @@
 import assert from 'node:assert/strict';
-import { rmSync } from 'node:fs';
-
-const mainPath = `/tmp/sakana-parliament-${process.pid}.sqlite`;
-const archivePath = `/tmp/sakana-parliament-archive-${process.pid}.sqlite`;
-for (const path of [mainPath, archivePath]) rmSync(path, { force: true });
-process.env.DATABASE_PATH = mainPath;
-process.env.ARCHIVE_DB_PATH = archivePath;
-process.env.GOVERNANCE_API_KEY = 'check';
-process.env.GOVERNANCE_MAX_CONCURRENT = '3';
-process.env.GOVERNANCE_LAW_API_URL = 'https://laws.example.test';
-process.env.GOVERNANCE_LAW_API_TOKEN = 'check-token';
-process.env.GOVERNANCE_LAW_SITE_URL = 'https://laws.example.test';
-
-const { loadBootstrapDocuments } = await import('../src/governance/config.js');
-const db = await import('../src/governance/db.js');
-const rules = await import('../src/governance/rules.js');
-const { runParliamentSession } = await import('../src/governance/parliament.js');
-const { advanceProposal, castAndPublishVote, processGovernanceOutbox } = await import('../src/governance/service.js');
-
-const { constitution, policy } = loadBootstrapDocuments({ serverName: 'Parliament Test' });
-const compiled = rules.compileConstitution({ content: constitution });
-assert.equal(compiled.rules.workflows.law.initial, 'agenda');
-assert.equal(compiled.rules.workflows.law.states.agenda.handler, 'parliament_agenda');
-assert.equal(compiled.rules.workflows.law.states.agenda.on.deferred, 'agenda');
-assert.equal(compiled.rules.parliament.maximumDeferrals, 3);
-assert.equal(compiled.rules.parliament.sessionInterval, '72h');
-assert.deepEqual(compiled.rules.workflows.law.config, {},
-  '国会の量的な値はworkflowではなくparliamentセクションが持つ');
-
-// --- 実行規則の安全弁 ------------------------------------------------------
-const injected = structuredClone(compiled.rules);
-injected.workflows.law.states.agenda.handler = 'eval_user_text';
-assert.throws(() => rules.validateGovernanceRules(injected), /未対応のworkflow handler/);
-
-const skipVote = structuredClone(compiled.rules);
-skipVote.workflows.law.states.agenda.on.adopted = 'enacted';
-assert.throws(() => rules.validateGovernanceRules(skipVote), /public_vote へ進む必要があります|到達不能状態/,
-  '国会は投票を飛ばして成立させられない');
-
-const extraOutcome = structuredClone(compiled.rules);
-extraOutcome.workflows.law.states.agenda.on.enact = 'enacted';
-assert.throws(() => rules.validateGovernanceRules(extraOutcome), /未対応の項目があります/,
-  '議題から任意の遷移を足せない');
-
-const looseDeferral = structuredClone(compiled.rules);
-looseDeferral.workflows.law.states.agenda.on.deferred = 'voting';
-assert.throws(() => rules.validateGovernanceRules(looseDeferral), /継続審議は同じ議題へ戻る/);
-
-// --- テスト用サーバー -------------------------------------------------------
-const GUILD_ID = 'g-parliament';
-db.bootstrapGovernanceGuild({
-  guildId: GUILD_ID,
-  enactedBy: 'owner',
-  trustedRoleId: '',
-  enforcementMode: 'shadow',
-  constitution,
-  policy,
-  appealRoleId: 'appeal-role',
-  judiciaryRoleId: 'judiciary-role',
-  categoryId: 'category',
-  parliamentForumId: 'parliament-forum',
-  courtForumId: 'court-forum',
-  courtChatChannelId: 'court-forum',
-  procedureChannelId: 'procedure'
-});
-
-const posts = [];
-const threads = new Map();
-
-function fakeThread(id, name, starterAuthor = { id: 'member-1', bot: false }) {
-  const thread = {
-    id,
-    name,
-    parentId: 'parliament-forum',
-    locked: false,
-    archived: false,
-    createdTimestamp: Date.now(),
-    appliedTags: [],
-    isThread: () => true,
-    fetchStarterMessage: async () => ({
-      id: `${id}-starter`,
-      content: `${name}をどうにかしてほしい。`,
-      author: starterAuthor,
-      edit: async () => {}
-    }),
-    send: async (payload) => {
-      posts.push({ threadId: id, ...payload });
-      return { id: `${id}-msg-${posts.length}` };
-    },
-    setAppliedTags: async (tags) => { thread.appliedTags = tags; },
-    setLocked: async () => { thread.locked = true; },
-    setArchived: async (value) => { thread.archived = value; },
-    setName: async (value) => { thread.name = value; }
-  };
-  threads.set(id, thread);
-  return thread;
+import {tmpdir} from 'node:os';
+import {rmSync} from 'node:fs';
+process.env.DATABASE_PATH=`${tmpdir()}/sakana-migration-${process.pid}.sqlite`;
+process.env.ARCHIVE_DB_PATH=`${tmpdir()}/sakana-migration-archive-${process.pid}.sqlite`;
+process.env.GOVERNANCE_API_KEY='check';
+const db=await import('../src/governance/db.js');
+const {loadBootstrapDocuments}=await import('./fixtures/legacy-governance.js');
+const {proposeLawDefinedGovernance}=await import('../src/governance/migration.js');
+const {advanceLegacyLegislation}=await import('../src/governance/legacy-legislation.js');
+const {advanceProposal}=await import('../src/governance/service.js');
+const {extractGovernanceRules,compileConstitution}=await import('../src/governance/rules.js');
+const docs=loadBootstrapDocuments({serverName:'Migration Test'});
+const legacyRules=extractGovernanceRules(docs.constitution);
+legacyRules.parliament.maximumDeferrals=4;
+for(const role of ['law','constitutionalAmendment']) {
+ legacyRules.votes[role].duration='20h';
+ legacyRules.workflows[role].states.voting.duration='20h';
 }
-
-const memberThread = fakeThread('thread-spam', '短時間の連投を止めたい');
-
-const guild = {
-  id: GUILD_ID,
-  name: 'Parliament Test',
-  client: { user: { id: 'bot' } },
-  roles: { cache: new Map(), everyone: null },
-  members: {
-    fetch: async () => new Map([
-      ['voter-1', { id: 'voter-1', user: { bot: false }, roles: { cache: new Map() } }],
-      ['voter-2', { id: 'voter-2', user: { bot: false }, roles: { cache: new Map() } }]
-    ])
-  },
-  channels: {
-    cache: new Map(),
-    fetch: async (id) => {
-      if (id === 'parliament-forum') {
-        return {
-          id,
-          threads: {
-            fetchActive: async () => ({ threads: new Map([...threads].filter(([, thread]) => !thread.archived)) }),
-            create: async ({ name, message }) => {
-              const created = fakeThread(`thread-ai-${threads.size}`, name, { id: 'bot', bot: true });
-              posts.push({ threadId: created.id, starter: true, content: message?.content ?? '' });
-              return created;
-            }
-          },
-          availableTags: [
-            { id: 'tag-agenda', name: '議題' },
-            { id: 'tag-discuss', name: '議論中' },
-            { id: 'tag-voting', name: '投票中' },
-            { id: 'tag-enacted', name: '成立' },
-            { id: 'tag-rejected', name: '不成立' }
-          ]
-        };
-      }
-      if (id === 'procedure') {
-        return {
-          id,
-          isTextBased: () => true,
-          messages: { fetch: async () => ({ id: 'procedure-msg' }) },
-          threads: {
-            create: async ({ name }) => {
-              const created = fakeThread('minutes', name, { id: 'bot', bot: true });
-              return created;
-            }
-          }
-        };
-      }
-      return threads.get(id) ?? null;
-    }
-  }
+for(const role of ['criminalCase','constitutionalCase']) legacyRules.workflows[role].states.defense.duration='4h';
+legacyRules.sanctions.appeals.duration='6h';
+legacyRules.workflows.criminalCase.states.appeal_window.duration='6h';
+legacyRules.sanctions.police.contestDuration='8h';
+legacyRules.sanctions.detention.maximum='4h';
+docs.constitution=docs.constitution.replace(/```governance-rules\s*[\s\S]*?```/,()=>`\u0060\u0060\u0060governance-rules\n${JSON.stringify(legacyRules)}\n\u0060\u0060\u0060`);
+docs.policy=compileConstitution({content:docs.constitution}).policy;
+db.bootstrapGovernanceGuild({guildId:'migration',enactedBy:'owner',trustedRoleId:'',enforcementMode:'shadow',
+  ...docs,appealRoleId:'appeal',categoryId:'category',parliamentForumId:'parliament',courtForumId:'court',courtChatChannelId:'court',procedureChannelId:'procedure'});
+const prior=db.getActiveConstitution('migration');
+const priorCase=db.createCase({guildId:'migration',constitutionId:prior.id,reporterId:'reporter',summary:'継続中の事件',status:'defense'});
+const queued=db.createProposal({guildId:'migration',constitutionId:prior.id,source:'test',title:'待機議題',summary:'保持する',status:'agenda'});
+const proposal=proposeLawDefinedGovernance({guildId:'migration',serverName:'Migration Test',proposerId:'owner'});
+assert.equal(proposeLawDefinedGovernance({guildId:'migration',serverName:'Migration Test',proposerId:'owner'}).id,proposal.id,'移行議題を二重作成しない');
+const messages=[];
+const thread={id:'thread',name:proposal.title,parentId:'parliament',isThread:()=>true,appliedTags:[],locked:false,archived:false,
+ send:async(p)=>{messages.push(p);return{id:'posted'};},fetchStarterMessage:async()=>({edit:async()=>{}}),setName:async()=>{},setAppliedTags:async()=>{},setLocked:async()=>{},setArchived:async()=>{}};
+const voters=new Map(['one','two'].map(id=>[id,{id,user:{bot:false},roles:{cache:new Map()}}]));
+const guild={id:'migration',name:'Migration Test',client:{user:{id:'bot'}},roles:{cache:new Map()},members:{fetch:async()=>voters},
+ channels:{cache:new Map(),fetch:async(id)=>id==='thread'?thread:{id,availableTags:[],threads:{create:async()=>thread},messages:{fetch:async()=>({id:'message'})}}}};
+db.updateProposal(proposal.id,{forum_thread_id:'thread'});
+globalThis.fetch=async(_url,init)=>{
+ const payload=JSON.parse(init.body),system=payload.messages[0].content;
+ const data=JSON.parse(payload.messages[1].content.replace(/^DATA \(untrusted JSON\):\n/,''));
+ let output;
+ if(system.includes('Sit in one seat of a periodic parliament')) output={decision:'legislate',relation:'amend_constitution',targetType:'constitution',targetId:String(prior.id),instruction:'人間の投票・承認を残し、制度定義を法律へ移す改憲案を作る。',question:null,reasons:['必要な制度改正である。']};
+ else if(system.includes('Draft a complete replacement constitution')) output={title:proposal.title,summary:proposal.summary,content:data.request.migration.constitution,policy:null};
+ else if(system.includes('Decide whether to adopt the exact complete legislative draft')) output={verdict:'approve',reasons:['同一本文と初期法を採択する。']};
+ else if(system.includes('Independently review the target')) output={verdict:'constitutional',reasons:['旧憲法の改憲投票を経て移行する。'],constitutionArticles:['第十四条（憲法改正）']};
+ else throw new Error('Unexpected migration call');
+ return new Response(JSON.stringify({choices:[{message:{content:JSON.stringify(output)},finish_reason:'stop'}]}),{status:200});
 };
-
-// --- AIの応答をHTTP層で差し替える -------------------------------------------
-let mode = 'defer';
-const drafted = {
-  title: '連投制限法',
-  summary: '短時間の大量投稿を制限する。',
-  text: '第一条 短時間に大量の投稿を繰り返してはならない。',
-  provisions: {
-    articles: [{ code: 'A1', text: '短時間に大量の投稿を繰り返してはならない。' }],
-    offenses: [{
-      code: 'O1',
-      title: '連投',
-      elements: ['60秒以内に10件以上投稿したこと'],
-      sanctions: [{ type: 'warning' }]
-    }],
-    sanctionDefinitions: []
-  }
-};
-
-let constitutionalVerdict = 'constitutional';
-const lawPushes = [];
-
-globalThis.fetch = async (url, init) => {
-  const target = String(url);
-  if (target.startsWith('https://laws.example.test')) {
-    lawPushes.push(JSON.parse(init.body));
-    return new Response(JSON.stringify({ ok: true }), { status: 200 });
-  }
-  const payload = JSON.parse(init.body);
-  const system = payload.messages[0].content;
-  let output;
-  if (system.includes('Sit in one seat of a periodic parliament')) {
-    output = mode === 'legislate'
-      ? {
-        decision: 'legislate',
-        relation: 'new',
-        targetType: null,
-        targetId: null,
-        instruction: '短時間の連投を制限する一般的な規則を作る。',
-        question: null,
-        reasons: ['討論で必要性が確認できた。']
-      }
-      : mode === 'reject'
-        ? {
-          decision: 'reject',
-          relation: null,
-          targetType: null,
-          targetId: null,
-          instruction: null,
-          question: null,
-          reasons: ['現行法ですでに扱える。']
-        }
-        : {
-          // 継続審議でも条文の方向まで出す。人間は白紙ではなくたたき台を直す。
-          decision: 'defer',
-          relation: 'new',
-          targetType: null,
-          targetId: null,
-          instruction: '短時間の連投に一般的な上限を定める。',
-          question: null,
-          reasons: ['判断材料が足りない。']
-        };
-    if (mode === 'defer') output.question = '何件までなら許容できますか。';
-  } else if (system.includes('Draft one narrowly scoped, general, prospective law')) {
-    output = drafted;
-  } else if (system.includes('Independently review the target against the supplied constitution')) {
-    output = {
-      verdict: constitutionalVerdict,
-      reasons: ['公共の福祉の範囲に収まる。'],
-      constitutionArticles: ['第四条（公共の福祉）']
-    };
-  } else {
-    throw new Error(`unexpected governance call: ${system.slice(0, 80)}`);
-  }
-  return new Response(JSON.stringify({
-    choices: [{ message: { content: JSON.stringify(output) }, finish_reason: 'stop' }]
-  }), { status: 200 });
-};
-
-db.updateGovernanceGuild(GUILD_ID, { procedure_message_id: 'procedure-msg' });
-
-const agendaState = compiled.rules.workflows.law.initial;
-
-// 人間はスレを立ててから議論する。国会はそのあとで初めて回る。
-db.recordActivity({
-  messageId: 'thread-old-1', guildId: GUILD_ID, channelId: memberThread.id, parentId: 'parliament',
-  userId: 'member-1', activityDate: '2026-08-16', contentHash: 'old-1',
-  content: '短時間の連投を止めたい', createdAt: Date.now() - 3_600_000
-});
-
-// --- 1回目: 継続審議 --------------------------------------------------------
-let governance = db.getGovernanceGuild(GUILD_ID);
-let session = await runParliamentSession(guild, governance, Date.now(), { manual: true });
-assert.equal(session.agendaCount, 1, '人間が立てたスレを議題として取り込む');
-assert.equal(session.outcomes[0].decision, 'defer');
-let proposal = db.getProposalByForumThread(memberThread.id);
-assert.ok(proposal, '提案スレにproposal行が紐づく');
-assert.equal(proposal.status, agendaState, '継続審議では議題のまま');
-assert.equal(proposal.deferrals, 1);
-assert.equal(proposal.proposer_id, 'member-1');
-assert.ok(posts.some((post) => String(post.content).includes('継続審議 (1回目)')));
-assert.ok(posts.some((post) => String(post.content).includes('何件までなら許容できますか')),
-  '次の国会まで何を聞きたいかを公開する');
-assert.ok(posts.some((post) => (post.files ?? []).some((file) => file.name === 'たたき台-法律案.md')),
-  '継続審議でも条文のたたき台を出す');
-assert.ok(db.getProposal(db.getProposalByForumThread(memberThread.id).id).body,
-  'たたき台は提案に保存して次の国会が読み直せるようにする');
-assert.ok(db.getGovernanceGuild(GUILD_ID).last_session_at, '開会時刻を記録する');
-
-// --- 開かれたことが分かる ---------------------------------------------------
-// 議題スレを個別に見なくても、いつ開かれて何を決めたかを1本で追える。
-const minutes = posts.filter((post) => post.threadId === 'minutes');
-assert.equal(minutes.length, 1, '開会ごとに議事録を1件残す');
-assert.match(minutes[0].content, /第1回 国会/, '第何回かを書く');
-assert.match(minutes[0].content, /継続審議/, '議題ごとの結論を書く');
-assert.match(minutes[0].content, /次の開会/, '次にいつ開くかを書く');
-assert.equal(db.getGovernanceGuild(GUILD_ID).parliament_thread_id, 'minutes',
-  '議事録スレを統治DBに固定する');
-
-// --- スレの過去発言が国会へ届く ---------------------------------------------
-// proposal行は「国会が最初に回ったとき」に作られる。created_atで切ると、人間が
-// それ以前に話し合った内容が丸ごと落ちる。
-assert.ok(
-  db.threadDiscussion(GUILD_ID, memberThread.id, 0).some((row) => row.message_id === 'thread-old-1'),
-  'proposal行より前のスレ発言も国会に届く'
-);
-
-// --- 誰も答えていないのに継続審議を繰り返さない ------------------------------
-mode = 'defer';
-db.updateProposal(proposal.id, { retry_after: null });
-session = await runParliamentSession(guild, db.getGovernanceGuild(GUILD_ID), Date.now(), { manual: true });
-proposal = db.getProposal(proposal.id);
-assert.notEqual(session.outcomes[0].decision, 'defer',
-  '前回の継続審議のあと誰も書いていなければ、もう一度は待たない');
-assert.equal(proposal.deferrals, 1, '空振りの継続審議で回数を消費しない');
-
-// 人間が答えたら、また意見を聞ける。
-db.recordActivity({
-  messageId: 'thread-reply-1', guildId: GUILD_ID, channelId: memberThread.id, parentId: 'parliament',
-  userId: 'member-2', activityDate: '2026-08-16', contentHash: 'reply-1',
-  content: '5分に10件くらいが妥当だと思う', createdAt: Date.now()
-});
-db.updateProposal(proposal.id, { retry_after: null });
-session = await runParliamentSession(guild, db.getGovernanceGuild(GUILD_ID), Date.now(), { manual: true });
-proposal = db.getProposal(proposal.id);
-assert.equal(session.outcomes[0].decision, 'defer', '新しい発言があれば継続審議を続けられる');
-assert.equal(proposal.deferrals, 2);
-
-// --- 調査記録はスレへ出さない -----------------------------------------------
-assert.equal(compiled.policy.investigation.publicRecord, 'none');
-assert.ok(!posts.some((post) => String(post.content).includes('## 調査記録')),
-  '調査の箇条書きはスレへ出さない（理由文が語る）');
-
-// --- 周期を待たない開会は起きない -------------------------------------------
-governance = db.getGovernanceGuild(GUILD_ID);
-assert.equal(await runParliamentSession(guild, governance, Date.now()), null,
-  '間隔を満たさない自動開会は何もしない');
-
-// --- 継続審議の上限 ---------------------------------------------------------
-const maximumDeferrals = compiled.rules.parliament.maximumDeferrals;
-assert.equal(maximumDeferrals, 3);
-db.updateProposal(proposal.id, { deferrals: maximumDeferrals });
-mode = 'defer';
-session = await runParliamentSession(guild, db.getGovernanceGuild(GUILD_ID), Date.now(), { manual: true });
-proposal = db.getProposal(proposal.id);
-assert.equal(session.outcomes[0].decision, 'error',
-  '上限に達した議題でdeferを返した席は無効票になる');
-assert.equal(proposal.status, agendaState, '有効な席が必要数そろわないうちは結論を出さない');
-assert.equal(proposal.deferrals, maximumDeferrals, '無効票では継続審議の回数も増やさない');
-
-mode = 'reject';
-db.updateProposal(proposal.id, { retry_after: null });
-session = await runParliamentSession(guild, db.getGovernanceGuild(GUILD_ID), Date.now(), { manual: true });
-proposal = db.getProposal(proposal.id);
-assert.equal(session.outcomes[0].decision, 'reject', '上限に達した議題は立法か不採択に収束する');
-assert.equal(proposal.status, 'rejected');
-assert.equal(threads.get(memberThread.id).archived, true, '結論が出たスレはアーカイブする');
-assert.equal(threads.get(memberThread.id).locked, true);
-
-// --- 立法 → 投票 → 成立 ----------------------------------------------------
-const secondThread = fakeThread('thread-links', 'リンク荒らしを止めたい');
-mode = 'legislate';
-session = await runParliamentSession(guild, db.getGovernanceGuild(GUILD_ID), Date.now(), { manual: true });
-let bill = db.getProposalByForumThread(secondThread.id);
-assert.equal(session.outcomes.find((entry) => entry.proposalId === bill.id).decision, 'legislate');
-bill = db.getProposal(bill.id);
-assert.equal(bill.status, 'voting', '立法を選んだ議題は投票へ進む');
-assert.equal(bill.title, drafted.title);
-assert.ok(bill.body?.provisions?.offenses?.length === 1);
-assert.equal(db.proposalElectorate(bill.id).length, 2, '受付時に有権者を固定する');
-assert.ok(posts.some((post) => String(post.content).includes('投票を開始しました')));
-
-for (const userId of ['voter-1', 'voter-2']) {
-  await castAndPublishVote({
-    guildId: GUILD_ID,
-    guild,
-    user: { id: userId },
-    member: { id: userId }
-  }, bill.id, 'yes');
-}
-bill = db.getProposal(bill.id);
-await advanceProposal(guild, bill, Date.now());
-bill = db.getProposal(bill.id);
-assert.equal(bill.status, 'enacted', '全員投票で締切前に開票して成立する');
-const laws = db.listLaws(GUILD_ID);
-assert.equal(laws.length, 1);
-assert.equal(laws[0].title, drafted.title);
-assert.equal(threads.get(secondThread.id).archived, true);
-
-// --- 法令サイトへの押し込み -------------------------------------------------
-await processGovernanceOutbox({ guilds: { cache: new Map(), fetch: async () => guild } });
-assert.ok(lawPushes.some((entry) => entry.type === 'law' && entry.title === drafted.title),
-  '成立した法律をWorkerへ押し込む');
-assert.ok(lawPushes.some((entry) => entry.type === 'constitution'), '憲法も公開正本へ載せる');
-const pushCount = lawPushes.length;
-const { syncLawSite } = await import('../src/governance/lawsite.js');
-syncLawSite(guild);
-await processGovernanceOutbox({ guilds: { cache: new Map(), fetch: async () => guild } });
-assert.equal(lawPushes.length, pushCount, '内容が変わらなければ再送しない');
-
-// --- AI席が落ちた回は継続審議の回数を消費しない -----------------------------
-const outageThread = fakeThread('thread-outage', 'AI席が落ちた回の議題');
-const workingFetch = globalThis.fetch;
-globalThis.fetch = async (url, init) => {
-  if (String(url).startsWith('https://laws.example.test')) return workingFetch(url, init);
-  return new Response('upstream down', { status: 503 });
-};
-session = await runParliamentSession(guild, db.getGovernanceGuild(GUILD_ID), Date.now(), { manual: true });
-globalThis.fetch = workingFetch;
-const outage = db.getProposalByForumThread(outageThread.id);
-assert.equal(session.outcomes.find((entry) => entry.proposalId === outage.id).decision, 'error');
-assert.equal(outage.deferrals, 0, 'AI席が落ちた回は継続審議の回数を消費しない');
-assert.equal(outage.status, agendaState);
-assert.ok(outage.retry_after > Date.now(), '失敗した議題は次の国会まで待つ');
-
-// --- 憲法適合を確認できない草案は投票へ進めない -----------------------------
-const thirdThread = fakeThread('thread-speech', '批判を禁止したい');
-constitutionalVerdict = 'unconstitutional';
-mode = 'legislate';
-session = await runParliamentSession(guild, db.getGovernanceGuild(GUILD_ID), Date.now(), { manual: true });
-const blocked = db.getProposalByForumThread(thirdThread.id);
-assert.equal(blocked.status, agendaState, '違憲の疑いがある草案は投票にかけない');
-assert.equal(blocked.deferrals, 1, '継続審議として次の国会へ送る');
-assert.ok(posts.some((post) => String(post.content).includes('憲法適合を確認できませんでした')));
-
-// --- 旧憲法のまま新コードが起動した場合 --------------------------------------
-const legacyRules = structuredClone(compiled.rules);
-delete legacyRules.panels.parliament;
-db.governanceDatabase.prepare('UPDATE governance_constitutions SET rules_json = ? WHERE guild_id = ?')
-  .run(JSON.stringify(legacyRules), GUILD_ID);
-await assert.rejects(
-  runParliamentSession(guild, db.getGovernanceGuild(GUILD_ID), Date.now(), { manual: true }),
-  /統治DBを作り直して/,
-  '旧手続のままの憲法では議題を作らずに止まる'
-);
-
-console.log('check-parliament: ok');
+await advanceLegacyLegislation(guild,db.getProposal(proposal.id));
+let prepared=db.getProposal(proposal.id);
+assert.equal(prepared.workflow_handler,'public_vote');
+assert.equal(db.getActiveConstitution(guild.id).id,prior.id,'AI審査だけでは改憲を成立させない');
+assert.throws(()=>db.enactConstitution({guildId:guild.id,proposalId:prepared.id,content:prepared.body.content,bootstrapLaws:prepared.body.bootstrapLaws}),/投票/);
+db.castProposalVote(proposal.id,'one','yes');db.castProposalVote(proposal.id,'two','yes');
+await advanceProposal(guild,db.getProposal(proposal.id),Date.now());
+const active=db.getActiveConstitution(guild.id);
+assert.equal(active.policy.schemaVersion,3);
+assert.equal(active.rules.workflows.law.states.vote.duration,'20h','現行の投票期間を移行案へ引き継ぐ');
+assert.equal(active.rules.workflows.constitutionalAmendment.states.draft.config.maximumVisits,4);
+assert.equal(active.rules.workflows.criminalCase.states.defense.duration,'4h');
+assert.equal(active.rules.workflows.criminalCase.states.appeal_window.duration,'6h');
+assert.equal(active.rules.workflows.criminalCase.states.contest_window.duration,'8h');
+assert.equal(active.rules.parliament.maximumDeferrals,undefined,'改稿上限は手続の定義だけに置く');
+assert.equal(active.version,prior.version+1);
+assert.equal(db.listLaws(guild.id).length,1,'改憲と同じ投票対象の初期法を同時に成立させる');
+assert.equal(db.getCase(priorCase.id).constitution_id,prior.id,'進行中事件は受付時の憲法を保持する');
+assert.equal(db.getProposal(queued.id).constitution_id,active.id,'未起草の議題を新法令へ移し直す');
+assert.equal(db.listProposalVotes(proposal.id).length,2,'移行を決めた実際の人間の票を保持する');
+assert.equal(db.getConstitution(prior.id).content,docs.constitution,'旧憲法本文を書き換えない');
+console.log('check-parliament: ok (reviewed constitutional migration)');

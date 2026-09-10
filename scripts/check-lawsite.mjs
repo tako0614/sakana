@@ -156,3 +156,18 @@ assert.throws(() => validateInstrument({ ...payload, extra: 1 }), /未対応の�
 assert.throws(() => validateInstrument({ ...payload, type: 'memo' }), /type が不正です/);
 
 console.log('check-lawsite: ok');
+
+// The law owns the operative institutions and procedures; readers must see them.
+const { readFileSync } = await import('node:fs');
+const organization = JSON.parse(readFileSync(new URL('../governance/founding-laws/organization.json', import.meta.url), 'utf8'));
+const organizationHtml = renderLaw({ guildId: '123', row: { ...lawV2, title: organization.title, text: organization.text, provisions_json: JSON.stringify(organization.provisions) } });
+assert.match(organizationHtml, /統治機関・手続・投票と承認/);
+assert.match(organizationHtml, /人間の公開投票/);
+assert.match(organizationHtml, /人間の執行承認/);
+assert.match(organizationHtml, /12時間/);
+assert.match(organizationHtml, /執行を取りやめる拒否票数/);
+const hostileDefinitions = structuredClone(organization.provisions);
+hostileDefinitions.governance[0].value.name = '<script>alert(1)</script>';
+const escapedGovernance = renderLaw({ guildId:'123', row:{...lawV2,provisions_json:JSON.stringify(hostileDefinitions)} });
+assert.doesNotMatch(escapedGovernance, /<script>alert/);
+assert.match(escapedGovernance, /&lt;script&gt;/);

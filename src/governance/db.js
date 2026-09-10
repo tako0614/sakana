@@ -2,7 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { db } from '../db.js';
 import { OPERATIONAL_SETTING_DEFAULTS } from './config.js';
 import { DAY_MS, canonicalJson, sha256 } from './policy.js';
-import { compileConstitution } from './rules.js';
+import { closeGovernanceVote, compileConstitution, compileLegalSystem } from './rules.js';
+import { AUTHORITY_SCHEMA, EFFECTIVE_SCHEMA } from './legal-system.js';
+import { compileLegalRecovery } from './legal-recovery.js';
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS governance_schema_migrations (
@@ -446,7 +448,7 @@ for (const [table, columns] of Object.entries({
   governance_activity: [['content', "TEXT NOT NULL DEFAULT ''"], ['parent_id', 'TEXT']],
   governance_proposals: [['vote_scope', "TEXT NOT NULL DEFAULT 'all'"]],
   governance_cases: [['alleged_at', 'INTEGER']],
-  governance_case_evidence: [['disclosed_at', 'INTEGER']],
+  governance_case_evidence: [['disclosed_at', 'INTEGER'], ['conversation_json', 'TEXT']],
   governance_agent_attempts: [['kind', "TEXT NOT NULL DEFAULT 'agent'"]]
 })) {
   const existing = new Set(db.pragma(`table_info(${table})`).map((row) => row.name));
@@ -1094,6 +1096,51 @@ db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied
 }
 db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (22, ?)').run(Date.now());
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS governance_legal_snapshots (
+    hash TEXT PRIMARY KEY, guild_id TEXT NOT NULL, constitution_id INTEGER NOT NULL,
+    content_json TEXT NOT NULL, created_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS governance_legal_runtime (
+    guild_id TEXT NOT NULL, constitution_id INTEGER NOT NULL, last_snapshot_hash TEXT NOT NULL,
+    PRIMARY KEY (guild_id, constitution_id)
+  );
+  CREATE TABLE IF NOT EXISTS governance_legal_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL,
+    procedure_id TEXT NOT NULL, snapshot_hash TEXT NOT NULL,
+    event_key TEXT NOT NULL UNIQUE, state TEXT NOT NULL, context_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'active', wake_at INTEGER, retry_after INTEGER,
+    failure_count INTEGER NOT NULL DEFAULT 0, last_error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS governance_institution_effects (
+    event_key TEXT PRIMARY KEY, guild_id TEXT NOT NULL, task_id INTEGER NOT NULL,
+    result_json TEXT NOT NULL, created_at INTEGER NOT NULL
+  );
+`);
+if (!db.pragma('table_info(governance_workflow_instances)').some((column) => column.name === 'legal_snapshot_hash')) {
+  db.exec('ALTER TABLE governance_workflow_instances ADD COLUMN legal_snapshot_hash TEXT');
+}
+if (!db.pragma('table_info(governance_outbox)').some((column) => column.name === 'retry_after')) {
+  db.exec('ALTER TABLE governance_outbox ADD COLUMN retry_after INTEGER');
+}
+if (!db.pragma('table_info(governance_reviews)').some((column) => column.name === 'target_hash')) {
+  db.exec('ALTER TABLE governance_reviews ADD COLUMN target_hash TEXT');
+}
+if (!db.pragma('table_info(governance_cases)').some((column) => column.name === 'workflow_state')) {
+  db.exec('ALTER TABLE governance_cases ADD COLUMN workflow_state TEXT');
+}
+if (!db.pragma('table_info(governance_case_approvals)').some((column) => column.name === 'target_hash')) {
+  db.exec('ALTER TABLE governance_case_approvals ADD COLUMN target_hash TEXT');
+}
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (23, ?)').run(Date.now());
+
+db.exec(`CREATE TABLE IF NOT EXISTS governance_human_vetoes (
+  subject_type TEXT NOT NULL, subject_id INTEGER NOT NULL, round_key TEXT NOT NULL,
+  target_hash TEXT NOT NULL, user_id TEXT NOT NULL, created_at INTEGER NOT NULL,
+  PRIMARY KEY (subject_type, subject_id, round_key, user_id)
+);`);
+db.prepare('INSERT OR IGNORE INTO governance_schema_migrations (version, applied_at) VALUES (24, ?)').run(Date.now());
+
 // 単一bot processが前提。前回processが外部操作の途中で落ちたrunning actionを
 // idempotency key付きoutboxから再試行できる状態へ戻す。
 db.prepare("UPDATE governance_outbox SET status = 'error', last_error = 'interrupted before completion' WHERE status = 'running'").run();
@@ -1128,7 +1175,10 @@ const proposalWorkflowStmt = db.prepare(`
 
 function hydrateProposal(row) {
   if (!row) return null;
-  const rules = parseJson(proposalRulesStmt.get(Number(row.constitution_id))?.rules_json, null);
+  const instance = getWorkflowInstance('proposal', row.id);
+  const rules = instance?.legal_snapshot_hash
+    ? getLegalSnapshot(instance.legal_snapshot_hash)?.rules
+    : parseJson(proposalRulesStmt.get(Number(row.constitution_id))?.rules_json, null);
   const workflow = proposalWorkflowStmt.get(String(row.id));
   const key = row.kind === 'amendment' ? 'constitutionalAmendment' : 'law';
   return {
@@ -1145,7 +1195,13 @@ function hydrateLaw(row) {
 }
 
 function hydrateCase(row) {
-  return row ? { ...row, verdict: parseJson(row.verdict_json, null) } : null;
+  if (!row) return null;
+  const instance = getWorkflowInstance('case', row.id);
+  const snapshot = instance?.legal_snapshot_hash ? getLegalSnapshot(instance.legal_snapshot_hash) : null;
+  const state = snapshot?.rules.workflows[instance.workflow_key]?.states[instance.current_state];
+  return { ...row, verdict: parseJson(row.verdict_json, null),
+    workflow_state: instance?.current_state ?? row.workflow_state ?? row.status,
+    workflow_handler: state?.handler ?? null };
 }
 
 function hydrateAdministrativeAct(row) {
@@ -1228,7 +1284,8 @@ export function updateGovernanceSurfaceMigration(guildId, patch) {
 
 export const bootstrapGovernanceGuild = db.transaction((input) => {
   if (getGovernanceGuild(input.guildId)) throw new Error('このサーバーは初期化済みです。');
-  const compiled = compileConstitution({ content: input.constitution, policy: input.policy });
+  const compiled = compileConstitution({ content: input.constitution, laws: input.laws ?? null });
+  if (!compiled.policy) throw new Error('自律統治の導入には憲法と基礎法令一式が必要です。');
   const now = Date.now();
   const contentHash = sha256(input.constitution);
   const pHash = sha256(canonicalJson(compiled.policy));
@@ -1282,6 +1339,13 @@ export const bootstrapGovernanceGuild = db.transaction((input) => {
     db.prepare(`INSERT INTO governance_settings (guild_id, key, value, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)`)
       .run(input.guildId, key, value, input.enactedBy, now);
   }
+  for (const law of input.laws ?? []) {
+    const proposal = db.prepare(`INSERT INTO governance_proposals
+      (guild_id, kind, source, title, summary, body_json, status, proposer_id, constitution_id, vote_scope, created_at, updated_at)
+      VALUES (?, 'law', 'founding', ?, ?, ?, 'enacted', ?, ?, 'none', ?, ?)`)
+      .run(input.guildId, law.title, law.summary, canonicalJson(law), input.enactedBy, constitutionId, now, now);
+    enactLaw({ ...law, guildId: input.guildId, constitutionId, proposalId: Number(proposal.lastInsertRowid), effectiveAt: now });
+  }
   writeAudit({
     guildId: input.guildId,
     actorType: 'operator',
@@ -1317,11 +1381,116 @@ export function getConstitution(id) {
 }
 
 export function getActiveConstitution(guildId) {
-  return hydrateConstitution(db.prepare(`
+  const constitution = hydrateConstitution(db.prepare(`
     SELECT c.* FROM governance_guilds g
     JOIN governance_constitutions c ON c.id = g.active_constitution_id
     WHERE g.guild_id = ?
   `).get(String(guildId)));
+  if (constitution?.rules?.$schema !== EFFECTIVE_SCHEMA) return constitution;
+  const laws = listLaws(guildId, { limit: 10000 }).filter((law) => law.effective_at <= Date.now());
+  let effective;
+  try {
+    effective = compileLegalSystem({ authority: constitution.rules.authority, laws });
+  } catch (error) {
+    const runtime = db.prepare('SELECT last_snapshot_hash FROM governance_legal_runtime WHERE guild_id = ? AND constitution_id = ?').get(String(guildId), constitution.id);
+    const baseline = runtime ? getLegalSnapshot(runtime.last_snapshot_hash) : {
+      constitutionId: constitution.id, constitutionHash: constitution.content_hash,
+      rules: constitution.rules, policy: constitution.policy, rulesHash: constitution.rules_hash
+    };
+    effective = compileLegalRecovery(constitution, baseline, error);
+    return { ...constitution, ...effective, rules_hash: effective.rulesHash };
+  }
+  const hash = saveLegalSnapshot({ ...constitution, ...effective, rules_hash: effective.rulesHash });
+  db.prepare(`INSERT INTO governance_legal_runtime (guild_id, constitution_id, last_snapshot_hash) VALUES (?, ?, ?)
+    ON CONFLICT(guild_id, constitution_id) DO UPDATE SET last_snapshot_hash = excluded.last_snapshot_hash
+    WHERE last_snapshot_hash != excluded.last_snapshot_hash`).run(String(guildId), constitution.id, hash);
+  return { ...constitution, ...effective, rules_hash: effective.rulesHash };
+}
+
+export const ensureLegalRecoveryProposal = db.transaction((guildId, now = Date.now()) => {
+  const constitution = getActiveConstitution(guildId);
+  if (!constitution?.rules?.recovery) return null;
+  const existing = listProposals(guildId, { limit: 10000 }).find((proposal) => proposal.source === 'constitutional_repair'
+    && proposal.workflow_handler !== 'terminal');
+  if (existing) return existing;
+  const interval = constitution.policy.legislation.sessionIntervalMilliseconds;
+  const task = createLegalTask({ guildId, procedureId: constitution.rules.bindings.law.target,
+    snapshotHash: saveLegalSnapshot(constitution), eventKey: `${guildId}:constitutional-repair:${constitution.rules_hash}:${Math.floor(now / interval)}`,
+    state: 'repair', input: { cause: constitution.rules.recovery.cause }, now });
+  if (task.status === 'completed') return null;
+  const proposal = createProposal({ guildId, constitutionId: constitution.id, kind: 'law', source: 'constitutional_repair',
+    title: '統治制度の修復法', summary: `憲法第十五条の暫定権限に基づき、停止した法令を復活させず代替組織法を起草する。制度の欠落: ${constitution.rules.recovery.cause}`,
+    status: constitution.rules.workflows.law.initial, voteScope: 'all' });
+  updateLegalTask(task.id, { completed: true, context: { proposalId: proposal.id } });
+  return proposal;
+});
+
+export function saveLegalSnapshot(constitution) {
+  const content = { constitutionId: constitution.id, constitutionHash: constitution.content_hash,
+    rules: constitution.rules, policy: constitution.policy, rulesHash: constitution.rules_hash };
+  const hash = sha256(canonicalJson({ guildId: constitution.guild_id, ...content }));
+  db.prepare(`INSERT OR IGNORE INTO governance_legal_snapshots (hash, guild_id, constitution_id, content_json, created_at) VALUES (?, ?, ?, ?, ?)`)
+    .run(hash, constitution.guild_id, constitution.id, canonicalJson(content), Date.now());
+  return hash;
+}
+
+export function getLegalSnapshot(hash) {
+  const row = db.prepare('SELECT * FROM governance_legal_snapshots WHERE hash = ?').get(hash);
+  return row ? { ...parseJson(row.content_json), hash, guildId: row.guild_id } : null;
+}
+
+export function createLegalTask({ guildId, procedureId, snapshotHash, eventKey, state, input, now = Date.now() }) {
+  db.prepare(`INSERT OR IGNORE INTO governance_legal_tasks
+    (guild_id, procedure_id, snapshot_hash, event_key, state, context_json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(guildId, procedureId, snapshotHash, eventKey, state, canonicalJson({ input }), now, now);
+  return hydrateLegalTask(db.prepare('SELECT * FROM governance_legal_tasks WHERE event_key = ?').get(eventKey));
+}
+function hydrateLegalTask(row) { return row ? { ...row, context: parseJson(row.context_json, {}) } : null; }
+export function getLegalTask(id) { return hydrateLegalTask(db.prepare('SELECT * FROM governance_legal_tasks WHERE id = ?').get(id)); }
+export function listLegalTasks(guildId, { pending = true, now = Date.now() } = {}) {
+  return db.prepare(`SELECT * FROM governance_legal_tasks WHERE guild_id = ?
+    ${pending ? "AND status = 'active' AND (retry_after IS NULL OR retry_after <= ?) AND (wake_at IS NULL OR wake_at <= ?)" : ''}
+    ORDER BY updated_at, id LIMIT 100`).all(...(pending ? [guildId, now, now] : [guildId])).map(hydrateLegalTask);
+}
+export function updateLegalTask(id, { state, context, wakeAt = null, completed = false, error = null }) {
+  const task = getLegalTask(id);
+  const failures = error ? task.failure_count + 1 : 0;
+  db.prepare(`UPDATE governance_legal_tasks SET state = ?, context_json = ?, wake_at = ?, status = ?,
+    retry_after = ?, failure_count = ?, last_error = ?, updated_at = ? WHERE id = ?`)
+    .run(state ?? task.state, canonicalJson(context ?? task.context), wakeAt, completed ? 'completed' : 'active',
+      error ? Date.now() + Math.min(3600000, 300000 * 2 ** Math.min(failures - 1, 4)) : null,
+      failures, error ? String(error.message ?? error).slice(0, 1000) : null, Date.now(), id);
+  return getLegalTask(id);
+}
+
+export const recordInstitutionEffect = db.transaction(({ task, eventKey, result, effect, constitution }) => {
+  const old = db.prepare('SELECT result_json FROM governance_institution_effects WHERE event_key = ?').get(eventKey);
+  if (old) return parseJson(old.result_json);
+  let recorded;
+  if (effect === 'propose' && result.decision === 'propose') {
+    const proposal = createProposal({ guildId: task.guild_id, kind: 'law', source: `institution:${task.id}`,
+      title: result.output.title, summary: result.output.summary, proposerId: null,
+      status: constitution.rules.workflows.law.initial, constitutionId: constitution.id, voteScope: constitution.policy.voting.defaultScope });
+    recorded = { type: 'proposal', id: proposal.id };
+  } else {
+    const act = createAdministrativeAct({ guildId: task.guild_id, kind: 'institution_report', actorType: 'ai',
+      summary: result.output.summary, detail: { taskId: task.id, procedureId: task.procedure_id,
+        snapshotHash: task.snapshot_hash, outputs: result.outputs } });
+    recorded = { type: 'administrative_act', id: act.id };
+  }
+  db.prepare('INSERT INTO governance_institution_effects (event_key, guild_id, task_id, result_json, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(eventKey, task.guild_id, task.id, canonicalJson(recorded), Date.now());
+  return recorded;
+});
+
+export function constitutionForSubject(type, record) {
+  const constitution = getConstitution(record.constitution_id);
+  const instance = getWorkflowInstance(type, record.id);
+  if (!instance?.legal_snapshot_hash) return constitution;
+  const snapshot = getLegalSnapshot(instance.legal_snapshot_hash);
+  if (!snapshot || snapshot.guildId !== record.guild_id || snapshot.constitutionId !== constitution.id) throw new Error('案件の適用法令snapshotが不正です。');
+  return { ...constitution, rules: snapshot.rules, policy: snapshot.policy, rules_hash: snapshot.rulesHash };
 }
 
 export function listConstitutions(guildId, { limit = 50 } = {}) {
@@ -1334,9 +1503,36 @@ export function listConstitutions(guildId, { limit = 50 } = {}) {
 }
 
 export const enactConstitution = db.transaction((input) => {
-  const compiled = compileConstitution({ content: input.content, policy: input.policy });
   const current = getActiveConstitution(input.guildId);
   if (!current) throw new Error('有効な憲法がありません。');
+  const bootstrapLaws = input.bootstrapLaws ?? [];
+  if (bootstrapLaws.length) {
+    const proposal = getProposal(input.proposalId);
+    if (current.policy.autonomous || bootstrapLaws.length !== 1 || proposal?.source !== 'legal_migration'
+      || proposal.kind !== 'amendment' || proposal.body.content !== input.content
+      || canonicalJson(proposal.body.bootstrapLaws) !== canonicalJson(bootstrapLaws)
+      || proposal.workflow_handler !== 'public_vote') throw new Error('初期法の同時成立には旧憲法下の移行改正案が必要です。');
+    const tally = proposalVoteSummary(proposal.id);
+    const vote = current.rules.votes.constitutionalAmendment;
+    const early = vote.earlyClose === 'all_ballots_cast' && tally.electorate > 0 && tally.yes + tally.no + tally.abstain === tally.electorate;
+    if ((proposal.stage_ends_at > Date.now() && !early) || !closeGovernanceVote({kind:'amendment',scope:proposal.vote_scope,...tally},current.rules).passed) throw new Error('旧憲法の改憲投票が成立していません。');
+    const review = listProposalDeliberations(proposal.id).at(-1)?.decision;
+    if (review?.targetHash !== sha256(canonicalJson(proposal.body))) throw new Error('移行案とAI採択・審査対象が一致しません。');
+    for (const [record,phase,verdict,seats,needed] of [
+      [review.adoption,'adoption','approve',current.rules.panels.parliament.seats,current.rules.panels.parliament.required.decision],
+      [review.review,'pre','constitutional',current.rules.panels.constitutional.seats,current.policy.judiciary.constitutionalVotesRequired]
+    ]) {
+      const rows=db.prepare('SELECT seat,verdict,target_hash FROM governance_reviews WHERE guild_id=? AND target_id=? AND panel_id=? AND phase=?')
+        .all(input.guildId,String(proposal.id),record?.panelId??'',phase);
+      if (rows.length!==seats || new Set(rows.map((row)=>row.seat)).size!==seats || rows.some((row)=>row.target_hash!==review.targetHash)
+        || rows.filter((row)=>row.verdict===verdict).length<needed) throw new Error('移行に必要な独立した判断がありません。');
+    }
+  }
+  const root = compileConstitution({ content: input.content });
+  if (current.policy.autonomous && root.rules.$schema !== AUTHORITY_SCHEMA) throw new Error('新制度から旧schemaへの権限移行は実装されていません。');
+  const compiled = root.rules.$schema === AUTHORITY_SCHEMA
+    ? compileConstitution({ content: input.content, laws: [...listLaws(input.guildId, { limit: 10000 }), ...bootstrapLaws] })
+    : root;
   if (input.targetConstitutionId !== undefined
     && Number(input.targetConstitutionId) !== Number(current.id)) {
     throw new Error('改正対象の憲法が審議中に更新されました。最新版を基礎に再討議が必要です。');
@@ -1368,6 +1564,13 @@ export const enactConstitution = db.transaction((input) => {
   );
   const id = Number(inserted.lastInsertRowid);
   updateGovernanceGuild(input.guildId, { active_constitution_id: id });
+  for (const law of bootstrapLaws) enactLaw({guildId:input.guildId,proposalId:input.proposalId,constitutionId:id,
+    code:law.code,title:law.title,text:law.text,provisions:law.provisions,effectiveAt:now});
+  if (bootstrapLaws.length) {
+    for (const proposal of listProposals(input.guildId,{limit:10000})) {
+      if (proposal.id !== input.proposalId && !['public_vote','terminal'].includes(proposal.workflow_handler)) rebaseProposalLegalSystem(proposal.id,{reason:'constitutional_migration'});
+    }
+  }
   writeAudit({ guildId: input.guildId, actorType: 'system', action: 'constitution.enacted', targetType: 'constitution', targetId: id, detail: { version: current.version + 1, proposalId: input.proposalId } });
   return getConstitution(id);
 });
@@ -1692,20 +1895,25 @@ export function consumeTrustedMutation({ guildId, userId, roleId, desired }) {
   return row;
 }
 
+if (!db.pragma('table_info(governance_activity)').some((row) => row.name === 'structure_json')) {
+  db.exec("ALTER TABLE governance_activity ADD COLUMN structure_json TEXT NOT NULL DEFAULT '{}'");
+}
 const insertActivityStmt = db.prepare(`
-  INSERT OR IGNORE INTO governance_activity
-    (message_id, guild_id, channel_id, parent_id, user_id, activity_date, content_hash, content, created_at)
-  VALUES (@messageId, @guildId, @channelId, @parentId, @userId, @activityDate, @contentHash, @content, @createdAt)
+  INSERT INTO governance_activity
+    (message_id, guild_id, channel_id, parent_id, user_id, activity_date, content_hash, content, created_at, structure_json)
+  VALUES (@messageId, @guildId, @channelId, @parentId, @userId, @activityDate, @contentHash, @content, @createdAt, @structureJson)
+  ON CONFLICT(message_id) DO UPDATE SET content=excluded.content, content_hash=excluded.content_hash, structure_json=excluded.structure_json
+  WHERE governance_activity.content IS NOT excluded.content OR governance_activity.structure_json IS NOT excluded.structure_json
 `);
 
 export function recordActivity(row) {
   if (!row) return false;
-  return insertActivityStmt.run(row).changes > 0;
+  return insertActivityStmt.run({ structureJson: '{}', ...row }).changes > 0;
 }
 
 export const recordActivities = db.transaction((rows) => {
   let count = 0;
-  for (const row of rows) count += insertActivityStmt.run(row).changes;
+  for (const row of rows) count += insertActivityStmt.run({ structureJson: '{}', ...row }).changes;
   return count;
 });
 
@@ -1952,6 +2160,9 @@ export function ensureWorkflowInstance({
   stateEnteredAt = Date.now(), wakeAt = null, context = {}, status = 'active'
 }) {
   const now = Date.now();
+  const active = getActiveConstitution(guildId);
+  const snapshotHash = active?.policy?.autonomous && Number(active.id) === Number(constitutionId)
+    ? saveLegalSnapshot(active) : null;
   db.prepare(`
     INSERT OR IGNORE INTO governance_workflow_instances
       (guild_id, constitution_id, workflow_key, subject_type, subject_id, current_state,
@@ -1963,6 +2174,9 @@ export function ensureWorkflowInstance({
     canonicalJson(context), String(status), now, now
   );
   const instance = getWorkflowInstance(subjectType, subjectId);
+  if (snapshotHash && instance && !instance.legal_snapshot_hash) {
+    db.prepare('UPDATE governance_workflow_instances SET legal_snapshot_hash = ? WHERE id = ?').run(snapshotHash, instance.id);
+  }
   if (instance && listWorkflowEvents(instance.id).length === 0) {
     db.prepare(`
       INSERT INTO governance_workflow_events
@@ -1971,7 +2185,7 @@ export function ensureWorkflowInstance({
       VALUES (?, 'created', 'system', NULL, NULL, ?, '{}', 'created', ?)
     `).run(instance.id, String(currentState), now);
   }
-  return instance;
+  return getWorkflowInstance(subjectType, subjectId);
 }
 
 export function getWorkflowInstance(subjectType, subjectId) {
@@ -1995,7 +2209,8 @@ function workflowStateIsTerminal(subjectType, subjectId, stateName) {
 function workflowStateHandler(subjectType, subjectId, stateName) {
   const instance = getWorkflowInstance(subjectType, subjectId);
   if (!instance) return null;
-  const constitution = getConstitution(instance.constitution_id);
+  const snapshot = instance.legal_snapshot_hash ? getLegalSnapshot(instance.legal_snapshot_hash) : null;
+  const constitution = snapshot ?? getConstitution(instance.constitution_id);
   const state = constitution?.rules?.workflows?.[instance.workflow_key]?.states?.[stateName];
   return state?.handler ?? null;
 }
@@ -2029,7 +2244,7 @@ export const transitionWorkflowInstance = db.transaction(({
         context_json = ?, status = ?, updated_at = ?
     WHERE id = ?
   `).run(
-    String(toState), now, wakeAt === null ? null : Number(wakeAt),
+    String(toState), String(toState) === instance.current_state ? instance.state_entered_at : now, wakeAt === null ? null : Number(wakeAt),
     context === null ? instance.context_json : canonicalJson(context),
     completed ? 'completed' : 'active', now, instance.id
   );
@@ -2115,7 +2330,8 @@ export function createProposal(input) {
     stateEnteredAt: proposal.stage_started_at,
     wakeAt: proposal.stage_ends_at
   });
-  const aiSource = input.source === 'weekly' || String(input.source).startsWith('mention_investigation:');
+  const aiSource = ['weekly', 'log_scan'].includes(input.source)
+    || ['mention_investigation:', 'institution:'].some((prefix) => String(input.source).startsWith(prefix));
   writeAudit({ guildId: input.guildId, actorType: aiSource ? 'ai' : 'member', actorId: aiSource ? null : input.proposerId, action: 'proposal.created', targetType: 'proposal', targetId: proposal.id, detail: { kind: proposal.kind, source: proposal.source, voteScope: proposal.vote_scope } });
   return getProposal(proposal.id);
 }
@@ -2321,6 +2537,22 @@ export function listProposals(guildId, { statuses = null, limit = 25 } = {}) {
     .all(guildId, limit).map(hydrateProposal);
 }
 
+export const repairInstitutionProposalScope = db.transaction((id) => {
+  const proposal = getProposal(id);
+  if (proposal?.vote_scope !== 'none' || !proposal.source.startsWith('institution:') || proposal.workflow_handler === 'terminal') return proposal;
+  const constitution = constitutionForSubject('proposal', proposal);
+  if (!constitution?.policy.autonomous || constitution.policy.voting.allowedScopes.includes('none')) return proposal;
+  const instance = getWorkflowInstance('proposal', id);
+  if (instance.context.publicVote?.announced || proposalElectorate(id).length || listProposalVotes(id).length) {
+    throw new Error('開始済みの投票資格は変更できません。法定の再審議が必要です。');
+  }
+  const scope = constitution.policy.voting.defaultScope;
+  db.prepare('UPDATE governance_proposals SET vote_scope = ? WHERE id = ?').run(scope, id);
+  writeAudit({ guildId: proposal.guild_id, actorType: 'system', action: 'proposal.scope_repaired',
+    targetType: 'proposal', targetId: id, detail: { from: 'none', to: scope, legalSnapshot: instance.legal_snapshot_hash } });
+  return getProposal(id);
+});
+
 export const updateProposal = db.transaction((id, patch) => {
   const allowed = new Set([
     'title', 'summary', 'body_json', 'status', 'forum_thread_id', 'forum_message_id',
@@ -2362,6 +2594,7 @@ export const setProposalKind = db.transaction((id, kind) => {
   const proposal = getProposal(id);
   if (!proposal) throw new Error('案件がありません。');
   if (proposal.kind === kind) return proposal;
+  if (constitutionForSubject('proposal', proposal)?.policy.autonomous) return rebaseProposalLegalSystem(id, { kind, reason: 'kind_changed' });
   const workflowKey = kind === 'amendment' ? 'constitutionalAmendment' : 'law';
   const rules = parseJson(proposalRulesStmt.get(Number(proposal.constitution_id))?.rules_json, null);
   if (!rules?.workflows?.[workflowKey]?.states?.[proposal.status]) {
@@ -2373,6 +2606,28 @@ export const setProposalKind = db.transaction((id, kind) => {
     UPDATE governance_workflow_instances SET workflow_key = ?, updated_at = ?
     WHERE subject_type = 'proposal' AND subject_id = ?
   `).run(workflowKey, Date.now(), String(id));
+  return getProposal(id);
+});
+
+export const rebaseProposalLegalSystem = db.transaction((id, { kind = null, reason = 'legal_system_changed' } = {}) => {
+  const proposal = getProposal(id);
+  const current = getActiveConstitution(proposal.guild_id);
+  if (!current?.policy.autonomous) throw new Error('移行先の法令定義がありません。');
+  const instance = getWorkflowInstance('proposal', id);
+  const nextKind = kind ?? proposal.kind;
+  const key = nextKind === 'amendment' ? 'constitutionalAmendment' : 'law';
+  const initial = current.rules.workflows[key].initial;
+  transitionWorkflowInstance({ subjectType: 'proposal', subjectId: id, toState: initial,
+    eventType: 'legal.rebased', context: { inputHistory: instance.context.inputHistory ?? instance.context.queue?.inputs ?? [] }, payload: { reason, oldSnapshot: instance.legal_snapshot_hash,
+      oldConstitution: proposal.constitution_id, body: proposal.body, context: instance.context,
+      voters: proposalElectorate(id), votes: listProposalVotes(id) } });
+  db.prepare('DELETE FROM governance_votes WHERE proposal_id = ?').run(id);
+  db.prepare('DELETE FROM governance_proposal_voters WHERE proposal_id = ?').run(id);
+  db.prepare(`UPDATE governance_proposals SET kind = ?, constitution_id = ?, status = ?, revision = revision + 1,
+    stage_ends_at = NULL, retry_after = NULL, last_error = NULL, target_type = NULL, target_id = NULL, target_hash = NULL WHERE id = ?`)
+    .run(nextKind, current.id, initial, id);
+  db.prepare(`UPDATE governance_workflow_instances SET constitution_id = ?, workflow_key = ?, legal_snapshot_hash = ? WHERE id = ?`)
+    .run(current.id, key, saveLegalSnapshot(current), instance.id);
   return getProposal(id);
 });
 
@@ -2403,6 +2658,13 @@ export function listProposalDeliberations(proposalId) {
 }
 
 export const snapshotProposalVoters = db.transaction((proposalId, rows) => {
+  const instance = getWorkflowInstance('proposal', proposalId);
+  if (instance?.legal_snapshot_hash) {
+    if (listProposalVotes(proposalId).length) transitionWorkflowInstance({ subjectType: 'proposal', subjectId: proposalId,
+      toState: instance.current_state, wakeAt: instance.wake_at, eventType: 'vote.superseded',
+      payload: { voters: proposalElectorate(proposalId), votes: listProposalVotes(proposalId), targetHash: instance.context.publicVote?.targetHash } });
+    db.prepare('DELETE FROM governance_votes WHERE proposal_id = ?').run(proposalId);
+  }
   db.prepare('DELETE FROM governance_proposal_voters WHERE proposal_id = ?').run(proposalId);
   const insert = db.prepare(`
     INSERT INTO governance_proposal_voters (proposal_id, user_id, eligible_general, trusted, snapshotted_at)
@@ -2427,6 +2689,9 @@ export const castProposalVote = db.transaction((proposalId, userId, choice) => {
     || Number(proposal.stage_ends_at) <= Date.now()) {
     throw new Error('この投票は受付中ではありません。');
   }
+  const instance = getWorkflowInstance('proposal', proposalId);
+  if (instance?.legal_snapshot_hash && (!instance.context.publicVote?.announced
+    || instance.context.publicVote.targetHash !== sha256(canonicalJson(proposal.body)))) throw new Error('投票対象の全文公開が完了していません。');
   const old = db.prepare('SELECT choice FROM governance_votes WHERE proposal_id = ? AND user_id = ?')
     .get(proposalId, userId)?.choice ?? null;
   const now = Date.now();
@@ -2475,7 +2740,8 @@ export function proposalVoteSummary(proposalId) {
     trustedElectorate: snapshot?.trusted_electorate ?? 0,
     trustedYes,
     trustedNo,
-    trustedAbstain
+    trustedAbstain,
+    vetoCount: humanVetoResult('proposal', proposalId).count
   };
 }
 
@@ -2500,6 +2766,12 @@ export function listProposalVotes(proposalId) {
 export const enactLaw = db.transaction((input) => {
   const text = String(input.text);
   const provisions = input.provisions;
+  const constitution = getConstitution(getGovernanceGuild(input.guildId)?.active_constitution_id ?? input.constitutionId);
+  if (constitution?.policy?.autonomous) {
+    const prospective = listLaws(input.guildId, { limit: 10000 }).filter((law) => Number(law.id) !== Number(input.supersedesLawId));
+    prospective.push({ code: input.code, text, provisions });
+    compileLegalSystem({ authority: constitution.rules.authority, laws: prospective });
+  }
   const superseded = input.supersedesLawId ? getLaw(input.supersedesLawId) : null;
   if (input.supersedesLawId && (!superseded || superseded.guild_id !== input.guildId || superseded.status !== 'active')) {
     throw new Error('改正対象の法律は現行ではありません。');
@@ -2597,6 +2869,9 @@ export function getCurrentLawVersion(lawId) {
 }
 
 export function updateLaw(id, patch) {
+  // Capture the effective procedure before an invalidation removes its authority.
+  const existingLaw = getLaw(id);
+  if (existingLaw && patch.status && patch.status !== existingLaw.status) getActiveConstitution(existingLaw.guild_id);
   const allowed = new Set(['status', 'ended_at']);
   const entries = Object.entries(patch).filter(([key]) => allowed.has(key));
   if (!entries.length) return getLaw(id);
@@ -2658,20 +2933,104 @@ export function lawAtTime(id, occurredAt) {
   `).get(Number(id), Number(occurredAt), Number(occurredAt)));
 }
 
+// A normal amendment preserves the immutable law applicable to the alleged act.
+// Suspension, repeal and unconstitutionality require relief, not silent revival.
+export function lawForCase(record) {
+  const law = getLaw(record.law_id);
+  const at = Number(record.alleged_at);
+  if (!law || law.guild_id !== record.guild_id || !['active', 'superseded'].includes(law.status)) {
+    throw new Error('適用法が停止・失効しています。処分を進めず救済が必要です。');
+  }
+  if (record.alleged_at == null || !Number.isFinite(at) || at < law.effective_at
+    || (law.ended_at != null && at >= law.ended_at)) throw new Error('行為時に有効な法律を確認できません。');
+  return law;
+}
+
 export function recordReview(input) {
   db.prepare(`
     INSERT INTO governance_reviews
       (guild_id, target_type, target_id, panel_id, phase, seat, model, verdict, reasons_json,
-       citations_json, input_hash, output_json, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       citations_json, input_hash, output_json, created_at, target_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     input.guildId, input.targetType, String(input.targetId), input.panelId, input.phase, input.seat,
     input.model, input.verdict, canonicalJson(input.reasons ?? []), canonicalJson(input.citations ?? []),
-    input.inputHash, canonicalJson(input.output), Date.now()
+    input.inputHash, canonicalJson(input.output), Date.now(), input.targetHash ?? null
   );
 }
 
+export const commitReviewedLegislation = db.transaction((proposalId, proof) => {
+  const proposal = getProposal(proposalId);
+  if (!proposal?.body) throw new Error('成立対象の本文がありません。');
+  const hash = sha256(canonicalJson(proposal.body));
+  if (hash !== proof.targetHash) throw new Error('審査対象と成立対象が一致しません。');
+  const previous = proposal.kind === 'amendment'
+    ? db.prepare('SELECT id FROM governance_constitutions WHERE proposal_id = ?').get(proposalId)
+    : db.prepare('SELECT id FROM governance_laws WHERE proposal_id = ?').get(proposalId);
+  if (previous) return { kind: proposal.kind, id: previous.id };
+  const pinned = constitutionForSubject('proposal', proposal);
+  const current = getActiveConstitution(proposal.guild_id);
+  if (current?.rules?.recovery && (proposal.source !== 'constitutional_repair' || proposal.kind !== 'law')) {
+    throw new Error('暫定権限で成立できるのは制度修復法だけです。');
+  }
+  if (!pinned?.policy.autonomous || current.content_hash !== pinned.content_hash || current.rules_hash !== pinned.rules_hash) {
+    const error = new Error('適用法令が審議中に変わりました。最新の法令で再検討します。');
+    error.code = 'LEGAL_STALE';
+    throw error;
+  }
+  const instance = getWorkflowInstance('proposal', proposalId);
+  const key = proposal.kind === 'amendment' ? 'constitutionalAmendment' : 'law';
+  const procedure = pinned.rules.workflows[key];
+  if (procedure.states[instance.current_state]?.handler !== 'law_enactment') throw new Error('法令は現在の段階に成立権限を与えていません。');
+  const check = (record, phase, verdict, handler, requiredKey) => {
+    if (!record || record.targetHash !== hash) throw new Error('同一案への必要な判断記録がありません。');
+    const state = procedure.states[record.state];
+    if (state?.handler !== handler || state.config.institution !== record.institutionId) throw new Error('判断を行う機関の根拠が不正です。');
+    const institution = pinned.rules.institutions[record.institutionId];
+    const rows = db.prepare(`SELECT seat, verdict, target_hash FROM governance_reviews
+      WHERE guild_id = ? AND target_id = ? AND panel_id = ? AND phase = ? AND target_type = ?`)
+      .all(proposal.guild_id, String(proposalId), record.panelId, phase, phase === 'adoption' ? 'proposal' : proposal.kind === 'amendment' ? 'amendment' : 'law');
+    if (!Number.isInteger(institution.required[requiredKey]) || rows.length !== institution.seats || new Set(rows.map((row) => row.seat)).size !== institution.seats
+      || rows.some((row) => row.seat < 1 || row.seat > institution.seats)
+      || rows.some((row) => row.target_hash !== hash)
+      || rows.filter((row) => row.verdict === verdict).length < institution.required[requiredKey]) throw new Error('独立したAI判断の必要票がありません。');
+  };
+  check(proof.adoption, 'adoption', 'approve', 'ai_ratification', 'approve');
+  check(proof.review, 'pre', 'constitutional', 'constitutional_panel', 'constitutional');
+  if (Object.values(procedure.states).some((state) => state.handler === 'public_vote')) {
+    const vote = instance.context.publicVote;
+    const summary = proposalVoteSummary(proposalId);
+    const rule = pinned.rules.votes[key];
+    const early = !rule.humanVeto && rule.earlyClose === 'all_ballots_cast' && summary.electorate > 0
+      && summary.yes + summary.no + summary.abstain === summary.electorate;
+    if (!vote?.announced || !vote.closed || vote.targetHash !== hash
+      || procedure.states[vote.state]?.handler !== 'public_vote'
+      || (Date.now() < vote.deadline && !early)
+      || !closeGovernanceVote({ kind: proposal.kind, scope: proposal.vote_scope, ...summary }, pinned.rules).passed) throw new Error('同一案への人間の投票が成立していません。');
+  }
+  let record;
+  if (proposal.kind === 'amendment') {
+    record = enactConstitution({ guildId: proposal.guild_id, content: proposal.body.content,
+      proposalId, enactedBy: 'ai', targetConstitutionId: proposal.target_id, targetHash: proposal.target_hash });
+  } else {
+    record = enactLaw({ guildId: proposal.guild_id, proposalId,
+      code: `LAW-${proposalId}-R${proposal.revision}`, title: proposal.body.title,
+      text: proposal.body.text, provisions: proposal.body.provisions, constitutionId: pinned.id,
+      supersedesLawId: proposal.target_type === 'law' ? Number(proposal.target_id) : null,
+      targetHash: proposal.target_hash });
+  }
+  writeAudit({ guildId: proposal.guild_id, actorType: 'ai', action: 'legislation.enacted', targetType: proposal.kind,
+    targetId: record.id, detail: { proposalId, targetHash: hash, legalSnapshot: instance.legal_snapshot_hash,
+      adoptionPanelId: proof.adoption.panelId, reviewPanelId: proof.review.panelId } });
+  enqueueAction({ guildId: proposal.guild_id, actionType: 'legislation_notice', targetId: proposalId,
+    payload: { proposalId, enacted: { kind: proposal.kind, id: record.id } }, idempotencyKey: `legislation-enacted:${proposalId}` });
+  return { kind: proposal.kind, id: record.id };
+});
+
 export function createCase(input) {
+  if (input.kind !== 'constitutional' && getActiveConstitution(input.guildId)?.rules?.recovery) {
+    throw new Error('制度修復中は新しい処罰手続を開始できません。');
+  }
   const now = Date.now();
   const result = db.prepare(`
     INSERT INTO governance_cases
@@ -2690,13 +3049,21 @@ export function createCase(input) {
   );
   const created = getCase(Number(result.lastInsertRowid));
   if (created.constitution_id) {
+    const constitution = getActiveConstitution(created.guild_id);
+    const procedure = constitution?.policy.autonomous
+      ? constitution.rules.workflows[created.kind === 'constitutional' ? 'constitutionalCase' : 'criminalCase'] : null;
+    const initial = procedure?.initial ?? created.status;
+    if (procedure) {
+      db.prepare('UPDATE governance_cases SET status = ?, workflow_state = ? WHERE id = ?')
+        .run(procedure.states[initial].config.phase ?? initial, initial, created.id);
+    }
     ensureWorkflowInstance({
       guildId: created.guild_id,
       constitutionId: created.constitution_id,
       workflowKey: created.kind === 'constitutional' ? 'constitutionalCase' : 'criminalCase',
       subjectType: 'case',
       subjectId: created.id,
-      currentState: created.status,
+      currentState: initial,
       stateEnteredAt: created.created_at,
       wakeAt: created.defense_until
     });
@@ -2710,7 +3077,7 @@ export function createCase(input) {
     targetId: created.id,
     detail: { kind: created.kind, accusedId: created.accused_id }
   });
-  return created;
+  return getCase(created.id);
 }
 
 export function getCase(id) {
@@ -2769,9 +3136,29 @@ export const updateCase = db.transaction((id, patch) => {
     'status', 'public_thread_id', 'private_thread_id', 'defense_until', 'panel_id',
     'verdict_json', 'finalized_at', 'retry_after', 'failure_count', 'last_error', 'alleged_at',
     'constitution_id', 'procedure_version', 'decision_due_at', 'response_completed_at',
-    'police_event_key', 'review_count', 'redefense_count'
+    'police_event_key', 'review_count', 'redefense_count', 'workflow_state'
   ]);
   const normalized = { ...patch };
+  const current = getCase(id);
+  const constitution = current ? constitutionForSubject('case', current) : null;
+  if ('status' in normalized && constitution?.policy.autonomous && normalized.status !== current.status) {
+    const instance = getWorkflowInstance('case', id);
+    const procedure = constitution.rules.workflows[instance.workflow_key];
+    const state = procedure.states[instance.current_state];
+    const targetName = state?.on[normalized.status]
+      ?? procedure.config.interruptions?.[normalized.status]
+      ?? (state?.handler === 'terminal' ? procedure.config.reopen?.[normalized.status] : null);
+    if (!targetName || !procedure.states[targetName]) throw new Error(`法律は ${instance.current_state} で ${normalized.status} の遷移を認めていません。`);
+    const target = procedure.states[targetName];
+    normalized.workflow_state = targetName;
+    if (target.handler !== 'terminal') {
+      normalized.status = target.config.phase ?? targetName;
+      normalized.finalized_at = null;
+    } else {
+      normalized.finalized_at ??= Date.now();
+      if (['completed', 'expired', 'exhausted', 'rejected'].includes(normalized.status)) normalized.status = target.config.phase ?? 'final';
+    }
+  }
   if ('verdict' in normalized) {
     normalized.verdict_json = canonicalJson(normalized.verdict);
     delete normalized.verdict;
@@ -2783,12 +3170,13 @@ export const updateCase = db.transaction((id, patch) => {
     .run({ id: Number(id), updated_at: Date.now(), ...Object.fromEntries(entries) });
   const updated = getCase(id);
   if ('status' in normalized && getWorkflowInstance('case', id)) {
-    const completed = workflowStateIsTerminal('case', id, updated.status)
+    const targetState = normalized.workflow_state ?? updated.workflow_state ?? updated.status;
+    const completed = workflowStateIsTerminal('case', id, targetState)
       ?? ['final', 'overturned', 'acquitted', 'dismissed', 'constitutional_uncertain', 'unenforceable'].includes(updated.status);
     transitionWorkflowInstance({
       subjectType: 'case',
       subjectId: id,
-      toState: updated.status,
+      toState: targetState,
       eventType: patch.workflowEventType ?? 'case.state_changed',
       wakeAt: updated.defense_until ?? updated.decision_due_at,
       payload: patch.workflowPayload ?? {},
@@ -2796,17 +3184,18 @@ export const updateCase = db.transaction((id, patch) => {
       completed
     });
   }
-  return updated;
+  return getCase(id);
 });
 
 export function addCaseEvidence(input) {
   const result = db.prepare(`
     INSERT INTO governance_case_evidence
-      (case_id, submitted_by, message_id, channel_id, author_id, content, content_hash, occurred_at, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (case_id, submitted_by, message_id, channel_id, author_id, content, content_hash, occurred_at, created_at, conversation_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     input.caseId, input.submittedBy, input.messageId ?? null, input.channelId ?? null,
-    input.authorId ?? null, input.content, sha256(input.content), input.occurredAt ?? null, Date.now()
+    input.authorId ?? null, input.content, sha256(input.content), input.occurredAt ?? null, Date.now(),
+    input.conversation ? JSON.stringify(input.conversation) : null
   );
   return Number(result.lastInsertRowid);
 }
@@ -2894,20 +3283,84 @@ export function listCaseDecisions(caseId, phase = null) {
 
 export const setCaseApproval = db.transaction((caseId, userId, decision, reason = '') => {
   if (!['approve', 'reject'].includes(decision)) throw new Error('承認値が不正です。');
+  const caseRecord = getCase(caseId);
+  const legal = caseRecord ? constitutionForSubject('case', caseRecord) : null;
+  const approval = getWorkflowInstance('case', caseId)?.context.approval;
+  if (legal?.policy.autonomous && (caseRecord.workflow_handler !== 'human_approval' || !approval
+    || approval.deadline <= Date.now() || !approval.members.includes(String(userId))
+    || approval.sanctionHash !== sanctionApprovalHash(getCaseSanction(caseId)))) throw new Error('法令で定める承認の対象・資格・期限を満たしません。');
   const previous = db.prepare(`
     SELECT * FROM governance_case_approvals WHERE case_id = ? AND user_id = ?
   `).get(Number(caseId), String(userId));
   db.prepare(`
-    INSERT INTO governance_case_approvals (case_id, user_id, decision, reason, created_at)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(case_id, user_id) DO UPDATE SET decision = excluded.decision, reason = excluded.reason, created_at = excluded.created_at
-  `).run(caseId, userId, decision, reason, Date.now());
+    INSERT INTO governance_case_approvals (case_id, user_id, decision, reason, created_at, target_hash)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(case_id, user_id) DO UPDATE SET decision = excluded.decision, reason = excluded.reason, created_at = excluded.created_at, target_hash = excluded.target_hash
+  `).run(caseId, userId, decision, reason, Date.now(), legal?.policy.autonomous ? approval.sanctionHash : null);
   return {
     oldDecision: previous?.decision ?? null,
     approval: db.prepare(`
       SELECT * FROM governance_case_approvals WHERE case_id = ? AND user_id = ?
     `).get(Number(caseId), String(userId))
   };
+});
+
+export function sanctionApprovalHash(sanction) {
+  return sha256(canonicalJson({ id: sanction.id, type: sanction.type, duration: sanction.duration_seconds,
+    definition: sanction.definition_code, profile: sanction.profile, required: sanction.required_approvals,
+    judgment: getCase(sanction.case_id)?.panel_id ?? null }));
+}
+
+export function legalApprovalResult(caseId, now = Date.now()) {
+  const sanction = getCaseSanction(caseId);
+  const approval = getWorkflowInstance('case', caseId)?.context.approval;
+  if (!sanction || !approval || approval.sanctionHash !== sanctionApprovalHash(sanction)) return { passed: false, rejected: false, approvals: 0 };
+  const ballots = listCaseApprovals(caseId).filter((row) => row.target_hash === approval.sanctionHash && row.created_at >= approval.openedAt && row.created_at <= approval.deadline && approval.members.includes(row.user_id));
+  const approvals = ballots.filter((row) => row.decision === 'approve').length;
+  const veto = humanVetoResult('case', caseId);
+  const rejected = veto.vetoed || (approval.rejectVotes > 0 && ballots.filter((row) => row.decision === 'reject').length >= approval.rejectVotes);
+  const vetoWindowOpen = Boolean(approval.veto && now < approval.deadline);
+  return { passed: !rejected && !vetoWindowOpen && approvals >= sanction.required_approvals,
+    rejected, approvals, vetoCount: veto.count, vetoWindowOpen };
+}
+
+function humanVetoRound(subjectType, subjectId) {
+  if (!['proposal', 'case'].includes(subjectType)) throw new Error('拒否権の対象が不正です。');
+  const record = subjectType === 'proposal' ? getProposal(subjectId) : getCase(subjectId);
+  const instance = getWorkflowInstance(subjectType, subjectId);
+  const period = subjectType === 'proposal' ? instance?.context.publicVote : instance?.context.approval;
+  const targetHash = subjectType === 'proposal' ? sha256(canonicalJson(record?.body))
+    : getCaseSanction(subjectId) ? sanctionApprovalHash(getCaseSanction(subjectId)) : null;
+  const expectedHash = subjectType === 'proposal' ? period?.targetHash : period?.sanctionHash;
+  const valid = Boolean(record && period?.veto && targetHash === expectedHash);
+  return { record, period, targetHash, valid,
+    key: sha256(canonicalJson({ subjectType, subjectId, targetHash, openedAt: period?.openedAt ?? null })) };
+}
+
+export function humanVetoResult(subjectType, subjectId) {
+  const round = humanVetoRound(subjectType, subjectId);
+  if (!round.valid) return { count: 0, vetoed: false };
+  const rows = db.prepare(`SELECT user_id, created_at FROM governance_human_vetoes
+    WHERE subject_type = ? AND subject_id = ? AND round_key = ? AND target_hash = ?`)
+    .all(subjectType, subjectId, round.key, round.targetHash);
+  const count = rows.filter((row) => round.period.veto.members.includes(row.user_id)
+    && row.created_at >= round.period.openedAt && row.created_at < round.period.deadline).length;
+  return { count, vetoed: count >= round.period.veto.required };
+}
+
+export const castHumanVeto = db.transaction((subjectType, subjectId, userId) => {
+  const round = humanVetoRound(subjectType, subjectId);
+  const { record, period } = round;
+  const handler = subjectType === 'proposal' ? 'public_vote' : 'human_approval';
+  if (!round.valid || record.workflow_handler !== handler || period.deadline <= Date.now()
+    || !period.veto.members.includes(String(userId)) || (subjectType === 'proposal' && !period.announced)) throw new Error('拒否権の対象・資格・行使期間を満たしません。');
+  const inserted = db.prepare(`INSERT OR IGNORE INTO governance_human_vetoes
+    (subject_type, subject_id, round_key, target_hash, user_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(subjectType, subjectId, round.key, round.targetHash, String(userId), Date.now()).changes;
+  if (inserted) writeAudit({ guildId: record.guild_id, actorType: 'member', actorId: String(userId),
+    action: 'human.veto', targetType: subjectType, targetId: subjectId,
+    detail: { round: round.key, targetHash: round.targetHash, required: period.veto.required } });
+  return humanVetoResult(subjectType, subjectId);
 });
 
 export function listCaseApprovals(caseId) {
@@ -3398,8 +3851,9 @@ export function enqueueAction({ guildId, actionType, targetId = null, payload, i
 }
 
 export function pendingActions(limit = 25) {
-  return db.prepare("SELECT * FROM governance_outbox WHERE status IN ('pending', 'error') AND attempts < 5 ORDER BY id LIMIT ?")
-    .all(limit).map((row) => ({ ...row, payload: parseJson(row.payload_json, {}) }));
+  return db.prepare(`SELECT * FROM governance_outbox WHERE status IN ('pending', 'error')
+    AND (attempts < 5 OR action_type = 'sanction_reverse') AND (retry_after IS NULL OR retry_after <= ?)
+    ORDER BY id LIMIT ?`).all(Date.now(), limit).map((row) => ({ ...row, payload: parseJson(row.payload_json, {}) }));
 }
 
 export function listActionFailures(guildId, limit = 10) {
@@ -3413,13 +3867,15 @@ export function listActionFailures(guildId, limit = 10) {
 export function retryFailedActions(guildId) {
   return db.prepare(`
     UPDATE governance_outbox
-    SET status = 'pending', attempts = 0, last_error = NULL
+    SET status = 'pending', attempts = 0, last_error = NULL, retry_after = NULL
     WHERE guild_id = ? AND status = 'error'
   `).run(String(guildId)).changes;
 }
 
 export function markActionRunning(id) {
-  db.prepare("UPDATE governance_outbox SET status = 'running', attempts = attempts + 1 WHERE id = ?").run(id);
+  return db.prepare(`UPDATE governance_outbox SET status = 'running', attempts = attempts + 1 WHERE id = ?
+    AND status IN ('pending', 'error') AND (attempts < 5 OR action_type = 'sanction_reverse')
+    AND (retry_after IS NULL OR retry_after <= ?)`).run(id, Date.now()).changes === 1;
 }
 
 export function completeAction(id) {
@@ -3428,8 +3884,11 @@ export function completeAction(id) {
 }
 
 export function failAction(id, error) {
-  db.prepare("UPDATE governance_outbox SET status = 'error', last_error = ? WHERE id = ?")
-    .run(String(error).slice(0, 500), id);
+  const action = db.prepare('SELECT action_type, attempts FROM governance_outbox WHERE id = ?').get(id);
+  const retryAfter = action?.action_type === 'sanction_reverse'
+    ? Date.now() + Math.min(3600000, 60000 * 2 ** Math.min(action.attempts - 1, 6)) : null;
+  db.prepare("UPDATE governance_outbox SET status = 'error', last_error = ?, retry_after = ? WHERE id = ?")
+    .run(String(error).slice(0, 500), retryAfter, id);
 }
 
 export function startAiCall(guildId, purpose, model, inputHash) {

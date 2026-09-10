@@ -36,7 +36,7 @@ function channelName(ctx, channelId) {
   if (cached?.name) return cached.name;
 
   try {
-    const row = archiveDb.prepare('SELECT name FROM channels WHERE channel_id = ?').get(channelId);
+    const row = archiveDb.prepare('SELECT name FROM channels WHERE guild_id = ? AND channel_id = ?').get(ctx.guild.id, channelId);
     if (row?.name) return row.name;
   } catch {
     // アーカイブが無い構成でも動くようにする
@@ -305,6 +305,8 @@ function listChannels(ctx, args) {
 /** 実行者に見えないチャンネルは、ツール経由でも絶対に見せない。 */
 function assertReadable(ctx, channel) {
   if (!channel) throw new Error('そのチャンネルは見つかりませんでした。');
+  const owner = channel.guildId ?? channel.guild?.id;
+  if (owner && String(owner) !== String(ctx.guild.id)) throw new Error('別サーバーのチャンネルは読めません。');
   if (!canRead(channel, ctx.member)) {
     throw new Error('そのチャンネルは呼び出した人に閲覧権限がないので読めません。');
   }
@@ -893,8 +895,8 @@ function canSeeHit(ctx, channelId) {
 
   try {
     const row = archiveDb
-      .prepare('SELECT parent_id, is_thread, is_private FROM channels WHERE channel_id = ?')
-      .get(channelId);
+      .prepare('SELECT parent_id, is_thread, is_private FROM channels WHERE guild_id = ? AND channel_id = ?')
+      .get(ctx.guild.id, channelId);
 
     if (!row?.is_thread || row.is_private || !row.parent_id) return false;
     const parent = ctx.guild.channels.cache.get(row.parent_id);
@@ -1217,8 +1219,8 @@ function locateMessage(ctx, messageId) {
 
   try {
     const row = archiveDb
-      .prepare('SELECT channel_id FROM messages WHERE message_id = ?')
-      .get(String(messageId));
+      .prepare('SELECT channel_id FROM messages WHERE guild_id = ? AND message_id = ?')
+      .get(ctx.guild.id, String(messageId));
 
     if (!row?.channel_id) return null;
     return isChannelAllowed(row.channel_id, ctx.channelScope) ? row.channel_id : null;
@@ -1543,7 +1545,7 @@ async function readReplies(ctx, anchor, args) {
 
   let target;
   try {
-    target = archiveDb.prepare('SELECT * FROM messages WHERE message_id = ?').get(anchor.messageId);
+    target = archiveDb.prepare('SELECT * FROM messages WHERE guild_id = ? AND message_id = ? AND deleted = 0').get(ctx.guild.id, anchor.messageId);
   } catch {
     return '返信の辿り方はローカルの取り込みが要る。管理者が `/index build` を実行するまでは direction:around で周辺を読んでください。';
   }
@@ -1558,33 +1560,34 @@ async function readReplies(ctx, anchor, args) {
 
   const byId = new Map();
   const add = (row) => {
-    if (row && isChannelAllowed(row.channel_id, ctx.channelScope)) byId.set(row.message_id, row);
+    if (!row || row.guild_id !== ctx.guild.id || row.deleted || !isChannelAllowed(row.channel_id, ctx.channelScope)) return false;
+    byId.set(row.message_id, row);
+    return true;
   };
 
   add(target);
 
   // 親を遡る (8ホップまで)
-  const parentStmt = archiveDb.prepare('SELECT * FROM messages WHERE message_id = ?');
+  const parentStmt = archiveDb.prepare('SELECT * FROM messages WHERE guild_id = ? AND message_id = ? AND deleted = 0');
   let cursor = target.reply_to;
   for (let hop = 0; hop < 8 && cursor; hop += 1) {
-    const parent = parentStmt.get(cursor);
+    const parent = parentStmt.get(ctx.guild.id, cursor);
     if (!parent || byId.has(parent.message_id)) break;
-    add(parent);
+    if (!add(parent)) break;
     cursor = parent.reply_to;
   }
 
   // 子を深さ3まで
   const childStmt = archiveDb.prepare(
-    'SELECT * FROM messages WHERE reply_to = ? AND deleted = 0 ORDER BY created_at LIMIT ?'
+    'SELECT * FROM messages WHERE guild_id = ? AND reply_to = ? AND deleted = 0 ORDER BY created_at LIMIT ?'
   );
   let frontier = [target.message_id];
   for (let depth = 0; depth < 3 && frontier.length > 0 && byId.size < limit; depth += 1) {
     const next = [];
     for (const id of frontier) {
-      for (const child of childStmt.all(id, limit)) {
+      for (const child of childStmt.all(ctx.guild.id, id, limit)) {
         if (byId.has(child.message_id)) continue;
-        add(child);
-        next.push(child.message_id);
+        if (add(child)) next.push(child.message_id);
         if (byId.size >= limit) break;
       }
       if (byId.size >= limit) break;

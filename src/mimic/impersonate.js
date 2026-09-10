@@ -54,7 +54,7 @@ export async function canUseToken(userId, engine = 'evex') {
 }
 
 /** 独自トークン形式のプロンプト。 */
-async function tokenPrompt(userId, { topic, engine }) {
+async function tokenPrompt(userId, { topic, engine, guildId, channelScope }) {
   const scheme = await roleScheme(engine);
   const token = tokenFor(userId);
   const other = scheme?.overflow ?? '<|other|>';
@@ -66,7 +66,7 @@ async function tokenPrompt(userId, { topic, engine }) {
   }
 
   // 48人の外。実発言を例に出して、同じ調子の続きを書かせる
-  const examples = exampleTurns(userId);
+  const examples = exampleTurns(userId, { guildId, channelScope });
   const turns = [];
   for (const example of examples) {
     if (example.prompt) turns.push({ token: other, reply: false, content: messageText(example.prompt) });
@@ -82,7 +82,7 @@ async function tokenPrompt(userId, { topic, engine }) {
 }
 
 /** 素の日本語形式 (evex-ft-1) のプロンプト。 */
-function plainPrompt(userId, { topic, channelId, askerId }) {
+function plainPrompt(userId, { topic, channelId, askerId, guildId, channelScope }) {
   const label = labelFor(userId);
   // 話しかける側も、ラベルを持っていれば本人の名前で置く。学習データは
   // 名前持ちと役が混在した会話なので、この形はそのまま分布の中にある
@@ -103,7 +103,7 @@ function plainPrompt(userId, { topic, channelId, askerId }) {
   // 本人には役を割り当てる — 学習していない名前を置くと、モデルが一度も見ていない
   // ラベルになって崩れる
   const me = assignPlainRoles(['target', 'asker']).get('target');
-  const examples = exampleTurns(userId);
+  const examples = exampleTurns(userId, { guildId, channelScope });
   const turns = [];
   for (const example of examples) {
     if (example.prompt) turns.push({ role: asker, content: plainText(example.prompt) });
@@ -125,15 +125,15 @@ function plainPrompt(userId, { topic, channelId, askerId }) {
  * 'examples' (実発言を例に真似) で、どちらで作ったかを表示に出す —
  * 深さが違うので、見た人が期待を合わせられる方がいい。
  */
-export async function impersonate(userId, { topic = null, channelId = null, askerId = null, engine = 'evex' } = {}) {
+export async function impersonate(userId, { guildId, channelScope, topic = null, channelId = null, askerId = null, engine = 'evex' } = {}) {
   if (hasOptedOut(userId)) {
     return { text: null, how: 'opted-out' };
   }
 
   const format = await mimicFormat(engine);
   const built = format === 'plain'
-    ? plainPrompt(userId, { topic, channelId, askerId })
-    : await tokenPrompt(userId, { topic, engine });
+    ? plainPrompt(userId, { topic, channelId, askerId, guildId, channelScope })
+    : await tokenPrompt(userId, { topic, engine, guildId, channelScope });
 
   if (built.how === 'empty') return { text: null, how: 'empty' };
 

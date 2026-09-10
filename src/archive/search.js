@@ -633,8 +633,9 @@ export function searchSummary(options) {
 /**
  * ヒットしたメッセージの前後を取り出す。Discord の検索は1件しか見せてくれない。
  */
-export function getContext(messageId, { before = 3, after = 3, channelScope } = {}) {
-  const target = db.prepare('SELECT * FROM messages WHERE message_id = ?').get(messageId);
+export function getContext(messageId, { guildId, before = 3, after = 3, channelScope } = {}) {
+  if (!guildId) throw new Error('Message context requires a guildId');
+  const target = db.prepare('SELECT * FROM messages WHERE guild_id = ? AND message_id = ? AND deleted = 0').get(guildId, messageId);
   if (!target) return null;
 
   if (channelScope && !isChannelAllowed(target.channel_id, channelScope)) return null;

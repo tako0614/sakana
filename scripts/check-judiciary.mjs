@@ -1,8 +1,9 @@
+import { tmpdir } from 'node:os';
 import assert from 'node:assert/strict';
 import { rmSync } from 'node:fs';
 
-const mainPath = `/tmp/sakana-judiciary-${process.pid}.sqlite`;
-const archivePath = `/tmp/sakana-judiciary-archive-${process.pid}.sqlite`;
+const mainPath = `${tmpdir()}/sakana-judiciary-${process.pid}.sqlite`;
+const archivePath = `${tmpdir()}/sakana-judiciary-archive-${process.pid}.sqlite`;
 for (const path of [mainPath, archivePath]) rmSync(path, { force: true });
 process.env.DATABASE_PATH = mainPath;
 process.env.ARCHIVE_DB_PATH = archivePath;
@@ -11,13 +12,14 @@ process.env.GOVERNANCE_API_KEY = 'check';
 const { loadBootstrapDocuments } = await import('../src/governance/config.js');
 const db = await import('../src/governance/db.js');
 const rules = await import('../src/governance/rules.js');
+const { normalizeActivityContent, sha256 } = await import('../src/governance/policy.js');
 const restrictions = await import('../src/governance/restrictions.js');
 const {
-  advanceCase, fileCriminalCase, requestTrial, withdrawContest, processGovernanceOutbox
+  advanceCase, approveCase, fileCriminalCase, requestTrial, withdrawContest, processGovernanceOutbox
 } = await import('../src/governance/service.js');
 
-const { constitution, policy } = loadBootstrapDocuments({ serverName: 'Judiciary Test' });
-const compiled = rules.compileConstitution({ content: constitution });
+const { constitution, policy, laws } = loadBootstrapDocuments({ serverName: 'Judiciary Test' });
+const compiled = rules.compileConstitution({ content: constitution, laws });
 
 // --- 実行規則の安全弁 ------------------------------------------------------
 assert.equal(compiled.rules.panels.police.seats, 1, '警察は速さのため1席');
@@ -28,13 +30,15 @@ assert.deepEqual(compiled.rules.sanctions.police.courtFirst, ['kick', 'ban'],
 assert.equal(compiled.rules.workflows.criminalCase.initial, 'police_review');
 assert.deepEqual(
   Object.keys(compiled.rules.workflows.criminalCase.states.contest_window.on).sort(),
-  ['contested', 'expired'],
+  ['filing', 'final'],
   '不服申立ての窓からは裁判所へ行くか確定するかしかない'
 );
 
 const punitive = structuredClone(compiled.rules);
 punitive.sanctions.detention.maximum = '48h';
-assert.throws(() => rules.validateGovernanceRules(punitive), /24時間を超えられません/);
+const invalidLaws = structuredClone(laws);
+invalidLaws[0].provisions.governance.find((entry) => entry.kind === 'regulation' && entry.key === 'sanctions').value.detention.maximum = '48h';
+assert.throws(() => rules.compileConstitution({ content: constitution, laws: invalidLaws }), /24時間を超えられません/);
 
 // --- テスト用サーバー -------------------------------------------------------
 const GUILD_ID = 'g-judiciary';
@@ -45,6 +49,7 @@ db.bootstrapGovernanceGuild({
   enforcementMode: 'live',
   constitution,
   policy,
+  laws,
   appealRoleId: 'appeal-role',
   judiciaryRoleId: 'report-role',
   categoryId: 'category',
@@ -79,6 +84,13 @@ const law = db.enactLaw({
 
 const posts = [];
 const threads = new Map();
+const publicMessages = new Map();
+const publicChannel = {
+  id: 'public', name: 'public', type: 0,
+  isTextBased: () => true, isThread: () => false,
+  permissionsFor: () => ({ has: () => true }),
+  messages: { fetch: async (id) => publicMessages.get(id) ?? null }
+};
 function fakeThread(id) {
   const thread = {
     id, isThread: () => true, locked: false, archived: false, appliedTags: [],
@@ -111,11 +123,12 @@ const guild = {
         kickable: true,
         bannable: true
       }
-      : new Map())
+      : new Map(['reviewer-1','reviewer-2'].map((id)=>[id,{id,user:{bot:false},roles:{cache:new Map([['trusted',true]])}}])))
   },
   channels: {
     cache: new Map(),
     fetch: async (id) => {
+      if (id === 'public') return publicChannel;
       if (id === 'procedure') {
         return {
           id, isTextBased: () => true,
@@ -264,6 +277,12 @@ charge = { type: 'ban' };
 const maximumRedefense = compiled.policy.investigation.maximumRedefense;
 assert.equal(maximumRedefense, 1);
 for (const [index, content] of ['連投A', '連投B'].entries()) {
+  const createdAt = Date.now() - 120_000 + index;
+  publicMessages.set(`found-${index}`, {
+    id: `found-${index}`, guildId: GUILD_ID, channelId: 'public',
+    channel: publicChannel, author: { id: 'accused2', bot: false },
+    content, createdTimestamp: createdAt, attachments: new Map()
+  });
   db.recordActivity({
     messageId: `found-${index}`,
     guildId: GUILD_ID,
@@ -271,9 +290,9 @@ for (const [index, content] of ['連投A', '連投B'].entries()) {
     parentId: null,
     userId: 'accused2',
     activityDate: '2026-08-16',
-    contentHash: `found-hash-${index}`,
+    contentHash: sha256(normalizeActivityContent(content)),
     content,
-    createdAt: Date.now() - 120_000 + index
+    createdAt
   });
 }
 const evidenceBefore = db.listCaseEvidence(serious.id).length;
@@ -294,7 +313,8 @@ assert.ok(db.listAudit(GUILD_ID, 50).some((row) => row.action === 'case.evidence
 discoverPlan = { query: '連投', ids: ['found-1'] };
 const evidenceAtLimit = db.listCaseEvidence(serious.id).length;
 db.updateCase(serious.id, { status: 'deliberation' });
-await advanceCase(guild, db.getCase(serious.id));
+await assert.rejects(() => advanceCase(guild, db.getCase(serious.id)), /AI席がそろいません/);
+assert.equal(db.getCase(serious.id).status, 'deliberation', '不正な席の出力を有罪・無罪に読み替えない');
 const decided = db.getCase(serious.id);
 assert.equal(decided.redefense_count, 1, 'やり直しは憲法の上限を超えない');
 assert.equal(db.listCaseEvidence(serious.id).length, evidenceAtLimit,
@@ -302,4 +322,128 @@ assert.equal(db.listCaseEvidence(serious.id).length, evidenceAtLimit,
 assert.notEqual(decided.status, 'defense', '上限後は示された証拠だけで判断へ進む');
 discoverPlan = null;
 
-console.log('check-judiciary: ok');
+// Human execution approval is part of the law-defined procedure.
+charge = {type:'ban'};
+await advanceCase(guild, db.getCase(serious.id));
+let sanction = db.getCaseSanction(serious.id);
+if (db.getCase(serious.id).workflow_handler === 'appeal_window') {
+  db.updateSanction(sanction.id,{appeal_deadline:Date.now()-1});
+  await advanceCase(guild,db.getCase(serious.id));
+}
+assert.equal(db.getCase(serious.id).workflow_handler,'human_approval');
+assert.equal(db.getCaseSanction(serious.id).required_approvals,2);
+assert.throws(()=>db.setCaseApproval(serious.id,'reporter','approve'),/資格/,'当事者は承認者になれない');
+const reviewInteraction=(id)=>({guild,guildId:GUILD_ID,user:{id},member:{id,user:{bot:false},roles:{cache:new Map([['trusted',true]])}}});
+await approveCase(reviewInteraction('reviewer-1'),serious.id,'approve');
+assert.equal(db.getCase(serious.id).workflow_handler,'human_approval','1人では執行しない');
+await approveCase(reviewInteraction('reviewer-2'),serious.id,'reject');
+assert.equal(db.getCaseSanction(serious.id).status,'unavailable','法定の拒否票で執行を取りやめる');
+assert.equal(db.getCase(serious.id).workflow_handler,'terminal');
+assert.throws(()=>db.setCaseApproval(serious.id,'reviewer-2','approve'),/期限/,'終了後に承認へ変えて執行できない');
+// Enacted law changes actual judicial seats, defense duration and state names.
+const organization = db.listLaws(GUILD_ID).find((entry) => entry.code === 'GOVERNANCE-ORGANIZATION');
+const revised = structuredClone(organization.provisions);
+const courtDefinition = revised.governance.find((entry) => entry.kind === 'institution' && entry.key === 'courtInstitution');
+courtDefinition.value.seats = 5;
+courtDefinition.value.required.responsible = 3;
+const caseProcedure = revised.governance.find((entry) => entry.key === 'criminalCaseProcedure').value;
+caseProcedure.states.answer = {...caseProcedure.states.defense, duration:'2h'};
+delete caseProcedure.states.defense;
+for (const state of Object.values(caseProcedure.states)) {
+  for (const [outcome,target] of Object.entries(state.on)) if (target === 'defense') state.on[outcome] = 'answer';
+}
+const changedLawProposal = db.createProposal({guildId:GUILD_ID,constitutionId:activeConstitution.id,source:'test',title:'裁判所の構成変更',summary:'test',status:'agenda'});
+db.enactLaw({guildId:GUILD_ID,proposalId:changedLawProposal.id,constitutionId:activeConstitution.id,code:'ORGANIZATION-2',
+  title:organization.title,text:organization.text,provisions:revised,supersedesLawId:organization.id,targetHash:organization.content_hash});
+assert.equal(db.constitutionForSubject('case',db.getCase(serious.id)).rules.panels.court.seats,3,'旧事件の席数は改正後も固定');
+db.updateGovernanceGuild(GUILD_ID,{enforcement_mode:'shadow'});
+async function readyApproval(accused) {
+  const record = await fileCriminalCase(guild,{id:'reporter'},{accused:{id:accused},lawId:law.id,offenseCode:'O2',summary:accused,
+    evidences:[{...evidence,messageId:accused,authorId:accused}],attemptReserved:true});
+  assert.equal(db.getWorkflowInstance('case',record.id).current_state,'answer');
+  assert.ok(record.defense_until-Date.now()<=2*3600000 && record.defense_until-Date.now()>2*3600000-10000,'法律の答弁期間を使う');
+  db.updateCase(record.id,{status:'deliberation'});
+  await advanceCase(guild,db.getCase(record.id));
+  assert.equal(db.listCaseDecisions(record.id,'trial').length,5,'改正法の5席で実際に審理する');
+  const sanction = db.getCaseSanction(record.id);
+  if (db.getCase(record.id).workflow_handler === 'appeal_window') {
+    db.updateSanction(sanction.id,{appeal_deadline:Date.now()-1});
+    await advanceCase(guild,db.getCase(record.id));
+  }
+  assert.equal(db.getCase(record.id).workflow_handler,'human_approval');
+  return db.getCase(record.id);
+}
+const approvedCase = await readyApproval('approved-person');
+await approveCase(reviewInteraction('reviewer-1'),approvedCase.id,'approve');
+await approveCase(reviewInteraction('reviewer-2'),approvedCase.id,'approve');
+assert.equal(db.getCase(approvedCase.id).workflow_handler,'sanction_execution');
+await processGovernanceOutbox(guild.client);
+assert.equal(db.getCaseSanction(approvedCase.id).status,'simulated','必要な人間の承認を得た後にだけ執行する');
+const expiredCase = await readyApproval('expired-person');
+const approvalDeadline=db.getWorkflowInstance('case',expiredCase.id).context.approval.deadline;
+await advanceCase(guild,expiredCase,approvalDeadline+1);
+assert.equal(db.getCaseSanction(expiredCase.id).status,'unavailable','承認なしの期限満了では執行しない');
+assert.equal(db.getCase(expiredCase.id).workflow_handler,'terminal');
+// Approval and veto powers can belong to separate, law-selected humans.
+const { validateHumanAuthority, selectHumanMembers } = await import('../src/governance/human-authority.js');
+assert.throws(() => validateHumanAuthority({scope:'designated'}), /指定/);
+assert.throws(() => validateHumanAuthority({scope:'administrators',users:['11111111111111111']}), /Discord ID/);
+const humanMembers = new Map([
+  ['admin-one',{id:'admin-one',user:{bot:false},roles:{cache:new Map()},permissions:{has:()=>true}}],
+  ['admin-two',{id:'admin-two',user:{bot:false},roles:{cache:new Map()},permissions:{has:()=>true}}],
+  ['11111111111111111',{id:'11111111111111111',user:{bot:false},roles:{cache:new Map()},permissions:{has:()=>false}}],
+  ['22222222222222222',{id:'22222222222222222',user:{bot:false},roles:{cache:new Map([['33333333333333333',true]])},permissions:{has:()=>false}}],
+  ['bot-admin',{id:'bot-admin',user:{bot:true},roles:{cache:new Map()},permissions:{has:()=>true}}]
+]);
+assert.deepEqual(selectHumanMembers(humanMembers,{scope:'operators'},{guild,operators:['admin-one']}),['admin-one']);
+const originalFetch = guild.members.fetch;
+guild.members.fetch = async (id) => typeof id === 'string' ? originalFetch(id) : humanMembers;
+const priorOrganization = db.listLaws(GUILD_ID).find((entry)=>entry.code==='ORGANIZATION-2');
+const humanLaw = structuredClone(priorOrganization.provisions);
+const humanProcedure = humanLaw.governance.find((entry)=>entry.key==='criminalCaseProcedure').value;
+Object.assign(humanProcedure.states.approval.config,{scope:'administrators',rejectVotes:0,
+  veto:{scope:'designated',users:['11111111111111111'],roles:['33333333333333333'],required:2}});
+const humanProposal = db.createProposal({guildId:GUILD_ID,constitutionId:activeConstitution.id,source:'test',title:'人間の権限',summary:'test',status:'agenda'});
+db.enactLaw({guildId:GUILD_ID,proposalId:humanProposal.id,constitutionId:activeConstitution.id,code:'ORGANIZATION-3',
+ title:priorOrganization.title,text:priorOrganization.text,provisions:humanLaw,supersedesLawId:priorOrganization.id,targetHash:priorOrganization.content_hash});
+const vetoCase=await readyApproval('veto-person');
+let humanPeriod=db.getWorkflowInstance('case',vetoCase.id).context.approval;
+assert.deepEqual(humanPeriod.members,['admin-one','admin-two']);
+assert.deepEqual(humanPeriod.veto.members,['11111111111111111','22222222222222222']);
+assert.throws(()=>db.setCaseApproval(vetoCase.id,'11111111111111111','approve'),/資格/,'拒否権だけの人は承認者にならない');
+assert.throws(()=>db.castHumanVeto('case',vetoCase.id,'admin-one'),/資格/,'管理者でも拒否権の指定がなければ行使できない');
+await approveCase(reviewInteraction('admin-one'),vetoCase.id,'approve');
+await approveCase(reviewInteraction('admin-two'),vetoCase.id,'approve');
+assert.equal(db.getCase(vetoCase.id).workflow_handler,'human_approval','承認が集まっても拒否期間を飛ばさない');
+humanMembers.get('22222222222222222').roles.cache.clear();
+assert.equal(db.castHumanVeto('case',vetoCase.id,'11111111111111111').count,1);
+assert.equal(db.castHumanVeto('case',vetoCase.id,'11111111111111111').count,1,'同じ人の拒否を二重計上しない');
+const { exerciseHumanVeto } = await import('../src/governance/service.js');
+await exerciseHumanVeto(reviewInteraction('22222222222222222'),'case',vetoCase.id);
+assert.equal(db.getCaseSanction(vetoCase.id).status,'unavailable','開始時に保存した拒否権の必要人数で執行を止める');
+assert.throws(()=>db.castHumanVeto('case',vetoCase.id,'11111111111111111'),/期間/);
+const afterVetoWindow=await readyApproval('veto-window-person');
+await approveCase(reviewInteraction('admin-one'),afterVetoWindow.id,'approve');
+await approveCase(reviewInteraction('admin-two'),afterVetoWindow.id,'approve');
+humanPeriod=db.getWorkflowInstance('case',afterVetoWindow.id).context.approval;
+const realNow=Date.now;
+Date.now=()=>humanPeriod.deadline+1;
+try {
+  await advanceCase(guild,db.getCase(afterVetoWindow.id));
+  await processGovernanceOutbox(guild.client);
+  assert.equal(db.getCaseSanction(afterVetoWindow.id).status,'simulated','拒否期間満了後、承認がそろった処分を執行する');
+} finally { Date.now=realNow; }
+// Zero required approvals must not remove an independently granted veto.
+const vetoOrganization=db.listLaws(GUILD_ID).find((entry)=>entry.code==='ORGANIZATION-3');
+const vetoOnlyLaw=structuredClone(vetoOrganization.provisions);
+vetoOnlyLaw.governance.find((entry)=>entry.key==='sanctions').value.approvals.ban=0;
+const vetoOnlyProposal=db.createProposal({guildId:GUILD_ID,constitutionId:activeConstitution.id,source:'test',title:'拒否期間を残した承認免除',summary:'test',status:'agenda'});
+db.enactLaw({guildId:GUILD_ID,proposalId:vetoOnlyProposal.id,constitutionId:activeConstitution.id,code:'ORGANIZATION-4',
+  title:vetoOrganization.title,text:vetoOrganization.text,provisions:vetoOnlyLaw,supersedesLawId:vetoOrganization.id,targetHash:vetoOrganization.content_hash});
+const vetoOnlyCase=await readyApproval('veto-only-person');
+await advanceCase(guild,db.getCase(vetoOnlyCase.id));
+assert.equal(db.getCaseSanction(vetoOnlyCase.id).required_approvals,0);
+assert.equal(db.getCase(vetoOnlyCase.id).workflow_handler,'human_approval','承認人数0でも独立した拒否期間を確保する');
+assert.equal(db.legalApprovalResult(vetoOnlyCase.id).passed,false);
+assert.throws(()=>validateHumanAuthority({scope:'administrators',required:0},{veto:true}),/必要人数/);
+console.log('check-judiciary: ok (law-selected human approval and veto)');

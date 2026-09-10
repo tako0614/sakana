@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { startConversationMemory } from './conversation/memory.js';
 import {
   Client,
   Events,
@@ -142,6 +143,7 @@ client.on(Events.GuildCreate, (guild) => {
 
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
+  startConversationMemory(readyClient);
   console.log(
     agentEnabled
       ? 'AI agent is enabled. Mention the bot to use it.'

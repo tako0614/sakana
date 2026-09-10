@@ -47,12 +47,12 @@
 1. すべての構成員は、法律の適用において平等に扱われる。
 2. 何人も、違反内容、適用される法律、証拠および処分を知らされ、反論と証拠提出の合理的な機会を保障される。
 3. 違反の成立に必要なすべての要件が証拠によって認定されない限り、違反なしとして扱う。
-4. 審査を行う各席は、実行規則が列挙する読み取り専用の調査手段を、同規則が定める手数の上限まで用いて証拠を収集し検証する。各席は独立に調査し、独立に判断する。席は、自ら取得した記録以外を証拠として引用してはならない。
-5. 法律は、前項により収集された証拠を、実行規則で定める警察の席が審査し、同規則の必要票を満たして違反を認定した場合に限り、警告、機能制限または期間を定めた発言停止を即時に行える。
-6. 審査または審理の過程で対象者に不利な証拠を追加したときは、その証拠を対象者に示し、実行規則で定める答弁期間を改めて与えなければならない。やり直しの回数は実行規則が定める上限を超えてはならず、上限に達した後は、既に示された証拠だけで判断しなければならない。
-7. 第五項の処分を受けた者は、実行規則で定める期間内に裁判所の審理を求められる。警告は期限なく、期間のある処分はその継続中に請求できる。求めなければ処分は確定する。
+4. 審査を行う各席は、法律が定める読み取り専用の調査手段を、同法が定める手数の上限まで用いて証拠を収集し検証する。各席は独立に調査し、独立に判断する。席は、自ら取得した記録以外を証拠として引用してはならない。
+5. 法律は、前項により収集された証拠を、法律で定める警察の席が審査し、同法の必要票を満たして違反を認定した場合に限り、警告、機能制限または期間を定めた発言停止を即時に行える。
+6. 審査または審理の過程で対象者に不利な証拠を追加したときは、その証拠を対象者に示し、法律で定める答弁期間を改めて与えなければならない。やり直しの回数は法律が定める上限を超えてはならず、上限に達した後は、既に示された証拠だけで判断しなければならない。
+7. 第五項の処分を受けた者は、法律で定める期間内に裁判所の審理を求められる。警告は期限なく、期間のある処分はその継続中に請求できる。求めなければ処分は確定する。
 8. 前項の請求は、判決が出るまでいつでも取り下げられる。取り下げた時点で処分は確定する。
-9. 追放および参加禁止は、警察が単独で行ってはならない。裁判所の判決と実行規則で定める公開承認を経なければ実行できない。
+9. 追放および参加禁止は、警察が単独で行ってはならない。法律で設置された独立した裁判所の判決を経なければ実行できない。人間による執行承認の要否、資格、必要人数、期限および拒否の効果は法律で定める。
 10. 警察の席が必要票に満たない審査で処分してはならない。判断できないときは処分せず終える。
 
 ## 第七条（法律による統治）
@@ -62,36 +62,33 @@
 3. 特定の個人を処罰することだけを目的とした法律を制定してはならない。
 4. 法律に複数の合理的な解釈がある場合は、構成員の自由をより広く保障する解釈を優先する。
 
-## 第八条（立法）
+## 第八条（自律的な立法と機関）
 
-1. 立法は、定期的に開かれる国会において行う。開会の間隔は、実行規則で定める。運営者は同じ手続で臨時に開会できるが、議題の扱い、合議、継続審議の上限および投票は通常の国会と同一とする。
-2. 議題は、構成員が公開の場へ提出した提案と、公権力が公開記録から発見した問題を、同等に扱う。
-3. 国会は、議題ごとに、実行規則で定める独立した複数席が、公開の討論、現行憲法および現行法を照らして合議し、同規則の必要票により立法、継続審議または不採択のいずれかを選ぶ。必要票に達しないときは継続審議とする。
-4. 国会は、条文案が本憲法に適合するかどうかを立法の判断に含めなければならない。適合を確認できない案を投票へ進めてはならない。
-5. 構成員の意見をさらに聞く必要があると判断したときは、結論を出さず継続審議とし、次の国会まで公開の討論に付す。継続審議の回数は実行規則が定める上限を超えてはならず、上限に達した議題については立法または不採択を選ばなければならない。
-6. 立法を選んだ議題は、条文および執行定義を公開したうえ、公開の記名投票によって確定する。
-7. 投票の受付を開始した後に、条文または執行定義を変更してはならない。
-8. 投票は、実行規則で定める期間の満了によって締め切る。実行規則が定める場合において、受付時に固定された有権者の全員が投票を終えたときは、期間の満了を待たずに開票する。この場合、締切前に認められる投票の変更は、その時点で終了する。
-9. 国会は、議題ごとに、選んだ結論、その理由、参照した討論および適用した現行法を公開しなければならない。継続審議とするときは、次の国会までに構成員へ求める論点を示さなければならない。
-10. 開会の間隔、1回の国会で扱う議題数の上限、公開記録から議題を発見するかどうか、合議の席数と必要票、継続審議の上限、投票範囲、定足数および成立条件は、本憲法末尾の実行規則で定める。運営者はこれらを変更できず、変更には改正手続を要する。
-11. すべての投票および特別な承認権限の行使は、監査可能な形で記録されなければならない。
+1. 立法、司法および行政の職務は、法律により設置されたAI機関へ委任する。構成員は意見、提案、異議および証拠を提出できる。法律は、AIの職務と人間の意思決定を区別し、投票または承認の要否、対象、資格、成立条件、期限および不成立後の処理を定める。AIは自ら担うべき調査、起草、合憲化の検討を構成員へ丸投げしてはならない。
+2. 法律は、機関の組織、職務、権限、調査手段、手続、開始条件、期限、必要な判断、成立条件、執行、救済および制度点検を定義できる。権限の付与は本憲法の委任範囲内に限る。
+3. 立法機関は構成員の提案と公開記録および現行法の点検から議題を発見し、自ら調査、起草、修正および採否の判断を行う。構成員に合憲性の判断または条文の作成を進行の条件として要求してはならない。
+4. 法律の成立には、同一版の条文と実行定義について権限あるAI機関の採択と独立した憲法審査を必要とする。修正したときは両判断を取り直す。適合を確認できない案は成立しない。
+5. 法律は、条文と実行定義を一体として成立させ公開する。実行定義だけを書き換えてはならない。
+6. 立法手続、機関の構成、必要票、開会、起案、修正および結論の期限は法律で定める。コードの設定や運営操作によってこれらの制度を変更してはならない。
+7. 意見、答弁および異議の機会は権利として保障し、返答がない場合は法定期限後にAIが利用可能な根拠から判断する。沈黙を賛否や違反の証拠とみなしてはならない。
+8. 改正案は、その成立前に有効な手続で決める。案が定める新しい成立条件をその案自身へ先取りして適用してはならない。
 
 ## 第九条（司法）
 
-1. 裁判所は、警察の処分が争われた事件と、警察が単独で行えない処分の事件だけを審理する。取締りそのものは行わない。
+1. 裁判所は、警察の処分が争われた事件、警察が単独で行えない処分の事件および第十三条の違憲審査を審理する。取締りそのものは行わない。
 2. 判決は、公開された法律および事件記録に基づき、公正かつ独立して行われなければならない。
 3. 判決は、適用した法律、認定した事実、使用した証拠、各構成要件の判断および処分の理由を示さなければならない。
-4. 重大な処分を受ける者には、本憲法の実行規則で定める範囲で上訴の機会を保障する。
+4. 重大な処分を受ける者には、法律で定める範囲で上訴の機会を保障する。
 5. 上訴中に暫定的な制限を行う場合も、本人が防御および裁判参加を継続できる手段を確保しなければならない。
-6. 被申立人が回答完了を表明した場合は直ちに審理し、表明しない場合も実行規則で定める答弁期間内に判断しなければならない。
-7. 裁判所は、実行規則が列挙する調査手段により事件記録を自ら補充できる。対象者に不利な証拠を加えるときは第六条第六項に従い、答弁のやり直しが上限に達している場合は、その証拠を採らない。
-8. 各席が用いた調査手段、その回数および引用した記録は、完全な形で監査可能に保存しなければならない。公開の粒度は実行規則で定める。判断の理由には、調査によって確かめた事実を含めなければならない。
-9. 調査の手数、1回の審議で受け取れる調査結果の総量および調査に費やせる時間は、実行規則が定める上限を超えてはならない。いずれかの上限に達したときは、その時点までに得た記録だけで判断する。審議は上限内に必ず終えなければならない。
+6. 被申立人が回答完了を表明した場合は直ちに審理し、表明しない場合も法律で定める答弁期間内に判断しなければならない。
+7. 裁判所は、法律が定める調査手段により事件記録を自ら補充できる。対象者に不利な証拠を加えるときは第六条第六項に従い、答弁のやり直しが上限に達している場合は、その証拠を採らない。
+8. 各席が用いた調査手段、その回数および引用した記録は、完全な形で監査可能に保存しなければならない。公開の粒度は法律で定める。判断の理由には、調査によって確かめた事実を含めなければならない。
+9. 調査の手数、1回の審議で受け取れる調査結果の総量および調査に費やせる時間は、法律が定める上限を超えてはならない。いずれかの上限に達したときは、その時点までに得た記録だけで判断する。審議は上限内に必ず終えなければならない。
 
 ## 第十条（拘留）
 
 1. 拘留は、事件の審理を確保するための保全であり、罰ではない。制裁として科してはならない。
-2. 拘留の時間は実行規則で定める上限を超えてはならず、不服申立ての期限を超えて続けてはならない。
+2. 拘留の時間は法律で定める上限を超えてはならず、不服申立ての期限を超えて続けてはならない。
 3. 拘留された者は、その事件の記録において反論および証拠提出を継続できなければならない。
 4. 同じ事件でその後に期間のある処分を科す場合は、拘留された時間を刑期から差し引かなければならない。
 5. 拘留の理由、開始、終了および対象は、監査可能な形で公開しなければならない。
@@ -100,7 +97,7 @@
 
 1. 処分は、適用される法律に明記された種類と上限を超えてはならない。
 2. 処分は、その目的を達成するために必要な最小限のものでなければならない。
-3. 処分の実行に特別な承認が必要となる条件は、本憲法の実行規則で定める。
+3. 処分の成立、独立したAI判断および執行の条件は法律で定める。
 4. 執行不能または権限の不足がある場合、公的機関は処分を拡張または代替せず、執行を停止しなければならない。
 5. 即時処分が裁判で維持された場合も、裁判中を含む既経過時間を刑期から差し引き、刑期を最初から開始してはならない。
 
@@ -114,22 +111,45 @@
 ## 第十三条（違憲審査および救済）
 
 1. 構成員は、法律、判決、処分または行政行為について違憲審査を申し立てることができる。
-2. 違憲審査は、裁判所の手続によって成立後に行う。立法において憲法適合性を判断したことは、この救済を妨げない。
+2. 違憲審査は、裁判所の手続によって成立後に行う。法律は、憲法審査院に裁判所の憲法審査部としてこの職務を委任できる。立法において憲法適合性を判断した席は、成立後の審査でも新たに独立して判断し、先の判断に拘束されない。
 3. 違憲と判断された行為は効力を失い、実行中の処分は停止される。
 4. 違憲な行為によって不利益を受けた者については、可能な限り原状回復および再審を行う。
 
 ## 第十四条（憲法改正）
 
-1. 本憲法および本憲法に含まれる実行規則は、第八条の国会の手続を経て確定した改正案について、公開の記名投票によらなければ改正できない。
-2. 改正の定足数および成立条件は、改正時点で有効な実行規則に従う。
-3. 改正案は、変更される権利、手続および公権力の範囲を明示しなければならない。
+1. 憲法改正の起草、修正、採択および審査はAI機関が行い、最終的な確定には人間の公開投票を必要とする。改正時点の憲法および法律の手続に従い、同一の改正案への独立した採択と憲法審査を経て確定する。
+2. 改正は、三席以上の独立した採決席の三分の二以上の賛成を必要とする。加えて、人間の公開投票における有効な賛否票の三分の二以上の賛成を必要とする。定足数と投票期間は法律で定め、法律は本条の最低要件を緩和できない。
+3. 改正案は、変更する権利、手続および権限を明示し、実行定義と一致しなければならない。自身の改正条件を先取りして適用してはならない。
 
-## 第十五条（実行規則）
+## 第十五条（法令に基づく実行）
 
-1. 次の`governance-rules`ブロックは本憲法の一部であり、公的botはこの規則を検証して統治手続へ適用しなければならない。
-2. 日本語条文と実行規則に矛盾がある改正案は成立手続へ進めず、国会の継続審議へ差し戻さなければならない。
-3. 実行規則にない権限、処分または遷移を、AIの解釈だけによって追加してはならない。
+1. 次の定義は、法律に機関、手続、規律およびその職務の割当てを定義する権限を委任する。具体的な制度は施行済み法律の実行定義による。
+2. 実行する行為には、根拠法令、条項、版、対象、必要な判断記録および理由を付す。複数の法律が同一の定義を競合して持つときは、その競合を解消するまで変更を施行してはならない。
+3. 法律は憲法を上書きできず、実装されていない操作を追加できない。実行基盤は権限と前提記録を検算し、記録、期限、実行結果および未完了の職務を保存する。
+4. 通信障害や計算資源の不足は、否決、有罪または権利喪失とみなさず、未完了の作業として再試行する。政治的な打切りは法律に従う。
+5. 進行中の案件は開始時の手続を記録し、新法の適用は経過規定による。取消、制限解除および原状回復も実行結果まで確認する。
+6. 組織法の停止、失効または違憲判断によって制度を構成できない場合、本憲法は最後に有効だった憲法改正手続を、代替組織法の成立と権利救済に限って暫定的に委任する。停止した法令自体は復活せず、新しい処罰および執行を停止する。AIは制度の欠落を調査し修復法を起草する。修復法には同一本文への独立したAI採択と憲法審査、全体選挙人の公開投票を必要とし、第十四条の最低賛成割合を下回ってはならない。投票期間は従前の改正期間と十二時間の長い方を満たし、早期確定してはならない。有効な制度を構成する代替法が成立したとき、この暫定権限は終了する。
 
 ```governance-rules
-{"$schema":"sakana.governance-rules/v1","electorates":{"general":{"type":"activity","memberAge":"30d","window":"30d","minimumMessages":500,"minimumActiveDays":20,"perDayCap":30,"minimumVisibleCharacters":5,"timezoneOffsetMinutes":540},"trusted":{"type":"discord_role","binding":"trusted"}},"panels":{"parliament":{"seats":3,"required":{"decision":2}},"constitutional":{"seats":3,"required":{"constitutional":3,"unconstitutional":2}},"court":{"seats":3,"required":{"responsible":2}},"police":{"seats":1,"required":{"responsible":1}},"judicialScreening":{"seats":3,"required":{"decision":2}}},"parliament":{"sessionInterval":"72h","agendaLimit":5,"maximumDeferrals":3,"logScan":true},"investigation":{"maximumSteps":{"police":20,"court":20,"parliament":20},"maximumOutputKilobytes":{"police":128,"court":128,"parliament":128},"maximumMinutes":{"police":10,"court":10,"parliament":10},"tools":{"police":["search_messages","read_user_messages","read_context","read_law","read_cases","read_constitution"],"court":["search_messages","read_user_messages","read_context","read_law","read_cases","read_precedent","read_case_record","read_constitution"],"parliament":["search_messages","read_channel","read_context","read_law","read_cases","read_precedent","read_constitution"]},"publicRecord":"none","maximumRedefense":1},"votes":{"defaultScope":"all","allowedScopes":["all","trusted"],"law":{"duration":"12h","earlyClose":"all_ballots_cast","yesRatio":0.5,"comparison":"gt","quorumRatio":0.25,"minimumBallots":2,"publicBallots":true,"trustedVeto":{"enabledForScope":"all","noRatio":0.6666666666666666,"denominator":"decisive_cast_ballots"}},"constitutionalAmendment":{"duration":"12h","earlyClose":"all_ballots_cast","yesRatio":0.6666666666666666,"comparison":"gte","quorumRatio":0.25,"minimumBallots":2,"publicBallots":true,"trustedVeto":{"enabledForScope":"all","noRatio":0.6666666666666666,"denominator":"decisive_cast_ballots"}}},"sanctions":{"allowed":["warning","restriction","timeout","kick","ban"],"restrictionPrimitives":["messages_per_window","block_links","block_attachments","block_mentions","block_reactions","block_thread_creation","block_voice","agent_calls_per_window","block_petitions","block_voting"],"maximumRestriction":"365d","timeout":{"discordMaximum":"28d","maximum":"28d","immediateMaximum":"1d"},"approvals":{"timeoutAboveImmediate":1,"kick":2,"ban":2},"appeals":{"timeoutAtLeast":"3d","types":["ban","timeout"],"duration":"1d"},"detention":{"maximum":"24h"},"police":{"contestDuration":"1d","immediate":["warning","restriction","timeout"],"courtFirst":["kick","ban"],"unlimitedWarningContest":true}},"workflows":{"law":{"initial":"agenda","config":{},"states":{"agenda":{"handler":"parliament_agenda","duration":null,"config":{},"on":{"adopted":"voting","deferred":"agenda","rejected":"rejected"}},"voting":{"handler":"public_vote","duration":"12h","config":{"vote":"law"},"on":{"passed":"enacted","rejected":"rejected","stale":"rejected"}},"enacted":{"handler":"terminal","duration":null,"config":{},"on":{}},"rejected":{"handler":"terminal","duration":null,"config":{},"on":{}}}},"constitutionalAmendment":{"initial":"agenda","config":{},"states":{"agenda":{"handler":"parliament_agenda","duration":null,"config":{},"on":{"adopted":"voting","deferred":"agenda","rejected":"rejected"}},"voting":{"handler":"public_vote","duration":"12h","config":{"vote":"constitutionalAmendment"},"on":{"passed":"enacted","rejected":"rejected","stale":"rejected"}},"enacted":{"handler":"terminal","duration":null,"config":{},"on":{}},"rejected":{"handler":"terminal","duration":null,"config":{},"on":{}}}},"criminalCase":{"initial":"police_review","config":{},"states":{"defense":{"handler":"defense_window","duration":"1d","config":{},"on":{"completed":"deliberation","expired":"deliberation"}},"deliberation":{"handler":"judicial_panel","duration":null,"config":{"panel":"court"},"on":{"responsible":"approval","no_case":"final","appealable":"appeal_window","executable":"execution","new_evidence":"defense"}},"approval":{"handler":"public_approval","duration":null,"config":{},"on":{"approved":"appeal_window","rejected":"final"}},"appeal_window":{"handler":"appeal_window","duration":"1d","config":{},"on":{"appealed":"appeal","expired":"execution"}},"appeal":{"handler":"judicial_panel","duration":null,"config":{"panel":"court"},"on":{"responsible":"approval","no_case":"final","executable":"execution"}},"execution":{"handler":"sanction_execution","duration":null,"config":{},"on":{"executed":"final","unavailable":"final","failed":"final"}},"final":{"handler":"terminal","duration":null,"config":{},"on":{}},"police_review":{"handler":"police_review","duration":null,"config":{"panel":"police"},"on":{"no_case":"final","immediate":"contest_window","court_first":"defense"}},"contest_window":{"handler":"contest_window","duration":null,"config":{},"on":{"contested":"defense","expired":"final"}}}},"constitutionalCase":{"initial":"defense","config":{"petitionsPerMemberPerDay":3},"states":{"defense":{"handler":"defense_window","duration":"1d","config":{},"on":{"completed":"deliberation","expired":"deliberation"}},"deliberation":{"handler":"constitutional_panel","duration":null,"config":{"panel":"constitutional"},"on":{"constitutional":"final","unconstitutional":"final","insufficient":"final"}},"final":{"handler":"terminal","duration":null,"config":{},"on":{}}}}}}
+{
+  "$schema": "sakana.constitution/v2",
+  "delegations": [
+    "institution",
+    "procedure",
+    "regulation",
+    "binding"
+  ],
+  "recovery": {
+    "mode": "last_valid_amendment_procedure",
+    "publicVote": "required",
+    "minimumVoteDuration": "12h"
+  },
+  "amendment": {
+    "mode": "procedure",
+    "minimumSeats": 3,
+    "minimumApprovalRatio": 0.6666666666666666,
+    "publicVote": "required",
+    "minimumPublicApprovalRatio": 0.6666666666666666
+  }
+}
 ```

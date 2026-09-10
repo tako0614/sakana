@@ -1,4 +1,5 @@
 import { ChannelType } from 'discord.js';
+import { discordStructure } from '../conversation/message.js';
 import {
   channelGaps,
   channelMessageRange,
@@ -84,11 +85,15 @@ function forwardedContent(message) {
 }
 
 export function toRecord(message) {
-  const content = message.content || forwardedContent(message);
+  // Forwarded text belongs to the snapshot, never to the forwarding author.
+  const content = message.content ?? '';
   const attachments = [...message.attachments.values()];
   const kinds = new Set(attachments.map(attachmentKind));
 
   const extraParts = [];
+  // Searchable quoted material remains separate from sender-authored content.
+  const forwarded = forwardedContent(message);
+  if (forwarded) extraParts.push(forwarded);
   for (const attachment of attachments) {
     extraParts.push(attachment.name ?? '');
     if (attachment.description) extraParts.push(attachment.description);
@@ -126,6 +131,7 @@ export function toRecord(message) {
     created_at: message.createdTimestamp,
     edited_at: message.editedTimestamp ?? null,
     reply_to: message.reference?.messageId ?? null,
+    structure_json: JSON.stringify(discordStructure(message)),
     attachment_count: attachments.length,
     attachment_kinds: kinds.size > 0 ? ` ${[...kinds].join(' ')} ` : '',
     embed_count: message.embeds?.length ?? 0,

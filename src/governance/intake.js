@@ -5,7 +5,8 @@ import {
   MessageFlags,
   PermissionFlagsBits
 } from 'discord.js';
-import { parseDiscordRef } from '../agent/format.js';
+import { parseDiscordRef, fromDiscordMessage } from '../agent/format.js';
+import { messageEnvelope } from '../conversation/message.js';
 import {
   claimGovernanceIntake,
   createGovernanceIntake,
@@ -85,7 +86,7 @@ function sourceLink(guildId, evidence) {
 function sourceContent(source) {
   return [
     source.content,
-    ...source.attachments.map((attachment) => `[添付] ${attachment.name} ${attachment.url}`)
+    ...Array.from(source.attachments?.values?.() ?? source.attachments ?? []).map((attachment) => `[添付] ${attachment.name} ${attachment.url}`)
   ].filter(Boolean).join('\n').slice(0, 8000);
 }
 
@@ -118,27 +119,34 @@ async function fetchSourceMessage(message, governance) {
     authorId: source.author.id,
     authorIsBot: source.author.bot,
     content: content.slice(0, 8000),
+    conversation: messageEnvelope(fromDiscordMessage(source)),
     occurredAt: source.createdTimestamp
   };
 }
 
-async function revalidateInvestigationEvidence(message, rows, partyIds = [], { allowBots = false } = {}) {
+export async function revalidateInvestigationEvidence(message, rows, partyIds = [], { allowBots = false } = {}) {
   const validated = [];
+  const fetchOrAbsent = async (read) => {
+    try { return await read(); } catch (error) {
+      if ([10003, 10007, 10008, 50001, 50013].includes(Number(error.code))) return null;
+      throw error; // A transport outage is not evidence that a source disappeared.
+    }
+  };
   for (const row of rows) {
-    const channel = await message.guild.channels.fetch(row.channelId).catch(() => null);
+    const channel = await fetchOrAbsent(() => message.guild.channels.fetch(row.channelId));
     if (!channel?.isTextBased?.()) continue;
     const everyone = message.guild.roles.everyone;
     if (!everyone || !channel.permissionsFor(everyone)?.has(PermissionFlagsBits.ViewChannel)) continue;
     let visible = true;
     for (const userId of new Set(partyIds.filter(Boolean))) {
-      const member = await message.guild.members.fetch(userId).catch(() => null);
+      const member = await fetchOrAbsent(() => message.guild.members.fetch(userId));
       if (!member || !channel.permissionsFor(member)?.has(PermissionFlagsBits.ViewChannel)) {
         visible = false;
         break;
       }
     }
     if (!visible) continue;
-    const source = await channel.messages.fetch(row.messageId).catch(() => null);
+    const source = await fetchOrAbsent(() => channel.messages.fetch(row.messageId));
     if (!source || (!allowBots && source.author.bot) || String(source.author.id) !== String(row.authorId)) continue;
     const content = sourceContent(source);
     const currentHash = sha256(normalizeActivityContent(content));
@@ -150,6 +158,7 @@ async function revalidateInvestigationEvidence(message, rows, partyIds = [], { a
       authorId: source.author.id,
       content,
       contentHash: currentHash,
+      conversation: messageEnvelope(fromDiscordMessage(source)),
       occurredAt: source.createdTimestamp
     });
   }
@@ -507,6 +516,7 @@ async function runAutomaticJudiciary(message, request, anchor, context, investig
   const panel = await screenJudicialMention({
     guildId: message.guildId,
     request: {
+      messageId: message.id,
       text: request,
       authorId: message.author.id,
       targetUserIds: context.targetUserIds,

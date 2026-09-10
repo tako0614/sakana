@@ -350,7 +350,7 @@ export async function handleMimicRequest(
     const messages = [...older, ...recentTurns].slice(-CONTEXT_MESSAGES);
 
     // /as で選ばれている人。抜けている人は無視する
-    const persona = personaFor(message.author.id);
+    const persona = personaFor(message.author.id, message.guildId);
     const wanted = persona && !hasOptedOut(persona) ? persona : null;
 
     // 載っている世代で形式が違う。取り違えるとモデルが一度も見ていない入力を

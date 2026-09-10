@@ -21,7 +21,7 @@ export const governanceDefinition = {
       properties: {
         action: {
           type: 'string',
-          enum: ['status', 'constitution', 'laws', 'law', 'proposals', 'proposal', 'cases', 'case', 'administration', 'administrative_act']
+          enum: ['status', 'constitution', 'institutions', 'procedures', 'laws', 'law', 'proposals', 'proposal', 'cases', 'case', 'administration', 'administrative_act']
         },
         id: { type: 'number', description: '内部参照が既に分かる場合だけ使う番号' },
         title: { type: 'string', description: '人が読める法律名・法案名・事件概要' }
@@ -85,10 +85,15 @@ function proposalKindLabel(value) {
   return value === 'amendment' ? '憲法改正案' : '法案';
 }
 
-function proposalStateLabel(value) {
-  return ({
+function proposalStateLabel(proposal) {
+  const handler = {
+    parliament_agenda: '議題（国会待ち）', legislation_draft: '起草・改稿中',
+    ai_ratification: '採択審議中', constitutional_panel: '憲法審査中',
+    public_vote: '投票中', law_enactment: '成立手続中', notice: '公告中', wait: '法定期間待ち'
+  }[proposal.workflow_handler];
+  return handler ?? ({
     agenda: '議題（国会待ち）', voting: '投票中', enacted: '成立', rejected: '不成立'
-  })[value] ?? value;
+  })[proposal.status] ?? proposal.status;
 }
 
 function caseKindLabel(value) {
@@ -140,14 +145,16 @@ export function runGovernanceInfo(ctx, args) {
   }
   if (action === 'status') {
     const constitution = getActiveConstitution(guildId);
+    const proposals = listProposals(guildId, { limit: 10000 }).filter((proposal) => proposal.workflow_handler !== 'terminal');
+    const cases = listCases(guildId, { limit: 10000 }).filter((entry) => !entry.finalized_at && entry.workflow_handler !== 'terminal');
     return [
       `状態: ${governanceStateLabel(governance.status)} / 執行: ${enforcementLabel(governance.enforcement_mode)}`,
       `憲法: v${constitution?.version ?? '?'}`,
       `手続: <#${governance.procedure_channel_id}>`,
       lawSiteLink(guildId) ? `法令集: ${lawSiteLink(guildId)}` : null,
       `現行法: ${listLaws(guildId).length}件`,
-      `議題: ${listProposals(guildId, { statuses: ['agenda'], limit: 100 }).length}件 / 投票中: ${listProposals(guildId, { statuses: ['voting'], limit: 100 }).length}件`,
-      `進行中事件: ${listCases(guildId, { statuses: ['filing', 'defense', 'deliberation', 'approval', 'appeal_window', 'appeal'], limit: 100 }).length}件`
+      `議題: ${proposals.filter((proposal) => proposal.workflow_handler !== 'public_vote').length}件 / 投票中: ${proposals.filter((proposal) => proposal.workflow_handler === 'public_vote').length}件`,
+      `進行中事件: ${cases.length}件`
     ].filter(Boolean).join('\n');
   }
   if (action === 'constitution') {
@@ -156,6 +163,14 @@ export function runGovernanceInfo(ctx, args) {
       ? `${lawSiteLine(guildId)}現行憲法 v${constitution.version}\n\n${constitution.content}`
       : '現行憲法がありません。';
   }
+  if (['institutions', 'procedures'].includes(action)) {
+    requireVisible(ctx, governance.procedure_channel_id, '手続');
+    const constitution = getActiveConstitution(guildId);
+    const kind = action === 'institutions' ? 'institution' : 'procedure';
+    const entries = constitution.rules?.[action] ?? {};
+    return Object.entries(entries).map(([key, value]) => ({ id: key, ...value,
+      legalBasis: constitution.rules.sources[`${kind}:${key}`] })).map((entry) => JSON.stringify(entry)).join('\n') || '旧憲法の実行規則を参照してください。';
+  }
   if (action === 'laws') {
     const laws = listLaws(guildId);
     return lawSiteLine(guildId)
@@ -163,11 +178,11 @@ export function runGovernanceInfo(ctx, args) {
   }
   if (action === 'law') {
     const law = requestedRecord(args, listLaws(guildId), guildId, '法律');
-    return `${lawSiteLine(guildId)}${law.title}\n\n${law.text}`;
+    return `${lawSiteLine(guildId)}${law.title}\n\n${law.text}${law.provisions.governance?.length ? `\n\n法令による機関・手続の定義:\n${JSON.stringify(law.provisions.governance)}` : ''}`;
   }
   if (action === 'proposals') {
     const proposals = listProposals(guildId, { limit: 50 });
-    return proposals.map((proposal) => `${proposalKindLabel(proposal.kind)} / ${proposalStateLabel(proposal.status)} / ${proposal.title}`).join('\n') || '法案はありません。';
+    return proposals.map((proposal) => `${proposalKindLabel(proposal.kind)} / ${proposalStateLabel(proposal)} / ${proposal.title}`).join('\n') || '法案はありません。';
   }
   if (action === 'proposal') {
     const proposal = requestedRecord(args, listProposals(guildId, { limit: 100 }), guildId, '法案');
@@ -176,7 +191,7 @@ export function runGovernanceInfo(ctx, args) {
       ? (ctx.guild.roles?.cache?.get?.(governance.trusted_role_id)?.name ?? '特別有権者')
       : '特別有権者';
     return [
-      `${proposalKindLabel(proposal.kind)} / ${proposalStateLabel(proposal.status)} / ${proposal.title}`,
+      `${proposalKindLabel(proposal.kind)} / ${proposalStateLabel(proposal)} / ${proposal.title}`,
       proposal.summary,
       `投票: 賛成${vote.yes} 反対${vote.no} 棄権${vote.abstain} / ${electorate}の反対${vote.trustedNo}/${vote.trustedTotal}有効票`,
       proposal.body?.content ?? proposal.body?.text ?? '本文は起草中'

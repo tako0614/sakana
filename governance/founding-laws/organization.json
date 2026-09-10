@@ -1,0 +1,852 @@
+{
+  "code": "GOVERNANCE-ORGANIZATION",
+  "title": "統治組織手続法",
+  "summary": "AI機関の職務と、立法・司法・執行・制度点検の手続を定める。",
+  "text": "A1 本法は国会、憲法審査院、裁判所、警察、司法受付院および各採決席を設置し、実行定義に示す職務、調査手段、席数、必要票を与える。人間は意見、提案、異議および証拠を提出できる。\nA2 AIは議題の検討、起草、採択、憲法審査、必要な修正を自律的に行う。立法および憲法改正は、以下の実行定義に定める公開投票を経て成立する。法律の投票は、その有無を含め法律で変更できる。改憲の最低要件は憲法に従う。\nA3 処分は行為時の法律、証拠、AI判断、答弁および救済の手続に基づいて行う。重大処分は独立した裁判所が判断する。処分、期間、異議・上訴、拘留の上限は実行定義に従う。 重大処分の執行には以下の実行定義に定める独立した人間の公開承認を要する。承認人数、資格、拒否および期限切れの扱いは本法に定める。\nA4 AIは根拠法令と証拠を自ら取得し、記録の由来を確認する。計算資源不足や通信障害は未完了の作業として再試行し、否決、有罪、権利喪失とみなさない。\nA5 国会は定期的に現行法と運用記録を点検し、矛盾、手続停滞、救済漏れを調査する。改善のための法案はAIが起案する。",
+  "provisions": {
+    "articles": [
+      {
+        "code": "A1",
+        "text": "本法は国会、憲法審査院、裁判所、警察、司法受付院および各採決席を設置し、実行定義に示す職務、調査手段、席数、必要票を与える。人間は意見、提案、異議および証拠を提出できる。"
+      },
+      {
+        "code": "A2",
+        "text": "AIは議題の検討、起草、採択、憲法審査、必要な修正を自律的に行う。立法および憲法改正は、以下の実行定義に定める公開投票を経て成立する。法律の投票は、その有無を含め法律で変更できる。改憲の最低要件は憲法に従う。"
+      },
+      {
+        "code": "A3",
+        "text": "処分は行為時の法律、証拠、AI判断、答弁および救済の手続に基づいて行う。重大処分は独立した裁判所が判断する。処分、期間、異議・上訴、拘留の上限は実行定義に従う。 重大処分の執行には以下の実行定義に定める独立した人間の公開承認を要する。承認人数、資格、拒否および期限切れの扱いは本法に定める。"
+      },
+      {
+        "code": "A4",
+        "text": "AIは根拠法令と証拠を自ら取得し、記録の由来を確認する。計算資源不足や通信障害は未完了の作業として再試行し、否決、有罪、権利喪失とみなさない。"
+      },
+      {
+        "code": "A5",
+        "text": "国会は定期的に現行法と運用記録を点検し、矛盾、手続停滞、救済漏れを調査する。改善のための法案はAIが起案する。"
+      }
+    ],
+    "offenses": [],
+    "sanctionDefinitions": [],
+    "governance": [
+      {
+        "kind": "institution",
+        "key": "parliamentInstitution",
+        "article": "A1",
+        "value": {
+          "name": "国会",
+          "mandate": "意見と公開記録から問題を調査し、自ら起草の方針と採否を判断する。合憲性や条文化を人間へ委ねない。",
+          "seats": 3,
+          "required": {
+            "decision": 2
+          },
+          "tools": [
+            "search_messages",
+            "read_channel",
+            "read_context",
+            "read_law",
+            "read_cases",
+            "read_precedent",
+            "read_constitution"
+          ]
+        }
+      },
+      {
+        "kind": "binding",
+        "key": "parliament",
+        "article": "A1",
+        "value": {
+          "kind": "institution",
+          "target": "parliamentInstitution"
+        }
+      },
+      {
+        "kind": "institution",
+        "key": "constitutionalInstitution",
+        "article": "A1",
+        "value": {
+          "name": "憲法審査院",
+          "mandate": "適用される憲法に対し、同一版の対象を独立に審査し、条項を挙げて具体的な理由を示す。",
+          "seats": 3,
+          "required": {
+            "constitutional": 3,
+            "unconstitutional": 2
+          },
+          "tools": [
+            "search_messages",
+            "read_user_messages",
+            "read_context",
+            "read_law",
+            "read_cases",
+            "read_precedent",
+            "read_case_record",
+            "read_constitution"
+          ]
+        }
+      },
+      {
+        "kind": "binding",
+        "key": "constitutional",
+        "article": "A1",
+        "value": {
+          "kind": "institution",
+          "target": "constitutionalInstitution"
+        }
+      },
+      {
+        "kind": "institution",
+        "key": "courtInstitution",
+        "article": "A1",
+        "value": {
+          "name": "裁判所",
+          "mandate": "法律と証拠を照合し、答弁と救済を保障したうえで独立に裁判する。",
+          "seats": 3,
+          "required": {
+            "responsible": 2
+          },
+          "tools": [
+            "search_messages",
+            "read_user_messages",
+            "read_context",
+            "read_law",
+            "read_cases",
+            "read_precedent",
+            "read_case_record",
+            "read_constitution"
+          ]
+        }
+      },
+      {
+        "kind": "binding",
+        "key": "court",
+        "article": "A1",
+        "value": {
+          "kind": "institution",
+          "target": "courtInstitution"
+        }
+      },
+      {
+        "kind": "institution",
+        "key": "policeInstitution",
+        "article": "A1",
+        "value": {
+          "name": "警察",
+          "mandate": "事前に成立した法律と実証した証拠のみで取締りを判断する。",
+          "seats": 1,
+          "required": {
+            "responsible": 1
+          },
+          "tools": [
+            "search_messages",
+            "read_user_messages",
+            "read_context",
+            "read_law",
+            "read_cases",
+            "read_constitution"
+          ]
+        }
+      },
+      {
+        "kind": "binding",
+        "key": "police",
+        "article": "A1",
+        "value": {
+          "kind": "institution",
+          "target": "policeInstitution"
+        }
+      },
+      {
+        "kind": "institution",
+        "key": "judicialScreeningInstitution",
+        "article": "A1",
+        "value": {
+          "name": "司法受付院",
+          "mandate": "申立てを調査し、適用法と証拠を確認して事件化の必要性を判断する。",
+          "seats": 3,
+          "required": {
+            "decision": 2
+          },
+          "tools": [
+            "search_messages",
+            "read_user_messages",
+            "read_context",
+            "read_law",
+            "read_cases",
+            "read_precedent",
+            "read_case_record",
+            "read_constitution"
+          ]
+        }
+      },
+      {
+        "kind": "binding",
+        "key": "judicialScreening",
+        "article": "A1",
+        "value": {
+          "kind": "institution",
+          "target": "judicialScreeningInstitution"
+        }
+      },
+      {
+        "kind": "institution",
+        "key": "adoptionInstitution",
+        "article": "A1",
+        "value": {
+          "name": "国会採決席",
+          "mandate": "完成した同一の条文と実行定義について、目的・実効性・比例性・他法との関係を判断し、採択または修正・不採択を決める。",
+          "seats": 3,
+          "required": {
+            "approve": 2
+          },
+          "tools": [
+            "search_messages",
+            "read_channel",
+            "read_context",
+            "read_law",
+            "read_cases",
+            "read_precedent",
+            "read_constitution"
+          ]
+        }
+      },
+      {
+        "kind": "binding",
+        "key": "adoption",
+        "article": "A1",
+        "value": {
+          "kind": "institution",
+          "target": "adoptionInstitution"
+        }
+      },
+      {
+        "kind": "institution",
+        "key": "amendmentAdoptionInstitution",
+        "article": "A1",
+        "value": {
+          "name": "憲法改正採決席",
+          "mandate": "完成した憲法改正案の権限と権利への影響を独立に判断する。現在の改正条件を適用し、新条件を先取りしない。",
+          "seats": 3,
+          "required": {
+            "approve": 3
+          },
+          "tools": [
+            "search_messages",
+            "read_channel",
+            "read_context",
+            "read_law",
+            "read_cases",
+            "read_precedent",
+            "read_constitution"
+          ]
+        }
+      },
+      {
+        "kind": "binding",
+        "key": "amendmentAdoption",
+        "article": "A1",
+        "value": {
+          "kind": "institution",
+          "target": "amendmentAdoptionInstitution"
+        }
+      },
+      {
+        "kind": "procedure",
+        "key": "lawProcedure",
+        "article": "A2",
+        "value": {
+          "name": "立法手続",
+          "mandate": "AIが起草、採択、憲法審査および改稿を行い、法律で定める公開投票を経て成立させる。",
+          "initial": "agenda",
+          "states": {
+            "agenda": {
+              "handler": "parliament_agenda",
+              "duration": null,
+              "config": {},
+              "on": {
+                "adopted": "draft",
+                "rejected": "rejected"
+              }
+            },
+            "draft": {
+              "handler": "legislation_draft",
+              "duration": null,
+              "config": {
+                "maximumVisits": 3
+              },
+              "on": {
+                "drafted": "adoption",
+                "exhausted": "rejected"
+              }
+            },
+            "adoption": {
+              "handler": "ai_ratification",
+              "duration": null,
+              "config": {
+                "institution": "adoptionInstitution"
+              },
+              "on": {
+                "approved": "review",
+                "revision": "draft",
+                "rejected": "rejected"
+              }
+            },
+            "review": {
+              "handler": "constitutional_panel",
+              "duration": null,
+              "config": {
+                "institution": "constitutionalInstitution"
+              },
+              "on": {
+                "constitutional": "vote",
+                "revision": "draft"
+              }
+            },
+            "enact": {
+              "handler": "law_enactment",
+              "duration": null,
+              "config": {},
+              "on": {
+                "enacted": "enacted",
+                "stale": "rejected"
+              }
+            },
+            "enacted": {
+              "handler": "terminal",
+              "duration": null,
+              "config": {},
+              "on": {}
+            },
+            "rejected": {
+              "handler": "terminal",
+              "duration": null,
+              "config": {},
+              "on": {}
+            },
+            "vote": {
+              "handler": "public_vote",
+              "duration": "12h",
+              "config": {},
+              "on": {
+                "passed": "enact",
+                "rejected": "rejected"
+              }
+            }
+          },
+          "config": {}
+        }
+      },
+      {
+        "kind": "binding",
+        "key": "law",
+        "article": "A2",
+        "value": {
+          "kind": "procedure",
+          "target": "lawProcedure"
+        }
+      },
+      {
+        "kind": "procedure",
+        "key": "constitutionalAmendmentProcedure",
+        "article": "A2",
+        "value": {
+          "name": "憲法改正手続",
+          "mandate": "AIが起草、採択、憲法審査および改稿を行い、法律で定める公開投票を経て成立させる。",
+          "initial": "agenda",
+          "states": {
+            "agenda": {
+              "handler": "parliament_agenda",
+              "duration": null,
+              "config": {},
+              "on": {
+                "adopted": "draft",
+                "rejected": "rejected"
+              }
+            },
+            "draft": {
+              "handler": "legislation_draft",
+              "duration": null,
+              "config": {
+                "maximumVisits": 3
+              },
+              "on": {
+                "drafted": "adoption",
+                "exhausted": "rejected"
+              }
+            },
+            "adoption": {
+              "handler": "ai_ratification",
+              "duration": null,
+              "config": {
+                "institution": "amendmentAdoptionInstitution"
+              },
+              "on": {
+                "approved": "review",
+                "revision": "draft",
+                "rejected": "rejected"
+              }
+            },
+            "review": {
+              "handler": "constitutional_panel",
+              "duration": null,
+              "config": {
+                "institution": "constitutionalInstitution"
+              },
+              "on": {
+                "constitutional": "vote",
+                "revision": "draft"
+              }
+            },
+            "enact": {
+              "handler": "law_enactment",
+              "duration": null,
+              "config": {},
+              "on": {
+                "enacted": "enacted",
+                "stale": "rejected"
+              }
+            },
+            "enacted": {
+              "handler": "terminal",
+              "duration": null,
+              "config": {},
+              "on": {}
+            },
+            "rejected": {
+              "handler": "terminal",
+              "duration": null,
+              "config": {},
+              "on": {}
+            },
+            "vote": {
+              "handler": "public_vote",
+              "duration": "12h",
+              "config": {},
+              "on": {
+                "passed": "enact",
+                "rejected": "rejected"
+              }
+            }
+          },
+          "config": {}
+        }
+      },
+      {
+        "kind": "binding",
+        "key": "constitutionalAmendment",
+        "article": "A2",
+        "value": {
+          "kind": "procedure",
+          "target": "constitutionalAmendmentProcedure"
+        }
+      },
+      {
+        "kind": "procedure",
+        "key": "criminalCaseProcedure",
+        "article": "A3",
+        "value": {
+          "name": "刑事手続",
+          "mandate": "証拠、適正手続、比例性、救済の機会を保障し、AIが判断と執行を遂行する。",
+          "initial": "police_review",
+          "config": {
+            "reopen": {
+              "filing": "filing"
+            },
+            "interruptions": {
+              "dismissed": "final",
+              "overturned": "final",
+              "unenforceable": "final",
+              "final": "final"
+            }
+          },
+          "states": {
+            "defense": {
+              "handler": "defense_window",
+              "duration": "1d",
+              "config": {
+                "phase": "defense"
+              },
+              "on": {
+                "deliberation": "deliberation"
+              }
+            },
+            "deliberation": {
+              "handler": "judicial_panel",
+              "duration": null,
+              "config": {
+                "institution": "courtInstitution",
+                "maximumVisits": 3,
+                "phase": "deliberation"
+              },
+              "on": {
+                "acquitted": "final",
+                "execution": "execution",
+                "appeal_window": "appeal_window",
+                "defense": "defense",
+                "exhausted": "final",
+                "approval": "approval"
+              }
+            },
+            "appeal_window": {
+              "handler": "appeal_window",
+              "duration": "1d",
+              "config": {
+                "phase": "appeal_window"
+              },
+              "on": {
+                "appeal": "appeal",
+                "execution": "execution",
+                "approval": "approval"
+              }
+            },
+            "appeal": {
+              "handler": "judicial_panel",
+              "duration": null,
+              "config": {
+                "institution": "courtInstitution",
+                "phase": "appeal"
+              },
+              "on": {
+                "overturned": "final",
+                "execution": "execution",
+                "approval": "approval"
+              }
+            },
+            "execution": {
+              "handler": "sanction_execution",
+              "duration": null,
+              "config": {
+                "phase": "execution"
+              },
+              "on": {
+                "final": "final",
+                "contest_window": "contest_window",
+                "unenforceable": "final"
+              }
+            },
+            "final": {
+              "handler": "terminal",
+              "duration": null,
+              "config": {
+                "phase": "final"
+              },
+              "on": {}
+            },
+            "police_review": {
+              "handler": "police_review",
+              "duration": null,
+              "config": {
+                "institution": "policeInstitution",
+                "phase": "police_review"
+              },
+              "on": {
+                "acquitted": "final",
+                "execution": "execution",
+                "filing": "filing",
+                "approval": "approval"
+              }
+            },
+            "contest_window": {
+              "handler": "contest_window",
+              "duration": "1d",
+              "config": {
+                "phase": "contest_window"
+              },
+              "on": {
+                "filing": "filing",
+                "final": "final"
+              }
+            },
+            "filing": {
+              "handler": "case_filing",
+              "duration": null,
+              "config": {
+                "phase": "filing"
+              },
+              "on": {
+                "defense": "defense"
+              }
+            },
+            "approval": {
+              "handler": "human_approval",
+              "duration": "3d",
+              "config": {
+                "phase": "approval",
+                "scope": "trusted",
+                "rejectVotes": 1,
+                "excludeParties": true
+              },
+              "on": {
+                "execution": "execution",
+                "appeal_window": "appeal_window",
+                "rejected": "final",
+                "expired": "final"
+              }
+            }
+          }
+        }
+      },
+      {
+        "kind": "binding",
+        "key": "criminalCase",
+        "article": "A3",
+        "value": {
+          "kind": "procedure",
+          "target": "criminalCaseProcedure"
+        }
+      },
+      {
+        "kind": "procedure",
+        "key": "constitutionalCaseProcedure",
+        "article": "A3",
+        "value": {
+          "name": "違憲審査手続",
+          "mandate": "証拠、適正手続、比例性、救済の機会を保障し、AIが判断と執行を遂行する。",
+          "initial": "filing",
+          "config": {
+            "petitionsPerMemberPerDay": 3,
+            "interruptions": {
+              "dismissed": "final",
+              "overturned": "final",
+              "unenforceable": "final"
+            }
+          },
+          "states": {
+            "defense": {
+              "handler": "defense_window",
+              "duration": "1d",
+              "config": {
+                "phase": "defense"
+              },
+              "on": {
+                "deliberation": "deliberation"
+              }
+            },
+            "deliberation": {
+              "handler": "constitutional_panel",
+              "duration": null,
+              "config": {
+                "institution": "constitutionalInstitution",
+                "phase": "deliberation"
+              },
+              "on": {
+                "final": "final",
+                "constitutional_uncertain": "final"
+              }
+            },
+            "final": {
+              "handler": "terminal",
+              "duration": null,
+              "config": {
+                "phase": "final"
+              },
+              "on": {}
+            },
+            "filing": {
+              "handler": "case_filing",
+              "duration": null,
+              "config": {
+                "phase": "filing"
+              },
+              "on": {
+                "defense": "defense"
+              }
+            }
+          }
+        }
+      },
+      {
+        "kind": "binding",
+        "key": "constitutionalCase",
+        "article": "A3",
+        "value": {
+          "kind": "procedure",
+          "target": "constitutionalCaseProcedure"
+        }
+      },
+      {
+        "kind": "regulation",
+        "key": "records",
+        "article": "A4",
+        "value": {
+          "type": "activity",
+          "memberAge": "30d",
+          "window": "30d",
+          "minimumMessages": 500,
+          "minimumActiveDays": 20,
+          "perDayCap": 30,
+          "minimumVisibleCharacters": 5,
+          "timezoneOffsetMinutes": 540
+        }
+      },
+      {
+        "kind": "regulation",
+        "key": "parliament",
+        "article": "A2",
+        "value": {
+          "sessionInterval": "72h",
+          "agendaLimit": 5,
+          "logScan": true
+        }
+      },
+      {
+        "kind": "regulation",
+        "key": "investigation",
+        "article": "A4",
+        "value": {
+          "maximumSteps": {
+            "police": 20,
+            "court": 20,
+            "parliament": 20
+          },
+          "maximumOutputKilobytes": {
+            "police": 128,
+            "court": 128,
+            "parliament": 128
+          },
+          "maximumMinutes": {
+            "police": 10,
+            "court": 10,
+            "parliament": 10
+          },
+          "publicRecord": "none",
+          "maximumRedefense": 1
+        }
+      },
+      {
+        "kind": "regulation",
+        "key": "sanctions",
+        "article": "A3",
+        "value": {
+          "allowed": [
+            "warning",
+            "restriction",
+            "timeout",
+            "kick",
+            "ban"
+          ],
+          "restrictionPrimitives": [
+            "messages_per_window",
+            "block_links",
+            "block_attachments",
+            "block_mentions",
+            "block_reactions",
+            "block_thread_creation",
+            "block_voice",
+            "agent_calls_per_window",
+            "block_petitions",
+            "block_voting"
+          ],
+          "maximumRestriction": "365d",
+          "timeout": {
+            "discordMaximum": "28d",
+            "maximum": "28d",
+            "immediateMaximum": "1d"
+          },
+          "appeals": {
+            "timeoutAtLeast": "3d",
+            "types": [
+              "ban",
+              "timeout"
+            ],
+            "duration": "1d"
+          },
+          "detention": {
+            "maximum": "24h"
+          },
+          "police": {
+            "contestDuration": "1d",
+            "immediate": [
+              "warning",
+              "restriction",
+              "timeout"
+            ],
+            "courtFirst": [
+              "kick",
+              "ban"
+            ],
+            "unlimitedWarningContest": true
+          },
+          "approvals": {
+            "timeoutAboveImmediate": 1,
+            "kick": 2,
+            "ban": 2
+          }
+        }
+      },
+      {
+        "kind": "procedure",
+        "key": "institutionalReview",
+        "article": "A5",
+        "value": {
+          "name": "制度点検",
+          "mandate": "現行法の矛盾、手続の停滞、未実装の職務、救済漏れを点検する。必要なら一般的な改正を提案し、不足を人間への承認依頼にしない。",
+          "initial": "review",
+          "config": {},
+          "trigger": {
+            "event": "schedule",
+            "interval": "72h"
+          },
+          "states": {
+            "review": {
+              "handler": "agent_task",
+              "duration": null,
+              "config": {
+                "institution": "parliamentInstitution",
+                "effect": "propose"
+              },
+              "on": {
+                "completed": "final"
+              }
+            },
+            "final": {
+              "handler": "terminal",
+              "duration": null,
+              "config": {},
+              "on": {}
+            }
+          }
+        }
+      },
+      {
+        "kind": "regulation",
+        "key": "votes",
+        "article": "A2",
+        "value": {
+          "defaultScope": "all",
+          "allowedScopes": [
+            "all",
+            "trusted"
+          ],
+          "law": {
+            "duration": "12h",
+            "earlyClose": "all_ballots_cast",
+            "yesRatio": 0.5,
+            "comparison": "gt",
+            "quorumRatio": 0.25,
+            "minimumBallots": 2,
+            "publicBallots": true,
+            "trustedVeto": {
+              "enabledForScope": "all",
+              "noRatio": 0.6666666666666666,
+              "denominator": "decisive_cast_ballots"
+            }
+          },
+          "constitutionalAmendment": {
+            "duration": "12h",
+            "earlyClose": "all_ballots_cast",
+            "yesRatio": 0.6666666666666666,
+            "comparison": "gte",
+            "quorumRatio": 0.25,
+            "minimumBallots": 2,
+            "publicBallots": true,
+            "trustedVeto": {
+              "enabledForScope": "all",
+              "noRatio": 0.6666666666666666,
+              "denominator": "decisive_cast_ballots"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

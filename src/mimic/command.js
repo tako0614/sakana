@@ -18,9 +18,9 @@ import { DEFAULT_ENGINE, ENGINES, engineCounts, engineFor, setEngine } from './p
 import { labelledSpeakers } from './plain.js';
 import { hasOptedOut, learnedSpeakers, optIn, optOut } from './speakers.js';
 
-async function overview(userId) {
-  const current = engineFor(userId);
-  const counts = new Map(engineCounts().map((row) => [row.engine, row.users]));
+async function overview(userId, guildId) {
+  const current = engineFor(userId, guildId);
+  const counts = new Map(engineCounts(guildId).map((row) => [row.engine, row.users]));
 
   // 自作モデルは世代ごとに別プロセス。立っていないものを選ばせないよう、
   // それぞれの状態を見る
@@ -95,7 +95,7 @@ export const mimicCommands = [
       // 省略なら表示だけ。誰でも叩けるので、確認と切り替えを同じ入口にしておく
       if (!engine) {
         await interaction.reply({
-          embeds: [await overview(interaction.user.id)],
+          embeds: [await overview(interaction.user.id, interaction.guildId)],
           flags: MessageFlags.Ephemeral
         });
         return;
@@ -126,11 +126,11 @@ export const mimicCommands = [
         }
       }
 
-      setEngine(interaction.user.id, engine);
+      setEngine(interaction.user.id, engine, interaction.guildId);
 
       await interaction.reply({
         content: `あなたの分を **${ENGINES[engine].label}** にしました。他の人には影響しません。`,
-        embeds: [await overview(interaction.user.id)],
+        embeds: [await overview(interaction.user.id, interaction.guildId)],
         flags: MessageFlags.Ephemeral
       });
     }
@@ -199,9 +199,11 @@ export const mimicCommands = [
       try {
         // その人が選んでいる世代で生成する。deepseek のままだと自作モデルが
         // 使われないので、既定は evex に落とす
-        const chosen = engineFor(interaction.user.id);
+        const chosen = engineFor(interaction.user.id, interaction.guildId);
         const engine = isSelfHosted(chosen) ? chosen : 'evex';
         const { text, how } = await impersonate(targetId, {
+          guildId: interaction.guildId,
+          channelScope: { mode: 'include', ids: [interaction.channelId] },
           topic,
           channelId: interaction.channelId,
           askerId: interaction.user.id,
@@ -273,7 +275,7 @@ export const mimicCommands = [
       const nameOf = (id) => pool().find((row) => row.userId === id)?.name ?? id;
 
       if (off) {
-        const changed = clearPersona(interaction.user.id);
+        const changed = clearPersona(interaction.user.id, interaction.guildId);
         await interaction.reply({
           content: changed
             ? 'bot 自身に戻しました。'
@@ -285,8 +287,8 @@ export const mimicCommands = [
 
       // 省略なら表示だけ。確認と切り替えを同じ入口にしておく (/model と同じ)
       if (!who) {
-        const current = personaFor(interaction.user.id);
-        const others = personaCounts()
+        const current = personaFor(interaction.user.id, interaction.guildId);
+        const others = personaCounts(interaction.guildId)
           .filter((row) => row.targetId !== current)
           .slice(0, 3)
           .map((row) => `${nameOf(row.targetId)} (${row.users}人)`);
@@ -322,10 +324,10 @@ export const mimicCommands = [
         return;
       }
 
-      setPersona(interaction.user.id, targetId);
+      setPersona(interaction.user.id, targetId, interaction.guildId);
 
       // evex を選んでいない人には効かないので、そこを黙らせない
-      const engine = engineFor(interaction.user.id);
+      const engine = engineFor(interaction.user.id, interaction.guildId);
       await interaction.reply({
         content: [
           `あなたの分を **${nameOf(targetId)} として** にしました。他の人には影響しません。`,
@@ -363,7 +365,7 @@ export const mimicCommands = [
 
       optOut(interaction.user.id);
       // 自分を選んでいた人の設定も消す。残すと黙って効かなくなって理由が分からない
-      const dropped = forgetPersona(interaction.user.id);
+      const dropped = forgetPersona(interaction.user.id, interaction.guildId);
       await interaction.reply({
         content: `外しました。あなたとしては書かれません${dropped ? ` (${dropped}人の /as を解除しました)` : ''}。\`/mimic-optout back:true\` で戻せます。`,
         flags: MessageFlags.Ephemeral

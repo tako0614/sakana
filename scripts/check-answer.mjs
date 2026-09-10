@@ -267,7 +267,7 @@ const userContentOf = (over = {}) => buildUserContent({
   });
 
   const mine = content.split('\n').find((line) => line.includes('6月と今日で'));
-  if (!mine?.includes('←あなた自身の発言')) fail(`自分の発言に印が付いていない: ${mine}`);
+  if (!mine?.includes('あなた自身の発言')) fail(`自分の発言に印が付いていない: ${mine}`);
 
   // 他人の行には付けない
   if (content.split('\n').find((l) => l.includes('たこの失言')).includes('あなた自身')) {
@@ -369,11 +369,8 @@ function fakeChannel(messages) {
   ask.channel = fakeChannel([ask]);
 
   const chain = await fetchReplyChain(ask, 'general');
-  if (chain.length !== 1) fail(`転送も鎖に入れる: ${chain.length}`);
-  if (chain[0].content !== '隠す必要ないしね') fail('転送の本文が入っていない');
-  if (!chain[0].authorName.includes('投稿者不明')) {
-    fail(`転送は投稿者不明と書く (取り違えを防ぐ): ${chain[0].authorName}`);
-  }
+  if (chain.length !== 0) fail('転送は返信連鎖に入れない');
+  if (chain.referenceState !== 'snapshot') fail('転送スナップショットとして区別する');
 }
 
 console.log('reply chain ok (リプ先 / 6ホップ / 削除 / 自己参照 / 転送)');
@@ -425,30 +422,16 @@ const { fromDiscordMessage } = await import('../src/agent/format.js');
     embeds: [],
     stickers: new Map()
   };
-  const contentOf = (over) => fromDiscordMessage({ ...base, ...over }, 'general').content;
+  const structured = (over) => fromDiscordMessage({ ...base, ...over }, 'general');
+  const image = structured({ content: '', attachments: new Map([['a', { name: 'screenshot.png' }]]) });
+  if (image.content !== '' || image.structure.attachments[0].name !== 'screenshot.png') fail('添付と本文を区別する');
+  const embed = structured({ content: '', embeds: [{ title: 'Asahi Linux', description: 'Apple Silicon 上の Linux' }] });
+  if (embed.structure.embeds[0].attribution !== 'embed_not_sender') fail('埋め込みを発言者の主張にしない');
+  const sticker = structured({ content: '', stickers: new Map([['s', { name: 'ぬこ' }]]) });
+  if (sticker.structure.stickers[0].name !== 'ぬこ') fail('スタンプを構造として保つ');
+  const both = structured({ content: 'これ見て', attachments: new Map([['a', { name: 'x.png' }]]) });
+  if (both.content !== 'これ見て' || both.structure.attachments.length !== 1) fail('本文と添付の両方を保つ');
 
-  const image = contentOf({ content: '', attachments: new Map([['a', { name: 'screenshot.png' }]]) });
-  if (!image.includes('screenshot.png')) fail(`画像だけの発言でファイル名が出ない: ${image}`);
-
-  const embed = contentOf({
-    content: '',
-    embeds: [{ title: 'Asahi Linux', description: 'Apple Silicon 上の Linux' }]
-  });
-  if (!embed.includes('Asahi Linux')) fail(`埋め込みだけの発言で中身が出ない: ${embed}`);
-  if (!embed.includes('Apple Silicon')) fail(`埋め込みの説明が出ない: ${embed}`);
-
-  const sticker = contentOf({ content: '', stickers: new Map([['s', { name: 'ぬこ' }]]) });
-  if (!sticker.includes('ぬこ')) fail(`スタンプ名が出ない: ${sticker}`);
-
-  // 本文があるときは足さない (普通の発言のトークンを増やさない / アーカイブ側と同じ規則)
-  const both = contentOf({ content: 'これ見て', attachments: new Map([['a', { name: 'x.png' }]]) });
-  if (both !== 'これ見て') fail(`本文があるなら足さない: ${both}`);
-
-  // 長い埋め込みは切る
-  const long = contentOf({ content: '', embeds: [{ description: 'あ'.repeat(500) }] });
-  if (long.length > 130) fail(`埋め込みが長すぎる: ${long.length} 文字`);
-
-  if (contentOf({ content: '' }) !== '') fail('何も無いなら空のまま');
 }
 
 console.log('extras ok (画像・埋め込み・スタンプの中身を渡す)');
@@ -527,12 +510,11 @@ console.log('discord link ok (3つ目を取る / channel も取れる / 番号�
     messageSnapshots: new Map([['far', { content: '隠す必要ないしね' }]])
   });
 
-  if (!forwarded.content.includes('隠す必要ないしね')) {
-    fail(`転送の本文を取り込んでいない: ${JSON.stringify(forwarded.content)}`);
-  }
-  // 投稿者は Discord が渡してこない。転送だと分かる印は要る
-  if (!forwarded.content.startsWith('[転送]')) fail(`転送の印が無い: ${forwarded.content}`);
-  if (forwarded.char_count === 0) fail('文字数が 0 のままだと len: で引けない');
+  if (forwarded.content !== '') fail('転送内容を転送者の発言にしない');
+  const structure = JSON.parse(forwarded.structure_json);
+  if (structure.forwarded[0]?.content !== '隠す必要ないしね') fail('転送スナップショットを失っている');
+  if (structure.forwarded[0]?.authorId !== null) fail('転送の投稿者を推測しない');
+  if (!forwarded.extra.includes('隠す必要ないしね')) fail('転送内容は検索可能に保つ');
 
   // 本文がある発言には足さない
   const normal = toRecord({

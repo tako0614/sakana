@@ -1,3 +1,4 @@
+import { tmpdir } from 'node:os';
 // 自作モデル (evex) 側の検証。
 //
 // 見ているのは1点だけ: 学習データと推論のプロンプトが同じ形かどうか。
@@ -6,8 +7,9 @@
 
 import { rmSync } from 'node:fs';
 
-const checkDatabasePath = `/tmp/sakana-mimic-check-${process.pid}.sqlite`;
+const checkDatabasePath = `${tmpdir()}/sakana-mimic-check-${process.pid}.sqlite`;
 process.env.DATABASE_PATH = checkDatabasePath;
+const TEST_GUILD = 'check-mimic-guild';
 for (const suffix of ['', '-wal', '-shm']) rmSync(`${checkDatabasePath}${suffix}`, { force: true });
 process.on('exit', () => {
   for (const suffix of ['', '-wal', '-shm']) rmSync(`${checkDatabasePath}${suffix}`, { force: true });
@@ -253,17 +255,17 @@ const clear = () => db.prepare('DELETE FROM agent_engine WHERE user_id = ?').run
 
 clear();
 try {
-  if (engineFor(USER) !== DEFAULT_ENGINE) fail('既定は deepseek');
+  if (engineFor(USER, TEST_GUILD) !== DEFAULT_ENGINE) fail('既定は deepseek');
   if (!ENGINES[DEFAULT_ENGINE]) fail('既定のエンジンが ENGINES に無い');
 
-  if (!setEngine(USER, 'evex')) fail('evex を選べない');
-  if (engineFor(USER) !== 'evex') fail('選択が保存されていない');
+  if (!setEngine(USER, 'evex', TEST_GUILD)) fail('evex を選べない');
+  if (engineFor(USER, TEST_GUILD) !== 'evex') fail('選択が保存されていない');
 
   // 他人には影響しない (自分のぶんだけ)
-  if (engineFor('check-model-other') !== DEFAULT_ENGINE) fail('選択が他人に漏れている');
+  if (engineFor('check-model-other', TEST_GUILD) !== DEFAULT_ENGINE) fail('選択が他人に漏れている');
 
-  if (setEngine(USER, 'gpt-9')) fail('知らないエンジンを受け付けてはいけない');
-  if (engineFor(USER) !== 'evex') fail('無効な指定で既存の選択を壊してはいけない');
+  if (setEngine(USER, 'gpt-9', TEST_GUILD)) fail('知らないエンジンを受け付けてはいけない');
+  if (engineFor(USER, TEST_GUILD) !== 'evex') fail('無効な指定で既存の選択を壊してはいけない');
 
   // 選べる自作モデルは全部 127.0.0.1 に回らないといけない。
   //
@@ -452,33 +454,33 @@ try {
   const YOU = 'check-persona-you';
   const TARGET = '1218933751950872728';
   const wipe = () => {
-    clearPersona(ME);
-    clearPersona(YOU);
+    clearPersona(ME, TEST_GUILD);
+    clearPersona(YOU, TEST_GUILD);
   };
 
   wipe();
   try {
-    if (personaFor(ME) !== null) fail('既定は bot 自身 (null)');
+    if (personaFor(ME, TEST_GUILD) !== null) fail('既定は bot 自身 (null)');
 
-    setPersona(ME, TARGET);
-    if (personaFor(ME) !== TARGET) fail('設定が保存されていない');
-    if (personaFor(YOU) !== null) fail('設定が他人に漏れている');
+    setPersona(ME, TARGET, TEST_GUILD);
+    if (personaFor(ME, TEST_GUILD) !== TARGET) fail('設定が保存されていない');
+    if (personaFor(YOU, TEST_GUILD) !== null) fail('設定が他人に漏れている');
 
     // 上書きできる (別の人に変える)
-    setPersona(ME, '456226577798135808');
-    if (personaFor(ME) !== '456226577798135808') fail('上書きできていない');
+    setPersona(ME, '456226577798135808', TEST_GUILD);
+    if (personaFor(ME, TEST_GUILD) !== '456226577798135808') fail('上書きできていない');
 
-    if (!personaCounts().some((row) => row.users > 0)) fail('内訳が取れていない');
+    if (!personaCounts(TEST_GUILD).some((row) => row.users > 0)) fail('内訳が取れていない');
 
-    if (!clearPersona(ME)) fail('解除できていない');
-    if (personaFor(ME) !== null) fail('解除後も残っている');
-    if (clearPersona(ME)) fail('二度目の解除で変更ありと言ってはいけない');
+    if (!clearPersona(ME, TEST_GUILD)) fail('解除できていない');
+    if (personaFor(ME, TEST_GUILD) !== null) fail('解除後も残っている');
+    if (clearPersona(ME, TEST_GUILD)) fail('二度目の解除で変更ありと言ってはいけない');
 
     // 対象から外れた人を選んでいた設定は消える。残すと黙って効かなくなる
-    setPersona(ME, TARGET);
-    setPersona(YOU, TARGET);
-    if (forgetPersona(TARGET) !== 2) fail('その人を選んでいた設定を消していない');
-    if (personaFor(ME) !== null || personaFor(YOU) !== null) fail('掃除できていない');
+    setPersona(ME, TARGET, TEST_GUILD);
+    setPersona(YOU, TARGET, TEST_GUILD);
+    if (forgetPersona(TARGET, TEST_GUILD) !== 2) fail('その人を選んでいた設定を消していない');
+    if (personaFor(ME, TEST_GUILD) !== null || personaFor(YOU, TEST_GUILD) !== null) fail('掃除できていない');
 
     console.log('persona ok (既定は bot 自身 / 自分のぶんだけ / 解除 / 対象離脱で掃除)');
   } finally {

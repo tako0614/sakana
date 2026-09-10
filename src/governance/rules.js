@@ -1,4 +1,6 @@
+import { AUTHORITY_SCHEMA, composeLegalSystem, validateAuthority } from './legal-system.js';
 import { canonicalJson, sha256, validateConstitutionPolicy } from './policy.js';
+import { validateHumanAuthority } from './human-authority.js';
 
 export const GOVERNANCE_RULES_SCHEMA = 'sakana.governance-rules/v1';
 export const GOVERNANCE_RULES_COMPILER_VERSION = 1;
@@ -133,19 +135,18 @@ function validatePanels(panels) {
   }
 }
 
-// 開会の間隔や1回の議題数は運用値ではなく統治の中身なので、運営panelではなく
-// 憲法の実行規則に置く。変えるには改憲手続が要る。
-function validateParliament(parliament) {
-  exactKeys(parliament, ['sessionInterval', 'agendaLimit', 'maximumDeferrals', 'logScan'], 'parliament');
+// 開会の間隔や議題数は法令の規定。v2以降の改稿回数は手続のmaximumVisitsが定める。
+function validateParliament(parliament, { lawDefined = false } = {}) {
+  exactKeys(parliament, ['sessionInterval', 'agendaLimit', 'logScan', ...(!lawDefined ? ['maximumDeferrals'] : [])], 'parliament');
   const interval = durationMilliseconds(parliament.sessionInterval, 'parliament.sessionInterval');
   if (interval < 3_600_000) throw new Error('parliament.sessionInterval は1時間以上である必要があります。');
   if (interval > 30 * 86_400_000) throw new Error('parliament.sessionInterval の技術上限は30日です。');
   integer(parliament.agendaLimit, 'parliament.agendaLimit', { min: 1, max: 20 });
-  integer(parliament.maximumDeferrals, 'parliament.maximumDeferrals', { min: 1, max: 20 });
+  if (!lawDefined) integer(parliament.maximumDeferrals, 'parliament.maximumDeferrals', { min: 1, max: 20 });
   if (typeof parliament.logScan !== 'boolean') throw new Error('parliament.logScan は真偽値である必要があります。');
 }
 
-function validateVotes(votes) {
+function validateVotes(votes, { lawDefined = false } = {}) {
   exactKeys(votes, ['defaultScope', 'allowedScopes', 'law', 'constitutionalAmendment'], 'votes');
   if (!['all', 'trusted'].includes(votes.defaultScope)) throw new Error('votes.defaultScope が不正です。');
   if (!Array.isArray(votes.allowedScopes) || votes.allowedScopes.length < 1
@@ -156,8 +157,9 @@ function validateVotes(votes) {
       vote,
       ['duration', 'yesRatio', 'comparison', 'quorumRatio', 'minimumBallots', 'publicBallots', 'trustedVeto'],
       `votes.${name}`,
-      ['earlyClose']
+      ['earlyClose', ...(lawDefined ? ['humanVeto'] : [])]
     );
+    if (vote.humanVeto !== undefined && vote.humanVeto !== null) validateHumanAuthority(vote.humanVeto, { veto: true });
     // earlyCloseを書かない旧憲法は締切満了だけで開票する。
     if ('earlyClose' in vote && !VOTE_EARLY_CLOSE.has(vote.earlyClose)) {
       throw new Error(`votes.${name}.earlyClose は never または all_ballots_cast です。`);
@@ -371,6 +373,7 @@ function validateInvestigation(investigation) {
 }
 
 export function validateGovernanceRules(input) {
+  if (input?.$schema === AUTHORITY_SCHEMA) return validateAuthority(input);
   const rules = exactKeys(input, ['$schema', 'electorates', 'panels', 'parliament', 'investigation', 'votes', 'sanctions', 'workflows'], 'governance-rules');
   if (rules.$schema !== GOVERNANCE_RULES_SCHEMA) throw new Error('未対応のgovernance-rules schemaです。');
   validateElectorates(rules.electorates);
@@ -490,9 +493,94 @@ export function policyFromGovernanceRules(input) {
   return validateConstitutionPolicy(policy, { technicalOnly: true });
 }
 
-export function compileConstitution({ content }) {
+export function compileLegalSystem({ authority, laws }) {
+  const rules = composeLegalSystem(authority, laws);
+  const { panels, sanctions } = rules;
+  const investigation = {
+    ...rules.investigation,
+    tools: Object.fromEntries(['police', 'court', 'parliament'].map((role) => [role, panels[role].tools]))
+  };
+  validateInvestigation(investigation);
+  rules.investigation = investigation;
+  const parliament = rules.parliament;
+  validateParliament(parliament, { lawDefined: true });
+  validateSanctions(sanctions);
+  validateVotes(rules.votes, { lawDefined: true });
+  for (const role of ['law', 'constitutionalAmendment']) {
+    if (rules.votes[role].humanVeto && !Object.values(rules.workflows[role].states).some((state) => state.handler === 'public_vote')) throw new Error('人間の拒否権には公開の投票・拒否期間が必要です。');
+  }
+  validateElectorates({ general: rules.records, trusted: { type: 'discord_role', binding: 'trusted' } });
+  if (Object.values(sanctions.approvals).some((value) => value > 0)
+    && !Object.values(rules.workflows.criminalCase.states).some((state) => state.handler === 'human_approval')) throw new Error('執行承認が必要な処分には承認手続が必要です。');
+  const duration = (workflow, handler) => {
+    const state = Object.values(workflow.states).find((entry) => entry.handler === handler);
+    if (!state || state.duration === null) throw new Error(`missing legal ${handler} period`);
+    return durationMilliseconds(state.duration);
+  };
+  const general = rules.records;
+  const policy = {
+    schemaVersion: 3,
+    autonomous: true,
+    voting: {
+      defaultScope: rules.votes.defaultScope, allowedScopes: rules.votes.allowedScopes,
+      lawYesRatio: rules.votes.law.yesRatio, amendmentYesRatio: rules.votes.constitutionalAmendment.yesRatio,
+      trustedVetoRatio: rules.votes.law.trustedVeto.noRatio, quorumRatio: rules.votes.law.quorumRatio,
+      minimumBallots: rules.votes.law.minimumBallots, publicBallots: true
+    },
+    timezoneOffsetMinutes: general.timezoneOffsetMinutes,
+    eligibility: {
+      memberAgeDays: durationMilliseconds(general.memberAge) / 86400000,
+      windowDays: durationMilliseconds(general.window) / 86400000,
+      minimumMessages: general.minimumMessages,
+      minimumActiveDays: general.minimumActiveDays,
+      perDayCap: general.perDayCap,
+      minimumVisibleCharacters: general.minimumVisibleCharacters
+    },
+    legislation: {
+      sessionIntervalMilliseconds: durationMilliseconds(parliament.sessionInterval),
+      agendaLimit: parliament.agendaLimit,
+      logScan: parliament.logScan
+    },
+    judiciary: {
+      defenseMilliseconds: duration(rules.workflows.criminalCase, 'defense_window'),
+      appealMilliseconds: durationMilliseconds(sanctions.appeals.duration),
+      constitutionalChallengesPerMemberPerDay: rules.workflows.constitutionalCase.config.petitionsPerMemberPerDay,
+      panelSeats: panels.court.seats,
+      constitutionalPanelSeats: panels.constitutional.seats,
+      guiltyVotesRequired: panels.court.required.responsible,
+      constitutionalVotesRequired: panels.constitutional.required.constitutional,
+      unconstitutionalVotesRequired: panels.constitutional.required.unconstitutional,
+      discordMaximumTimeoutSeconds: durationMilliseconds(sanctions.timeout.discordMaximum) / 1000,
+      maximumTimeoutSeconds: durationMilliseconds(sanctions.timeout.maximum) / 1000,
+      immediateTimeoutMaximumSeconds: durationMilliseconds(sanctions.timeout.immediateMaximum) / 1000,
+      timeoutApprovalsAboveSeconds: sanctions.approvals.timeoutAboveImmediate,
+      kickApprovals: sanctions.approvals.kick, banApprovals: sanctions.approvals.ban,
+      appealTimeoutMinimumSeconds: durationMilliseconds(sanctions.appeals.timeoutAtLeast) / 1000,
+      maximumRestrictionSeconds: durationMilliseconds(sanctions.maximumRestriction) / 1000,
+      allowedSanctions: sanctions.allowed,
+      restrictionPrimitives: sanctions.restrictionPrimitives,
+      policeProcedure: {
+        panelSeats: panels.police.seats, votesRequired: panels.police.required.responsible,
+        contestMilliseconds: durationMilliseconds(sanctions.police.contestDuration),
+        detentionMaximumSeconds: durationMilliseconds(sanctions.detention.maximum) / 1000,
+        immediateSanctions: sanctions.police.immediate, courtFirstSanctions: sanctions.police.courtFirst,
+        unlimitedWarningContest: sanctions.police.unlimitedWarningContest
+      }
+    },
+    investigation
+  };
+  validateConstitutionPolicy(policy, { technicalOnly: true });
+  return { rules, policy, rulesHash: sha256(canonicalJson(rules)), sourceFormat: 'law-defined-v2', compilerVersion: 2 };
+}
+
+export function compileConstitution({ content, laws = null }) {
   const rules = extractGovernanceRules(content);
   if (!rules) throw new Error('憲法にgovernance-rulesブロックがありません。');
+  if (rules.$schema === AUTHORITY_SCHEMA) {
+    if (laws) return compileLegalSystem({ authority: rules, laws });
+    return { sourceFormat: 'constitutional-authority-v2', compilerVersion: 2, rules,
+      rulesHash: sha256(canonicalJson(rules)), policy: null };
+  }
   const projectedPolicy = policyFromGovernanceRules(rules);
   const canonical = canonicalJson(rules);
   return {
@@ -519,7 +607,7 @@ export function workflowNext(compiled, key, stateName, outcome) {
   return next;
 }
 
-export function closeGovernanceVote({ kind, yes, no, abstain, electorate, trustedNo, trustedTotal, scope = 'all' }, rules) {
+export function closeGovernanceVote({ kind, yes, no, abstain, electorate, trustedNo, trustedTotal, vetoCount = 0, scope = 'all' }, rules) {
   const vote = kind === 'amendment' ? rules.votes.constitutionalAmendment : rules.votes.law;
   const decisive = Number(yes) + Number(no);
   const yesRatio = decisive > 0 ? Number(yes) / decisive : 0;
@@ -532,12 +620,14 @@ export function closeGovernanceVote({ kind, yes, no, abstain, electorate, truste
   const trustedNeeded = Number(trustedTotal) > 0
     ? Math.ceil(Number(trustedTotal) * vote.trustedVeto.noRatio)
     : Infinity;
-  const vetoed = vetoApplies && Number(trustedTotal) > 0 && Number(trustedNo) >= trustedNeeded;
+  const humanVetoed = Boolean(vote.humanVeto && Number(vetoCount) >= vote.humanVeto.required);
+  const vetoed = humanVetoed || (vetoApplies && Number(trustedTotal) > 0 && Number(trustedNo) >= trustedNeeded);
   return {
     passed: ratioPassed && quorumPassed && !vetoed,
     ratioPassed,
     quorumPassed,
     vetoed,
+    humanVetoed,
     quorumNeeded,
     trustedNeeded,
     decisive,

@@ -4,10 +4,12 @@ import {
   completeGovernanceNotification,
   failGovernanceNotification,
   getGovernanceGuild,
+  getWorkflowInstance,
   getOperationalSetting,
   reconcileGovernanceNotification,
   writeAudit
 } from './db.js';
+import { humanAuthorityLabel } from './human-authority.js';
 
 const NOTIFICATION_LIMIT_KEYS = Object.freeze({
   everyone: 'notification_everyone_daily_limit',
@@ -19,6 +21,7 @@ const EVENT_AUDIENCES = Object.freeze({
   proposal_vote_all: 'everyone',
   proposal_vote_trusted: 'trusted_role',
   case_approval: 'trusted_role',
+  case_approval_all: 'everyone',
   case_defense: 'user',
   case_appeal: 'user'
 });
@@ -48,6 +51,7 @@ function notificationAllowedMentions(descriptor) {
 }
 
 function suppressionReason(guild, descriptor) {
+  if (descriptor.silent) return '法令で指定した対象者への公開カード。全員・特別有権者への一括通知は使わない。';
   if (descriptor.audienceKind === 'everyone'
     && !guild.members?.me?.permissions?.has?.(PermissionFlagsBits.MentionEveryone)) {
     return 'bot lacks MentionEveryone permission';
@@ -85,14 +89,17 @@ export function proposalVoteNotification(guild, proposal) {
 
 export function caseApprovalNotification(guild, caseRecord, sanction) {
   const governance = getGovernanceGuild(guild.id);
+  const approval = getWorkflowInstance('case', caseRecord.id)?.context.approval;
   const roleId = discordId(governance?.trusted_role_id);
-  return eventDescriptor({
+  const selected = approval && !['all', 'trusted'].includes(approval.scope);
+  const descriptor = eventDescriptor({
     guildId: guild.id,
-    eventKey: `governance:case:${caseRecord.id}:approval:${sanction.id}`,
-    eventType: 'case_approval',
+    eventKey: `governance:case:${caseRecord.id}:approval:${sanction.id}${approval ? `:${approval.openedAt}` : ''}`,
+    eventType: approval?.scope === 'all' ? 'case_approval_all' : 'case_approval',
     audienceId: roleId,
-    mention: roleId ? `<@&${roleId}>` : '特別有権者'
+    mention: selected ? humanAuthorityLabel(approval.authority ?? approval) : approval?.scope === 'all' ? '@everyone' : roleId ? `<@&${roleId}>` : '承認資格のある構成員'
   });
+  return selected ? { ...descriptor, silent: true } : descriptor;
 }
 
 function casePartyNotification(guild, caseRecord, phase, deadline) {

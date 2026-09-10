@@ -29,8 +29,10 @@ import {
   contestButtons
 } from './discord.js';
 import { policyHash, sha256 } from './policy.js';
+import { reportManualExecution } from './manual-execution.js';
 import {
   approveCase,
+  exerciseHumanVeto,
   appealCase,
   backfillGovernanceActivity,
   castAndPublishVote,
@@ -92,7 +94,7 @@ function requireOperator(interaction) {
 }
 
 function setupHashes(documents) {
-  return { constitutionHash: sha256(documents.constitution), policyHash: policyHash(documents.policy) };
+  return { constitutionHash: sha256(documents.constitution), policyHash: policyHash({ policy: documents.policy, laws: documents.laws ?? [] }) };
 }
 
 function setupBlockingPermissions(report) {
@@ -108,7 +110,7 @@ function setupPreviewPayload(interaction, session, documents, report, { resumed 
       `# ${interaction.guild.name} 統治機能の導入確認`,
       '',
       resumed ? '途中まで作成された導入処理を、安全に続きから再開します。' : 'まだサーバーには変更を加えていません。',
-      '初期憲法とpolicyの全文を添付しています。内容を確認してから確定してください。',
+      '初期憲法と統治組織手続法の全文を添付しています。内容を確認してから確定してください。',
       '',
       `開始状態: **記録のみ**（Discord上の処分は実行しません）`,
       '特別有権者: 未設定（導入後の管理画面で設定可能）',
@@ -117,12 +119,12 @@ function setupPreviewPayload(interaction, session, documents, report, { resumed 
     ].filter(Boolean).join('\n').slice(0, 1_900),
     files: [
       { attachment: Buffer.from(documents.constitution), name: 'initial-constitution.md' },
-      { attachment: Buffer.from(`${JSON.stringify(documents.policy, null, 2)}\n`), name: 'initial-constitution-policy.json' }
+      { attachment: Buffer.from(`${JSON.stringify(documents.laws, null, 2)}\n`), name: 'initial-laws.json' }
     ],
     components: blocking.length ? [] : [new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId(`gov:setup:${session.id}:confirm`)
-        .setLabel(resumed ? '導入を再開' : 'この憲法で導入')
+        .setLabel(resumed ? '導入を再開' : 'この憲法・法律で導入')
         .setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId(`gov:setup:${session.id}:cancel`).setLabel('取り消す').setStyle(ButtonStyle.Danger)
     )],
@@ -203,6 +205,7 @@ async function executeSetup(interaction, sessionId) {
         enforcementMode: 'shadow',
         constitution: documents.constitution,
         policy: documents.policy,
+        laws: documents.laws,
         ...surfaces
       });
     if (surfaces.legacyGuideChannelId || surfaces.legacyGazetteChannelId) {
@@ -369,7 +372,7 @@ export async function handleGovernanceComponent(interaction) {
       if (value === 'withdraw') {
         await interaction.deferReply({ flags: EPHEMERAL });
         await withdrawContest(interaction.guild, member, id);
-        await interaction.editReply('申立てを取り下げ、処分を確定しました。');
+        await interaction.editReply('申立ての取下げを記録しました。処分は法定手続に従って扱います。');
         return true;
       }
       if (value === 'complete') {
@@ -380,6 +383,19 @@ export async function handleGovernanceComponent(interaction) {
       }
     }
     await interaction.deferReply({ flags: EPHEMERAL });
+    if (action === 'veto') {
+      const result = await exerciseHumanVeto(interaction, value, id);
+      await ensureGovernanceUx(interaction.guild, getGovernanceGuild(interaction.guildId));
+      await interaction.editReply(`拒否権の行使を記録しました（${result.count}人）。${result.vetoed ? '成立・執行を取りやめます。' : '法律で定める必要人数への到達を待ちます。'}`);
+      return true;
+    }
+    if (action === 'manual') {
+      const [requestKey, result] = String(value).split('-');
+      await reportManualExecution(interaction.guild, interaction.user.id, { sanctionId: id, requestKey, result });
+      await ensureGovernanceUx(interaction.guild, getGovernanceGuild(interaction.guildId));
+      await interaction.editReply('管理者による対応完了を記録しました。');
+      return true;
+    }
     if (action === 'vote') {
       await castAndPublishVote(interaction, id, value);
       await ensureGovernanceUx(interaction.guild, getGovernanceGuild(interaction.guildId));

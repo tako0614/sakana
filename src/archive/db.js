@@ -33,6 +33,7 @@ db.exec(`
     deleted INTEGER NOT NULL DEFAULT 0
   );
 
+  CREATE INDEX IF NOT EXISTS idx_msg_live_scope ON messages(deleted, guild_id, channel_id);
   CREATE INDEX IF NOT EXISTS idx_msg_guild_time ON messages(guild_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_msg_channel_time ON messages(channel_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_msg_author_time ON messages(guild_id, author_id, created_at);
@@ -495,19 +496,60 @@ db.function('regexp', { deterministic: true }, (pattern, value) => {
   }
 });
 
+// The source and its pending projection change together, including deletions.
+// Coalescing pending ids bounds the queue during a full history import.
+if (!db.prepare('PRAGMA table_info(messages)').all().some((column) => column.name === 'structure_json')) {
+  db.exec("ALTER TABLE messages ADD COLUMN structure_json TEXT NOT NULL DEFAULT '{}'");
+}
+db.exec(`
+  CREATE TABLE IF NOT EXISTS memory_pending (message_id TEXT PRIMARY KEY);
+  CREATE TABLE IF NOT EXISTS memory_projection_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS message_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL,
+    content TEXT NOT NULL, structure_json TEXT NOT NULL, edited_at INTEGER,
+    deleted INTEGER NOT NULL, observed_until INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_message_version ON message_versions(message_id, id);
+  CREATE TRIGGER IF NOT EXISTS messages_history_au BEFORE UPDATE ON messages
+    WHEN old.content IS NOT new.content OR old.edited_at IS NOT new.edited_at OR old.deleted IS NOT new.deleted
+  BEGIN
+    INSERT INTO message_versions(message_id, content, structure_json, edited_at, deleted, observed_until)
+      VALUES(old.message_id, old.content, old.structure_json, old.edited_at, old.deleted, unixepoch('subsec') * 1000);
+  END;
+  DROP TRIGGER IF EXISTS messages_memory_ai;
+  CREATE TRIGGER messages_memory_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO memory_pending VALUES (new.message_id) ON CONFLICT(message_id) DO NOTHING;
+  END;
+  DROP TRIGGER IF EXISTS messages_memory_au;
+  CREATE TRIGGER messages_memory_au AFTER UPDATE ON messages BEGIN
+    INSERT INTO memory_pending VALUES (new.message_id) ON CONFLICT(message_id) DO NOTHING;
+  END;
+  DROP TRIGGER IF EXISTS messages_memory_ad;
+  CREATE TRIGGER messages_memory_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO memory_pending VALUES (old.message_id) ON CONFLICT(message_id) DO NOTHING;
+  END;
+`);
+if (!db.prepare("SELECT 1 FROM memory_projection_state WHERE key = 'seeded-v1'").get()) {
+  db.transaction(() => {
+    db.exec('INSERT OR IGNORE INTO memory_pending SELECT message_id FROM messages');
+    db.prepare('INSERT INTO memory_projection_state VALUES (?, ?)').run('seeded-v1', '1');
+  })();
+}
+
 const upsertMessageStmt = db.prepare(`
   INSERT INTO messages (
     message_id, guild_id, channel_id, parent_id, author_id, author_name, is_bot,
     content, extra, created_at, edited_at, reply_to,
     attachment_count, attachment_kinds, embed_count, sticker_count, link_count,
-    reaction_count, char_count, pinned, deleted
+    reaction_count, char_count, pinned, deleted, structure_json
   ) VALUES (
     @message_id, @guild_id, @channel_id, @parent_id, @author_id, @author_name, @is_bot,
     @content, @extra, @created_at, @edited_at, @reply_to,
     @attachment_count, @attachment_kinds, @embed_count, @sticker_count, @link_count,
-    @reaction_count, @char_count, @pinned, 0
+    @reaction_count, @char_count, @pinned, 0, @structure_json
   )
   ON CONFLICT(message_id) DO UPDATE SET
+    guild_id = CASE WHEN messages.guild_id = '' THEN excluded.guild_id ELSE messages.guild_id END,
     author_name = excluded.author_name,
     content = excluded.content,
     extra = excluded.extra,
@@ -521,7 +563,8 @@ const upsertMessageStmt = db.prepare(`
     reaction_count = excluded.reaction_count,
     char_count = excluded.char_count,
     pinned = excluded.pinned,
-    deleted = 0
+    deleted = 0,
+    structure_json = excluded.structure_json
 `);
 
 const deleteMentionsStmt = db.prepare('DELETE FROM message_mentions WHERE message_id = ?');
@@ -537,7 +580,7 @@ function saveOne(record) {
   // 子テーブル向けの配列は名前付きパラメータに渡せないので分離する
   const { mentions = [], reactions = [], links = [], ...row } = record;
 
-  upsertMessageStmt.run(row);
+  upsertMessageStmt.run({ structure_json: '{}', ...row });
 
   deleteMentionsStmt.run(row.message_id);
   for (const userId of mentions) {

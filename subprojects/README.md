@@ -14,4 +14,4 @@ Initialize the source checkout with:
 git submodule update --init subprojects/atom-memory
 ```
 
-Run checks inside that directory with `npm ci && npm run check`. Changes to the library, its package release, and its documentation belong to the independent repository. The Sakana runtime does not automatically install or invoke the library by initializing this submodule.
+Run the library's own checks inside that directory with `npm ci && npm run check`. Changes to the library, its package release, and its documentation belong to the independent repository. Sakana builds the pinned source during root `npm ci` and uses its public entry points from `src/conversation/memory.js`. The host owns Discord ingestion, access policies, and the shared agent runtime. See [the integration architecture](../docs/agent-architecture.md).

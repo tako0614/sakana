@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { compileConstitution } from './rules.js';
 
 function number(value, fallback) {
   const parsed = Number(value);
@@ -88,8 +89,9 @@ export function renderBootstrapConstitution(template, serverName) {
 export function loadBootstrapDocuments({ serverName = 'Community' } = {}) {
   const template = readFileSync(new URL('../../governance/constitution.md', import.meta.url), 'utf8').trim();
   const constitution = renderBootstrapConstitution(template, serverName);
-  const policy = JSON.parse(readFileSync(new URL('../../governance/policy.json', import.meta.url), 'utf8'));
-  return { constitution, policy };
+  const laws = [JSON.parse(readFileSync(new URL('../../governance/founding-laws/organization.json', import.meta.url), 'utf8'))];
+  const { policy } = compileConstitution({ content: constitution, laws });
+  return { constitution, policy, laws };
 }
 
 export function isGovernanceOperator(member) {

@@ -13,7 +13,7 @@ import { getTopXP } from '../db.js';
 import { chunkCoverage } from '../archive/chunks.js';
 import { db as archiveDb, reactionUsers } from '../archive/db.js';
 import { resolveModel } from '../archive/embed-job.js';
-import { aggregateSearch, isChannelAllowed, searchSummary, topReactionEmojis } from '../archive/search.js';
+import { aggregateSearch, buildSearch, isChannelAllowed, searchSummary, topReactionEmojis } from '../archive/search.js';
 import { shortTime, truncate } from './format.js';
 import { resolveMemberId } from './members.js';
 
@@ -135,7 +135,7 @@ function channelLabel(ctx, channelId) {
   if (cached?.name) return cached.name;
 
   try {
-    const row = archiveDb.prepare('SELECT name FROM channels WHERE channel_id = ?').get(channelId);
+    const row = archiveDb.prepare('SELECT name FROM channels WHERE guild_id = ? AND channel_id = ?').get(ctx.guild.id, channelId);
     if (row?.name) return row.name;
   } catch {
     // アーカイブが無い構成でも動く
@@ -152,15 +152,17 @@ function channelLabel(ctx, channelId) {
  */
 function replyPartners(ctx, userId) {
   try {
+    const visible = buildSearch({ guildId: ctx.guild.id, channelScope: ctx.channelScope });
     const rows = archiveDb.prepare(`
+      WITH visible AS (SELECT m.* FROM messages m WHERE ${visible.where})
       SELECT p.author_id AS id, p.author_name AS name, COUNT(*) AS count
-      FROM messages m
-      JOIN messages p ON p.message_id = m.reply_to
+      FROM visible m
+      JOIN visible p ON p.message_id = m.reply_to
       WHERE m.guild_id = ? AND m.author_id = ? AND m.deleted = 0 AND p.author_id != ?
       GROUP BY p.author_id
       ORDER BY count DESC
       LIMIT 5
-    `).all(ctx.guild.id, userId, userId);
+    `).all(...visible.params, ctx.guild.id, userId, userId);
 
     return rows.filter((row) => row.name);
   } catch {
@@ -284,6 +286,10 @@ function reactionsInfo(ctx, args) {
     return 'at に参照番号かメッセージ ID を渡してください (検索してから番号を渡す)。';
   }
 
+  const location = locate(ctx, entry.messageId);
+  if (!location || !isChannelAllowed(location, ctx.channelScope)) {
+    return 'その発言はこのサーバーに無いか、閲覧権限がありません。';
+  }
   let counts = [];
   try {
     counts = archiveDb
@@ -291,12 +297,6 @@ function reactionsInfo(ctx, args) {
       .all(entry.messageId);
   } catch {
     return 'リアクションの記録はローカルの取り込みが要る。管理者が `/index build` を実行するまでは使えません。';
-  }
-
-  // 見えないチャンネルの発言のリアクションは出さない
-  const location = entry.channelId ?? locate(entry.messageId);
-  if (location && !isChannelAllowed(location, ctx.channelScope)) {
-    return 'その発言があるチャンネルは読めません。';
   }
 
   if (counts.length === 0) return 'その発言にリアクションは付いていません (取り込み済みの範囲では)。';
@@ -323,11 +323,11 @@ function reactionsInfo(ctx, args) {
   return lines.join('\n');
 }
 
-function locate(messageId) {
+function locate(ctx, messageId) {
   try {
     return archiveDb
-      .prepare('SELECT channel_id FROM messages WHERE message_id = ?')
-      .get(String(messageId))?.channel_id ?? null;
+      .prepare('SELECT channel_id FROM messages WHERE guild_id = ? AND message_id = ? AND deleted = 0')
+      .get(ctx.guild.id, String(messageId))?.channel_id ?? null;
   } catch {
     return null;
   }

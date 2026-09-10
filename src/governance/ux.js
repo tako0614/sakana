@@ -16,12 +16,15 @@ import {
   getActiveConstitution,
   getCaseSanction,
   getConstitution,
+  getWorkflowInstance,
+  legalApprovalResult,
   getGovernanceGuild,
   getOperationalSetting,
   governanceNotificationStats,
   listActionFailures,
   listCaseApprovals,
   listCases,
+  listSanctions,
   listNotificationFailures,
   listProposals,
   proposalVoteSummary,
@@ -55,6 +58,8 @@ import {
 import { setTrustedMember } from './service.js';
 import { policeProcedure } from './policy.js';
 import { lawSiteLink } from './lawsite.js';
+import { humanAuthorityLabel } from './human-authority.js';
+import { manualExecutionDetail } from './manual-execution.js';
 
 const EPHEMERAL = MessageFlags.Ephemeral;
 const ACTIVE_CASE_STATUSES = ['filing', 'police_review', 'contest_window', 'defense', 'deliberation', 'approval', 'appeal_window', 'appeal', 'execution'];
@@ -88,7 +93,7 @@ async function electorateLabel(guild, governance) {
 function activeCounts(guildId) {
   const proposals = activeProposals(guildId);
   return {
-    agenda: proposals.filter((proposal) => proposalHandler(proposal) === 'parliament_agenda').length,
+    agenda: proposals.filter((proposal) => proposalHandler(proposal) !== 'public_vote').length,
     voting: proposals.filter((proposal) => proposalHandler(proposal) === 'public_vote').length,
     cases: listCases(guildId, { statuses: ACTIVE_CASE_STATUSES, limit: 100 }).length
   };
@@ -195,14 +200,14 @@ export async function renderGovernanceOperationsPanel(guild, governance) {
       `Bot権限: ${permissions.ok ? 'OK' : `不足: ${permissions.missing.join('、')}`}`,
       `失敗した処理: ${failures.length + workflows.length}件`,
       `特別有権者: ${electorate}`,
-      `国会(憲法で固定): ${Math.round((constitution?.policy.legislation.sessionIntervalMilliseconds ?? 0) / 3_600_000)}時間ごと / 1回 ${constitution?.policy.legislation.agendaLimit ?? '?'}議題 / 継続審議 ${constitution?.policy.legislation.maximumDeferrals ?? '?'}回 / 自律起案 ${constitution?.policy.legislation.logScan ? '有効' : '無効'}${governance.last_session_at ? ` / 前回 <t:${Math.floor(Number(governance.last_session_at) / 1000)}:R>` : ''}`,
+      `国会(${constitution?.policy.autonomous ? '法律で規定' : '憲法で規定'}): ${(constitution?.policy.legislation.sessionIntervalMilliseconds ?? 0) / 3_600_000}時間ごと / 1回 ${constitution?.policy.legislation.agendaLimit ?? '?'}議題${constitution?.policy.autonomous ? '' : ` / 継続審議 ${constitution?.policy.legislation.maximumDeferrals ?? '?'}回`} / 自律起案 ${constitution?.policy.legislation.logScan ? '有効' : '無効'}${governance.last_session_at ? ` / 前回 <t:${Math.floor(Number(governance.last_session_at) / 1000)}:R>` : ''}`,
       `AI受付: 一般 ${getOperationalSetting(guild.id, 'general_daily_calls')}回/日 / ${electorateName} ${getOperationalSetting(guild.id, 'trusted_daily_calls')}回/日`,
       `AI調査: 会話 ${getOperationalSetting(guild.id, 'investigation_conversation_limit')}件 / 対象者 ${getOperationalSetting(guild.id, 'investigation_actor_limit')}件 / サーバー ${getOperationalSetting(guild.id, 'investigation_guild_limit')}件 / 最大事件 ${getOperationalSetting(guild.id, 'investigation_case_limit')}件`,
       `通知上限: 全体 ${getOperationalSetting(guild.id, 'notification_everyone_daily_limit')}回 / ${electorateName} ${getOperationalSetting(guild.id, 'notification_trusted_daily_limit')}回 / 当事者1人 ${getOperationalSetting(guild.id, 'notification_user_daily_limit')}回（各24時間）`,
       `通知実績（24時間）: 送信 ${notificationStats.delivered} / 上限・権限で抑制 ${notificationStats.suppressed} / 失敗 ${notificationStats.failed}`,
       '',
       `公開手続: <#${governance.procedure_channel_id}>`,
-      'ここで変更できるのはBotの運用値だけです。憲法・投票・司法policyは改憲手続を経なければ変更できません。'
+      'ここで変更できるのはBotの運用値だけです。統治の条件を変えるには、根拠となる憲法・法律の改正手続が必要です。'
     ].join('\n').slice(0, 1_900),
     components: operationsComponents(governance),
     allowedMentions: { parse: [] }
@@ -243,18 +248,22 @@ function actionLink(guildId, channelId, label) {
 }
 
 function voteActionComponents(guildId, proposal) {
+  const veto = getWorkflowInstance('proposal', proposal.id)?.context.publicVote?.veto;
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`gov:vote:${proposal.id}:yes`).setLabel('賛成').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`gov:vote:${proposal.id}:no`).setLabel('反対').setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId(`gov:vote:${proposal.id}:abstain`).setLabel('棄権').setStyle(ButtonStyle.Secondary),
+    ...(veto ? [new ButtonBuilder().setCustomId(`gov:veto:${proposal.id}:proposal`).setLabel('拒否権を行使').setStyle(ButtonStyle.Danger)] : []),
     actionLink(guildId, proposal.forum_thread_id, '本文・議論')
   )];
 }
 
 function approvalActionComponents(guildId, caseRecord) {
+  const veto = getWorkflowInstance('case', caseRecord.id)?.context.approval?.veto;
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`gov:approve:${caseRecord.id}:approve`).setLabel('執行承認').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`gov:approve:${caseRecord.id}:reject`).setLabel('承認しない').setStyle(ButtonStyle.Danger),
+    ...(veto ? [new ButtonBuilder().setCustomId(`gov:veto:${caseRecord.id}:case`).setLabel('拒否権を行使').setStyle(ButtonStyle.Danger)] : []),
     actionLink(guildId, caseRecord.public_thread_id, '判決記録')
   )];
 }
@@ -273,6 +282,7 @@ function sanctionName(sanction) {
 export function renderProposalVoteAction(guild, proposal) {
   const summary = proposalVoteSummary(proposal.id);
   const notification = proposalVoteNotification(guild, proposal);
+  const veto = getWorkflowInstance('proposal', proposal.id)?.context.publicVote?.veto;
   return {
     key: `vote:${proposal.id}`,
     notification,
@@ -281,6 +291,7 @@ export function renderProposalVoteAction(guild, proposal) {
       `**${safeLabel(proposal.title, 180)}**`,
       `対象: ${proposal.vote_scope === 'all' ? '全員' : '特別有権者'}${deadline(proposal.stage_ends_at)}`,
       `現在: 賛成 ${summary.yes} / 反対 ${summary.no} / 棄権 ${summary.abstain}`,
+      ...(veto ? [`拒否権: ${humanAuthorityLabel(veto)} / 行使 ${summary.vetoCount}/${veto.required}人。拒否期間の満了まで早期成立しません。`] : []),
       '下のボタンから記名投票できます。選び直すと票が更新されます。'
     ].join('\n').slice(0, 1_900),
     components: voteActionComponents(guild.id, proposal),
@@ -290,7 +301,8 @@ export function renderProposalVoteAction(guild, proposal) {
 
 export function renderCaseApprovalAction(guild, caseRecord) {
   const sanction = getCaseSanction(caseRecord.id);
-  const approved = listCaseApprovals(caseRecord.id).filter((entry) => entry.decision === 'approve').length;
+  const approval = getWorkflowInstance('case', caseRecord.id)?.context.approval;
+  const approved = approval ? legalApprovalResult(caseRecord.id).approvals : listCaseApprovals(caseRecord.id).filter((entry) => entry.decision === 'approve').length;
   const notification = caseApprovalNotification(guild, caseRecord, sanction);
   return {
     key: `approve:${caseRecord.id}`,
@@ -298,9 +310,11 @@ export function renderCaseApprovalAction(guild, caseRecord) {
     content: [
       notification.mention,
       `**${safeLabel(caseRecord.summary, 180)}**`,
+      approval ? `承認者: ${humanAuthorityLabel(approval.authority ?? approval)} / 承認期限: <t:${Math.floor(approval.deadline / 1000)}:F>${approval.rejectVotes > 0 ? ` / 拒否 ${approval.rejectVotes}票で中止` : ''}` : null,
+      approval?.veto ? `拒否権: ${humanAuthorityLabel(approval.veto)}の${approval.veto.required}人。拒否期間の満了まで執行しません。` : null,
       caseRecord.accused_id ? `対象: ${publicMemberLabel(caseRecord.accused_id)}` : null,
       `処分: ${sanctionName(sanction)} / 承認 ${approved}/${sanction?.required_approvals ?? '?'}人`,
-      '特別有権者は下のボタンから記名で判断します。被申立人と申立人は承認できません。'
+      `${approval ? '開始時に承認資格を満たした構成員' : '特別有権者'}は下のボタンから記名で判断します。被申立人と申立人は承認できません。`
     ].filter(Boolean).join('\n').slice(0, 1_900),
     components: approvalActionComponents(guild.id, caseRecord),
     allowedMentions: { parse: [] }
@@ -314,7 +328,23 @@ export function renderGovernanceActionCards(guild) {
     .filter((caseRecord) => caseRecord.public_thread_id && getCaseSanction(caseRecord.id));
   return [
     ...proposals.map((proposal) => renderProposalVoteAction(guild, proposal)),
-    ...approvals.map((caseRecord) => renderCaseApprovalAction(guild, caseRecord))
+    ...approvals.map((caseRecord) => renderCaseApprovalAction(guild, caseRecord)),
+    ...listSanctions(guild.id, ['pending_manual_execution', 'pending_manual_reversal']).map((sanction) => {
+      const request = manualExecutionDetail(sanction).manualRequest;
+      const execute = request.kind === 'execute';
+      const buttons = [new ButtonBuilder().setCustomId(`gov:manual:${sanction.id}:${request.key}-done`)
+        .setLabel(execute ? '執行完了' : '取消への対応完了').setStyle(ButtonStyle.Success)];
+      if (!execute && !request.priorExecutionReported) buttons.push(new ButtonBuilder()
+        .setCustomId(`gov:manual:${sanction.id}:${request.key}-not_executed`).setLabel('未執行のまま取消').setStyle(ButtonStyle.Secondary));
+      return { key: `manual:${sanction.id}`, content: [
+        `## C-${sanction.case_id} / ${execute ? '管理者の執行待ち' : '管理者の取消対応待ち'}`,
+        `対象: ${publicMemberLabel(sanction.user_id)} / 処分: ${sanctionName(sanction)}`,
+        execute ? '管理者がDiscordで手動執行した後、「執行完了」を押してください。'
+          : sanction.type === 'ban' ? '管理者がDiscordでBANを解除した後、対応完了を押してください。'
+            : '管理者が取消を本人へ伝え、再参加を案内した後、対応完了を押してください。',
+        'ボタンは管理者の完了報告を記録します。'
+      ].join('\n'), components: [new ActionRowBuilder().addComponents(buttons)], allowedMentions: { parse: [] } };
+    })
   ];
 }
 
@@ -322,7 +352,7 @@ function actionCardKey(message) {
   for (const row of message.components ?? []) {
     for (const component of row.components ?? []) {
       const customId = component.customId ?? component.data?.custom_id;
-      const match = String(customId ?? '').match(/^gov:(vote|approve):(\d+):/);
+      const match = String(customId ?? '').match(/^gov:(vote|approve|manual):(\d+):/);
       if (match) return `${match[1]}:${match[2]}`;
     }
   }
@@ -346,7 +376,7 @@ export async function syncGovernanceActionCards(guild, channel) {
     const message = messages.shift() ?? null;
     const { key: _key, notification, ...payload } = card;
     if (!message) {
-      const delivery = beginGovernanceNotification(guild, notification);
+      const delivery = notification ? beginGovernanceNotification(guild, notification) : null;
       try {
         const sent = await channel.send({
           ...payload,
@@ -358,7 +388,7 @@ export async function syncGovernanceActionCards(guild, channel) {
         throw error;
       }
     } else {
-      reconcileGovernanceNotificationMessage(notification, message);
+      if (notification) reconcileGovernanceNotificationMessage(notification, message);
       const editPayload = { ...payload, allowedMentions: { parse: [] } };
       if (message.content !== editPayload.content || !componentsMatch(message, editPayload.components)) {
         await message.edit(editPayload);
@@ -391,6 +421,7 @@ export async function renderGovernanceProcedureHub(guild, governance) {
       `法律にしたいことは <#${governance.parliament_forum_id}> へ投稿してください。違反の通報・上訴・違憲審査は <@&${governance.judiciary_role_id}> に自然文で話してください。`,
       `国会は${Math.round(intervalMs / 3_600_000)}時間ごとに開き、議会の投稿と公開ログを議題として読みます。${nextAt ? `次の開会: <t:${Math.floor(nextAt / 1000)}:R>` : '次の開会: まもなく'}`,
       '投票と執行承認が始まると、この下に操作カードが出ます。',
+      constitution?.policy.autonomous ? 'AIが調査・起草・審査・修正を進めます。人間の投票・承認が必要な段階と成立条件は、憲法と法律に従います。' : null,
       '',
       `議題 ${agenda.length}件 / いま操作できる案件: 投票 ${voting.length}件 / 承認 ${approvals.length}件`
     ].filter(Boolean).join('\n').slice(0, 1_900),
@@ -540,7 +571,7 @@ function electoratePanel(governance) {
         new UserSelectMenuBuilder().setCustomId('gov:admin_user:remove').setPlaceholder('特別有権者から削除').setMinValues(1).setMaxValues(1)
       ),
       new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('gov:admin:disable_electorate').setLabel('特別有権者機能を無効化').setStyle(ButtonStyle.Danger)
+        new ButtonBuilder().setCustomId('gov:admin:disable_electorate').setLabel('特別有権者ロールの利用を停止').setStyle(ButtonStyle.Danger)
       )
     ],
     flags: EPHEMERAL
@@ -735,9 +766,9 @@ export async function handleGovernanceUxInteraction(interaction) {
   if (customId === 'gov:admin:disable_electorate') {
     requireOwner(interaction);
     updateGovernanceGuild(interaction.guildId, { trusted_role_id: '' });
-    createAdministrativeAct({ guildId: interaction.guildId, kind: 'trusted_role', actorId: interaction.user.id, summary: '特別有権者機能を無効化', detail: { before: governance.trusted_role_id, after: '' } });
-    await postAuthorityChange(interaction.guild, getGovernanceGuild(interaction.guildId), '特別有権者機能を無効化', `運営者: <@${interaction.user.id}>`);
-    await interaction.reply({ content: '特別有権者機能を無効化しました。', flags: EPHEMERAL });
+    createAdministrativeAct({ guildId: interaction.guildId, kind: 'trusted_role', actorId: interaction.user.id, summary: '特別有権者ロールの利用を停止', detail: { before: governance.trusted_role_id, after: '' } });
+    await postAuthorityChange(interaction.guild, getGovernanceGuild(interaction.guildId), '特別有権者ロールの利用を停止', `運営者: <@${interaction.user.id}>`);
+    await interaction.reply({ content: '新たな特別有権者の受付を停止しました。法令で必要な投票・承認は省略しません。', flags: EPHEMERAL });
     await refreshDashboard(interaction);
     return true;
   }
@@ -758,7 +789,7 @@ export async function handleGovernanceUxInteraction(interaction) {
       report.blockers.length ? `開始できません:\n- ${report.blockers.join('\n- ')}` : '必須条件: OK',
       ...report.warnings.map((warning) => `注意: ${warning}`),
       '',
-      '実執行では、成立法と確定判決に基づきtimeout・kick・ban・各種制限がDiscordへ反映されます。'
+      '実執行ではtimeout・各種制限をBotが反映します。ban・kickは必要な承認後に管理者が手動で行い、案件カードの「執行完了」で記録します。'
     ];
     await interaction.reply({
       content: lines.join('\n'),

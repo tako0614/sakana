@@ -1,3 +1,4 @@
+import { conversationMemory } from '../conversation/memory.js';
 // メンションで呼ばれる AI エージェント。
 //
 //   @bot この議論まとめて
@@ -250,36 +251,37 @@ const REPLY_CHAIN_LIMIT = 6;
 export async function fetchReplyChain(message, channelName) {
   const chain = [];
   const seen = new Set([message.id]);
-  // 参照を持っているのは「いま見ている側」なので、ホップごとに進める
   let node = message;
-  let parentId = message.reference?.messageId ?? null;
-
-  while (parentId && chain.length < REPLY_CHAIN_LIMIT && !seen.has(parentId)) {
+  chain.referenceState = 'not_applicable';
+  while (node.reference?.messageId && chain.length < REPLY_CHAIN_LIMIT) {
+    // A forwarded snapshot is quoted material attached to the sender's message.
+    // It is not an interlocutor, nor a hop in this conversation's reply chain.
+    if (node.reference.type === 1 || node.messageSnapshots?.size) {
+      chain.referenceState = chain.length ? chain.referenceState : 'snapshot';
+      break;
+    }
+    const parentId = node.reference.messageId;
+    if (seen.has(parentId)) { chain.referenceState = 'cycle'; break; }
     seen.add(parentId);
-
-    // 転送 (forward) は本文が message_snapshots 側に入り、参照先が別チャンネルなので
-    // channel.messages.fetch では取れない。スナップショットがあるならそれを使う。
-    const snapshot = node.messageSnapshots?.get(parentId) ?? null;
-
-    // 直近30件を先に取ってあるのでキャッシュに載っていることが多い。
-    // 載っていないぶんだけ取りに行く (削除済みなら鎖はそこで切れる)。
-    const parent = snapshot
-      ?? message.channel.messages?.cache?.get(parentId)
-      ?? await message.channel.messages.fetch(parentId).catch(() => null);
-
-    if (!parent) break;
-
-    const entry = fromDiscordMessage(parent, parent.channel?.name ?? channelName);
-
-    // 転送のスナップショットに投稿者は入ってこない。分からないまま名前を出すと
-    // 取り違えるので、そう書く (誰の発言かの取り違えは捏造と同じ害になる)。
-    if (snapshot) entry.authorName = '転送された発言 (投稿者不明)';
-
-    chain.push(entry);
+    const targetChannelId = node.reference.channelId ?? node.channelId;
+    const targetChannel = targetChannelId === message.channelId ? message.channel
+      : message.guild?.channels?.cache?.get(targetChannelId);
+    // Never follow a reference into a broader/different audience during preload.
+    // The read tool can resolve explicit requests under its permission checks.
+    if (!targetChannel || targetChannelId !== message.channelId) {
+      chain.referenceState = 'unavailable'; break;
+    }
+    let parent = targetChannel.messages?.cache?.get(parentId);
+    if (!parent) {
+      try { parent = await targetChannel.messages.fetch(parentId); }
+      catch (error) { chain.referenceState = Number(error.code) === 10008 ? 'deleted' : 'unavailable'; break; }
+    }
+    if (!parent) { chain.referenceState = 'unavailable'; break; }
+    chain.push(fromDiscordMessage(parent, parent.channel?.name ?? channelName));
+    chain.referenceState = 'resolved';
     node = parent;
-    parentId = parent.reference?.messageId ?? null;
   }
-
+  if (chain.length === REPLY_CHAIN_LIMIT && node.reference?.messageId) chain.referenceState = 'depth_limit';
   return chain.reverse();
 }
 
@@ -296,7 +298,7 @@ export async function handleAgentRequest(message, client) {
   // ドル換算の上限に混ぜると請求と乖離するから。
   const governanceTopic = Boolean(getGovernanceGuild(guild.id))
     && isGovernanceAgentTopic(message.content);
-  const chosen = engineFor(message.author.id);
+  const chosen = engineFor(message.author.id, guild.id);
   // 自作モデル側はどれも「会話の続きを1発言書く」だけ。道具も検索も使えない。
   //
   // 名前を並べていたら evex-1 を足したときに書き足し忘れ、選んだ人が黙って
@@ -423,10 +425,14 @@ export async function handleAgentRequest(message, client) {
       extras: describeExtras(message),
       recent,
       replyChain,
+      requestMessage: { ...fromDiscordMessage(message), referenceState: replyChain.referenceState },
       refs
     });
 
+    const memory = conversationMemory({ guildId: guild.id, channel: message.channel, member, query: message.content });
     const result = await runAgent({
+      guildId: guild.id,
+      memory,
       system,
       userContent,
       toolset,
@@ -443,7 +449,7 @@ export async function handleAgentRequest(message, client) {
       deadlineAt: Date.now() + agentConfig.deadlineMs,
       weigh: weighTokens,
       onToolCall: (name, args) => indicator.setStatus(toolLabel(name, args))
-    });
+    }).finally(() => memory.close());
 
     finalizeCall(reservation.id, {
       status: 'ok',
