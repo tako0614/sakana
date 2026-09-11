@@ -1,23 +1,35 @@
 # 本番運用メモ
 
-2026-09-10時点。実行先はProxmoxのCT102 `discord`、既存の `sakana.service`。
+2026-09-11時点。実行先はProxmoxのCT102 `discord`、既存の `sakana.service`。
 
 - 作業・データディレクトリ: `/root/sakana`。
-- 稼働ソース: `/root/sakana/releases/20260910T192754Z`。systemdの `90-release.conf` がこのソースとtsxを指定する。
-- DBバックアップ: `/root/sakana/backups/before-20260910T192754Z`。停止中のDBと従来のservice定義を保持。
+- 稼働ソース: `/root/sakana/releases/20260911T022756Z`。9月11日02:32 UTCに切替。systemdの `90-release.conf` がこのソースとtsxを指定する。
+- 今回のバックアップ: `/root/sakana/backups/before-20260911T012405Z`。SQLiteのオンラインバックアップによるアーカイブ約1.47GBと、切替前のservice定義を保持。前回の停止中DBバックアップは `/root/sakana/backups/before-20260910T192754Z`。
 - Atomはサーバー内のSQLite。新しい外部DB・GPU・推論モデルは追加していない。
 - 模倣モデルの利用先にサーバー制約はない。会話の原文・記憶・実行記録・個人設定はサーバー単位で扱う。
 - 法律サイト: https://sakana-laws.shoutatomiyama0614.workers.dev 。Worker版 `0e0f8fb1-c7e8-4ee7-8b5d-5ae27f4b5e08`。
 
 ## 初回履歴移行
 
-`sakana-history-structure.service` がtakoserver、Evex Developersの順にDiscordから再取得する。中断時はチャンネルの保存済み取得位置から再試行する。Bot内のworker threadが原文キューをAtomへ同期する。CLIからAtomを同時更新しない。
+導入時の `sakana-history-structure.service` はtakoserver、Evex Developersの再取得を終了コード0で完了した。中断時はチャンネルの保存済み取得位置から再試行する。Bot内のworker threadが原文キューをAtomへ同期する。CLIからAtomを同時更新しない。
 
 移行開始時のアーカイブは約104万件。コピー上の試験は1,000件あたり約37秒だった。実際の所要時間はDiscordのレート制限、ディスク負荷、編集・再取得の量で変わる。初回ジョブの開始を全件完了とは扱わない。
 
-状態はリリースディレクトリの `history-import-result.json`、`history-<guildId>.log` と `journalctl -u sakana.service` の `Conversation memory` に出る。原文の `memory_pending` が未反映数。所属先不明の古い行は、Discordから所属先を確認して再取得した時に補う。
+再取得結果は `/root/sakana/releases/20260910T192754Z/history-import-result.json` と同じ場所の `history-<guildId>.log` に残る。原文同期の現況は `journalctl -u sakana.service` の `Conversation memory` に出る。原文の `memory_pending` が未反映数。所属先不明の古い行は、Discordから所属先を確認して再取得した時に補う。
 
-## 統治の移行状態
+## AIによる意味の整理
+
+新しいリリースでは `deepseek-v4-flash` のWriterを有効にし、既存履歴と新着を継続的に整理する。説明・話題のまとまり・役割付き関係をAtomへ保存し、会話・警察・裁判・議会が共通の想起経路で読む。[構造と再処理の契約](agent-architecture.md)を参照。
+
+原文同期とAI整理は一つのworkerが担当する。既定は最大60発言・60KB、同時に一バッチ。モデルの結果と確定状態を保存し、再起動時はチェックポイントから再開する。新しい外部DBやGPUは追加していない。
+
+初回の本番確認で、Atomのメタデータ検索とキュー選択に全件走査・並べ替えが見つかった。最終版はメタデータのprefixとスコープ内ページングに索引を使い、次の仕事はキュー順の索引から取得する。まだAI整理が存在しないチャンネルではWriter用の既存整理検索を省く。
+
+`memory_writer_pending` がAI未処理数、`memory_writer_runs` が完了バッチ・生成Atom数・API使用量。`processedMessages` は再整理を含む累計であり、固有の処理済み発言数ではない。約104万件の既存履歴は順次処理するため、リリース完了は全件の意味整理完了を意味しない。
+
+本番の状態確認は `/root/sakana` を作業ディレクトリにして、リリース内の `scripts/organize-conversations.mjs --status --guild SERVER_ID` を実行する。Bot稼働中に別のWriterや原文同期CLIを同時実行しない。
+
+## 9月10日に確認した統治の移行状態
 
 takoserverの移行改憲案は提案82として登録済み。初期案への実AI審査は修正を要求しており、現時点で新憲法の成立を確認した記録はない。AIの起草・修正・独立審査の後、現行憲法の人間の公開投票を通す。人間の票や承認を管理スクリプトで代行しない。
 
@@ -27,6 +39,8 @@ takoserverの管理対象Botロール `Evex 公式` には、Discord側ではKic
 
 ## 検証
 
-全体の `npm run check`、サーバー分離、永続化失敗時の再処理、Atom SQLiteの関連88テストが通過。本番で見つかった再取得時のキュー重複は、失敗する回帰例を確認してからUPSERT対応のトリガーへ修正した。旧版DBコピーの移行・quick_checkも成功している。
+リリース配置先で `npm run check`、Atom本体の全143テスト、実DeepSeekによる合成会話の整理・想起試験が通過。編集・削除による解釈の失効、入力変更中の確定拒否、永続化失敗後の再開、サーバー分離、統治の出力量予算も回帰検査に含む。テスト用DBは分離したtmpfsを使用し、Botのデータを検査入力にしていない。
+
+リリース内の `verify-writer-result.json`、`cutover-writer-result.json` に検証と切替結果を保存する。初回バックアップの結果は `/root/sakana/releases/20260911T012405Z/backup-writer-result.json` に残る。`readback-writer-result.json` は直近のサービス状態・処理数。配布した変更ファイルは `writer-manifest.json` のSHA-256で照合してから切り替えた。
 
 コードの切り戻しはserviceのリリース指定を戻して行う。DBは履歴取り込みや投票で更新されるため、バックアップを無条件に上書き復元しない。

@@ -368,12 +368,13 @@ export function buildToolset({ guildId, allowed, caseId = null, constitution = n
   const trace = [];
   let spentBytes = 0;
   const pages = new Map();
+  const memoryInterpretations = new Set();
   const record = (entry) => { trace.push(entry); onStep?.(entry); };
   return {
     readOnly: true,
     call(name, args) { return this.run(name, args); },
     exhausted: () => spentBytes >= maximumOutputBytes,
-    checkpoint: () => ({ trace, retrieved: [...retrieved], spentBytes, pages: [...pages] }),
+    checkpoint: () => ({ trace, retrieved: [...retrieved], spentBytes, pages: [...pages], memoryInterpretations: [...memoryInterpretations] }),
     assertCurrent() {
       const publicChannels = new Set(publicMemoryChannels(guildId));
       const invalid = (message) => Object.assign(new Error(message), { code: 'AGENT_CONTEXT_INVALIDATED' });
@@ -390,7 +391,14 @@ export function buildToolset({ guildId, allowed, caseId = null, constitution = n
       trace.splice(0, trace.length, ...saved.trace);
       for (const [id, row] of saved.retrieved) retrieved.set(id, row);
       for (const [id, entry] of saved.pages ?? []) pages.set(id, entry);
+      for (const ref of saved.memoryInterpretations ?? []) memoryInterpretations.add(ref);
       spentBytes = saved.spentBytes;
+    },
+    observeMemoryInterpretation(ref, bytes) {
+      if (memoryInterpretations.has(ref)) return true;
+      if (spentBytes + bytes > maximumOutputBytes) return false;
+      spentBytes += bytes; memoryInterpretations.add(ref);
+      return true;
     },
     observeMemory(envelope, bytes = Buffer.byteLength(JSON.stringify(envelope))) {
       if (!envelope.body?.complete || envelope.state?.deleted) return false;

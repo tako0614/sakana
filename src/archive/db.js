@@ -536,6 +536,61 @@ if (!db.prepare("SELECT 1 FROM memory_projection_state WHERE key = 'seeded-v1'")
   })();
 }
 
+// Operational queues only. Semantic descriptions and relationships live in Atom,
+// not in a second summary database. Re-reading an edited input schedules every
+// conversation batch which observed it, including context/cross-batch references.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS memory_writer_pending (
+    message_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL, queued_at INTEGER NOT NULL DEFAULT 0,
+    generation INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_writer_ready ON memory_writer_pending(queued_at DESC, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_writer_counts ON memory_writer_pending(guild_id, attempts);
+  CREATE INDEX IF NOT EXISTS idx_writer_channel ON memory_writer_pending(channel_id, created_at);
+  CREATE TABLE IF NOT EXISTS memory_writer_inputs (
+    batch_id TEXT NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(batch_id, message_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_writer_input ON memory_writer_inputs(message_id);
+  CREATE TABLE IF NOT EXISTS memory_writer_runs (
+    batch_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+    model TEXT NOT NULL, messages INTEGER NOT NULL, atoms INTEGER NOT NULL,
+    completed_at INTEGER NOT NULL, usage TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_writer_runs_channel ON memory_writer_runs(guild_id, channel_id, completed_at);
+  DROP INDEX IF EXISTS idx_writer_queue;
+`);
+for (const event of ['INSERT', 'UPDATE', 'DELETE']) {
+  const row = event === 'DELETE' ? 'old' : 'new';
+  const condition = event === 'UPDATE' ? `WHEN old.content IS NOT new.content
+    OR old.guild_id IS NOT new.guild_id OR old.channel_id IS NOT new.channel_id
+    OR old.author_id IS NOT new.author_id OR old.author_name IS NOT new.author_name
+    OR old.edited_at IS NOT new.edited_at OR old.deleted IS NOT new.deleted
+    OR old.reply_to IS NOT new.reply_to OR old.reaction_count IS NOT new.reaction_count
+    OR json_remove(old.structure_json, '$.observedAt') IS NOT json_remove(new.structure_json, '$.observedAt')` : '';
+  db.exec(`CREATE TRIGGER IF NOT EXISTS messages_writer_${event.toLowerCase()} AFTER ${event} ON messages ${condition} BEGIN
+    INSERT INTO memory_writer_pending(message_id, guild_id, channel_id, created_at, queued_at)
+      VALUES (${row}.message_id, ${row}.guild_id, ${row}.channel_id, ${row}.created_at, unixepoch('subsec') * 1000)
+      ON CONFLICT(message_id) DO UPDATE SET guild_id=excluded.guild_id, channel_id=excluded.channel_id,
+        generation=generation+1, queued_at=excluded.queued_at, retry_at=0;
+    INSERT INTO memory_writer_pending(message_id, guild_id, channel_id, created_at, queued_at)
+      SELECT m.message_id, m.guild_id, m.channel_id, m.created_at, unixepoch('subsec') * 1000
+      FROM messages m WHERE m.message_id IN (
+        SELECT i.message_id FROM memory_writer_inputs i WHERE i.batch_id IN (
+          SELECT batch_id FROM memory_writer_inputs WHERE message_id=${row}.message_id))
+      ON CONFLICT(message_id) DO UPDATE SET generation=generation+1, queued_at=excluded.queued_at, retry_at=0;
+  END;`);
+}
+if (!db.prepare("SELECT 1 FROM memory_projection_state WHERE key = 'writer-seeded-v1'").get()) {
+  db.transaction(() => {
+    db.exec(`INSERT INTO memory_writer_pending(message_id,guild_id,channel_id,created_at)
+      SELECT message_id,guild_id,channel_id,created_at FROM messages WHERE deleted=0
+      ON CONFLICT(message_id) DO NOTHING`);
+    db.prepare('INSERT INTO memory_projection_state VALUES (?, ?)').run('writer-seeded-v1', '1');
+  })();
+}
+
 const upsertMessageStmt = db.prepare(`
   INSERT INTO messages (
     message_id, guild_id, channel_id, parent_id, author_id, author_name, is_bot,

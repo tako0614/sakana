@@ -1,12 +1,16 @@
 # 会話構造・Atom Memory・agent実行基盤
 
-Sakanaの会話agent、警察、裁判所、憲法審査院、議会は `src/ai/runtime.js` の同じ実行ループを使う。役割ごとに変えるのは、モデル接続、入力、許可された道具、予算、結果の検証である。統治の機関・手続き・調査権限は、引き続き適用される憲法と成立した組織法が定義する。
+Sakanaの会話agent、Memory Writer、警察、裁判所、憲法審査院、議会は `src/ai/runtime.js` の同じ実行ループを使う。役割ごとに変えるのは、モデル接続、入力、許可された道具、予算、結果の検証である。統治の機関・手続き・調査権限は、引き続き適用される憲法と成立した組織法が定義する。
 
 ```mermaid
 flowchart TD
   Discord[Discordの履歴・新着・編集・削除] --> Archive[原文アーカイブと変更履歴]
   Archive --> Queue[原文と同時更新する同期キュー]
-  Queue --> Atom[Atom Memory: 出典と関係]
+  Queue --> Atom[Atom Memory: 原資料]
+  Archive --> Writer[DeepSeek Memory Writer]
+  Writer --> Runtime
+  Writer -->|有限のedit| Atom
+  Atom --> Meaning[説明・まとまり・役割付き関係もAtom]
   Chat[会話agent] --> Runtime[共通agent実行ループ・永続チェックポイント]
   Institutions[警察・裁判・憲法審査・議会] --> Runtime
   Atom -->|現在の閲覧権限で参照| Runtime
@@ -42,16 +46,41 @@ flowchart TD
 モデル選択と話者設定は `(guild_id, user_id)` ごとに保存する。旧来のユーザー単位の設定は所属先を断定できないため、`agent_engine_legacy_unscoped` / `agent_persona_legacy_unscoped` に保持し、各サーバーへ自動配布しない。新しいサーバー別設定の既定は通常のagentとbot自身の話者である。
 
 - ライブラリは独立した `subprojects/atom-memory` の公開エントリーポイントを使う。独自のAtom実装やライブラリ内へのSakana固有処理は追加しない。
-- 原文の正本はアーカイブ。Atomは読み取り用の派生保存先で、メッセージから発言者・チャンネル・スレッドへの関係を持つ。返信先IDはメッセージ内に明示する。
+- 原文の正本はアーカイブ。意味情報の正本はAtomの受理済みの版で、説明・まとまり・関係も同じAtom形式にする。バッチやキューは輸送・再開の管理であり、別の意味モデルや話題の所属ではない。
 - 権限はサーバー・チャンネルごとのpolicyにする。entityも同じ範囲に置き、関係をたどることで別の非公開チャンネルへ越境させない。
 - 会話の自動想起は応答するチャンネルに限定する。統治の自動想起は現在公開されているチャンネルに限定し、機関に `search_messages` が許可されている場合だけ使う。取得した新しい原文は法定の調査手数・出力量へ計上する。
-- 原文の取り込み権限はhostだけが持つ。AIの生成物を原文・証拠・法律へ昇格させない。今回の構造化は原文とDiscordの関係の整理であり、全発言から主張や人物像をLLMで抽出する処理ではない。
+- 原文の取り込み権限はhostだけが持つ。AIの生成物を原文・証拠・法律へ昇格させない。DeepSeekのWriterが会話から主張・条件・反論・決定事項・未解決点などを抽出する。出自はorganizationとしてhostが設定し、実際に読んだ原文版をsourcesで指定する。
 - 編集・削除は永続キューで追随する。旧Atomをpurgeし、それに依存する観測を無効にする。原文を読んでから回答するまでに変更や権限失効があれば、その実行を失効させる。統治の再試行では新しい記録から調査し直す。
 - アーカイブの `message_versions` は導入後に観測した本文の編集・削除前の状態を保存する。導入前の編集履歴や、既に消えて取得できない発言を復元したことにはしない。
 
 Atomの自動想起は予算内の候補検索で、全履歴の完全走査ではない。診断と同期残数を入力へ添える。候補に出なかったことを「発言が存在しない」と解釈せず、必要なら既存のアーカイブ検索で全期間を調べる。
 
 大量取り込みではAtomのSQLiteを `synchronous: 'NORMAL'` で使い、バッチの `flush()` が成功してから原文側のキューを確認・削除する。保存途中の停止やflush失敗では処理済みにしない。Atomの通常利用は従来どおり `FULL` が既定である。Bot稼働中にDiscordを再取得するCLIは `--index-only` を付け、Atomへの書き込みをBotのworkerに任せる。
+
+## Atomの設計に沿ったWriter
+
+[Atomの設計](../subprojects/atom-memory/spec/ARCHITECTURE.md)と[出典・関係のAPI](../subprojects/atom-memory/docs/concepts.md)に従う。AIが本文・役割・意味上のまとまりを提案し、hostが参照・出典・版を検証する。Sakanaの共通runAgentをハーネスとして使い、第二のエージェント実行ループは追加しない。
+
+- 毎回のモデル呼び出し前に関連する記憶を読み直す。必要ならWriter自身がmemory_searchを呼び、同じ内容のまとまりを再利用する。
+- Writerは有限のAtom編集案を出す。情報の複数所属はgroup/memberなどの外付けの関係Atomとして保存し、全件ルートや親の巨大メンバー配列を要求しない。
+- 条件のrequiredリンク、根拠の観測版参照、sourcesを残し、全変更を公開APIのeditで一括確定する。モデルがsource区分、policy、任意IDを割り当てる経路はない。
+- モデルへ渡した文脈全体の入力依存を記録する。編集・削除が入れば旧解釈を想起から外し、関連バッチを再処理する。資料の訂正と別人による反論を同じ操作にはしない。
+- 想起にはAtomのread.textを使い、役割付きリンク・出自・共有引用の対応を保つ。警察・裁判へは原文の必須同梱と既存の証拠採用検査を通して渡す。生成要約を正式な投票や成立済みの法律として扱わない。
+- 失敗は未処理として再試行する。モデル出力、Atom確定、flush、キュー確認を区別し、確定後の再起動では同じAI呼び出しを繰り返さない。
+
+DeepSeekのリクエスト形式は[公式Chat Completions API](https://api-docs.deepseek.com/api/create-chat-completion/)に従う。Writerの状態と累積バッチ数を確認する:
+
+```sh
+npm run memory:organize -- --status --guild SERVER_ID
+```
+
+Botを止めた検証環境で一バッチだけ整理する:
+
+```sh
+npm run memory:organize -- --guild SERVER_ID --batches 1
+```
+
+通常はBotのworkerへ任せる。CLIのWriterにも共有の実行leaseがあるが、原文同期だけの旧CLIと同時にAtomへ書き込まない。
 
 ## 共通実行ループ
 
@@ -72,7 +101,7 @@ Atomの自動想起は予算内の候補検索で、全履歴の完全走査で�
 
 ### 既存設備で動かす構成
 
-常駐するNode botと同じホストにアーカイブ、Atom DB、実行DBを置く。構造化のために別サーバー、外部ベクトルDB、GPUを追加する必要はない。返信・転送・編集等の構造はDiscordのデータから決定的に作り、各発言をLLMへ送って分類する費用を発生させない。会話や調査のモデル呼び出しは、各役割の予算内で従来の推論先を使う。
+常駐するNode botと同じホストにアーカイブ、Atom DB、実行DBを置く。構造化のために別サーバー、外部ベクトルDB、GPUを追加する必要はない。返信・転送・編集等のメタデータはDiscordから正確に保持し、その意味をDeepSeek Writerが整理する。既定はdeepseek-v4-flashの非思考モード。最大60発言・60KBを一つの輸送単位にし、前後の文脈と同じチャンネルの返信先を含める。古い未処理履歴と新着を永続キューで処理し、静かな状態を60秒待って細切れの再推論を減らす。
 
 既存アーカイブを移行元にし、メタデータが不足する記録だけを取得可能な範囲で補う。Atomへの同期は専用worker threadで少量ずつチェックポイントを残し、Discordの応答処理を止めない。検索時に全件同期を待たず、同期待ちの原文を候補から除外する。保存先は派生データと変更履歴の分だけ増えるため、本番の全件移行前に小規模なコピーで追加容量と処理速度を測定する。常駐中の別モデルの整理は、この移行とは別の運用判断にする。
 
@@ -86,7 +115,7 @@ npm run check
 
 `npm ci` のprepareで固定したAtomソースをビルドする。コンパイラは `atom-memory-typescript` というnpm aliasに固定し、既存UI依存のTypeScript peerと混在させない。production用にdevDependenciesを取り除く場合はビルド後に行い、Atomのdistを実行環境に含める。
 
-既にアーカイブにある履歴を構造化する:
+既にアーカイブにある履歴の原文とDiscordメタデータを同期する（これだけではAIによる意味の整理は完了しない）:
 
 ```sh
 npm run memory:structure
@@ -106,7 +135,7 @@ npm run memory:structure -- --discord --guild SERVER_ID --refresh-structure
 
 このCLIはbotの応答・メッセージ送信・退出・統治スケジューラを開始しない。取り込みは既存indexerのチェックポイントで再開する。`--refresh-structure` を再度指定すると先頭から再取得するので、中断からの再開時は外す。
 
-通常起動時は既存の履歴取り込み設定に従ってアーカイブを更新し、5秒ごとのworkerがAtomへ同期する。履歴の取得範囲は既存indexerの被覆状況で確認する。権限不足、既に削除された発言、列挙上限に達したスレッドなどは欠損として扱い、キューが空になっただけで「Discordの全履歴を保有した」とは判定しない。
+通常起動時は一つのworkerが原文同期とAIによる整理を進める。原文同期残数とAI未処理数は別に表示する。履歴の取得範囲は既存indexerの被覆状況で確認する。権限不足、既に削除された発言、列挙上限に達したスレッドなどは欠損として扱い、キューが空になっただけで「Discordの全履歴を保有した」とは判定しない。
 
 |設定|既定値|
 |---|---|
@@ -118,4 +147,4 @@ npm run memory:structure -- --discord --guild SERVER_ID --refresh-structure
 
 ## 検証
 
-`check-agent-runtime.mjs` は会話の関係・出典・非公開情報の分離・編集・削除・再起動・途中再開を検査する。`check-agentic-governance.mjs` は調査失敗、長文のページング、即時保存、agenticな憲法審査、証拠台帳との一致、憲法の版固定を検査する。`check-guild-isolation.mjs` は別サーバーのID・同じユーザー・同じrun ID・非公開チャンネルを組み合わせて情報が混ざらないことを検査する。これらは `npm run check` に含まれる。外部モデルを使う品質評価と本番への反映は、これらのローカル検査とは別である。
+`check-memory-writer.mjs` はAI生成関係の想起、出典の検証、別サーバーの分離、API障害、確定後の停止からの再開、削除後の無効化を検査する。`check-memory-writer-live.mjs` は隔離した合成会話を実DeepSeekで整理し、生成されたAtomがBotの想起経路へ戻ることを検査する。`check-agent-runtime.mjs` は会話の関係・出典・非公開情報の分離・編集・削除・再起動・途中再開を検査する。`check-agentic-governance.mjs` は調査失敗、長文のページング、即時保存、agenticな憲法審査、証拠台帳との一致、憲法の版固定を検査する。`check-guild-isolation.mjs` は別サーバーのID・同じユーザー・同じrun ID・非公開チャンネルを組み合わせて情報が混ざらないことを検査する。これらは `npm run check` に含まれる。外部モデルを使う品質評価と本番への反映は、これらのローカル検査とは別である。

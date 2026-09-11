@@ -585,7 +585,8 @@ async function callGovernanceAgent({
     memory = role.tools.includes('search_messages') && String(recallQuery).trim()
       ? conversationMemory({ guildId, query: recallQuery,
         governance: true, canRecall: () => toolset.steps < maximumSteps && !toolset.exhausted(),
-        onObservation: (entry, bytes) => toolset.steps < maximumSteps && toolset.observeMemory(entry, bytes) }) : null;
+        onObservation: (entry, bytes) => toolset.steps < maximumSteps && toolset.observeMemory(entry, bytes),
+        onInterpretation: (ref, bytes) => toolset.observeMemoryInterpretation(ref, bytes) }) : null;
     const result = await runAgent({
       guildId: String(guildId),
       runId: `governance:${guildId}:${inputHash}`, toolset, memory,

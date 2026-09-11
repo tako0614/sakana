@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
-import { MemoryHost } from '../../subprojects/atom-memory/dist/index.js';
+import { MemoryHost, LexicalCandidateProvider } from '../../subprojects/atom-memory/dist/index.js';
 import { SqliteStorage } from '../../subprojects/atom-memory/dist/adapters/sqlite.js';
 import { db } from '../archive/db.js';
 import { canRead } from '../archive/permissions.js';
@@ -8,6 +8,11 @@ import { archiveEnvelope } from './message.js';
 
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 const policy = (guild, channel) => `discord:${guild}:${channel}`;
+export const conversationSourceHash = (row) => {
+  if (!row || row.deleted) return digest('deleted');
+  const envelope = archiveEnvelope(row);
+  return digest(JSON.stringify({ ...envelope, state: { ...envelope.state, observedAt: null } }));
+};
 let instance;
 let discordClient;
 let syncing;
@@ -18,9 +23,18 @@ class ConversationStorage extends SqliteStorage {
   append(revisions) {
     super.append(revisions);
     for (const revision of revisions) {
-      if (revision.provenance.producerId !== 'discord-ingestion' || revision.body.kind !== 'inline') continue;
+      if (revision.body.kind !== 'inline') continue;
       let value;
       try { value = JSON.parse(revision.body.value); } catch { continue; }
+      if (revision.provenance.producerId === 'discord-memory-writer' && value.schema === 'discord.memory.v1') {
+        const key = `sakana:writer-batch:${value.batchId}`;
+        const batch = this.metaGet(key);
+        if (!batch) throw new Error('Writer commit has no source checkpoint');
+        this.metaSet(key, { ...batch, committed: true, refs: [...(batch.refs ?? []), {
+          kind: 'pinned', atomId: revision.atomId, revisionId: revision.revisionId, nodeId: value.nodeId
+        }] });
+      }
+      if (revision.provenance.producerId !== 'discord-ingestion') continue;
       if (value.sourceKey) this.metaSet(`sakana:source:${value.sourceKey}`, {
         kind: 'pinned', atomId: revision.atomId, revisionId: revision.revisionId
       });
@@ -37,7 +51,7 @@ function memoryHost() {
     if (!resolve) throw new Error('Memory access denied');
     return resolve();
   } };
-  const host = new MemoryHost({ storage, authority });
+  const host = new MemoryHost({ storage, authority, candidateProvider: new LexicalCandidateProvider() });
   instance = { host, storage, grants };
   if (!storage.metaGet('sakana:projection-v1')) {
     db.exec('INSERT OR IGNORE INTO memory_pending SELECT message_id FROM messages');
@@ -46,28 +60,30 @@ function memoryHost() {
   return instance;
 }
 
-function binding({ subject, scopes, ingest = false, writePolicy }) {
+function binding({ subject, scopes, ingest = false, writable = false, writePolicy }) {
   const { grants } = memoryHost();
   const auth = { authorizationHandle: randomUUID() };
   grants.set(auth.authorizationHandle, () => {
     const readPolicies = [...new Set(scopes())].sort();
-    return { subject, readPolicies, writePolicies: ingest ? readPolicies : [],
+    return { subject, readPolicies, writePolicies: ingest || writable ? readPolicies : [],
       canIngestSource: ingest, generation: digest(JSON.stringify(readPolicies)) };
   });
-  return { auth, writePolicy: writePolicy ?? 'unwritable', actor: { type: ingest ? 'input-adapter' : 'agent' } };
+  return { auth, writePolicy: writePolicy ?? 'unwritable', actor: ingest ? { type: 'input-adapter' }
+    : { type: 'agent', generatedOrigin: 'organization' } };
 }
 
 // Serialized, restartable projection. Archive writes enqueue ids atomically;
 // a conditional acknowledgement never loses an edit that arrived during await.
-export function syncConversationMemory({ limit = 100 } = {}) {
+export function syncConversationMemory({ limit = 100, messageIds } = {}) {
   if (syncing) return syncing;
-  syncing = project(limit).finally(() => { syncing = null; });
+  syncing = project(limit, messageIds).finally(() => { syncing = null; });
   return syncing;
 }
 
-async function project(limit) {
+async function project(limit, messageIds) {
   const { host, storage, grants } = memoryHost();
-  const pending = db.prepare('SELECT message_id FROM memory_pending LIMIT ?').all(limit);
+  const pending = messageIds ? [...new Set(messageIds)].map((message_id) => ({ message_id }))
+    : db.prepare('SELECT message_id FROM memory_pending LIMIT ?').all(limit);
   const acknowledgements = [];
   for (const { message_id: messageId } of pending) {
     const row = db.prepare('SELECT * FROM messages WHERE message_id = ?').get(messageId);
@@ -77,8 +93,7 @@ async function project(limit) {
     const envelope = row && !row.deleted ? archiveEnvelope(row) : null;
     // Observation time changes during reindexing without changing the source.
     const text = envelope ? JSON.stringify(envelope) : null;
-    const semanticSnapshot = envelope ? { ...envelope, state: { ...envelope.state, observedAt: null } } : null;
-    const sourceHash = digest(semanticSnapshot ? JSON.stringify(semanticSnapshot) : 'deleted');
+    const sourceHash = conversationSourceHash(row);
     if (old?.hash !== sourceHash) {
       // Purge makes old observations and dependent generated notes unusable.
       // Source edit history remains in the archive's restricted audit table.
@@ -169,7 +184,83 @@ export function publicMemoryChannels(guildId) {
 
 export function hasConversationClient() { return Boolean(discordClient); }
 
-export function conversationMemory({ guildId, channel, member, query, onObservation, canRecall, governance = false }) {
+function currentBatch(batch) {
+  if (!batch?.committed || !batch.refs?.length) return false;
+  const { storage } = memoryHost();
+  return batch.sources.every(({ messageId, hash }) => {
+    const row = db.prepare('SELECT * FROM messages WHERE message_id = ?').get(messageId);
+    return row && !row.deleted && conversationSourceHash(row) === hash
+      && storage.metaGet(`sakana:message:${messageId}`)?.hash === hash;
+  });
+}
+
+function acceptedAtom(atom, bound) {
+  const { host, storage } = memoryHost();
+  let value;
+  try { value = JSON.parse(atom.text); } catch { return null; }
+  if (atom.provenance.origin === 'source' && value.messageId) {
+    const mapped = storage.metaGet(`sakana:message:${value.messageId}`);
+    if (!mapped || db.prepare('SELECT 1 FROM memory_pending WHERE message_id = ?').get(value.messageId)
+      || !mapped.refs.some((ref) => host.reference(ref, bound) === atom.ref)) return null;
+    return { value, sources: [{ messageId: value.messageId, hash: mapped.hash }] };
+  }
+  if (atom.provenance.producer === 'discord-memory-writer' && value.schema === 'discord.memory.v1') {
+    const batch = storage.metaGet(`sakana:writer-batch:${value.batchId}`);
+    if (!currentBatch(batch) || !batch.refs.some((ref) => host.reference(ref, bound) === atom.ref)) return null;
+    return { value, sources: batch.sources };
+  }
+  return null;
+}
+
+// Host integration for the Writer. Models only receive issued names and a
+// finite write plan; authority, source status and version checks stay here.
+export function conversationWriterSession({ guildId, channelId }) {
+  const { host, storage, grants } = memoryHost();
+  const scope = policy(guildId, channelId);
+  const bound = binding({ subject: 'discord-memory-writer', scopes: () => [scope], writable: true, writePolicy: scope });
+  const client = host.connect(bound);
+  return {
+    client, storage,
+    sourceRefs(messageId) {
+      const mapped = storage.metaGet(`sakana:message:${messageId}`);
+      if (mapped?.guildId !== guildId || mapped?.channelId !== channelId) throw new Error('Writer source is outside its channel');
+      return (mapped.refs ?? []).map((ref) => host.reference(ref, bound));
+    },
+    async recall(context) {
+      // The Writer searches existing organization, while its input already
+      // carries source messages. Do not scan a cold raw corpus before the first
+      // completed organization in this channel exists.
+      if (!db.prepare('SELECT 1 FROM memory_writer_runs WHERE guild_id=? AND channel_id=? AND atoms>0 LIMIT 1').get(guildId, channelId)) return [];
+      const result = await client.read({ context }, { tokens: 16000, depth: 1, limit: 12 });
+      const evidence = result.items.filter((atom) => atom.provenance.origin === 'source')
+        .flatMap((atom) => {
+          const entry = acceptedAtom(atom, bound);
+          return entry?.value.complete ? [{ ref: atom.ref, document: JSON.parse(entry.value.document) }] : [];
+        });
+      return result.items.flatMap((atom) => {
+        if (atom.provenance.origin === 'source') return [];
+        const accepted = acceptedAtom(atom, bound);
+        return accepted ? [{ atom, sources: accepted.sources,
+          evidence: evidence.filter((item) => atom.sources.some((source) => source.ref === item.ref)).map((item) => item.document) }] : [];
+      });
+    },
+    checkpoint(batchId) { return storage.metaGet(`sakana:writer-batch:${batchId}`); },
+    rebind(atom) {
+      const value = JSON.parse(atom.text);
+      const batch = storage.metaGet(`sakana:writer-batch:${value.batchId}`);
+      if (!currentBatch(batch)) throw Object.assign(new Error('Recalled Writer memory changed during execution'), { code: 'AGENT_CONTEXT_INVALIDATED' });
+      const ref = batch.refs.find((ref) => ref.nodeId === value.nodeId);
+      if (!ref) throw new Error('Recalled Writer reference is unavailable');
+      return { ...atom, ref: host.reference(ref, bound) };
+    },
+    prepare(batchId, data) { storage.metaSet(`sakana:writer-batch:${batchId}`, { ...data, refs: [], committed: false }); },
+    current: currentBatch,
+    flush() { storage.flush(); },
+    close() { grants.delete(bound.auth.authorizationHandle); }
+  };
+}
+
+export function conversationMemory({ guildId, channel, member, query, onObservation, onInterpretation, canRecall, governance = false }) {
   if (!guildId) throw new Error('Conversation memory requires a guildId');
   if (!governance && String(channel?.guildId ?? channel?.guild?.id) !== String(guildId)) {
     throw new Error('Conversation memory channel belongs to another guild');
@@ -184,31 +275,55 @@ export function conversationMemory({ guildId, channel, member, query, onObservat
   const receipts = [];
   const observed = new Map();
   return {
-    async read() {
+    async read({ observations = [] } = {}) {
       if (!scopes().length || canRecall?.() === false) return null;
-      const result = await client.read({ query: String(query ?? '').slice(0, 4000) }, { tokens: 12000, depth: 0, limit: 8 });
+      const result = await client.read({ query: String(query ?? '').slice(0, 4000),
+        observations: observations.map((text) => String(text).slice(0, 2000)) }, { tokens: 16000, depth: 1, limit: 16 });
       observedScopes = JSON.stringify(scopes().sort());
       receipts.push(result.receipt);
-      const shown = new Set(result.refs);
-      const documents = [];
+      const accepted = new Map();
       for (const atom of result.items) {
-        if (!shown.has(atom.ref) || atom.provenance.origin !== 'source') continue;
         try {
-          const part = JSON.parse(atom.text);
-          const mapped = storage.metaGet(`sakana:message:${part.messageId}`);
-          if (!mapped || db.prepare('SELECT 1 FROM memory_pending WHERE message_id = ?').get(part.messageId)) continue;
-          // A crash between a library commit and host checkpoint can leave an
-          // orphan revision. Only the committed current projection is exposed.
-          if (!mapped.refs.some((ref) => host.reference(ref, bound) === atom.ref)) continue;
-          // Institutions can accept only complete sources within their enacted
-          // output budget. Chat may still inspect an explicitly partial source.
-          if (onObservation && (!part.complete || onObservation(JSON.parse(part.document), Buffer.byteLength(JSON.stringify(part))) === false)) continue;
-          observed.set(part.messageId, mapped.hash);
-          documents.push(part);
-        } catch { /* Non-message atoms never become evidence. */ }
+          const entry = acceptedAtom(atom, bound);
+          if (!entry) continue;
+          const part = entry.value;
+          if (onObservation && atom.provenance.origin === 'source'
+            && (!part.complete || onObservation(JSON.parse(part.document), Buffer.byteLength(JSON.stringify(part))) === false)) continue;
+          for (const source of entry.sources) observed.set(source.messageId, source.hash);
+          accepted.set(atom.ref, atom);
+        } catch { /* A revoked or pending source never becomes current evidence. */ }
       }
+      // Keep Atom's packed text (including shared quotes and role-bearing links),
+      // rather than converting it back to a raw-message-only search result.
+      // Required companions are indivisible, also when host evidence budgets fail.
+      let changed;
+      do {
+        changed = false;
+        for (const atom of accepted.values()) {
+          if (atom.links.some((link) => link.required && !accepted.has(link.ref))) {
+            accepted.delete(atom.ref); changed = true;
+          }
+        }
+      } while (changed);
+      if (onInterpretation) {
+        for (const atom of accepted.values()) if (atom.provenance.origin !== 'source'
+          && !onInterpretation(atom.ref, Buffer.byteLength(JSON.stringify(atom)))) accepted.delete(atom.ref);
+        do {
+          changed = false;
+          for (const atom of accepted.values()) if (atom.links.some((link) => link.required && !accepted.has(link.ref))) {
+            accepted.delete(atom.ref); changed = true;
+          }
+        } while (changed);
+      }
+      const packed = result.text ? JSON.parse(result.text) : { memory: [], evidence: [] };
+      packed.memory = (packed.memory ?? []).filter((atom) => accepted.has(atom.ref));
+      const quotes = new Set(packed.memory.flatMap((atom) => atom.quote ? [atom.quote.ref] : []));
+      packed.evidence = (packed.evidence ?? []).filter((entry) => quotes.has(entry.ref));
+      // No configured generator currently creates ephemeral explanations.
+      packed.temporary = [];
       const channelIds = governance ? publicMemoryChannels(guildId) : [channel.id];
-      return { ...result, text: JSON.stringify({ documents,
+      return { ...result, text: JSON.stringify({ ...packed,
+        interpretation: 'AI-generated organization is interpretation, not a direct quote, verified fact, vote or legal authority.',
         coverage: { ...memoryStatus({ guildId, channelIds }), diagnostics: result.diagnostics } }) };
     },
     async assertCurrent() {
@@ -227,9 +342,14 @@ export function conversationMemory({ guildId, channel, member, query, onObservat
 export function startConversationMemory(client) {
   discordClient = client;
   let worker, retry, closed = false;
+  const updateGuilds = () => worker?.postMessage({ guildIds: [...client.guilds.cache.keys()] });
+  client.on('guildCreate', updateGuilds);
+  client.on('guildDelete', updateGuilds);
   const start = () => {
     if (closed) return;
-    worker = new Worker(new URL('./projection-worker.js', import.meta.url));
+    worker = new Worker(new URL('./projection-worker.js', import.meta.url), {
+      workerData: { guildIds: [...client.guilds.cache.keys()] }
+    });
     worker.on('error', (error) => console.error('Conversation memory worker failed:', error));
     worker.on('message', (status) => console.log('Conversation memory:', JSON.stringify(status)));
     worker.on('exit', (code) => {
@@ -242,5 +362,9 @@ export function startConversationMemory(client) {
     worker.unref();
   };
   start();
-  return () => { closed = true; clearTimeout(retry); void worker?.terminate(); };
+  return () => {
+    closed = true; clearTimeout(retry);
+    client.off('guildCreate', updateGuilds); client.off('guildDelete', updateGuilds);
+    void worker?.terminate();
+  };
 }
