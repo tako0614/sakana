@@ -3,7 +3,7 @@
 2026-09-11時点。実行先はProxmoxのCT102 `discord`、既存の `sakana.service`。
 
 - 作業・データディレクトリ: `/root/sakana`。
-- 稼働ソース: `/root/sakana/releases/20260911T022756Z`。9月11日02:32 UTCに切替。systemdの `90-release.conf` がこのソースとtsxを指定する。
+- 稼働ソース: `/root/sakana/releases/20260911T024438Z`。9月11日02:49 UTCに切替。systemdの `90-release.conf` がこのソースとtsxを指定する。
 - 今回のバックアップ: `/root/sakana/backups/before-20260911T012405Z`。SQLiteのオンラインバックアップによるアーカイブ約1.47GBと、切替前のservice定義を保持。前回の停止中DBバックアップは `/root/sakana/backups/before-20260910T192754Z`。
 - Atomはサーバー内のSQLite。新しい外部DB・GPU・推論モデルは追加していない。
 - 模倣モデルの利用先にサーバー制約はない。会話の原文・記憶・実行記録・個人設定はサーバー単位で扱う。
@@ -25,6 +25,8 @@
 
 初回の本番確認で、Atomのメタデータ検索とキュー選択に全件走査・並べ替えが見つかった。最終版はメタデータのprefixとスコープ内ページングに索引を使い、次の仕事はキュー順の索引から取得する。まだAI整理が存在しないチャンネルではWriter用の既存整理検索を省く。
 
+発言の訂正時に呼ぶAtomのpurgeも、全履歴の走査から、過去版の参照・出典・読取依存を辿る方式へ変更した。既存DBへの依存索引の移行はBotを止めて実施済み。索引はSQLiteのトリガーで更新されるため、コードを切り戻した場合の旧書込方式でも維持される。
+
 `memory_writer_pending` がAI未処理数、`memory_writer_runs` が完了バッチ・生成Atom数・API使用量。`processedMessages` は再整理を含む累計であり、固有の処理済み発言数ではない。約104万件の既存履歴は順次処理するため、リリース完了は全件の意味整理完了を意味しない。
 
 本番の状態確認は `/root/sakana` を作業ディレクトリにして、リリース内の `scripts/organize-conversations.mjs --status --guild SERVER_ID` を実行する。Bot稼働中に別のWriterや原文同期CLIを同時実行しない。
@@ -39,7 +41,7 @@ takoserverの管理対象Botロール `Evex 公式` には、Discord側ではKic
 
 ## 検証
 
-リリース配置先で `npm run check`、Atom本体の全143テスト、実DeepSeekによる合成会話の整理・想起試験が通過。編集・削除による解釈の失効、入力変更中の確定拒否、永続化失敗後の再開、サーバー分離、統治の出力量予算も回帰検査に含む。テスト用DBは分離したtmpfsを使用し、Botのデータを検査入力にしていない。
+リリース配置先で `npm run check`、Atom本体の全146テスト、実DeepSeekによる合成会話の整理・想起試験が通過。編集・削除による解釈の失効、入力変更中の確定拒否、永続化失敗後の再開、サーバー分離、統治の出力量予算も回帰検査に含む。purgeの全履歴走査を禁止した回帰例は旧版で失敗し、新版で通過した。テスト用DBは分離したtmpfsを使用し、Botのデータを検査入力にしていない。
 
 リリース内の `verify-writer-result.json`、`cutover-writer-result.json` に検証と切替結果を保存する。初回バックアップの結果は `/root/sakana/releases/20260911T012405Z/backup-writer-result.json` に残る。`readback-writer-result.json` は直近のサービス状態・処理数。配布した変更ファイルは `writer-manifest.json` のSHA-256で照合してから切り替えた。
 
