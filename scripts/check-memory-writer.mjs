@@ -14,6 +14,7 @@ const { toRecord } = await import('../src/archive/indexer.js');
 const { conversationMemory, syncConversationMemory } = await import('../src/conversation/memory.js');
 const { runConversationWriter, writerStatus, validateWriterPlan } = await import('../src/conversation/writer.js');
 const { SqliteStorage } = await import('../subprojects/atom-memory/dist/adapters/sqlite.js');
+const { MemoryHost } = await import('../subprojects/atom-memory/dist/index.js');
 const message = (id, content, extra = {}) => ({ id, content, guildId: 'g', channelId: 'c',
   author: { id: 'alice', username: 'alice' }, attachments: new Map(),
   createdTimestamp: 1700000000000, reactions: { cache: new Map() }, ...extra });
@@ -105,5 +106,34 @@ try {
       return { choices: [{ message: { content: JSON.stringify({ atoms: [plan.atoms[0]] }) } }] };
     } }), /source changed/, 'an edit during model inference must reject the stale write plan');
   assert.equal(writerStatus(['g']).pending, 2);
+  // Several attachment-only messages produce a truthy newline-only string.
+  // Existing organization must not turn that into an invalid recall request.
+  for (let i = 0; i < 6; i++) saveMessage(toRecord(message(`empty-${i}`, '', {
+    createdTimestamp: 1700001000000 + i * 1000
+  })));
+  let emptyBatchCalls = 0;
+  await runConversationWriter({ guildIds: ['g'], now: Date.now() + 1000000,
+    request: async () => {
+      emptyBatchCalls++;
+      return { choices: [{ message: { content: '{"atoms":[]}' } }] };
+    } });
+  assert.equal(emptyBatchCalls, 1, 'attachment-only batches still reach the AI');
+  saveMessage(toRecord(message('budget-source', '原資料からこの提案を整理する。', { createdTimestamp: 1700004000000 })));
+  const connect = MemoryHost.prototype.connect;
+  MemoryHost.prototype.connect = function (...args) {
+    const client = connect.apply(this, args);
+    client.read = async () => { throw Object.assign(new Error('BUDGET_EXHAUSTED'), { code: 'BUDGET_EXHAUSTED' }); };
+    return client;
+  };
+  try {
+    const organized = await runConversationWriter({ guildIds: ['g'], now: Date.now() + 1000000,
+      request: async ({ messages }) => {
+        assert.ok(messages.some(message => message.content?.includes('retrieval_budget')),
+          'the model must see that recall was incomplete, not that prior memory was absent');
+        return { choices: [{ message: { content: JSON.stringify({ atoms: [{ id: 'a1', kind: 'statement',
+          text: 'Aliceは原資料から提案を整理するよう求めた。', sources: ['budget-source'], links: [] }] }) } }] };
+      } });
+    assert.equal(organized.batchAtoms, 1, 'optional recall budget must not permanently strand a source batch');
+  } finally { MemoryHost.prototype.connect = connect; }
   console.log('memory writer: grounded Atom relations, isolation, durable retry and deletion invalidation passed');
 } finally { db.close(); rmSync(directory, { recursive: true, force: true }); }

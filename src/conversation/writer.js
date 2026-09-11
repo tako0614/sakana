@@ -175,7 +175,16 @@ export async function runConversationWriter({ guildIds, request = requestWriterM
       const citationIds = new Set(sourceRefs.keys());
       const existing = new Map();
       const remember = async (query) => {
-        const found = await session.recall(String(query).slice(0, 3000));
+        const context = String(query ?? '').trim().slice(0, 3000) || 'Discord会話の説明・まとまり・関係';
+        let found;
+        try { found = await session.recall(context); }
+        catch (error) {
+          if (error.code !== 'BUDGET_EXHAUSTED') throw error;
+          // Optional recall is finite. Oversized prior memory does not prevent
+          // organizing the actual source messages already supplied to this run.
+          return { entries: [], coverage: { complete: false, reason: 'retrieval_budget',
+            note: '既存記憶の探索は予算で打ち切られた。記憶が存在しないことを意味しない。入力の原資料から整理する。' } };
+        }
         for (const entry of found) {
           let name = [...existing].find(([, value]) => value.atom.ref === entry.atom.ref)?.[0];
           if (!name) { name = `e${existing.size + 1}`; existing.set(name, entry); }
