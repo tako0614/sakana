@@ -168,6 +168,7 @@ function start() {
         env: {
           ...process.env,
           SEMANTIC_MODEL_NAME: embedConfig.modelName,
+          ...(embedConfig.modelRevision ? { SEMANTIC_MODEL_REVISION: embedConfig.modelRevision } : {}),
           SEMANTIC_MAX_LENGTH: String(embedConfig.maxLength),
           SEMANTIC_THREADS: String(embedConfig.threads),
           SEMANTIC_MICRO_BATCH: String(embedConfig.microBatch),

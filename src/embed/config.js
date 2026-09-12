@@ -26,6 +26,7 @@ export const embedConfig = {
   modelName: process.env.SEMANTIC_MODEL_NAME ?? 'intfloat/multilingual-e5-small',
   // 会話のまとまり1つで 400 トークン前後になるので 192 では切れる。
   // 1件あたりは遅くなるが、件数が 1/5 になるので合計では速い。
+  modelRevision: process.env.SEMANTIC_MODEL_REVISION ?? ((process.env.SEMANTIC_MODEL_NAME ?? 'intfloat/multilingual-e5-small') === 'intfloat/multilingual-e5-small' ? '614241f622f53c4eeff9890bdc4f31cfecc418b3' : undefined),
   maxLength: number(process.env.SEMANTIC_MAX_LENGTH, 384),
   threads: number(process.env.SEMANTIC_THREADS, 4),
   microBatch: number(process.env.SEMANTIC_MICRO_BATCH, 16),

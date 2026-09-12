@@ -2,12 +2,13 @@ import { createHash, randomUUID } from 'node:crypto';
 import { db } from '../archive/db.js';
 import { runAgent } from '../ai/runtime.js';
 import { archiveEnvelope } from './message.js';
+import { reserveMemoryCall, finishMemoryCall, memoryCostReport } from './cost.js';
 import { conversationSourceHash, conversationWriterSession, syncConversationMemory } from './memory.js';
 
 const integer = (value, fallback, maximum) => Math.min(maximum, Math.max(1, Number.parseInt(value, 10) || fallback));
 export const writerConfig = {
   enabled: !['0', 'false', 'off'].includes(process.env.MEMORY_WRITER_ENABLED ?? 'true'),
-  model: process.env.MEMORY_WRITER_MODEL || process.env.DEEPSEEK_MODEL || 'deepseek-v4-flash',
+  model: process.env.MEMORY_WRITER_MODEL || process.env.DEEPSEEK_MODEL || 'deepseek-flash',
   apiKey: process.env.DEEPSEEK_API_KEY || '',
   baseUrl: (process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com').replace(/\/+$/, ''),
   batchMessages: integer(process.env.MEMORY_WRITER_BATCH_MESSAGES, 60, 100),
@@ -32,21 +33,25 @@ transport上の入力バッチは意味上のまとまりではない。入力�
 必要ならmemory_searchで既存の整理を探す。最後は次のJSONだけを返す:
 {"atoms":[{"id":"a1","kind":"statement|collection|relation|summary|hypothesis","text":"日本語の自立した内容。発言者・条件を含む","sources":["入力のmessage ID"],"links":[{"role":"役割名","target":"a2 または source:MESSAGE_ID または発行済みeN","required":false}]}]}
 各Atomに最低1件の実際に読んだmessage IDをsourcesに指定する。sourcesは発言者の根拠であり、真実の認定ではない。
-新しいAtomのidは一意。関係の役割・向きは意味に合わせる。条件を別Atomにした場合は、その条件なしで主張を読めないrequired=trueのリンクを使う。
+新しいAtomのidは一意。既存の整理の説明や条件を更新する場合は任意のreviseフィールドに発行済みeNを指定し、そのAtomの新しい版を作る。別の発言や反論を同一の事実へ上書きしない。必要な既存リンクはlinksに含める。関係の役割・向きは意味に合わせる。条件を別Atomにした場合は、その条件なしで主張を読めないrequired=trueのリンクを使う。
 本文にa1やe1などの一時参照名を使わず、関係する話者と内容を自立した日本語で説明する。構造上の参照はlinksへ置く。
 未発行参照や循環した新規参照は使わない。本文は各3000文字以内、1回最大40 Atom。保存価値のある情報がない場合だけatomsを空にできる。`;
 
 export async function requestWriterModel({ messages, tools }) {
-  const response = await fetch(`${writerConfig.baseUrl}/chat/completions`, {
-    method: 'POST', signal: AbortSignal.timeout(writerConfig.timeoutMs),
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${writerConfig.apiKey}` },
-    body: JSON.stringify({ model: writerConfig.model, messages, stream: false,
-      max_tokens: writerConfig.maxOutputTokens, thinking: { type: 'disabled' },
-      ...(tools?.length ? { tools, tool_choice: 'auto' } : { response_format: { type: 'json_object' } }) })
-  });
-  // The durable queue retries failures; error logs never contain source bodies or credentials.
-  if (!response.ok) throw new Error(`Memory Writer provider HTTP ${response.status}`);
-  const data = await response.json();
+  const reservation = reserveMemoryCall({ model: writerConfig.model, messages, tools, outputTokens: writerConfig.maxOutputTokens });
+  let data;
+  try {
+    const response = await fetch(`${writerConfig.baseUrl}/chat/completions`, {
+      method: 'POST', signal: AbortSignal.timeout(writerConfig.timeoutMs),
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${writerConfig.apiKey}` },
+      body: JSON.stringify({ model: writerConfig.model, messages, stream: false,
+        max_tokens: writerConfig.maxOutputTokens, thinking: { type: 'disabled' },
+        ...(tools?.length ? { tools, tool_choice: 'auto' } : { response_format: { type: 'json_object' } }) })
+    });
+    // The durable queue retries failures; error logs never contain source bodies or credentials.
+    if (!response.ok) throw new Error(`Memory Writer provider HTTP ${response.status}`);
+    data = await response.json();
+  } finally { finishMemoryCall(reservation, data?.usage); }
   if (data.choices?.[0]?.finish_reason === 'length') throw new Error('Memory Writer output was truncated');
   return data;
 }
@@ -108,12 +113,17 @@ export function validateWriterPlan(value, sourceIds, existing = new Map()) {
   const parsed = typeof value === 'string' ? JSON.parse(value) : value;
   if (!parsed || !Array.isArray(parsed.atoms) || parsed.atoms.length > 40) throw new Error('Expected a finite atoms array');
   const nodes = new Map();
+  const revisions = new Set();
   const kinds = new Set(['statement', 'collection', 'relation', 'summary', 'hypothesis']);
   for (const node of parsed.atoms) {
     if (!node || !/^a[1-9][0-9]*$/.test(node.id) || nodes.has(node.id)
       || !kinds.has(node.kind) || typeof node.text !== 'string' || !node.text.trim() || node.text.length > 3000
       || !Array.isArray(node.sources) || !node.sources.length || node.sources.some((id) => !sourceIds.has(id))
       || !Array.isArray(node.links) || node.links.length > 20) throw new Error('Invalid Atom or unobserved source');
+    if (node.revise !== undefined) {
+      if (!existing.has(node.revise) || revisions.has(node.revise)) throw new Error('Revision must name one issued organization Atom once');
+      revisions.add(node.revise);
+    }
     nodes.set(node.id, node);
   }
   for (const node of nodes.values()) for (const link of node.links) {
@@ -141,7 +151,7 @@ export function writerStatus(guildIds) {
   const queue = db.prepare(`SELECT count(*) pending, sum(attempts>0) retrying FROM memory_writer_pending ${scope}`).get(...args);
   const runs = db.prepare(`SELECT count(*) batches, coalesce(sum(messages),0) processedMessages,
     coalesce(sum(atoms),0) atoms, max(completed_at) lastCompletedAt FROM memory_writer_runs ${scope}`).get(...args);
-  return { ...queue, ...runs, model: writerConfig.model, enabled: writerConfig.enabled && !!writerConfig.apiKey };
+  return { ...queue, ...runs, cost: memoryCostReport(), model: writerConfig.model, enabled: writerConfig.enabled && !!writerConfig.apiKey };
 }
 
 export async function runConversationWriter({ guildIds, request = requestWriterModel, now = Date.now() } = {}) {
@@ -174,10 +184,10 @@ export async function runConversationWriter({ guildIds, request = requestWriterM
       const sourceRefs = new Map(sources.map((source) => [source.messageId, session.sourceRefs(source.messageId)]));
       const citationIds = new Set(sourceRefs.keys());
       const existing = new Map();
-      const remember = async (query) => {
+      const remember = async (query, state = {}) => {
         const context = String(query ?? '').trim().slice(0, 3000) || 'Discord会話の説明・まとまり・関係';
         let found;
-        try { found = await session.recall(context); }
+        try { found = await session.recall(context, state); }
         catch (error) {
           if (error.code !== 'BUDGET_EXHAUSTED') throw error;
           // Optional recall is finite. Oversized prior memory does not prevent
@@ -223,8 +233,8 @@ export async function runConversationWriter({ guildIds, request = requestWriterM
         system: instruction, userContent: JSON.stringify({ guildId: batch.guildId, channelId: batch.channelId,
           messages: batch.rows.map(archiveEnvelope), targetMessageIds: batch.pending.map((item) => item.message_id) }),
         request, toolset, memory: {
-          async read() {
-            const entries = await remember(batch.rows.slice(-6).map((row) => row.content).join('\n') || '会話の整理');
+          async read({ context, thought, observations } = {}) {
+            const entries = await remember(batch.rows.slice(-6).map((row) => row.content).join('\n') || '会話の整理', { context, thought, observations });
             return { text: JSON.stringify({ existing: entries }) };
           }, assertCurrent
         }, maximumSteps: 3, deadlineAt: Date.now() + writerConfig.timeoutMs * 3,
@@ -256,8 +266,11 @@ export async function runConversationWriter({ guildIds, request = requestWriterM
             // Source companions are required, so courts cannot receive an AI
             // interpretation without its original utterances inside the budget.
             links.push(...citations.map(({ ref }) => ({ role: '根拠', target: { ref, at: 'observed', required: true } })));
-            created.set(node.id, await draft.write({ text: JSON.stringify({ schema: 'discord.memory.v1', batchId,
-              nodeId: node.id, kind: node.kind, text: node.text }), links }, { sources: citations }));
+            const content = { text: JSON.stringify({ schema: 'discord.memory.v1', batchId,
+              nodeId: node.id, kind: node.kind, text: node.text }), links };
+            created.set(node.id, node.revise
+              ? await draft.revise(existing.get(node.revise).atom.ref, content, { sources: citations })
+              : await draft.write(content, { sources: citations }));
           }
           assertCurrent();
         }, { budget: { maxAtoms: 2000, maxBytes: 16000000 }, deadline: new Date(Date.now() + 120000).toISOString() });
@@ -268,6 +281,8 @@ export async function runConversationWriter({ guildIds, request = requestWriterM
       atomCount = saved.refs.length;
     }
     assertCurrent();
+    await session.index(batchId);
+    assertCurrent();
     session.flush();
     db.transaction(() => {
       for (const item of batch.pending) db.prepare('DELETE FROM memory_writer_pending WHERE message_id=? AND generation=?').run(item.message_id, item.generation);
@@ -276,6 +291,7 @@ export async function runConversationWriter({ guildIds, request = requestWriterM
     })();
     return { ...writerStatus(guildIds), completedBatch: batchId, batchMessages: batch.pending.length, batchAtoms: atomCount };
   } catch (error) {
+    if (error.code === 'MEMORY_BUDGET_PAUSED') return { ...writerStatus(guildIds), paused: 'daily_budget', retryAt: error.retryAt };
     if (batch) db.transaction(() => {
       for (const item of batch.pending) db.prepare(`UPDATE memory_writer_pending SET attempts=attempts+1,
         retry_at=?, last_error=? WHERE message_id=? AND generation=?`).run(

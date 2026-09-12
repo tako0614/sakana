@@ -1,3 +1,4 @@
+process.env.MEMORY_EMBEDDINGS = '0';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';

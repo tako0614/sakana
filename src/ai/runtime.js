@@ -19,6 +19,9 @@ function journal() {
 
 const active = new Set();
 const hash = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const memoryStateTool = { type: 'function', function: { name: 'memory_focus',
+  description: '次の推論で探す記憶の焦点を設定する。文脈と、明示できる短い検討状態を使う。事実認定や外部操作は行わない。',
+  parameters: { type: 'object', properties: { context: { type: 'string', maxLength: 3000 }, thought: { type: 'string', maxLength: 3000 } }, additionalProperties: false } } };
 const emptyUsage = () => ({ prompt_tokens: 0, completion_tokens: 0, prompt_cache_hit_tokens: 0 });
 
 /** One host-owned execution loop for chat and every institution. Providers only
@@ -34,7 +37,9 @@ export async function runAgent({ guildId, system, userContent, toolset = { defin
   const runKey = `guild:${JSON.stringify([guildId, runId])}`;
   runId = runKey;
   if (active.has(runKey)) throw new Error('Agent run is already active');
-  const inputHash = hash({ guildId, system, userContent, tools: toolset.definitions, maximumSteps, separateFinal });
+  const definitions = memory ? [...toolset.definitions, memoryStateTool] : toolset.definitions;
+  if (toolset.definitions.some(tool => tool.function?.name === 'memory_focus')) throw new Error('memory_focus belongs to the shared runtime');
+  const inputHash = hash({ guildId, system, userContent, tools: definitions, maximumSteps, separateFinal });
   runId = journal().prepare('SELECT run_id FROM agent_run_heads WHERE run_key = ?').get(runKey)?.run_id ?? runId;
   let stored = journal().prepare('SELECT * FROM agent_runs WHERE id = ? AND guild_id = ?').get(runId, guildId);
   // An independent new deliberation must not inherit a previous verdict just
@@ -68,7 +73,7 @@ export async function runAgent({ guildId, system, userContent, toolset = { defin
   active.add(runKey);
   try {
     toolset.restore?.(state.host);
-    if (state.toolInFlight && !toolset.readOnly) throw new Error('Interrupted tool may have changed external state; automatic replay is disabled');
+    if (state.toolInFlight && !toolset.readOnly && state.pending[state.pendingIndex]?.function?.name !== 'memory_focus') throw new Error('Interrupted tool may have changed external state; automatic replay is disabled');
     if (state.complete) { await memory?.assertCurrent?.(); await toolset.assertCurrent?.(); return result(); }
     save();
     let invalid = 0;
@@ -78,7 +83,7 @@ export async function runAgent({ guildId, system, userContent, toolset = { defin
         let args;
         try { args = JSON.parse(call.function?.arguments || '{}'); } catch { args = null; }
         const name = call.function?.name ?? '';
-        const permitted = toolset.definitions.some((entry) => entry.function?.name === name);
+        const permitted = definitions.some((entry) => entry.function?.name === name);
         state.toolInFlight = true;
         save();
         let output;
@@ -88,7 +93,11 @@ export async function runAgent({ guildId, system, userContent, toolset = { defin
         else {
           await memory?.assertCurrent?.();
           onToolCall?.(name, args);
-          output = await toolset.call(name, args, { runId, callId: call.id });
+          if (name === 'memory_focus') {
+            if (Object.keys(args).some(key => !['context', 'thought'].includes(key))
+              || Object.values(args).some(value => typeof value !== 'string' || value.length > 3000)) output = { error: 'Provide only bounded context and thought strings' };
+            else { state.memoryState = args; output = { focus: args, note: '次のモデル呼び出し前に記憶を選び直す。これは根拠ではない。' }; }
+          } else output = await toolset.call(name, args, { runId, callId: call.id });
           state.used.push({ name, args });
           state.steps += 1;
         }
@@ -110,7 +119,9 @@ export async function runAgent({ guildId, system, userContent, toolset = { defin
       if (toolset.exhausted?.()) state.phase = 'final';
       let final = state.phase === 'final';
       await toolset.assertCurrent?.();
-      const recalled = await memory?.read?.({ observations: state.messages
+      const recalled = await memory?.read?.({
+        context: state.memoryState?.context ?? state.messages.filter(entry => ['user', 'assistant'].includes(entry.role)).slice(-3).map(entry => entry.content ?? '').join('\n').slice(-6000),
+        thought: state.memoryState?.thought, observations: state.messages
         .filter((entry) => entry.role === 'tool').slice(-2).map((entry) => entry.content) });
       if (stepsUsed() >= maximumSteps || toolset.exhausted?.()) { state.phase = 'final'; final = true; }
       const messages = [...state.messages];
@@ -119,7 +130,7 @@ export async function runAgent({ guildId, system, userContent, toolset = { defin
         ? 'Return the requested complete JSON now. Cite only records actually observed. Missing facts remain unknown.'
         : 'ここまでで取得できた材料だけで、いま答えを書いて。足りない部分は分からないと書いて。' });
       save();
-      const data = await request({ messages, tools: final ? null : toolset.definitions,
+      const data = await request({ messages, tools: final ? null : definitions,
         deadlineAt: state.deadlineAt ?? Infinity, final, effort: invalid ? 'low' : undefined });
       for (const key of Object.keys(totals)) totals[key] += data.usage?.[key] ?? 0;
       state.rounds += 1;

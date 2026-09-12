@@ -1,3 +1,4 @@
+process.env.MEMORY_EMBEDDINGS = '0';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -135,5 +136,30 @@ try {
       } });
     assert.equal(organized.batchAtoms, 1, 'optional recall budget must not permanently strand a source batch');
   } finally { MemoryHost.prototype.connect = connect; }
+  saveMessage(toRecord(message('rev-source', 'revision-topic: 管理者の役割を整理する。', {
+    channelId: 'revision-channel', createdTimestamp: 1700007000000
+  })));
+  await runConversationWriter({ guildIds: ['g'], now: Date.now() + 1000000,
+    request: async () => ({ choices: [{ message: { content: JSON.stringify({ atoms: [{ id: 'a1', kind: 'collection',
+      text: 'revision-topic: 管理者の役割の整理。', sources: ['rev-source'], links: [] }] }) } }] }) });
+  const verify = new SqliteStorage(process.env.ATOM_MEMORY_PATH);
+  const group = () => verify.scan({ policies: ['discord:g:revision-channel'], limit: 100 }, verify.watermark())
+    .find(row => row.provenance.producerId === 'discord-memory-writer');
+  const previousGroup = group();
+  saveMessage(toRecord(message('rev-update', 'revision-topic: banは手動執行という条件も明記する。', {
+    channelId: 'revision-channel', createdTimestamp: 1700007001000
+  })));
+  await runConversationWriter({ guildIds: ['g'], now: Date.now() + 1000000,
+    request: async ({ messages }) => {
+      const block = messages.findLast(row => row.content?.startsWith('REFERENCE MEMORY'));
+      const existing = JSON.parse(block.content.slice(block.content.indexOf('\n') + 1)).existing;
+      const selected = existing.find(row => JSON.parse(row.text).kind === 'collection');
+      assert.ok(selected, 'Writer must receive the existing arrangement as an issued reference');
+      return { choices: [{ message: { content: JSON.stringify({ atoms: [{ id: 'a1', kind: 'collection', revise: selected.ref,
+        text: 'revision-topic: 管理者がbanを手動執行する役割の整理。', sources: ['rev-source', 'rev-update'], links: [] }] }) } }] };
+    } });
+  assert.equal(group().atomId, previousGroup.atomId, 'reorganization revises the same Atom identity');
+  assert.notEqual(group().revisionId, previousGroup.revisionId);
+  verify.close();
   console.log('memory writer: grounded Atom relations, isolation, durable retry and deletion invalidation passed');
 } finally { db.close(); rmSync(directory, { recursive: true, force: true }); }

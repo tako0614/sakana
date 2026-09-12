@@ -50,3 +50,11 @@ takoserverの管理対象Botロール `Evex 公式` には、Discord側ではKic
 リリース内の `verify-writer-result.json`、`cutover-writer-result.json` に検証と切替結果を保存する。初回バックアップの結果は `/root/sakana/releases/20260911T012405Z/backup-writer-result.json` に残る。`readback-writer-result.json` は直近のサービス状態・処理数。配布した変更ファイルは `writer-manifest.json` のSHA-256で照合してから切り替えた。
 
 コードの切り戻しはserviceのリリース指定を戻して行う。DBは履歴取り込みや投票で更新されるため、バックアップを無条件に上書き復元しない。
+
+## 9月12日のライブラリ・Sakana更新（本番未反映）
+
+Atomの差分索引API・SQLiteのベクトル候補取得と、Sakanaの共有埋め込み・Writer改訂・明示的な記憶焦点・Writer費用記録を追加した。AtomはJSライブラリのままで、常駐処理はSakanaが担当する。[費用と設定](memory-cost.md)を参照。
+
+Atomの151テスト・ドキュメント例・ドキュメントビルドと、Sakanaの全体検査を通過。キャッシュ済みE5の384次元ベクトルで、文脈・明示的な検討状態から原資料と関係を取得する試験も通過。このローカル環境にはDeepSeekのAPIキーがなく、今回の実DeepSeek試験と本番切替は未実施。
+
+既存SQLiteへ初めて適用する時は、変更フィード用の `(policy,sequence,revision_id)` 索引を構築する。前回同様、Botの停止中に新リリースのSqliteStorageを開いて移行を済ませてから起動する。既存履歴のベクトル生成は起動後の有限なキュー処理で行い、DBを開く段階で全履歴を埋め込まない。

@@ -39,3 +39,5 @@ const report = { directory, status, recalled: atoms };
 writeFileSync(join(directory, 'result.json'), JSON.stringify(report, null, 2));
 console.log(JSON.stringify(report, null, 2));
 memory.close();
+const { shutdown } = await import('../src/embed/worker.js');
+shutdown();

@@ -41,6 +41,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
 MODEL_NAME = os.environ.get("SEMANTIC_MODEL_NAME", "intfloat/multilingual-e5-small")
+MODEL_REVISION = os.environ.get("SEMANTIC_MODEL_REVISION")
 MAX_LENGTH = int(os.environ.get("SEMANTIC_MAX_LENGTH", "192"))
 THREADS = int(os.environ.get("SEMANTIC_THREADS", "4"))
 MICRO_BATCH = int(os.environ.get("SEMANTIC_MICRO_BATCH", "16"))
@@ -80,8 +81,8 @@ class Embedder:
         except RuntimeError:
             pass  # 既に並列領域に入っていると失敗する
 
-        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        self.model = AutoModel.from_pretrained(MODEL_NAME)
+        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, revision=MODEL_REVISION)
+        self.model = AutoModel.from_pretrained(MODEL_NAME, revision=MODEL_REVISION)
         self.model.eval()
         self.dim = int(self.model.config.hidden_size)
 
@@ -144,6 +145,7 @@ def handle_embed(embedder, request):
         "id": request.get("id"),
         "ok": True,
         "dim": embedder.dim,
+        "model_revision": getattr(embedder.model.config, "_commit_hash", None),
         "encode": encode,
         "count": len(cleaned),
         "ms": int((time.time() - started) * 1000),
@@ -172,6 +174,7 @@ def main():
         "op": "ready",
         "model": MODEL_NAME,
         "dim": embedder.dim,
+        "model_revision": getattr(embedder.model.config, "_commit_hash", None),
         "max_length": MAX_LENGTH,
         "prefix_query": PREFIX_QUERY,
         "prefix_passage": PREFIX_PASSAGE,

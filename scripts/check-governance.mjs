@@ -1,3 +1,4 @@
+process.env.MEMORY_EMBEDDINGS = '0';
 import { tmpdir } from 'node:os';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';

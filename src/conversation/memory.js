@@ -1,10 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
-import { MemoryHost, LexicalCandidateProvider } from '../../subprojects/atom-memory/dist/index.js';
+import { MemoryHost, LexicalCandidateProvider, HybridCandidateProvider } from '../../subprojects/atom-memory/dist/index.js';
 import { SqliteStorage } from '../../subprojects/atom-memory/dist/adapters/sqlite.js';
 import { db } from '../archive/db.js';
 import { canRead } from '../archive/permissions.js';
 import { archiveEnvelope } from './message.js';
+import { conversationEmbedding } from './embedding.js';
+import { embedTexts } from '../embed/worker.js';
+import { embedConfig } from '../embed/config.js';
 
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 const policy = (guild, channel) => `discord:${guild}:${channel}`;
@@ -51,8 +54,9 @@ function memoryHost() {
     if (!resolve) throw new Error('Memory access denied');
     return resolve();
   } };
-  const host = new MemoryHost({ storage, authority, candidateProvider: new LexicalCandidateProvider() });
-  instance = { host, storage, grants };
+  const embedding = embedConfig.enabled && !['0', 'false', 'off'].includes(process.env.MEMORY_EMBEDDINGS ?? 'true') ? conversationEmbedding() : undefined;
+  const host = new MemoryHost({ storage, authority, embedding, candidateProvider: embedding ? new HybridCandidateProvider() : new LexicalCandidateProvider() });
+  instance = { host, storage, grants, embedding };
   if (!storage.metaGet('sakana:projection-v1')) {
     db.exec('INSERT OR IGNORE INTO memory_pending SELECT message_id FROM messages');
     storage.metaSet('sakana:projection-v1', true);
@@ -226,12 +230,12 @@ export function conversationWriterSession({ guildId, channelId }) {
       if (mapped?.guildId !== guildId || mapped?.channelId !== channelId) throw new Error('Writer source is outside its channel');
       return (mapped.refs ?? []).map((ref) => host.reference(ref, bound));
     },
-    async recall(context) {
+    async recall(context, state = {}) {
       // The Writer searches existing organization, while its input already
       // carries source messages. Do not scan a cold raw corpus before the first
       // completed organization in this channel exists.
       if (!db.prepare('SELECT 1 FROM memory_writer_runs WHERE guild_id=? AND channel_id=? AND atoms>0 LIMIT 1').get(guildId, channelId)) return [];
-      const result = await client.read({ context }, { tokens: 16000, depth: 1, limit: 12 });
+      const result = await client.read({ ...state, context: [context, state.context].filter(Boolean).join('\n') }, { tokens: 8000, depth: 2, limit: 12 });
       const evidence = result.items.filter((atom) => atom.provenance.origin === 'source')
         .flatMap((atom) => {
           const entry = acceptedAtom(atom, bound);
@@ -255,6 +259,12 @@ export function conversationWriterSession({ guildId, channelId }) {
     },
     prepare(batchId, data) { storage.metaSet(`sakana:writer-batch:${batchId}`, { ...data, refs: [], committed: false }); },
     current: currentBatch,
+    async index(batchId) {
+      if (!memoryHost().embedding) return { indexed: 0, disabled: true };
+      const batch = storage.metaGet(`sakana:writer-batch:${batchId}`);
+      const refs = [...batch.refs.map(ref => host.reference(ref, bound)), ...batch.sources.flatMap(source => this.sourceRefs(source.messageId))];
+      return host.indexAtoms(refs, bound, { limit: 512, budget: { maxModelCalls: 512, maxCandidates: 10000, maxBytes: 16000000, maxModelInputTokens: 1000000 }, deadline: new Date(Date.now() + 120000).toISOString() });
+    },
     flush() { storage.flush(); },
     close() { grants.delete(bound.auth.authorizationHandle); }
   };
@@ -275,10 +285,11 @@ export function conversationMemory({ guildId, channel, member, query, onObservat
   const receipts = [];
   const observed = new Map();
   return {
-    async read({ observations = [] } = {}) {
+    async read({ context, thought, observations = [] } = {}) {
       if (!scopes().length || canRecall?.() === false) return null;
       const result = await client.read({ query: String(query ?? '').slice(0, 4000),
-        observations: observations.map((text) => String(text).slice(0, 2000)) }, { tokens: 16000, depth: 1, limit: 16 });
+        context: String(context ?? '').slice(-6000), thought: String(thought ?? '').slice(0, 3000),
+        observations: observations.map((text) => String(text).slice(0, 2000)) }, { tokens: 16000, depth: 2, limit: 16 });
       observedScopes = JSON.stringify(scopes().sort());
       receipts.push(result.receipt);
       const accepted = new Map();
@@ -351,7 +362,14 @@ export function startConversationMemory(client) {
       workerData: { guildIds: [...client.guilds.cache.keys()] }
     });
     worker.on('error', (error) => console.error('Conversation memory worker failed:', error));
-    worker.on('message', (status) => console.log('Conversation memory:', JSON.stringify(status)));
+    worker.on('message', (status) => {
+      if (status.embedding) {
+        const { id, texts, options } = status.embedding;
+        const owner = worker;
+        const send = result => { try { owner?.postMessage({ embeddingResult: { id, ...result } }); } catch { /* The requesting worker exited. */ } };
+        embedTexts(texts, options).then(result => send({ result }), error => send({ error: String(error.message ?? error) }));
+      } else console.log('Conversation memory:', JSON.stringify(status));
+    });
     worker.on('exit', (code) => {
       if (!closed) {
         console.error('Conversation memory worker exited:', code);
@@ -367,4 +385,23 @@ export function startConversationMemory(client) {
     client.off('guildCreate', updateGuilds); client.off('guildDelete', updateGuilds);
     void worker?.terminate();
   };
+}
+
+// Called by Sakana's scheduler. Atom itself owns no timer, provider or daemon.
+export async function updateConversationIndex({ guildIds, limit = 32 } = {}) {
+  if (!guildIds?.length) return { indexed: 0, pending: false };
+  const { host, storage, grants } = memoryHost();
+  if (!memoryHost().embedding) return { indexed: 0, disabled: true };
+  const channels = db.prepare(`SELECT guild_id,channel_id FROM channels WHERE guild_id IN (${guildIds.map(() => '?').join(',')})`).all(...guildIds);
+  const ordered = channels.sort((a,b) => a.channel_id.localeCompare(b.channel_id));
+  if (!ordered.length) return { indexed: 0, pending: false };
+  const last = storage.metaGet('sakana:index-channel') ?? '';
+  const selected = ordered.find(row => row.channel_id > last) ?? ordered[0];
+  storage.metaSet('sakana:index-channel', selected.channel_id);
+  const bound = binding({ subject: 'discord-indexer', scopes: () => [policy(selected.guild_id, selected.channel_id)] });
+  try {
+    const result = await host.updateIndex(bound, { limit, budget: { maxModelCalls: limit, maxModelInputTokens: 300000, maxCandidates: 10000, maxBytes: 16000000 }, deadline: new Date(Date.now() + 120000).toISOString() });
+    storage.flush();
+    return result;
+  } finally { grants.delete(bound.auth.authorizationHandle); }
 }
