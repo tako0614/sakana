@@ -147,7 +147,7 @@ try {
     .find(row => row.provenance.producerId === 'discord-memory-writer');
   const previousGroup = group();
   saveMessage(toRecord(message('rev-update', 'revision-topic: banは手動執行という条件も明記する。', {
-    channelId: 'revision-channel', createdTimestamp: 1700007001000
+    channelId: 'revision-channel', createdTimestamp: 1700266200000
   })));
   await runConversationWriter({ guildIds: ['g'], now: Date.now() + 1000000,
     request: async ({ messages }) => {
@@ -160,6 +160,25 @@ try {
     } });
   assert.equal(group().atomId, previousGroup.atomId, 'reorganization revises the same Atom identity');
   assert.notEqual(group().revisionId, previousGroup.revisionId);
+  saveMessage(toRecord(message('period-early', 'period-topic: 月曜に資料を提案した。', {
+    channelId: 'period-channel', createdTimestamp: 1710000000000
+  })));
+  saveMessage(toRecord(message('period-later', 'period-topic: 木曜に条件を追加した。', {
+    channelId: 'period-channel', createdTimestamp: 1710259200000
+  })));
+  let periodCalls = 0;
+  const period = await runConversationWriter({ guildIds: ['g'], now: Date.now() + 1000000,
+    request: async ({ messages }) => {
+      periodCalls++;
+      const input = JSON.parse(messages[1].content);
+      assert.deepEqual(new Set(input.targetMessageIds), new Set(['period-early', 'period-later']));
+      assert.equal(input.period.to - input.period.from, 3 * 86400000);
+      assert.equal(input.period.complete, false, 'a transport slice must not claim full period coverage');
+      return { choices: [{ message: { content: JSON.stringify({ atoms: [{ id: 'a1', kind: 'collection',
+        text: 'period-topic: 月曜の提案に木曜の条件が付いた議論。', sources: input.targetMessageIds, links: [] }] }) } }] };
+    } });
+  assert.equal(periodCalls, 1, 'sparse history across days should share one model request');
+  assert.equal(period.batchAtoms, 1);
   verify.close();
   console.log('memory writer: grounded Atom relations, isolation, durable retry and deletion invalidation passed');
 } finally { db.close(); rmSync(directory, { recursive: true, force: true }); }

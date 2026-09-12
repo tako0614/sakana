@@ -58,3 +58,12 @@ Atomの差分索引API・SQLiteのベクトル候補取得と、Sakanaの共有�
 Atomの151テスト・ドキュメント例・ドキュメントビルドと、Sakanaの全体検査を通過。キャッシュ済みE5の384次元ベクトルで、文脈・明示的な検討状態から原資料と関係を取得する試験も通過。このローカル環境にはDeepSeekのAPIキーがなく、今回の実DeepSeek試験と本番切替は未実施。
 
 既存SQLiteへ初めて適用する時は、変更フィード用の `(policy,sequence,revision_id)` 索引を構築する。前回同様、Botの停止中に新リリースのSqliteStorageを開いて移行を済ませてから起動する。既存履歴のベクトル生成は起動後の有限なキュー処理で行い、DBを開く段階で全履歴を埋め込まない。
+
+
+### 2026-09-12: Atom Memory 0.3.0 の公開
+
+`atom-memory@0.3.0` をnpmのlatestとして公開し、同じtarballの再インストール・integrity・型・SQLite・バッチWriter・索引更新を確認した。docsは https://atom-memory.takos.jp/history を含む10ページを読み戻し、公開manifestとnpmの版を照合済み。Atomの157テスト、Node 22/24のCI、13個のdocs実行例が合格。公開記録は `subprojects/atom-memory/validation/release.json`。
+
+SakanaのWriterは30分の固定区切りを最大7日・60件・60KBの入力範囲へ変更し、AIが以前の話題を検索・改訂しながらまとめて書く。探索と最終出力は既定最大6ステップ。入力範囲を期間全体の既読・完了と扱わず、既存のメッセージ世代と確定チェックポイントを使う。`MEMORY_WRITER_BATCH_WINDOW_MS` と `MEMORY_WRITER_MAX_STEPS` は `.env.example` を参照。
+
+この変更はリポジトリへ反映し、Sakanaの全体チェックで検証した。稼働中のDiscord botへのデプロイ、今回の版での新しいDeepSeek呼び出し、全履歴の有料処理は実行していない。
