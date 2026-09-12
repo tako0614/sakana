@@ -67,3 +67,15 @@ Atomの151テスト・ドキュメント例・ドキュメントビルドと、S
 SakanaのWriterは30分の固定区切りを最大7日・60件・60KBの入力範囲へ変更し、AIが以前の話題を検索・改訂しながらまとめて書く。探索と最終出力は既定最大6ステップ。入力範囲を期間全体の既読・完了と扱わず、既存のメッセージ世代と確定チェックポイントを使う。`MEMORY_WRITER_BATCH_WINDOW_MS` と `MEMORY_WRITER_MAX_STEPS` は `.env.example` を参照。
 
 この変更はリポジトリへ反映し、Sakanaの全体チェックで検証した。稼働中のDiscord botへのデプロイ、今回の版での新しいDeepSeek呼び出し、全履歴の有料処理は実行していない。
+
+## Atom 0.4 / OpenRouterへの切替手順（2026-09-12）
+
+この節は今回のコードの手順。上の9月11日の稼働記録を今回のデプロイ済み証拠として扱わない。今回の作業環境ではOpenRouterキーが未設定で、保存済みProxmoxセッションの読取は401だった。実AI試験とCT102への切替は、接続が戻った後の未実施項目。
+
+1. リリース用の新しいディレクトリへSakanaと固定したAtomサブモジュールを配置し、`npm ci` と隔離DBでの `npm run check` を完了する。稼働ディレクトリで開発・試験をしない。
+2. 既存のEnvironmentFileへ `OPENROUTER_API_KEY`、`AI_MODEL=deepseek/deepseek-v4-flash-0731`、`MEMORY_WRITER_MODEL=inclusionai/ling-3.0-flash` を用意する。旧DeepSeekキーだけでは新コードの有料推論は有効にならない。金額上限は既存の運用値を引き継ぐ。
+3. Botと別の書込ジョブを止め、アーカイブ・Atom・agent実行DB・通常DBをSQLite backupで保存し、service定義と旧リリース先も記録する。
+4. 0.3と同じE5設定で有限の `updateIndex` / `prepareIndex` を進める。標準adapterは旧索引と進捗を移し、互換ベクトルを再利用する。ランキング変更だけの全件再埋め込み・全履歴の有料再整理をしない。
+5. systemdのリリース参照を切り替え、Botを起動する。MainPID、ExecStart、実リリースcommit、guild別Writer状態、OpenRouterのmodel/provider/usage、エラーログを読み戻す。原文・索引キューの未完了数をリリース成功と混同しない。
+
+旧版へ戻す際はBotを停止して旧リリース参照へ戻す。共通費用台帳へ移した後は、旧版のWriter台帳が空になるので、そのまま有料Writerを起動しない。まず `MEMORY_WRITER_DAILY_USD=0` で止め、当日の `ai_model_calls` のWriter請求・推定・未確定予約を旧台帳へ引き継いでから既存上限を戻す。新しいメッセージを失うDB全体の無条件復元はしない。ベクトルmetadataを0.3が読めない場合は、旧版の索引だけ再準備する。

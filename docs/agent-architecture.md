@@ -7,7 +7,7 @@ flowchart TD
   Discord[Discordの履歴・新着・編集・削除] --> Archive[原文アーカイブと変更履歴]
   Archive --> Queue[原文と同時更新する同期キュー]
   Queue --> Atom[Atom Memory: 原資料]
-  Archive --> Writer[DeepSeek Memory Writer]
+  Archive --> Writer[OpenRouter Ling Writer]
   Writer --> Runtime
   Writer -->|有限のedit| Atom
   Atom --> Meaning[説明・まとまり・役割付き関係もAtom]
@@ -50,7 +50,7 @@ flowchart TD
 - 原文の正本はアーカイブ。意味情報の正本はAtomの受理済みの版で、説明・まとまり・関係も同じAtom形式にする。バッチやキューは輸送・再開の管理であり、別の意味モデルや話題の所属ではない。
 - 権限はサーバー・チャンネルごとのpolicyにする。entityも同じ範囲に置き、関係をたどることで別の非公開チャンネルへ越境させない。
 - 会話の自動想起は応答するチャンネルに限定する。統治の自動想起は現在公開されているチャンネルに限定し、機関に `search_messages` が許可されている場合だけ使う。取得した新しい原文は法定の調査手数・出力量へ計上する。
-- 原文の取り込み権限はhostだけが持つ。AIの生成物を原文・証拠・法律へ昇格させない。DeepSeekのWriterが会話から主張・条件・反論・決定事項・未解決点などを抽出する。出自はorganizationとしてhostが設定し、実際に読んだ原文版をsourcesで指定する。
+- 原文の取り込み権限はhostだけが持つ。AIの生成物を原文・証拠・法律へ昇格させない。LingのWriterが会話から主張・条件・反論・決定事項・未解決点などを抽出する。出自はorganizationとしてhostが設定し、実際に読んだ原文版をsourcesで指定する。
 - 編集・削除は永続キューで追随する。旧Atomをpurgeし、それに依存する観測を無効にする。原文を読んでから回答するまでに変更や権限失効があれば、その実行を失効させる。統治の再試行では新しい記録から調査し直す。
 - アーカイブの `message_versions` は導入後に観測した本文の編集・削除前の状態を保存する。導入前の編集履歴や、既に消えて取得できない発言を復元したことにはしない。
 
@@ -70,7 +70,7 @@ Atomの自動想起は予算内の候補検索で、全履歴の完全走査で�
 - Writerは既存の発行済み整理を `revise` で改訂できる。別人の異なる主張を一つの事実へ上書きせず、条件・根拠・必要な関係を新しい版へ残す。
 - 失敗は未処理として再試行する。モデル出力、Atom確定、flush、キュー確認を区別し、確定後の再起動では同じAI呼び出しを繰り返さない。
 
-DeepSeekのリクエスト形式は[公式Chat Completions API](https://api-docs.deepseek.com/api/create-chat-completion/)に従う。Writerの状態と累積バッチ数を確認する:
+会話・Writer・警察・裁判・議会の有料リクエストは `src/ai/provider.js` に集約する。OpenRouterのChat Completionsと標準のreasoning形式を使い、ツール継続に必要なreasoning_detailsを保持する。Writerの状態と累積バッチ数を確認する:
 
 ```sh
 npm run memory:organize -- --status --guild SERVER_ID
@@ -105,7 +105,7 @@ npm run memory:organize -- --guild SERVER_ID --batches 1
 
 ### 既存設備で動かす構成
 
-常駐するNode botと同じホストにアーカイブ、Atom DB、実行DBを置く。構造化のために別サーバー、外部ベクトルDB、GPUを追加する必要はない。返信・転送・編集等のメタデータはDiscordから正確に保持し、その意味をDeepSeek Writerが整理する。既定はdeepseek-flashの非思考モード。最大60発言・60KBを一つの輸送単位にし、前後の文脈と同じチャンネルの返信先を含める。古い未処理履歴と新着を永続キューで処理し、静かな状態を60秒待って細切れの再推論を減らす。
+常駐するNode botと同じホストにアーカイブ、Atom DB、実行DBを置く。構造化のために別サーバー、外部ベクトルDB、GPUを追加する必要はない。返信・転送・編集等のメタデータはDiscordから正確に保持し、その意味をLing Writerが整理する。既定は `inclusionai/ling-3.0-flash` の非思考モード。最大60発言・60KBを一つの輸送単位にし、前後の文脈と同じチャンネルの返信先を含める。古い未処理履歴と新着を永続キューで処理し、静かな状態を60秒待って細切れの再推論を減らす。
 
 既存アーカイブを移行元にし、メタデータが不足する記録だけを取得可能な範囲で補う。Atomへの同期は専用worker threadで少量ずつチェックポイントを残し、Discordの応答処理を止めない。検索時に全件同期を待たず、同期待ちの原文を候補から除外する。保存先は派生データと変更履歴の分だけ増えるため、本番の全件移行前に小規模なコピーで追加容量と処理速度を測定する。常駐中の別モデルの整理は、この移行とは別の運用判断にする。
 
@@ -151,10 +151,18 @@ npm run memory:structure -- --discord --guild SERVER_ID --refresh-structure
 
 ## 検証
 
-`check-memory-writer.mjs` はAI生成関係の想起、出典の検証、別サーバーの分離、API障害、確定後の停止からの再開、削除後の無効化を検査する。`check-memory-writer-live.mjs` は隔離した合成会話を実DeepSeekで整理し、生成されたAtomがBotの想起経路へ戻ることを検査する。`check-agent-runtime.mjs` は会話の関係・出典・非公開情報の分離・編集・削除・再起動・途中再開を検査する。`check-agentic-governance.mjs` は調査失敗、長文のページング、即時保存、agenticな憲法審査、証拠台帳との一致、憲法の版固定を検査する。`check-guild-isolation.mjs` は別サーバーのID・同じユーザー・同じrun ID・非公開チャンネルを組み合わせて情報が混ざらないことを検査する。これらは `npm run check` に含まれる。外部モデルを使う品質評価と本番への反映は、これらのローカル検査とは別である。
+`check-memory-writer.mjs` はAI生成関係の想起、出典の検証、別サーバーの分離、API障害、確定後の停止からの再開、削除後の無効化を検査する。`check-memory-writer-live.mjs` は隔離した合成会話を実Lingで整理し、生成されたAtomがBotの想起経路へ戻ることを検査する。`check-agent-runtime.mjs` は会話の関係・出典・非公開情報の分離・編集・削除・再起動・途中再開を検査する。`check-agentic-governance.mjs` は調査失敗、長文のページング、即時保存、agenticな憲法審査、証拠台帳との一致、憲法の版固定を検査する。`check-guild-isolation.mjs` は別サーバーのID・同じユーザー・同じrun ID・非公開チャンネルを組み合わせて情報が混ざらないことを検査する。これらは `npm run check` に含まれる。外部モデルを使う品質評価と本番への反映は、これらのローカル検査とは別である。
 
 ## 索引更新と費用の所有者
 
-Atomは有限の `write` / `edit` / `indexAtoms` / `updateIndex` / `read` を提供するJSライブラリ。ジョブの起動・頻度・DeepSeek・埋め込みworker・API費用はSakana側に置く。新規のWriter出力はAtomへ確定した後に優先してベクトル化し、索引失敗時は保存済みAI結果から再開する。既存履歴とlogical参照先の改訂は、保存済み進捗を使う差分索引で追随する。
+Atomは有限の `write` / `edit` / `indexAtoms` / `updateIndex` / `read` を提供するJSライブラリ。ジョブの起動・頻度・OpenRouter・埋め込みworker・API費用はSakana側に置く。新規のWriter出力はAtomへ確定した後に優先してベクトル化し、索引失敗時は保存済みAI結果から再開する。既存履歴とlogical参照先の改訂は、保存済み進捗を使う差分索引で追随する。
 
 検索はSQLiteのベクトル近似候補と語句候補を合わせ、実ベクトルで採点して深さ2まで関係を展開する。権限・証拠・出力量の検査は共通のまま。全履歴の取り込み完了や完全な上位検索を近似探索の終了から判定しない。[費用・見積もり・日額上限](memory-cost.md)を参照。
+
+## Atom 0.4 の順位と継続するまとまり
+
+`search`・`read`・自動想起は文脈・明示的thoughtとの類似度と、役割・方向の重み付き伝播で順位を決める。LLMの重要度採点や全履歴の重要度更新ジョブは持たない。最大64 seed・512ノード・4096リンク・深さ2が既定で、操作予算でも打ち切る。詳細は[ライブラリのランキング](https://atom-memory.takos.jp/ranking)。
+
+Writerが既存のcollectionへ接続するリンクはlogicalにし、継続的な改訂へ追随する。根拠や主張はobservedで特定版を固定する。原資料の訂正・削除、サーバーとチャンネルの読取権限は順位とは別に検証する。エンコーダーの識別子と表現が同じなら、ランキングを変えてもE5ベクトルを再計算しない。
+
+モデル変更後に旧モデルの途中のツール会話を再開しないよう、共有ランタイムのチェックポイント照合にproviderとmodelを含める。投票・承認・拒否権・手動ban/kickの執行条件は各機能の既存のホスト検証を使う。

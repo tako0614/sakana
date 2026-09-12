@@ -381,7 +381,7 @@ export function reserveCall({ guildId, channelId, userId, admin = false, skipUse
 }
 
 /**
- * 使い終わった枠を確定する。usage は DeepSeek のレスポンスの usage をそのまま渡す。
+ * 使い終わった枠を確定する。usage は共通providerが正規化したトークン使用量。請求額はAI費用台帳で扱う。
  */
 export function finalizeCall(id, { status = 'ok', rounds = 0, usage = {} } = {}) {
   running = Math.max(0, running - 1);

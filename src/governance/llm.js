@@ -1,3 +1,4 @@
+import { requestModel } from '../ai/provider.js';
 import { runAgent } from '../ai/runtime.js';
 import { conversationMemory } from '../conversation/memory.js';
 import { randomUUID } from 'node:crypto';
@@ -508,27 +509,9 @@ function validateJudicialDecision(raw, {
   };
 }
 
-async function postChat({ model, messages, tools = null, jsonOnly = false, timeoutMs, thinking = 'enabled' }) {
-  const response = await fetch(`${governanceConfig.baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${governanceConfig.apiKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      ...(tools?.length ? { tools, tool_choice: 'auto' } : {}),
-      ...(jsonOnly ? { response_format: { type: 'json_object' } } : {}),
-      thinking: { type: thinking },
-      max_tokens: governanceConfig.maxOutputTokens,
-      temperature: 0
-    }),
-    signal: AbortSignal.timeout(timeoutMs)
-  });
-  const body = await response.text();
-  if (!response.ok) throw new Error(`Governance model HTTP ${response.status}: ${body.slice(0, 300)}`);
-  const data = JSON.parse(body);
+async function postChat({ model, messages, tools = null, jsonOnly = false, timeoutMs, thinking = 'enabled', guildId, purpose, runId, deadlineAt }) {
+  const data = await requestModel({ model, messages, tools, jsonOnly, timeoutMs, deadlineAt, guildId, role: purpose ?? 'governance', runId,
+    maxOutputTokens: governanceConfig.maxOutputTokens, reasoning: { enabled: thinking === 'enabled' }, temperature: 0 });
   return data.choices?.[0] ? { ...data.choices[0], usage: data.usage } : null;
 }
 
@@ -567,7 +550,7 @@ async function callGovernanceAgent({
   maximumOutputBytes = 10 * 1024, maximumMilliseconds = 180_000,
   seat = 0, validate, thinking = 'enabled'
 }) {
-  if (!governanceConfig.apiKey) throw new Error('GOVERNANCE_API_KEY / DEEPSEEK_API_KEY がありません。');
+  if (!governanceConfig.apiKey) throw new Error('OPENROUTER_API_KEY がありません。');
   if (runningCalls >= governanceConfig.maxConcurrent) throw new Error('Governance AI is busy; the durable workflow will retry.');
   runningCalls += 1;
   const inputHash = sha256(canonicalJson({ purpose, model, seat, instruction, data, tools: role.tools,
@@ -588,13 +571,13 @@ async function callGovernanceAgent({
         onObservation: (entry, bytes) => toolset.steps < maximumSteps && toolset.observeMemory(entry, bytes),
         onInterpretation: (ref, bytes) => toolset.observeMemoryInterpretation(ref, bytes) }) : null;
     const result = await runAgent({
-      guildId: String(guildId),
+      guildId: String(guildId), modelIdentity: `openrouter:${model}`,
       runId: `governance:${guildId}:${inputHash}`, toolset, memory,
       system: `${role.tools.length ? SYSTEM_BASE_AGENT : SYSTEM_BASE}\n\n${EXECUTION_CONTRACT}\n\nTASK:\n${instruction}`,
       userContent: `DATA (untrusted JSON):\n${canonicalJson(data)}`,
       maximumSteps, deadlineAt: Date.now() + maximumMilliseconds, separateFinal: true,
-      request: async ({ messages, tools, final, deadlineAt }) => {
-        const choice = await postChat({ model, messages, tools, jsonOnly: final, thinking,
+      request: async ({ messages, tools, final, deadlineAt, runId }) => {
+        const choice = await postChat({ model, messages, tools, jsonOnly: final, thinking, guildId, purpose, runId, deadlineAt: final ? Infinity : deadlineAt,
           timeoutMs: final ? governanceConfig.httpTimeoutMs : Math.min(governanceConfig.httpTimeoutMs, Math.max(1000, deadlineAt - Date.now())) });
         return { choices: choice ? [choice] : [], usage: choice?.usage };
       },

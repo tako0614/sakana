@@ -26,20 +26,20 @@ const emptyUsage = () => ({ prompt_tokens: 0, completion_tokens: 0, prompt_cache
 
 /** One host-owned execution loop for chat and every institution. Providers only
  * implement request(); capabilities and final validation remain host supplied.
- * Checkpoints contain explicit messages/tool observations, never reasoning_content.
+ * Checkpoints retain protocol reasoning blocks for tool continuation; memory_focus supplies retrieval signals.
  * A failed request propagates to the durable workflow, never becomes a verdict.
  */
 export async function runAgent({ guildId, system, userContent, toolset = { definitions: [], call: async () => '' },
   request, usage, budget = Infinity, weigh = () => 0, deadlineAt = Infinity,
   maximumSteps = Infinity, separateFinal = false, validate = (message) => message.content,
-  onToolCall, runId = randomUUID(), memory = null, reuseCompleted = false }) {
+  onToolCall, runId = randomUUID(), memory = null, reuseCompleted = false, modelIdentity }) {
   if (typeof guildId !== 'string' || !guildId.trim()) throw new Error('Agent execution requires a guildId');
   const runKey = `guild:${JSON.stringify([guildId, runId])}`;
   runId = runKey;
   if (active.has(runKey)) throw new Error('Agent run is already active');
   const definitions = memory ? [...toolset.definitions, memoryStateTool] : toolset.definitions;
   if (toolset.definitions.some(tool => tool.function?.name === 'memory_focus')) throw new Error('memory_focus belongs to the shared runtime');
-  const inputHash = hash({ guildId, system, userContent, tools: definitions, maximumSteps, separateFinal });
+  const inputHash = hash({ guildId, system, userContent, tools: definitions, maximumSteps, separateFinal, modelIdentity });
   runId = journal().prepare('SELECT run_id FROM agent_run_heads WHERE run_key = ?').get(runKey)?.run_id ?? runId;
   let stored = journal().prepare('SELECT * FROM agent_runs WHERE id = ? AND guild_id = ?').get(runId, guildId);
   // An independent new deliberation must not inherit a previous verdict just
@@ -130,7 +130,7 @@ export async function runAgent({ guildId, system, userContent, toolset = { defin
         ? 'Return the requested complete JSON now. Cite only records actually observed. Missing facts remain unknown.'
         : 'ここまでで取得できた材料だけで、いま答えを書いて。足りない部分は分からないと書いて。' });
       save();
-      const data = await request({ messages, tools: final ? null : definitions,
+      const data = await request({ guildId, runId, messages, tools: final ? null : definitions,
         deadlineAt: state.deadlineAt ?? Infinity, final, effort: invalid ? 'low' : undefined });
       for (const key of Object.keys(totals)) totals[key] += data.usage?.[key] ?? 0;
       state.rounds += 1;
@@ -141,7 +141,8 @@ export async function runAgent({ guildId, system, userContent, toolset = { defin
       const calls = message.tool_calls ?? [];
       if (calls.length && final) throw new Error('Provider requested a tool after capability closure');
       if (calls.length) {
-        state.messages.push({ role: 'assistant', content: message.content ?? '', tool_calls: calls });
+        state.messages.push({ role: 'assistant', content: message.content ?? '', tool_calls: calls,
+          ...(message.reasoning_details ? { reasoning_details: message.reasoning_details } : message.reasoning || message.reasoning_content ? { reasoning: message.reasoning ?? message.reasoning_content } : {}) });
         state.pending = calls;
         save();
         continue;

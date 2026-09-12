@@ -84,6 +84,10 @@ try {
   assert.match(recalled.text, /administrators must act manually/);
   assert.doesNotMatch(recalled.text, /OTHER_GUILD_SECRET/);
   assert.ok(packed.memory.some((atom) => atom.links.some((link) => link.role === 'opposition')));
+  assert.ok(packed.memory.some(atom => atom.links.some(link => link.role === 'group' && link.at === 'logical')),
+    'Ongoing collection links follow revisions');
+  assert.ok(packed.memory.some(atom => atom.links.some(link => link.role === 'opposition' && link.at === 'observed')),
+    'Evidence and statements remain pinned to the observed version');
   const budgeted = conversationMemory({ guildId: 'g', channel, member: { id: 'viewer' }, query: 'golden_semantic',
     onObservation: () => true, onInterpretation: () => false });
   assert.ok(JSON.parse((await budgeted.read()).text).memory.every((atom) => atom.provenance.origin === 'source'),

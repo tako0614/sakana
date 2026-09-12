@@ -1,3 +1,4 @@
+import { agentConfig } from '../agent/config.js';
 // どのモデルで答えるかの選択。誰でも自分のぶんだけ変えられる。
 //
 // agent_settings は value が REAL なので文字列を入れられない。数値に符号化すると
@@ -23,7 +24,7 @@ const countStmt = db.prepare('SELECT engine, COUNT(*) n FROM agent_engine WHERE 
  */
 export const ENGINES = {
   deepseek: {
-    label: 'deepseek-v4-flash',
+    label: agentConfig.model,
     summary: '検索・read・web・引用つきのエージェント。事実を調べて答える'
   },
   evex: {

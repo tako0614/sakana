@@ -1,3 +1,4 @@
+import { providerConfig } from '../ai/provider.js';
 import { readFileSync } from 'node:fs';
 import { compileConstitution } from './rules.js';
 
@@ -31,20 +32,13 @@ function models(value, fallback) {
 
 const defaultModel = firstNonEmpty(
   process.env.GOVERNANCE_MODEL,
-  process.env.DEEPSEEK_MODEL,
-  'deepseek-v4-flash'
+  providerConfig.model
 );
 
 export const governanceConfig = {
   enabled: flag(process.env.GOVERNANCE_ENABLED, true),
   operators: list(process.env.GOVERNANCE_OPERATOR_USERS),
-  apiKey: firstNonEmpty(process.env.GOVERNANCE_API_KEY, process.env.DEEPSEEK_API_KEY),
-  baseUrl: firstNonEmpty(
-    process.env.GOVERNANCE_BASE_URL,
-    process.env.DEEPSEEK_BASE_URL,
-    'https://api.deepseek.com'
-  )
-    .replace(/\/+$/, ''),
+  apiKey: providerConfig.apiKey,
   drafterModel: firstNonEmpty(process.env.GOVERNANCE_DRAFTER_MODEL, defaultModel),
   judgeModels: models(process.env.GOVERNANCE_JUDGE_MODELS, defaultModel),
   appealModels: models(process.env.GOVERNANCE_APPEAL_MODELS, defaultModel),

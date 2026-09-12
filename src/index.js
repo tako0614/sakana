@@ -147,7 +147,7 @@ client.once(Events.ClientReady, (readyClient) => {
   console.log(
     agentEnabled
       ? 'AI agent is enabled. Mention the bot to use it.'
-      : 'DEEPSEEK_API_KEY is not set. The AI agent is disabled.'
+      : 'OPENROUTER_API_KEY is not set. The AI agent is disabled.'
   );
 
   // 許可していないサーバーに入っていたら出る

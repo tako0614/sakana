@@ -5,7 +5,7 @@ import { join } from 'node:path';
 const directory = mkdtempSync(join(tmpdir(), 'sakana-agentic-governance-'));
 process.env.DATABASE_PATH = `${directory}/main.sqlite`;
 process.env.ARCHIVE_DB_PATH = `${directory}/archive.sqlite`;
-process.env.GOVERNANCE_API_KEY = 'review-fixture';
+process.env.OPENROUTER_API_KEY = 'review-fixture';
 const base = new URL('../', import.meta.url).href;
 const db = await import(base + 'src/governance/db.js');
 const { loadBootstrapDocuments } = await import(base + 'src/governance/config.js');

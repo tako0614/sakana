@@ -2,15 +2,16 @@ import { createHash, randomUUID } from 'node:crypto';
 import { db } from '../archive/db.js';
 import { runAgent } from '../ai/runtime.js';
 import { archiveEnvelope } from './message.js';
-import { reserveMemoryCall, finishMemoryCall, memoryCostReport } from './cost.js';
+import { memoryCostReport } from './cost.js';
+import { providerConfig, requestModel } from '../ai/provider.js';
 import { conversationSourceHash, conversationWriterSession, syncConversationMemory } from './memory.js';
 
 const integer = (value, fallback, maximum) => Math.min(maximum, Math.max(1, Number.parseInt(value, 10) || fallback));
 export const writerConfig = {
   enabled: !['0', 'false', 'off'].includes(process.env.MEMORY_WRITER_ENABLED ?? 'true'),
-  model: process.env.MEMORY_WRITER_MODEL || process.env.DEEPSEEK_MODEL || 'deepseek-flash',
-  apiKey: process.env.DEEPSEEK_API_KEY || '',
-  baseUrl: (process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com').replace(/\/+$/, ''),
+  model: providerConfig.writerModel,
+  apiKey: providerConfig.apiKey,
+
   batchMessages: integer(process.env.MEMORY_WRITER_BATCH_MESSAGES, 60, 100),
   batchBytes: integer(process.env.MEMORY_WRITER_BATCH_BYTES, 60000, 200000),
   batchWindowMs: integer(process.env.MEMORY_WRITER_BATCH_WINDOW_MS, 7 * 86400000, 366 * 86400000),
@@ -40,23 +41,10 @@ transport上の入力バッチは意味上のまとまりではない。入力�
 本文にa1やe1などの一時参照名を使わず、関係する話者と内容を自立した日本語で説明する。構造上の参照はlinksへ置く。
 未発行参照や循環した新規参照は使わない。本文は各3000文字以内、1回最大40 Atom。保存価値のある情報がない場合だけatomsを空にできる。`;
 
-export async function requestWriterModel({ messages, tools }) {
-  const reservation = reserveMemoryCall({ model: writerConfig.model, messages, tools, outputTokens: writerConfig.maxOutputTokens });
-  let data;
-  try {
-    const response = await fetch(`${writerConfig.baseUrl}/chat/completions`, {
-      method: 'POST', signal: AbortSignal.timeout(writerConfig.timeoutMs),
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${writerConfig.apiKey}` },
-      body: JSON.stringify({ model: writerConfig.model, messages, stream: false,
-        max_tokens: writerConfig.maxOutputTokens, thinking: { type: 'disabled' },
-        ...(tools?.length ? { tools, tool_choice: 'auto' } : { response_format: { type: 'json_object' } }) })
-    });
-    // The durable queue retries failures; error logs never contain source bodies or credentials.
-    if (!response.ok) throw new Error(`Memory Writer provider HTTP ${response.status}`);
-    data = await response.json();
-  } finally { finishMemoryCall(reservation, data?.usage); }
-  if (data.choices?.[0]?.finish_reason === 'length') throw new Error('Memory Writer output was truncated');
-  return data;
+export async function requestWriterModel({ messages, tools, guildId, runId, deadlineAt }) {
+  return requestModel({ model: writerConfig.model, messages, tools, guildId, runId, deadlineAt, role: 'writer',
+    maxOutputTokens: writerConfig.maxOutputTokens, timeoutMs: writerConfig.timeoutMs,
+    reasoning: { enabled: false }, jsonOnly: !tools?.length });
 }
 
 function lease(acquire = false) {
@@ -154,7 +142,7 @@ export function writerStatus(guildIds) {
   const queue = db.prepare(`SELECT count(*) pending, sum(attempts>0) retrying FROM memory_writer_pending ${scope}`).get(...args);
   const runs = db.prepare(`SELECT count(*) batches, coalesce(sum(messages),0) processedMessages,
     coalesce(sum(atoms),0) atoms, max(completed_at) lastCompletedAt FROM memory_writer_runs ${scope}`).get(...args);
-  return { ...queue, ...runs, cost: memoryCostReport(), model: writerConfig.model, enabled: writerConfig.enabled && !!writerConfig.apiKey };
+  return { ...queue, ...runs, cost: memoryCostReport(undefined, guildIds), model: writerConfig.model, enabled: writerConfig.enabled && !!writerConfig.apiKey };
 }
 
 export async function runConversationWriter({ guildIds, request = requestWriterModel, now = Date.now() } = {}) {
@@ -232,7 +220,7 @@ export async function runConversationWriter({ guildIds, request = requestWriterM
       };
       // Same execution/checkpoint loop as conversation, police, courts and parliament.
       // The model chooses a finite Atom edit plan; commit is a host-owned operation.
-      const result = batch.rows.length ? await runAgent({ guildId: batch.guildId, runId: `memory-writer:${batchId}`,
+      const result = batch.rows.length ? await runAgent({ guildId: batch.guildId, modelIdentity: `openrouter:${writerConfig.model}`, runId: `memory-writer:${batchId}`,
         system: instruction, userContent: JSON.stringify({ guildId: batch.guildId, channelId: batch.channelId,
           period: { from: Math.min(...batch.pending.map((item) => item.created_at)),
             to: Math.max(...batch.pending.map((item) => item.created_at)), complete: false,
@@ -267,7 +255,10 @@ export async function runConversationWriter({ guildIds, request = requestWriterM
             const links = node.links.flatMap((link) => {
               const refs = link.target.startsWith('source:') ? sourceRefs.get(link.target.slice(7))
                 : [created.get(link.target)?.ref ?? existing.get(link.target)?.atom.ref];
-              return refs.map((ref) => ({ role: link.role, target: { ref, at: 'observed', required: link.required } }));
+              const targetKind = result.output.atoms.find(atom => atom.id === link.target)?.kind
+                ?? existing.get(link.target)?.value?.kind;
+              return refs.map((ref) => ({ role: link.role, target: { ref,
+                at: targetKind === 'collection' ? 'logical' : 'observed', required: link.required } }));
             });
             // Source companions are required, so courts cannot receive an AI
             // interpretation without its original utterances inside the budget.

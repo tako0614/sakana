@@ -9,7 +9,7 @@ const archivePath = `${tmpdir()}/sakana-investigation-archive-${process.pid}.sql
 for (const path of [mainPath, archivePath]) rmSync(path, { force: true });
 process.env.DATABASE_PATH = mainPath;
 process.env.ARCHIVE_DB_PATH = archivePath;
-process.env.GOVERNANCE_API_KEY = 'check';
+process.env.OPENROUTER_API_KEY = 'check';
 
 const { loadBootstrapDocuments } = await import('./fixtures/legacy-governance.js');
 const db = await import('../src/governance/db.js');

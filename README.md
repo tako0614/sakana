@@ -629,13 +629,14 @@ URL の判定は**名前ではなく解決した IP** で行います (`src/agen
 ### 設定
 
 ```env
-DEEPSEEK_API_KEY=sk-...             # これが無ければエージェントは無効 (他の機能は動く)
-DEEPSEEK_MODEL=deepseek-v4-flash
+OPENROUTER_API_KEY=sk-or-...             # これが無ければエージェントは無効 (他の機能は動く)
+AI_MODEL=deepseek/deepseek-v4-flash-0731
+MEMORY_WRITER_MODEL=inclusionai/ling-3.0-flash
 AGENT_REASONING_EFFORT=high         # low / high / max の真ん中
 AGENT_THINKING=true
 
-AGENT_TOKEN_WEIGHT_CACHED=0.2       # 0.028 / 0.14 (実単価の比)
-AGENT_TOKEN_WEIGHT_OUTPUT=2.0       # 0.28 / 0.14
+AGENT_TOKEN_WEIGHT_CACHED=0.2       # 固定の使用量換算比。請求額とは別
+AGENT_TOKEN_WEIGHT_OUTPUT=2.0       # 固定の使用量換算比
 AGENT_PRICE_IN_PER_MTOK=0.14        # ドル ↔ 換算トークンの換算レート
 AGENT_REQUEST_USD=0.02              # 1リクエストの暴走ガード
 AGENT_USER_DAILY_USD=0.05           # 1人あたり
@@ -912,3 +913,5 @@ evex 側 (20.1% / 32.2% / 10) に寄る。
 
 学習は t4-small で 88 分・$0.59 (batch 48 + `torch.compile` で 93,500 tok/s)。
 `torch.compile` は速いだけでなくメモリも減り、単体では OOM する batch 48 が通る。
+
+AIの接続・費用は[共通接続と費用記録](docs/memory-cost.md)、Atom 0.4の移行と本番反映状態は[運用メモ](docs/deployment.md)を参照してください。

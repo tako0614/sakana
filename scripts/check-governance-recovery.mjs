@@ -6,7 +6,7 @@ import { join } from 'node:path';
 const directory = mkdtempSync(join(tmpdir(), 'sakana-governance-recovery-'));
 process.env.DATABASE_PATH = join(directory, 'main.sqlite');
 process.env.ARCHIVE_DB_PATH = join(directory, 'archive.sqlite');
-process.env.GOVERNANCE_API_KEY = 'check';
+process.env.OPENROUTER_API_KEY = 'check';
 const db = await import('../src/governance/db.js');
 const { loadBootstrapDocuments } = await import('../src/governance/config.js');
 const { compileConstitution } = await import('../src/governance/rules.js');

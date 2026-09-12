@@ -3,7 +3,7 @@ import {tmpdir} from 'node:os';
 import {rmSync} from 'node:fs';
 process.env.DATABASE_PATH=`${tmpdir()}/sakana-migration-${process.pid}.sqlite`;
 process.env.ARCHIVE_DB_PATH=`${tmpdir()}/sakana-migration-archive-${process.pid}.sqlite`;
-process.env.GOVERNANCE_API_KEY='check';
+process.env.OPENROUTER_API_KEY='check';
 const db=await import('../src/governance/db.js');
 const {loadBootstrapDocuments}=await import('./fixtures/legacy-governance.js');
 const {proposeLawDefinedGovernance}=await import('../src/governance/migration.js');

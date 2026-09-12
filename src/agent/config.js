@@ -1,5 +1,6 @@
+import { providerConfig } from '../ai/provider.js';
 // AI エージェントの設定。
-// DEEPSEEK_API_KEY が無ければ機能ごと無効になるので、既存の bot 動作には影響しない。
+// OPENROUTER_API_KEY が無ければ機能ごと無効になるので、既存の bot 動作には影響しない。
 
 function number(value, fallback) {
   const parsed = Number(value);
@@ -16,9 +17,8 @@ function list(value) {
 }
 
 export const agentConfig = {
-  apiKey: process.env.DEEPSEEK_API_KEY ?? '',
-  baseUrl: (process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com').replace(/\/+$/, ''),
-  model: process.env.DEEPSEEK_MODEL ?? 'deepseek-v4-flash',
+  apiKey: providerConfig.apiKey,
+  model: process.env.AGENT_MODEL || providerConfig.model,
 
   // 公式のツマミは low / high / max。真ん中の high を既定にする。
   reasoningEffort: process.env.AGENT_REASONING_EFFORT ?? 'high',
@@ -68,11 +68,9 @@ export const agentConfig = {
   // ただし「換算トークン500万」では高いか安いか判断できないので、
   // 設定する数字はドルで書き、内部でトークンに直す。
   //
-  // 重みは「キャッシュミス入力1トークン = 1」に正規化した実単価の比。
-  // deepseek-v4-flash は 1Mトークンあたり 入力 $0.14 / キャッシュ $0.028 / 出力 $0.28
-  // なので 0.028/0.14 = 0.2、0.28/0.14 = 2.0。
-  // (キャッシュヒットの単価は資料で $0.028 と $0.0028 が食い違っていた。上限は壁なので
-  //  高い方を採る。実際が安ければ厳しめに働くだけで、逆より安全。)
+  // 利用者の公平な使用量制限に使う固定の換算レート。OpenRouterの請求額ではない。
+  // モデル・接続先が変わっても過去の換算使用量との比較を維持する。
+  // 実際の請求額・提供元・未確定予約は src/ai/cost.js で別に記録する。
   tokenWeightInput: number(process.env.AGENT_TOKEN_WEIGHT_INPUT, 1),
   tokenWeightCached: number(process.env.AGENT_TOKEN_WEIGHT_CACHED, 0.2),
   tokenWeightOutput: number(process.env.AGENT_TOKEN_WEIGHT_OUTPUT, 2.0),
@@ -84,11 +82,6 @@ export const agentConfig = {
   // 上限はドルで書く。/agentlimit で管理者が実行中に変えられる。0 で無制限。
   // 管理者は判定そのものを通らないので、これは他の人を縛る壁。
   //
-  // 実測 (プロンプトを直した後の57件): 1回 平均 $0.0024 / 最悪 $0.0116。
-  // 1人 $0.05/日 なら平均 約21回・重いの4回。全体の 10% なので、
-  // 10人が同じだけ使ってようやく全体に当たる。
-  // 以前の $0.25 は1人で約104回・全体の半分を取れてしまい、2人で全体が尽きた。
-  // 信頼している人は /agentlimit grant で個別に上げる。
   globalDailyUsd: number(process.env.AGENT_GLOBAL_DAILY_USD, 0.5),
   userDailyUsd: number(process.env.AGENT_USER_DAILY_USD, 0.05),
   userWindowMs: number(process.env.AGENT_USER_WINDOW_MS, 86_400_000),

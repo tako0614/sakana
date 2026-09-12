@@ -5,7 +5,7 @@ import { join } from 'node:path';
 const directory=mkdtempSync(join(tmpdir(),'sakana-human-authority-'));
 process.env.DATABASE_PATH=join(directory,'main.sqlite');
 process.env.ARCHIVE_DB_PATH=join(directory,'archive.sqlite');
-process.env.GOVERNANCE_API_KEY='check';
+process.env.OPENROUTER_API_KEY='check';
 const {loadBootstrapDocuments}=await import('../src/governance/config.js');
 const db=await import('../src/governance/db.js');
 const {draftBill}=await import('../src/governance/llm.js');
