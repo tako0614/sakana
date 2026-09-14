@@ -28,6 +28,7 @@ const response = (value) => new Response(JSON.stringify({ choices: [{ message: {
 const run = () => runJudicialPanel({ guildId: gid, caseRecord: db.getCase(record.id), law, offense: law.provisions.offenses[0], evidence, submissions: [], policy: db.constitutionForSubject('case', record).policy, phase: 'police' });
 let calls = [];
 globalThis.fetch = async (_url, init) => {
+  if (_url.endsWith('/endpoints')) return { ok: true, json: async () => ({ data: { endpoints: [{ pricing: { prompt: '0.0000001', completion: '0.0000002' } }] } }) };
  const body = JSON.parse(init.body); calls.push(body);
  return body.tools?.length ? new Response('outage', { status: 503 }) : response(output);
 };
@@ -38,6 +39,7 @@ console.log('A1: investigative failure remains a retryable execution failure');
 calls = [];
 let traceRowsDuringInvestigation = null;
 globalThis.fetch = async (_url, init) => {
+  if (_url.endsWith('/endpoints')) return { ok: true, json: async () => ({ data: { endpoints: [{ pricing: { prompt: '0.0000001', completion: '0.0000002' } }] } }) };
  const body = JSON.parse(init.body); calls.push(body);
  if (body.tools?.length && !body.messages.some((message) => message.role === 'tool')) return new Response(JSON.stringify({ choices: [{ message: { content: '', tool_calls: [{ id: 'read-law', type: 'function', function: { name: 'read_law', arguments: JSON.stringify({ code: 'LONG' }) } }] } }] }), { status: 200 });
  if (body.tools?.length) {
@@ -63,7 +65,8 @@ assert.match(JSON.parse(assembled).text, /TAIL_EXCEPTION/);
 console.log('A2/A3: complete paged laws and immediate durable observations');
 
 calls = [];
-globalThis.fetch = async (_url, init) => { calls.push(JSON.parse(init.body)); return response({ verdict: 'constitutional', reasons: ['供給された対象を確認'], constitutionArticles: ['第三条（言論の自由）'] }); };
+globalThis.fetch = async (_url, init) => {
+  if (_url.endsWith('/endpoints')) return { ok: true, json: async () => ({ data: { endpoints: [{ pricing: { prompt: '0.0000001', completion: '0.0000002' } }] } }) }; calls.push(JSON.parse(init.body)); return response({ verdict: 'constitutional', reasons: ['供給された対象を確認'], constitutionArticles: ['第三条（言論の自由）'] }); };
 const constitutional = await runConstitutionalPanel({ guildId: gid, targetType: 'law', targetId: law.id, phase: 'pre', constitution: root, target: law });
 assert.equal(constitutional.outputs.length, 3);
 assert.ok(calls.some((call) => call.tools?.some((tool) => tool.function.name === 'read_constitution')));

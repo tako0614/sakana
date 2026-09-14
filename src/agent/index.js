@@ -1,4 +1,6 @@
 import { conversationMemory } from '../conversation/memory.js';
+import { selectContextMessages } from '../conversation/admission.js';
+import { isDreamGuild } from '../conversation/dream-config.js';
 // メンションで呼ばれる AI エージェント。
 //
 //   @bot この議論まとめて
@@ -62,6 +64,12 @@ const NOTICE_GLOBAL_LIMIT = 'サーバー全体の使用量の上限に達しま
 const NOTICE_ERROR = 'エージェントの実行に失敗しました';
 
 const NOTICE_HEADS = [NOTICE_BUSY, NOTICE_USER_LIMIT, NOTICE_GLOBAL_LIMIT, NOTICE_ERROR];
+
+export function chatRunId({ guildId, channelId, memberId, messageId }) {
+  const identity = [guildId, channelId, memberId, messageId].map((value) => String(value ?? '').trim());
+  if (identity.some((value) => !value)) throw new Error('Chat run identity requires guild, channel, member and message IDs');
+  return `discord-chat:${JSON.stringify(identity)}`;
+}
 
 /**
  * その発言が bot の出した定型文か。直近の会話に混ぜないために使う。
@@ -225,7 +233,7 @@ async function fetchRecent(channel, { exclude, selfId, limit }) {
 
   try {
     // 経過表示のぶんだけ多めに取る。捨てる件数が読めないので少し余裕を持たせる。
-    const fetched = await channel.messages.fetch({ limit: Math.min(limit + 8, 100) });
+    const fetched = await channel.messages.fetch({ limit: isDreamGuild(channel.guildId ?? channel.guild?.id) ? 100 : Math.min(limit + 8, 100) });
     return [...fetched.values()]
       .filter((message) => !exclude.has(message.id))
       .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
@@ -233,7 +241,7 @@ async function fetchRecent(channel, { exclude, selfId, limit }) {
       // 自分の経過表示と断り文は会話ではない。混ぜると枠を食うし、自分の発言として
       // 読まれる。ID で除くだけでは足りない (落ちた実行が消し損ねたぶんが残っている)。
       .filter((message) => !isIndicatorMessage(message, selfId) && !isAgentNotice(message, selfId))
-      .slice(-limit);
+      .slice(-(isDreamGuild(channel.guildId ?? channel.guild?.id) ? 100 : limit));
   } catch (error) {
     console.error('Failed to preload recent messages:', error);
     return [];
@@ -367,7 +375,9 @@ export async function handleAgentRequest(message, client) {
   let indicator = null;
   let ctx = null;
 
-  // 例外や中断でも使ったぶんが残るように、外で持って runAgent に渡す。
+  // 例外や中断でも、この呼び出しで新たに使ったぶんは残す。
+  // 再開前の累計をこの新しい予約に付け替えないため、runAgent が
+  // この object に書くのは呼び出し単位の差分だけ。
   const usage = { prompt_tokens: 0, completion_tokens: 0, prompt_cache_hit_tokens: 0 };
 
   try {
@@ -410,7 +420,13 @@ export async function handleAgentRequest(message, client) {
 
     // 鎖に入ったものは背景から抜く。同じ発言を2回載せてもトークンだけ増える。
     const inChain = new Set(replyChain.map((entry) => entry.messageId));
-    const recent = preloaded.filter((entry) => !inChain.has(entry.messageId));
+    const available = preloaded.filter((entry) => !inChain.has(entry.messageId));
+    const recent = isDreamGuild(guild.id)
+      ? selectContextMessages(available, { guildId: guild.id, channelId: message.channelId,
+          selfId: client.user?.id, maxUnits: agentConfig.preloadMessages, maxBytes: 60000 })
+        .map(unit => ({ ...unit.messages[0], contextMessages: unit.messages,
+          content: unit.messages.map(item => item.content).join('\n') }))
+      : available;
 
     // query を省略した意味検索で「いまの会話」を使う
     ctx.recent = recent;
@@ -429,9 +445,15 @@ export async function handleAgentRequest(message, client) {
       refs
     });
 
-    const memory = conversationMemory({ guildId: guild.id, channel: message.channel, member, query: message.content });
+    const memory = conversationMemory({ guildId: guild.id, channel: message.channel, member });
     const result = await runAgent({
       guildId: guild.id,
+      // Discord input identity survives a process restart. An unfinished
+      // provider response can therefore finish its pending memory-use ack
+      // without another paid request. Completed runs still use the runtime's
+      // default reuseCompleted=false behavior if the event is handled again.
+      runId: chatRunId({ guildId: guild.id, channelId: message.channelId,
+        memberId: member.id, messageId: message.id }),
       memory,
       system,
       userContent,
@@ -453,8 +475,8 @@ export async function handleAgentRequest(message, client) {
 
     finalizeCall(reservation.id, {
       status: 'ok',
-      rounds: result.rounds,
-      usage: result.usage
+      rounds: result.invocation.rounds,
+      usage: result.invocation.usage
     });
     recordToolCalls(reservation.id, result.used);
     finished = true;

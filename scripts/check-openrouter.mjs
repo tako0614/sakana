@@ -59,5 +59,11 @@ try{
   const shared={guildId:'g',runId:'model-change',system:'s',userContent:'u',reuseCompleted:true,modelIdentity:'old',request:input=>requestModel({...input,maxOutputTokens:100})};
   await runAgent(shared);
   await assert.rejects(runAgent({...shared,modelIdentity:'new'}),/checkpoint input mismatch/);
+  const guardedCount = requests.length;
+  await assert.rejects(requestModel({ messages: [], maxOutputTokens: 100,
+    beforeSend: async () => { throw new Error('scope revoked after pricing'); } }), /scope revoked/);
+  assert.equal(requests.length, guardedCount, 'transport validates freshness after pricing before POST');
+  assert.deepEqual(db.prepare('SELECT status,reported_usd FROM ai_model_calls ORDER BY rowid DESC LIMIT 1').get(),
+    { status: 'cancelled', reported_usd: 0 });
   console.log('OpenRouter: shared routing, protocol continuation, usage, scoped accounting and preflight cap passed');
 }finally{globalThis.fetch=original;db.close();rmSync(dir,{recursive:true,force:true});}

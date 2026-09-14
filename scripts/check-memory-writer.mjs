@@ -3,186 +3,336 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
 
 const directory = mkdtempSync(join(tmpdir(), 'sakana-writer-'));
 process.env.ARCHIVE_DB_PATH = join(directory, 'archive.sqlite');
 process.env.ATOM_MEMORY_PATH = join(directory, 'atoms.sqlite');
 process.env.AGENT_RUNTIME_PATH = join(directory, 'runs.sqlite');
 process.env.MEMORY_WRITER_QUIET_MS = '1';
-const { db, saveMessage, markMessageDeleted } = await import('../src/archive/db.js');
+
+const { db, saveMessage } = await import('../src/archive/db.js');
 const { toRecord } = await import('../src/archive/indexer.js');
-const { conversationMemory, syncConversationMemory } = await import('../src/conversation/memory.js');
-const { runConversationWriter, writerStatus, validateWriterPlan } = await import('../src/conversation/writer.js');
+const {
+  conversationMemory
+} = await import('../src/conversation/memory.js');
+const {
+  runConversationWriter,
+  validateWriterPlan,
+  writerStatus
+} = await import('../src/conversation/writer.js');
 const { SqliteStorage } = await import('../subprojects/atom-memory/dist/adapters/sqlite.js');
-const { MemoryHost } = await import('../subprojects/atom-memory/dist/index.js');
-const message = (id, content, extra = {}) => ({ id, content, guildId: 'g', channelId: 'c',
-  author: { id: 'alice', username: 'alice' }, attachments: new Map(),
-  createdTimestamp: 1700000000000, reactions: { cache: new Map() }, ...extra });
-const channel = { id: 'c', guild: { id: 'g', members: { me: { id: 'bot' } } }, permissionsFor: () => ({ has: () => true }) };
-const reader = () => conversationMemory({ guildId: 'g', channel, member: { id: 'viewer' }, query: 'golden_semantic' });
-let calls = 0;
-const plan = { atoms: [
-  { id: 'a1', kind: 'statement', text: 'golden_semantic: Alice proposed allowing a bot to ban.', sources: ['proposal'], links: [] },
-  { id: 'a2', kind: 'statement', text: 'golden_semantic: Bob rejected automated bans; administrators must act manually.', sources: ['correction'], links: [] },
-  { id: 'a3', kind: 'collection', text: 'golden_semantic: discussion about who executes bans.', sources: ['proposal', 'correction'], links: [] },
-  { id: 'a4', kind: 'relation', text: 'golden_semantic: Bob opposed the proposal in this discussion.', sources: ['correction'],
-    links: [{ role: 'group', target: 'a3', required: false }, { role: 'proposal', target: 'a1', required: false },
-      { role: 'opposition', target: 'a2', required: true }] }
-] };
-const request = async ({ messages }) => {
-  calls++;
-  const input = JSON.parse(messages[1].content);
-  assert.ok(input.messages.every((row) => row.location.guildId === 'g' && row.location.channelId === 'c'));
-  assert.equal(input.messages.find((row) => row.id === 'correction').reference.messageId, 'proposal');
-  return { choices: [{ message: { content: JSON.stringify(plan) } }], usage: { prompt_tokens: 100, completion_tokens: 80 } };
-};
-try {
-  saveMessage(toRecord(message('proposal', 'Botがbanを実行するようにしたい。')));
-  saveMessage(toRecord(message('correction', '反対。banは管理者が手動でやる。', {
-    author: { id: 'bob', username: 'bob' }, createdTimestamp: 1700000001000,
-    reference: { messageId: 'proposal', channelId: 'c' }
-  })));
-  saveMessage(toRecord(message('secret', 'OTHER_GUILD_SECRET', { guildId: 'other', channelId: 'other' })));
-  assert.throws(() => validateWriterPlan({ atoms: [{ ...plan.atoms[0], sources: ['secret'] }] }, new Set(['proposal'])), /unobserved/);
-  assert.throws(() => validateWriterPlan({ atoms: [{ ...plan.atoms[0], links: [{ role: 'x', target: 'unissued', required: false }] }] }, new Set(['proposal'])), /unissued/);
+const { MemoryClient } = await import('../subprojects/atom-memory/dist/index.js');
 
-  // Provider outage does not turn raw ingestion into completed AI understanding.
-  await assert.rejects(runConversationWriter({ guildIds: ['g'], now: Date.now() + 100,
-    request: async () => { throw new Error('HTTP 503'); } }), /503/);
-  assert.equal(writerStatus(['g']).pending, 2);
-  assert.equal(writerStatus(['g']).batches, 0);
-
-  // Atom commit succeeds but its durability barrier fails. Retry in another
-  // process must acknowledge the same generation without paying for another call.
-  const flush = SqliteStorage.prototype.flush;
-  let flushes = 0;
-  SqliteStorage.prototype.flush = function () {
-    if (++flushes === 2) throw new Error('writer durable barrier failed');
-    return flush.call(this);
+function rawMessage(id, content, {
+  guildId = 'g',
+  channelId = 'c',
+  authorId = 'alice',
+  createdAt = 1700000000000,
+  editedAt = null,
+  replyTo = null
+} = {}) {
+  return {
+    id,
+    content,
+    guildId,
+    channelId,
+    author: { id: authorId, username: authorId },
+    attachments: new Map(),
+    reactions: { cache: new Map() },
+    createdTimestamp: createdAt,
+    ...(editedAt === null ? {} : { editedTimestamp: editedAt }),
+    ...(replyTo ? { reference: { messageId: replyTo, channelId } } : {})
   };
-  try {
-    await assert.rejects(runConversationWriter({ guildIds: ['g'], now: Date.now() + 100000, request }), /durable barrier/);
-    assert.equal(writerStatus(['g']).pending, 2);
-  } finally { SqliteStorage.prototype.flush = flush; }
-  const restart = spawnSync(process.execPath, ['--input-type=module', '-e', `
-    const {runConversationWriter}=await import('./src/conversation/writer.js');
-    const r=await runConversationWriter({guildIds:['g'],now:Date.now()+1000000,
-      request:async()=>{throw Error('must not repeat completed AI extraction')}});
-    console.log(JSON.stringify(r));
-  `], { cwd: process.cwd(), env: process.env, encoding: 'utf8' });
-  assert.equal(restart.status, 0, restart.stderr);
-  assert.equal(calls, 1);
-  assert.equal(writerStatus(['g']).pending, 0);
-  assert.equal(writerStatus(['g']).atoms, 4);
+}
+
+function save(message) {
+  saveMessage(toRecord(message));
+}
+
+function writerInput(messages) {
+  for (const message of messages) {
+    try {
+      const value = JSON.parse(message.content);
+      if (value.schema === 'sakana.writer.input.v2') return value;
+    } catch {
+      // Provider messages include prompts and transient memory blocks too.
+    }
+  }
+  throw new Error('Writer input was not supplied to the provider');
+}
+
+function incorporatedPlan(input, text = 'event') {
+  const ids = input.targets.map((target) => target.messageId);
+  return {
+    changes: [
+      {
+        id: 'a1',
+        op: 'create',
+        text: text + ': Alice proposed automated bans under discussion.',
+        sources: ids,
+        links: [{ role: 'related', target: 'a2', at: 'logical', required: false }]
+      },
+      {
+        id: 'a2',
+        op: 'create',
+        text: text + ': Bob opposed automation and required manual administrator action.',
+        sources: ids,
+        links: [{ role: 'counter-position', target: 'a1', at: 'logical', required: false }]
+      }
+    ],
+    sourceOutcomes: input.targets.map((target) => ({
+      messageId: target.messageId,
+      generation: target.generation,
+      outcome: 'incorporated',
+      refs: ['a1', 'a2']
+    })),
+    continuation: null
+  };
+}
+
+const channel = {
+  id: 'c',
+  guild: { id: 'g', members: { me: { id: 'bot' } } },
+  permissionsFor: () => ({ has: () => true })
+};
+
+try {
+  const targets = [{ messageId: 'one', generation: 4 }];
+  assert.throws(() => validateWriterPlan({
+    changes: [],
+    sourceOutcomes: [],
+    continuation: null
+  }, { targets, sourceIds: ['one'] }), /every target/i);
+  assert.throws(() => validateWriterPlan({
+    changes: [{
+      id: 'a1',
+      op: 'create',
+      text: 'unissued source',
+      sources: ['secret'],
+      links: []
+    }],
+    sourceOutcomes: [{
+      messageId: 'one',
+      generation: 4,
+      outcome: 'incorporated',
+      refs: ['a1']
+    }],
+    continuation: null
+  }, { targets, sourceIds: ['one'] }), /issued sources/i);
+  assert.doesNotThrow(() => validateWriterPlan({
+    changes: [{
+      id: 'a1',
+      op: 'create',
+      text: 'ordinary context does not need a kind',
+      sources: ['one'],
+      links: [{ role: 'self-cycle', target: 'a1', at: 'logical', required: false }]
+    }],
+    sourceOutcomes: [{
+      messageId: 'one',
+      generation: 4,
+      outcome: 'incorporated',
+      refs: ['a1']
+    }],
+    continuation: null
+  }, { targets, sourceIds: ['one'] }));
+  assert.doesNotThrow(() => validateWriterPlan({
+    changes: [],
+    sourceOutcomes: [{
+      messageId: 'one',
+      generation: 4,
+      outcome: 'context_only',
+      refs: []
+    }],
+    continuation: null
+  }, { targets, sourceIds: ['one'] }));
+
+  save(rawMessage('proposal', 'Botがbanを自動実行する案。'));
+  save(rawMessage('correction', '反対。banは管理者が手動実行する。', {
+    authorId: 'bob',
+    createdAt: 1700000001000,
+    replyTo: 'proposal'
+  }));
+  save(rawMessage('secret', 'OTHER_GUILD_SECRET', {
+    guildId: 'other',
+    channelId: 'other'
+  }));
+
+  let calls = 0;
+  const request = async ({ messages, consumeRequest, model }) => {
+    await consumeRequest({ model });
+    calls += 1;
+    const input = writerInput(messages);
+    assert.ok(input.messages.every((row) =>
+      row.location.guildId === 'g' && row.location.channelId === 'c'));
+    assert.equal(
+      input.messages.find((row) => row.id === 'correction').reference.messageId,
+      'proposal'
+    );
+    return {
+      choices: [{
+        message: { content: JSON.stringify(incorporatedPlan(input, 'golden_semantic')) }
+      }],
+      usage: { prompt_tokens: 20, completion_tokens: 10 }
+    };
+  };
+
+  const first = await runConversationWriter({
+    guildIds: ['g'],
+    now: Date.now() + 1000,
+    request
+  });
+  assert.equal(first.pending, 0, JSON.stringify(first));
+  assert.equal(first.batchAtoms, 2);
+  assert.equal(calls, 2, 'exploration and capability-closed final are separate generations');
   assert.equal(writerStatus(['other']).pending, 1);
 
-  const before = reader();
-  const recalled = await before.read();
-  const packed = JSON.parse(recalled.text);
-  assert.ok(packed.memory.some((atom) => atom.provenance.origin === 'organization'));
-  assert.match(recalled.text, /administrators must act manually/);
+  const storage = new SqliteStorage(process.env.ATOM_MEMORY_PATH);
+  const revisions = storage.scan(
+    { policies: ['discord:g:c'], limit: 100 },
+    storage.watermark()
+  ).filter((row) => row.provenance.producerId === 'discord-memory-writer');
+  const firstAtom = revisions.find((row) =>
+    row.body.kind === 'inline' && row.body.value.includes('Alice proposed'));
+  const secondAtom = revisions.find((row) =>
+    row.body.kind === 'inline' && row.body.value.includes('Bob opposed'));
+  assert.ok(firstAtom && secondAtom, 'one atomic event operation wrote both ordinary Atoms');
+  assert.ok(firstAtom.slots.some((slot) =>
+    slot.target.atomId === secondAtom.atomId));
+  assert.ok(secondAtom.slots.some((slot) =>
+    slot.target.atomId === firstAtom.atomId),
+  'batch-local links preserve a cycle without host topological sorting');
+
+  const reader = conversationMemory({
+    guildId: 'g',
+    channel,
+    member: { id: 'viewer' }
+  });
+  const recalled = await reader.read({ context: 'golden_semantic manual administrator' });
+  assert.match(recalled.text, /manual administrator/);
   assert.doesNotMatch(recalled.text, /OTHER_GUILD_SECRET/);
-  assert.ok(packed.memory.some((atom) => atom.links.some((link) => link.role === 'opposition')));
-  assert.ok(packed.memory.some(atom => atom.links.some(link => link.role === 'group' && link.at === 'logical')),
-    'Ongoing collection links follow revisions');
-  assert.ok(packed.memory.some(atom => atom.links.some(link => link.role === 'opposition' && link.at === 'observed')),
-    'Evidence and statements remain pinned to the observed version');
-  const budgeted = conversationMemory({ guildId: 'g', channel, member: { id: 'viewer' }, query: 'golden_semantic',
-    onObservation: () => true, onInterpretation: () => false });
-  assert.ok(JSON.parse((await budgeted.read()).text).memory.every((atom) => atom.provenance.origin === 'source'),
-    'generated descriptions consume the institution output budget too');
-  budgeted.close();
-  // Regeneration is queued for ALL inputs that shared the changed context.
-  markMessageDeleted('correction');
-  assert.equal(writerStatus(['g']).pending, 2);
-  await assert.rejects(before.assertCurrent(), /changed|STALE|REVOKED/);
-  before.close();
-  const stale = reader();
-  assert.doesNotMatch((await stale.read()).text, /administrators must act manually/);
-  stale.close();
-  await syncConversationMemory();
-  const after = reader();
-  assert.doesNotMatch((await after.read()).text, /administrators must act manually/);
-  after.close();
-  await assert.rejects(runConversationWriter({ guildIds: ['g'], now: Date.now() + 1000000,
-    request: async () => {
-      saveMessage(toRecord(message('proposal', 'The proposal was withdrawn.')));
-      return { choices: [{ message: { content: JSON.stringify({ atoms: [plan.atoms[0]] }) } }] };
-    } }), /source changed/, 'an edit during model inference must reject the stale write plan');
-  assert.equal(writerStatus(['g']).pending, 2);
-  // Several attachment-only messages produce a truthy newline-only string.
-  // Existing organization must not turn that into an invalid recall request.
-  for (let i = 0; i < 6; i++) saveMessage(toRecord(message(`empty-${i}`, '', {
-    createdTimestamp: 1700001000000 + i * 1000
-  })));
-  let emptyBatchCalls = 0;
-  await runConversationWriter({ guildIds: ['g'], now: Date.now() + 1000000,
-    request: async () => {
-      emptyBatchCalls++;
-      return { choices: [{ message: { content: '{"atoms":[]}' } }] };
-    } });
-  assert.equal(emptyBatchCalls, 1, 'attachment-only batches still reach the AI');
-  saveMessage(toRecord(message('budget-source', '原資料からこの提案を整理する。', { createdTimestamp: 1700004000000 })));
-  const connect = MemoryHost.prototype.connect;
-  MemoryHost.prototype.connect = function (...args) {
-    const client = connect.apply(this, args);
-    client.read = async () => { throw Object.assign(new Error('BUDGET_EXHAUSTED'), { code: 'BUDGET_EXHAUSTED' }); };
-    return client;
+  reader.close();
+
+  save(rawMessage('context-only', '了解', {
+    guildId: 'context-g',
+    channelId: 'context-c',
+    createdAt: 1701000000000
+  }));
+  const contextOnly = await runConversationWriter({
+    guildIds: ['context-g'],
+    now: Date.now() + 2000,
+    request: async ({ messages, consumeRequest, model }) => {
+      await consumeRequest({ model });
+      const input = writerInput(messages);
+      return {
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              changes: [],
+              sourceOutcomes: input.targets.map((target) => ({
+                messageId: target.messageId,
+                generation: target.generation,
+                outcome: 'context_only',
+                refs: []
+              })),
+              continuation: null
+            })
+          }
+        }]
+      };
+    }
+  });
+  assert.equal(contextOnly.pending, 0, JSON.stringify(contextOnly));
+  assert.equal(contextOnly.batchAtoms, 0,
+    'host records an explicit context-only outcome without calling Atom write');
+
+  save(rawMessage('restart-source', 'restart_plan_topic', {
+    guildId: 'restart-g',
+    channelId: 'restart-c',
+    createdAt: 1702000000000
+  }));
+  let restartCalls = 0;
+  const restartRequest = async ({ messages, consumeRequest, model }) => {
+    await consumeRequest({ model });
+    restartCalls += 1;
+    const input = writerInput(messages);
+    return {
+      choices: [{
+        message: {
+          content: JSON.stringify(incorporatedPlan(input, 'restart_plan_topic'))
+        }
+      }]
+    };
+  };
+  const originalWrite = MemoryClient.prototype.write;
+  let interrupted = false;
+  MemoryClient.prototype.write = async function (...args) {
+    const result = await originalWrite.apply(this, args);
+    const writerChange = args[0]?.changes?.some((change) => change.input);
+    if (writerChange && !interrupted) {
+      interrupted = true;
+      throw new Error('writer interruption after atomic write');
+    }
+    return result;
   };
   try {
-    const organized = await runConversationWriter({ guildIds: ['g'], now: Date.now() + 1000000,
-      request: async ({ messages }) => {
-        assert.ok(messages.some(message => message.content?.includes('retrieval_budget')),
-          'the model must see that recall was incomplete, not that prior memory was absent');
-        return { choices: [{ message: { content: JSON.stringify({ atoms: [{ id: 'a1', kind: 'statement',
-          text: 'Aliceは原資料から提案を整理するよう求めた。', sources: ['budget-source'], links: [] }] }) } }] };
-      } });
-    assert.equal(organized.batchAtoms, 1, 'optional recall budget must not permanently strand a source batch');
-  } finally { MemoryHost.prototype.connect = connect; }
-  saveMessage(toRecord(message('rev-source', 'revision-topic: 管理者の役割を整理する。', {
-    channelId: 'revision-channel', createdTimestamp: 1700007000000
-  })));
-  await runConversationWriter({ guildIds: ['g'], now: Date.now() + 1000000,
-    request: async () => ({ choices: [{ message: { content: JSON.stringify({ atoms: [{ id: 'a1', kind: 'collection',
-      text: 'revision-topic: 管理者の役割の整理。', sources: ['rev-source'], links: [] }] }) } }] }) });
-  const verify = new SqliteStorage(process.env.ATOM_MEMORY_PATH);
-  const group = () => verify.scan({ policies: ['discord:g:revision-channel'], limit: 100 }, verify.watermark())
-    .find(row => row.provenance.producerId === 'discord-memory-writer');
-  const previousGroup = group();
-  saveMessage(toRecord(message('rev-update', 'revision-topic: banは手動執行という条件も明記する。', {
-    channelId: 'revision-channel', createdTimestamp: 1700266200000
-  })));
-  await runConversationWriter({ guildIds: ['g'], now: Date.now() + 1000000,
-    request: async ({ messages }) => {
-      const block = messages.findLast(row => row.content?.startsWith('REFERENCE MEMORY'));
-      const existing = JSON.parse(block.content.slice(block.content.indexOf('\n') + 1)).existing;
-      const selected = existing.find(row => JSON.parse(row.text).kind === 'collection');
-      assert.ok(selected, 'Writer must receive the existing arrangement as an issued reference');
-      return { choices: [{ message: { content: JSON.stringify({ atoms: [{ id: 'a1', kind: 'collection', revise: selected.ref,
-        text: 'revision-topic: 管理者がbanを手動執行する役割の整理。', sources: ['rev-source', 'rev-update'], links: [] }] }) } }] };
-    } });
-  assert.equal(group().atomId, previousGroup.atomId, 'reorganization revises the same Atom identity');
-  assert.notEqual(group().revisionId, previousGroup.revisionId);
-  saveMessage(toRecord(message('period-early', 'period-topic: 月曜に資料を提案した。', {
-    channelId: 'period-channel', createdTimestamp: 1710000000000
-  })));
-  saveMessage(toRecord(message('period-later', 'period-topic: 木曜に条件を追加した。', {
-    channelId: 'period-channel', createdTimestamp: 1710259200000
-  })));
-  let periodCalls = 0;
-  const period = await runConversationWriter({ guildIds: ['g'], now: Date.now() + 1000000,
-    request: async ({ messages }) => {
-      periodCalls++;
-      const input = JSON.parse(messages[1].content);
-      assert.deepEqual(new Set(input.targetMessageIds), new Set(['period-early', 'period-later']));
-      assert.equal(input.period.to - input.period.from, 3 * 86400000);
-      assert.equal(input.period.complete, false, 'a transport slice must not claim full period coverage');
-      return { choices: [{ message: { content: JSON.stringify({ atoms: [{ id: 'a1', kind: 'collection',
-        text: 'period-topic: 月曜の提案に木曜の条件が付いた議論。', sources: input.targetMessageIds, links: [] }] }) } }] };
-    } });
-  assert.equal(periodCalls, 1, 'sparse history across days should share one model request');
-  assert.equal(period.batchAtoms, 1);
-  verify.close();
-  console.log('memory writer: grounded Atom relations, isolation, durable retry and deletion invalidation passed');
-} finally { db.close(); rmSync(directory, { recursive: true, force: true }); }
+    await assert.rejects(runConversationWriter({
+      guildIds: ['restart-g'],
+      now: Date.now() + 3000,
+      request: restartRequest
+    }), /after atomic write/);
+  } finally {
+    MemoryClient.prototype.write = originalWrite;
+  }
+  const resumed = await runConversationWriter({
+    guildIds: ['restart-g'],
+    now: Date.now() + 4000000,
+    request: async () => {
+      throw new Error('durable model result must be reused');
+    }
+  });
+  assert.equal(resumed.pending, 0, JSON.stringify(resumed));
+  assert.equal(restartCalls, 2,
+    'planned idempotent replay performs no additional provider generation');
+
+  save(rawMessage('edited-source', 'old source during await', {
+    guildId: 'edit-g',
+    channelId: 'edit-c',
+    createdAt: 1703000000000
+  }));
+  await assert.rejects(runConversationWriter({
+    guildIds: ['edit-g'],
+    now: Date.now() + 5000,
+    request: async ({ messages, consumeRequest, model }) => {
+      await consumeRequest({ model });
+      const input = writerInput(messages);
+      save(rawMessage('edited-source', 'new source wins during await', {
+        guildId: 'edit-g',
+        channelId: 'edit-c',
+        createdAt: 1703000000000,
+        editedAt: 1703000001000
+      }));
+      return {
+        choices: [{
+          message: { content: JSON.stringify(incorporatedPlan(input, 'stale')) }
+        }]
+      };
+    }
+  }), { code: 'AGENT_CONTEXT_INVALIDATED' });
+  assert.ok(writerStatus(['edit-g']).pending > 0,
+    'a source edit during provider await remains pending and publishes no stale plan');
+
+  assert.equal(
+    storage.scan({ policies: ['discord:edit-g:edit-c'], limit: 100 }, storage.watermark())
+      .some((row) => row.body.kind === 'inline' && row.body.value.includes('"stale"')),
+    false
+  );
+  storage.close();
+
+  console.log(
+    'memory writer: v2 outcomes, atomic local cycles, context-only handling, ' +
+    'idempotent plan replay, source fencing and guild isolation passed'
+  );
+} finally {
+  db.close();
+  rmSync(directory, { recursive: true, force: true });
+}

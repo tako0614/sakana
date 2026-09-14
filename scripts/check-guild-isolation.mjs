@@ -79,9 +79,9 @@ try {
     await syncConversationMemory();
     const channel = { id: 'public-a', guildId: 'guild-a', guild: { id: 'guild-a', members: { me: { id: 'bot' } } },
       permissionsFor: () => ({ has: () => true }) };
-    const memory = conversationMemory({ guildId: 'guild-a', channel, member: { id: 'reader' }, query: 'LOCAL_PUBLIC_SENTINEL' });
+    const memory = conversationMemory({ guildId: 'guild-a', channel, member: { id: 'reader' } });
     try {
-      const output = JSON.parse((await memory.read()).text);
+      const output = JSON.parse((await memory.read({ context: 'LOCAL_PUBLIC_SENTINEL' })).text);
       assert.equal(output.coverage.messages, 1);
     } finally { memory.close(); }
   });

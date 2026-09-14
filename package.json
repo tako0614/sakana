@@ -5,7 +5,7 @@
   "main": "src/index.js",
   "type": "module",
   "scripts": {
-    "precheck": "npm run memory:build && node scripts/check-openrouter.mjs && node scripts/check-agent-runtime.mjs && node scripts/check-memory-writer.mjs && node scripts/check-memory-index.mjs && node scripts/check-guild-isolation.mjs && node scripts/check-agentic-governance.mjs && node scripts/check-governance.mjs && node scripts/check-parliament.mjs && node scripts/check-autonomous-governance.mjs && node scripts/check-human-authority.mjs && node scripts/check-manual-execution.mjs && node scripts/check-governance-recovery.mjs && node scripts/check-judiciary.mjs && node scripts/check-investigation.mjs && node scripts/check-lawsite.mjs",
+    "precheck": "npm run memory:build && node scripts/check-openrouter.mjs && node scripts/check-agent-runtime.mjs && node scripts/check-memory-use.mjs && node scripts/check-memory-public-writer.mjs && node scripts/check-memory-permission-race.mjs && node scripts/check-memory-writer.mjs && node scripts/check-memory-refresh.mjs && node scripts/check-memory-index.mjs && node scripts/check-guild-isolation.mjs && node scripts/check-agentic-governance.mjs && node scripts/check-governance.mjs && node scripts/check-parliament.mjs && node scripts/check-autonomous-governance.mjs && node scripts/check-human-authority.mjs && node scripts/check-manual-execution.mjs && node scripts/check-governance-recovery.mjs && node scripts/check-judiciary.mjs && node scripts/check-investigation.mjs && node scripts/check-lawsite.mjs && npm run check:dream",
     "start": "node --import tsx src/index.js",
     "chat": ".venv-llm/bin/python scripts/llm/chat.py",
     "web:dev": "npm --prefix web run dev",
@@ -16,7 +16,8 @@
     "memory:build": "node node_modules/atom-memory-typescript/bin/tsc -p subprojects/atom-memory/tsconfig.json",
     "memory:structure": "node --import dotenv/config scripts/structure-conversations.mjs",
     "prepare": "npm run memory:build",
-    "memory:organize": "node scripts/organize-conversations.mjs"
+    "memory:organize": "node scripts/organize-conversations.mjs",
+    "check:dream": "node scripts/check-dream-admission.mjs && node scripts/check-dream-cost.mjs && node scripts/check-openrouter-embeddings.mjs && node scripts/check-dream-embedding.mjs && node scripts/check-dream-coverage.mjs && node scripts/check-dream-scheduler.mjs && node scripts/check-dream-memory.mjs && node scripts/check-dream-writer.mjs"
   },
   "keywords": [
     "discord",

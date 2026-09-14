@@ -150,6 +150,7 @@ let charge = null;
 // 席が調査で見つけたことにする追加記録。null なら何も足さない。
 let discoverPlan = null;
 globalThis.fetch = async (_url, init) => {
+  if (_url.endsWith('/endpoints')) return { ok: true, json: async () => ({ data: { endpoints: [{ pricing: { prompt: '0.0000001', completion: '0.0000002' } }] } }) };
   const payload = JSON.parse(init.body);
   const system = payload.messages[0].content;
   if (!system.includes('Decide only the charged offense')) throw new Error('unexpected call');

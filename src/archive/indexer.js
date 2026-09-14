@@ -1,6 +1,7 @@
 import { ChannelType } from 'discord.js';
 import { discordStructure } from '../conversation/message.js';
 import {
+  db,
   channelGaps,
   channelMessageRange,
   channelTailGap,
@@ -184,33 +185,35 @@ function channelRow(channel) {
   };
 }
 
-async function collectThreads(channel, botMember) {
+async function collectThreads(channel, botMember, errors = [], skipped = []) {
   const threads = [];
 
-  const active = await channel.threads.fetchActive().catch(() => null);
+  const active = await channel.threads.fetchActive().catch(error => {
+    errors.push({channelId:channel.id,stage:'active_threads',code:error.code??error.status??'unavailable'}); return null;
+  });
   if (active) threads.push(...active.threads.values());
 
   for (const type of ['public', 'private']) {
+    if (type === 'private' && channel.type !== ChannelType.GuildText) continue;
     let before;
 
-    // private は fetchAll を付けないと discord.js が before をリクエストに載せず
-    // (ThreadManager が type==='public' || fetchAll のときだけ before を送る)、
-    // さらに「bot が参加済み」のスレッドしか返さない経路を使う。
-    // つまり同じ1ページ目を200回引き直して、101件目以降は永久に取り込まれない。
-    // fetchAll には ManageThreads が要るので、拒否されたら従来の経路に落とす。
+    // All-private pagination uses timestamps; joined-private pagination uses
+    // thread snowflakes. discord.js supports both when given the right cursor.
     let fetchAll = type === 'private';
     let exhausted = false;
 
     for (let page = 0; page < 200; page += 1) {
+      let failure;
       let fetched = await channel.threads
         .fetchArchived({ type, fetchAll, limit: PAGE_SIZE, before })
-        .catch(() => null);
+        .catch(error => { failure=error; return null; });
 
-      if (!fetched && fetchAll) {
+      if (!fetched && fetchAll && [403,50001,50013].includes(failure?.status??failure?.code)) {
         fetchAll = false;
+        before = undefined;
         fetched = await channel.threads
           .fetchArchived({ type, limit: PAGE_SIZE, before })
-          .catch(() => null);
+          .catch(error => { failure=error; return null; });
 
         if (fetched) {
           console.warn(
@@ -219,7 +222,13 @@ async function collectThreads(channel, botMember) {
         }
       }
 
-      if (!fetched || fetched.threads.size === 0) { exhausted = true; break; }
+      if (!fetched) {
+        const item={channelId:channel.id,stage:`${type}_threads`,code:failure?.code??failure?.status??'unavailable'};
+        if ([403,50001,50013].includes(failure?.status??failure?.code)) skipped.push(item);
+        else errors.push(item);
+        exhausted=true; break;
+      }
+      if (fetched.threads.size === 0) { exhausted = true; break; }
 
       threads.push(...fetched.threads.values());
 
@@ -229,16 +238,19 @@ async function collectThreads(channel, botMember) {
         if (stamp < oldest) oldest = stamp;
       }
 
-      if (!fetched.hasMore || !Number.isFinite(oldest)) { exhausted = true; break; }
-
-      // before が効かない経路では次ページを引いても同じ結果なので、ここで打ち切る
-      if (type === 'private' && !fetchAll) { exhausted = true; break; }
-
-      before = oldest;
+      if (!fetched.hasMore) { exhausted = true; break; }
+      const next = type === 'private' && !fetchAll
+        ? [...fetched.threads.keys()].sort((a,b)=>BigInt(a)<BigInt(b)?-1:1)[0] : oldest;
+      if (!Number.isFinite(oldest) || next === before) {
+        errors.push({channelId:channel.id,stage:`${type}_threads`,code:'pagination_stalled'});
+        exhausted=true; break;
+      }
+      before = next;
       await sleep(FETCH_DELAY_MS);
     }
 
     if (!exhausted) {
+      errors.push({channelId:channel.id,stage:`${type}_threads`,code:'page_limit'});
       console.warn(
         `#${channel.name ?? channel.id} の${type === 'private' ? '非公開' : '公開'}アーカイブ済みスレッドが200ページ上限に達しました。取りきれていません。`
       );
@@ -259,10 +271,11 @@ async function collectThreads(channel, botMember) {
  */
 export async function collectIndexableChannels(guild) {
   const botMember = guild.members.me ?? await guild.members.fetchMe().catch(() => null);
-  if (!botMember) return { channels: [], skipped: [] };
+  if (!botMember) return { channels: [], skipped: [], errors: [{code:'bot_member_unavailable'}] };
 
   const result = [];
   const skipped = [];
+  const errors = [];
 
   for (const channel of guild.channels.cache.values()) {
     const hasMessages = MESSAGE_CHANNEL_TYPES.has(channel.type) && !isThreadType(channel.type);
@@ -278,13 +291,13 @@ export async function collectIndexableChannels(guild) {
     if (hasMessages) result.push(channel);
 
     if (hasThreads) {
-      const threads = await collectThreads(channel, botMember);
+      const threads = await collectThreads(channel, botMember, errors, skipped);
       result.push(...threads);
       await sleep(FETCH_DELAY_MS);
     }
   }
 
-  return { channels: result, skipped };
+  return { channels: [...new Map(result.map(channel=>[channel.id,channel])).values()], skipped, errors };
 }
 
 async function indexChannel(channel, { mode, job }) {
@@ -598,6 +611,12 @@ const HEAD_TOLERANCE_MS = 86_400_000;
 
 export function coverageReport(guildId) {
   const channels = listChannelStates(guildId);
+  let enumeration;
+  try { enumeration=JSON.parse(db.prepare('SELECT value FROM memory_projection_state WHERE key=?').get(`archive-full-coverage:${guildId}`)?.value??'null'); } catch { enumeration=null; }
+  const verifiedChannelIds = Array.isArray(enumeration?.channelIds) ? enumeration.channelIds : [];
+  const verifiedFull = Boolean(enumeration?.schema===1 && enumeration.guildId===guildId && enumeration.complete
+    && enumeration.mode==='full' && verifiedChannelIds.length && !enumeration.errors?.length
+    && verifiedChannelIds.every(id=>channels.some(row=>row.channel_id===id && row.complete===1 && !row.last_error)));
   let gapCount = 0;
   let gapMs = 0;
   const worst = [];
@@ -636,6 +655,7 @@ export function coverageReport(guildId) {
   headMissing.sort((a, b) => b.ms - a.ms);
 
   return {
+    verifiedFull, verifiedChannelIds, enumeration,
     gapCount,
     gapMs,
     worst: worst.slice(0, 5),
@@ -689,8 +709,16 @@ export async function runIndexJob(guild, { mode = 'full', onProgress = () => {} 
     channelsTotal: 0,
     currentChannel: null
   };
+  const saveEnumeration = (complete=false) => {
+    if (mode !== 'full') return;
+    db.prepare(`INSERT INTO memory_projection_state(key,value) VALUES(?,?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(`archive-full-coverage:${guild.id}`,
+      JSON.stringify({schema:1,guildId:guild.id,mode,startedAt:job.startedAt,finishedAt:complete?Date.now():null,
+        complete,channelIds:job.channelIds??[],skipped:job.skipped??[],errors:job.errors??[]}));
+  };
 
   claimJob(guild.id, job);
+  saveEnumeration();
   setGuildState(guild.id, {
     status: 'running',
     mode,
@@ -704,9 +732,12 @@ export async function runIndexJob(guild, { mode = 'full', onProgress = () => {} 
   });
 
   try {
-    const { channels, skipped } = await collectIndexableChannels(guild);
+    const { channels, skipped, errors } = await collectIndexableChannels(guild);
     job.channelsTotal = channels.length;
     job.skipped = skipped;
+    job.errors = errors;
+    job.channelIds = channels.map(channel=>channel.id);
+    saveEnumeration();
     setGuildState(guild.id, { channels_total: channels.length });
     onProgress(job);
 
@@ -719,6 +750,7 @@ export async function runIndexJob(guild, { mode = 'full', onProgress = () => {} 
       try {
         await indexChannel(channel, { mode, job });
       } catch (error) {
+        job.errors.push({channelId:channel.id,stage:'messages',code:error.code??error.status??'unavailable'});
         console.error(`Failed to index channel ${channel.id}:`, error);
         upsertChannel(channelRow(channel));
         updateChannelState(channel.id, { last_error: String(error.message ?? error).slice(0, 300) });
@@ -740,6 +772,7 @@ export async function runIndexJob(guild, { mode = 'full', onProgress = () => {} 
       channels_done: job.channelsDone,
       current_channel: null
     });
+    saveEnumeration(!job.cancelled && !job.errors.length && job.channelsDone===job.channelsTotal);
 
     return job;
   } catch (error) {

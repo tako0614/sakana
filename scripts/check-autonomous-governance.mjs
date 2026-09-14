@@ -140,6 +140,7 @@ const base = {
     offenses: [{ code: 'O1', title: '大量投稿', elements: ['会話の継続を妨げる大量投稿をしたこと'], sanctions: [{ type: 'warning' }] }], sanctionDefinitions: [] }
 };
 globalThis.fetch = async (url, init) => {
+  if (url.endsWith('/endpoints')) return { ok: true, json: async () => ({ data: { endpoints: [{ pricing: { prompt: '0.0000001', completion: '0.0000002' } }] } }) };
   if (String(url).startsWith('https://laws.example.test')) return new Response(JSON.stringify({ok:true}), {status:200});
   const body = JSON.parse(init.body);
   const system = body.messages[0].content;

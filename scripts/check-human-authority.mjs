@@ -17,7 +17,7 @@ const body={title:'人間の権限を指定する法律',summary:'承認者と�
 const config=body.provisions.governance.find((entry)=>entry.key==='criminalCaseProcedure').value.states.approval.config;
 Object.assign(config,{scope:'designated',users:['11111111111111111'],veto:{scope:'designated',roles:['22222222222222222'],required:1}});
 let output=body;
-globalThis.fetch=async()=>new Response(JSON.stringify({choices:[{message:{content:JSON.stringify(output)},finish_reason:'stop'}]}),{status:200});
+globalThis.fetch=async(url)=>url.endsWith('/endpoints') ? new Response(JSON.stringify({data:{endpoints:[{pricing:{prompt:'0.0000001',completion:'0.0000002'}}]}}),{status:200}) : new Response(JSON.stringify({choices:[{message:{content:JSON.stringify(output)},finish_reason:'stop'}]}),{status:200});
 const request={guildId:'human-authority',constitution,activeLaws:[],policy:constitution.policy,
   petition:{title:body.title,summary:'承認者 11111111111111111 と拒否権ロール 22222222222222222 を指定する。'}};
 const drafted=await draftBill(request);

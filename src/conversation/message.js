@@ -4,6 +4,21 @@
 const values = (collection) => Array.isArray(collection) ? collection : [...(collection?.values?.() ?? [])];
 const id = (value) => value == null ? null : String(value);
 
+export function discordExtraText(message) {
+  const parts = [];
+  for (const entry of values(message.messageSnapshots ?? message.message_snapshots)) {
+    const text = (entry.message ?? entry).content;
+    if (text) parts.push(`[転送] ${text}`);
+  }
+  for (const a of values(message.attachments)) parts.push(a.name ?? a.filename ?? '', a.description ?? '');
+  for (const e of values(message.embeds)) {
+    parts.push(e.title ?? '', e.description ?? '', e.author?.name ?? '', e.footer?.text ?? '');
+    for (const f of e.fields ?? []) parts.push(f.name ?? '', f.value ?? '');
+  }
+  for (const s of values(message.stickers ?? message.sticker_items)) parts.push(s.name ?? '');
+  return parts.filter(Boolean).join('\n');
+}
+
 export function discordStructure(message) {
   const reference = message.reference ?? message.message_reference;
   const snapshots = values(message.messageSnapshots ?? message.message_snapshots);
@@ -39,8 +54,11 @@ export function discordStructure(message) {
     }),
     attachments: values(message.attachments).map((a) => ({ id: id(a.id), name: a.name ?? a.filename,
       description: a.description ?? null, url: a.url, contentType: a.contentType ?? a.content_type ?? null, contentRead: false })),
-    embeds: values(message.embeds).map((e) => ({ title: e.title ?? null, description: e.description ?? null, url: e.url ?? null, attribution: 'embed_not_sender' })),
+    embeds: values(message.embeds).map((e) => ({ title: e.title ?? null, description: e.description ?? null,
+      url: e.url ?? null, fields: (e.fields ?? []).map(f => ({ name: f.name, value: f.value })),
+      author: e.author?.name ?? null, footer: e.footer?.text ?? null, attribution: 'embed_not_sender' })),
     stickers: values(message.stickers ?? message.sticker_items).map((s) => ({ id: id(s.id), name: s.name })),
+    webhookId: id(message.webhookId ?? message.webhook_id),
     pinned: Boolean(message.pinned), partial: Boolean(message.partial),
     observedAt: Date.now()
   };
@@ -71,8 +89,20 @@ export function messageEnvelope(message, { lookup, selfId, bodyChars = Infinity 
     schema: 'discord.message.v1', id: message.messageId,
     location: { guildId: message.guildId, channelId: message.channelId, channelName: message.channelName ?? null, thread: structure.thread },
     author: { id: message.authorId, name: message.authorName, bot: Boolean(message.isBot),
+      webhookId: structure.webhookId ?? null,
       identity: selfId && message.authorId === selfId ? 'あなた自身の発言' : 'participant' },
     body: { text: content.slice(0, bodyChars), complete: !structure.partial && content.length <= bodyChars, characters: content.length },
+    // Legacy archives kept embed fields/footer and attachment descriptions here.
+    // These are source material, never silently attributed to the sender.
+    supplemental: { text: String(message.extra ?? '').slice(0, bodyChars),
+      attribution: 'embed_attachment_or_quoted_material',
+      complete: String(message.extra ?? '').length <= bodyChars,
+      characters: String(message.extra ?? '').length },
+    ...(message.contextGroup ? { contextGroup: message.contextGroup } : {}),
+    ...(message.memorySelection ? { memorySelection: {
+      state: message.memorySelection.state, reason: message.memorySelection.reason,
+      representativeId: message.memorySelection.representativeId ?? null
+    } } : {}),
     reference,
     ...(structure.replyChainState ? { replyChain: { termination: structure.replyChainState } } : {}),
     state: { createdAt: message.createdAt, editedAt: message.editedAt ?? null, deleted: Boolean(message.deleted),
@@ -85,7 +115,7 @@ export function messageEnvelope(message, { lookup, selfId, bodyChars = Infinity 
 
 export function archiveEnvelope(row) {
   return messageEnvelope({ messageId: row.message_id, guildId: row.guild_id, channelId: row.channel_id,
-    authorId: row.author_id, authorName: row.author_name, isBot: Boolean(row.is_bot), content: row.content,
+    authorId: row.author_id, authorName: row.author_name, isBot: Boolean(row.is_bot), content: row.content, extra: row.extra,
     createdAt: row.created_at, editedAt: row.edited_at, deleted: Boolean(row.deleted),
     reactionCount: row.reaction_count, structure: archiveStructure(row) });
 }

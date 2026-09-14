@@ -2,7 +2,9 @@
 // presentation convenience; author ids, reply targets and source state are explicit.
 
 import { TZ_OFFSET_HOURS } from '../archive/query.js';
-import { archiveStructure, discordStructure, messageEnvelope } from '../conversation/message.js';
+import { archiveStructure, discordStructure, discordExtraText, messageEnvelope } from '../conversation/message.js';
+import { admissionFor } from '../conversation/admission.js';
+import { isDreamGuild } from '../conversation/dream-config.js';
 
 const TZ_OFFSET_MS = TZ_OFFSET_HOURS * 3_600_000;
 
@@ -189,6 +191,8 @@ export function fromArchiveRow(row, channelName) {
     authorName: row.author_name || 'unknown',
     isBot: Boolean(row.is_bot),
     content: row.content ?? '',
+    extra: row.extra ?? '',
+    ...(isDreamGuild(row.guild_id) ? { memorySelection: admissionFor(row) } : {}),
     createdAt: row.created_at,
     editedAt: row.edited_at,
     deleted: Boolean(row.deleted),
@@ -205,8 +209,7 @@ export function fromArchiveRow(row, channelName) {
  * そのまま渡すと `(本文なし)` になって何が貼られたのか分からない。
  *
  * アーカイブの取り込みは同じものを extra に集めていて (`indexer.js`)、
- * `fromArchiveRow` は `content || extra` で使う。生の Message 側だけ抜けていたので、
- * 同じ規則にそろえる (本文があるときは足さない = 普通の発言のトークンは増えない)。
+ * 本文と添付・引用は別フィールドで保持し、共通envelopeでも出典を区別する。
  */
 export function describeExtras(message) {
   const parts = [];
@@ -243,6 +246,7 @@ export function fromDiscordMessage(message, channelName) {
       ?? 'unknown',
     isBot: Boolean(message.author?.bot),
     content: message.content ?? '',
+    extra: discordExtraText(message),
     createdAt: message.createdTimestamp,
     editedAt: message.editedTimestamp ?? null,
     deleted: false,
@@ -270,6 +274,7 @@ export function fromRawMessage(raw, guildId, channelName) {
       ?? 'unknown',
     isBot: Boolean(raw.author?.bot),
     content: raw.content ?? '',
+    extra: discordExtraText(raw),
     createdAt: raw.timestamp ? Date.parse(raw.timestamp) : Date.now(),
     editedAt: raw.edited_timestamp ? Date.parse(raw.edited_timestamp) : null,
     deleted: false,
@@ -288,12 +293,23 @@ export function formatMessages(
   { refs, showChannel = false, bodyChars = 300, tailOf = null, selfId = null } = {}
 ) {
   // Allocate references first: a reply can appear before its parent in search results.
-  for (const message of messages) refs?.add(message);
+  for (const message of messages) for (const item of message.contextMessages ?? [message]) refs?.add(item);
   return messages.map((message) => {
-    const ref = refs?.add(message);
-    const envelope = messageEnvelope(message, {
+    const parts = message.contextMessages ?? [message];
+    const first = parts[0];
+    const ref = refs?.add(first);
+    const envelope = messageEnvelope(first, {
       lookup: (id) => refs?.byMessageId.get(id), selfId, bodyChars
     });
+    if (parts.length > 1) {
+      envelope.contextGroup = { kind: 'consecutive_same_author', count: parts.length,
+        note: '表示上まとめた連投。各メッセージの本文・ID・実際の返信先は別。',
+        continuations: parts.slice(1).map(part => {
+          const item = messageEnvelope(part, { lookup: id => refs?.byMessageId.get(id), selfId, bodyChars });
+          const { schema, author, location, ...content } = item;
+          return { ref: refs?.add(part), ...content };
+        }) };
+    }
     if (!showChannel) delete envelope.location.channelName;
     const note = tailOf?.(message);
     if (note) envelope.contextNote = note;

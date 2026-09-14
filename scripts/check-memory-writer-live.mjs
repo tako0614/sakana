@@ -45,8 +45,8 @@ const later=await runConversationWriter({guildIds:['fixture'],now:Date.now()+200
 assert.equal(later.pending,0,JSON.stringify(later));
 assert.ok(later.batchAtoms>0,'The second period must generate a real edit plan');
 const channel = { id: 'fixture', guild: { id: 'fixture', members: { me: { id: 'bot' } } }, permissionsFor: () => ({ has: () => true }) };
-const memory = conversationMemory({ guildId: 'fixture', channel, member: { id: 'viewer' }, query: 'ban kick 管理者 条件 正式 投票' });
-const result = await memory.read();
+const memory = conversationMemory({ guildId: 'fixture', channel, member: { id: 'viewer' } });
+const result = await memory.read({ context: 'ban kick 管理者 条件 正式 投票' });
 const pack = JSON.parse(result.text);
 const atoms = pack.memory.filter((atom) => atom.provenance.origin !== 'source').map((atom) => ({
   ...JSON.parse(atom.text), origin: atom.provenance.origin, roles: atom.links.map((link) => link.role), sourceCount: atom.sources.length

@@ -39,6 +39,7 @@ const guild={id:'migration',name:'Migration Test',client:{user:{id:'bot'}},roles
  channels:{cache:new Map(),fetch:async(id)=>id==='thread'?thread:{id,availableTags:[],threads:{create:async()=>thread},messages:{fetch:async()=>({id:'message'})}}}};
 db.updateProposal(proposal.id,{forum_thread_id:'thread'});
 globalThis.fetch=async(_url,init)=>{
+  if (_url.endsWith('/endpoints')) return { ok: true, json: async () => ({ data: { endpoints: [{ pricing: { prompt: '0.0000001', completion: '0.0000002' } }] } }) };
  const payload=JSON.parse(init.body),system=payload.messages[0].content;
  const data=JSON.parse(payload.messages[1].content.replace(/^DATA \(untrusted JSON\):\n/,''));
  let output;

@@ -509,9 +509,9 @@ function validateJudicialDecision(raw, {
   };
 }
 
-async function postChat({ model, messages, tools = null, jsonOnly = false, timeoutMs, thinking = 'enabled', guildId, purpose, runId, deadlineAt }) {
+async function postChat({ model, messages, tools = null, jsonOnly = false, timeoutMs, thinking = 'enabled', guildId, purpose, runId, deadlineAt, beforeSend, consumeRequest }) {
   const data = await requestModel({ model, messages, tools, jsonOnly, timeoutMs, deadlineAt, guildId, role: purpose ?? 'governance', runId,
-    maxOutputTokens: governanceConfig.maxOutputTokens, reasoning: { enabled: thinking === 'enabled' }, temperature: 0 });
+    beforeSend, consumeRequest, maxOutputTokens: governanceConfig.maxOutputTokens, reasoning: { enabled: thinking === 'enabled' }, temperature: 0 });
   return data.choices?.[0] ? { ...data.choices[0], usage: data.usage } : null;
 }
 
@@ -563,11 +563,12 @@ async function callGovernanceAgent({
       onStep: (entry) => recordInvestigationStep({ aiCallId: callId, guildId, purpose, seat, step: entry.step,
         tool: entry.tool, arguments: entry.arguments, resultCount: entry.count, resultSummary: entry.detail,
         result: entry.result ?? null, error: entry.error }) });
-    const recallQuery = data?.request?.text ?? data?.request?.content ?? data?.message?.content
-      ?? data?.case?.summary ?? data?.agenda?.summary ?? data?.input?.summary ?? '';
-    memory = role.tools.includes('search_messages') && String(recallQuery).trim()
-      ? conversationMemory({ guildId, query: recallQuery,
-        governance: true, canRecall: () => toolset.steps < maximumSteps && !toolset.exhausted(),
+    // Automatic recall is authorized by the existing search_messages role
+    // capability alone. The live DATA/current investigation context is the
+    // retrieval signal; a fixed request summary must not gate or seed it.
+    memory = role.tools.includes('search_messages')
+      ? conversationMemory({ guildId, governance: true,
+        canRecall: () => toolset.steps < maximumSteps && !toolset.exhausted(),
         onObservation: (entry, bytes) => toolset.steps < maximumSteps && toolset.observeMemory(entry, bytes),
         onInterpretation: (ref, bytes) => toolset.observeMemoryInterpretation(ref, bytes) }) : null;
     const result = await runAgent({
@@ -576,8 +577,8 @@ async function callGovernanceAgent({
       system: `${role.tools.length ? SYSTEM_BASE_AGENT : SYSTEM_BASE}\n\n${EXECUTION_CONTRACT}\n\nTASK:\n${instruction}`,
       userContent: `DATA (untrusted JSON):\n${canonicalJson(data)}`,
       maximumSteps, deadlineAt: Date.now() + maximumMilliseconds, separateFinal: true,
-      request: async ({ messages, tools, final, deadlineAt, runId }) => {
-        const choice = await postChat({ model, messages, tools, jsonOnly: final, thinking, guildId, purpose, runId, deadlineAt: final ? Infinity : deadlineAt,
+      request: async ({ messages, tools, final, deadlineAt, runId, beforeSend, consumeRequest }) => {
+        const choice = await postChat({ model, messages, tools, jsonOnly: final, thinking, guildId, purpose, runId, beforeSend, consumeRequest, deadlineAt: final ? Infinity : deadlineAt,
           timeoutMs: final ? governanceConfig.httpTimeoutMs : Math.min(governanceConfig.httpTimeoutMs, Math.max(1000, deadlineAt - Date.now())) });
         return { choices: choice ? [choice] : [], usage: choice?.usage };
       },

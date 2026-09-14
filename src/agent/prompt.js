@@ -52,6 +52,7 @@ export function buildSystemPrompt(ctx, toolset) {
     '  各行は discord.message.v1。reference.kind=reply だけが返信。reference.ref/messageId が宛先で、時系列・メンション・転送は返信ではない。',
     '  reference.availability が not_fetched / unavailable / deleted の場合、返信先の発言内容や意図を推定で補わない。',
     '  body.complete=false は抜粋。forwarded / embeds / 添付の内容は送信者自身の発言とは限らない。thread と channel の境界も守る。',
+    '  supplemental はカード・添付・引用の補足。contextGroup は同じ人の連投を表示上まとめたもの。続きの各ID・ref・返信先を使い分ける。',
     '',
     '## 動き方',
     '- 直近の会話は最初から渡してある。それで答えられるなら道具を呼ばずに答える。',

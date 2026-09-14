@@ -23,6 +23,7 @@ let failing = false;
 
 // ツールを渡された最初の往復だけツールを呼び、あとは文章を返す偽の API。
 globalThis.fetch = async (_url, init) => {
+  if (_url.endsWith('/endpoints')) return { ok: true, json: async () => ({ data: { endpoints: [{ pricing: { prompt: '0.0000001', completion: '0.0000002' } }] } }) };
   const body = JSON.parse(init.body);
   calls.push(body);
 

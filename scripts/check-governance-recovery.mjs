@@ -85,6 +85,7 @@ console.log('R7: legal waits and visit limits are enforced for institutions and 
   const guild = fakeGuild(root.guild_id);
   let outage = true;
   globalThis.fetch = async (_url, init) => {
+  if (_url.endsWith('/endpoints')) return { ok: true, json: async () => ({ data: { endpoints: [{ pricing: { prompt: '0.0000001', completion: '0.0000002' } }] } }) };
     const system = JSON.parse(init.body).messages[0].content;
     const seat = Number(/independent seat (\d+)/.exec(system)?.[1]);
     if (outage && seat === 3) return new Response('outage', { status: 503 });
@@ -115,6 +116,7 @@ console.log('R5: failed AI seats retain a retryable agenda without recording rej
   db.enactLaw({ guildId: guild.id, proposalId: amendmentId, constitutionId: root.id, code: 'NEW', title: '新法', text: '新法', provisions, supersedesLawId: old.id, targetHash: old.content_hash });
   const citedLaws = [];
   globalThis.fetch = async (_url, init) => {
+  if (_url.endsWith('/endpoints')) return { ok: true, json: async () => ({ data: { endpoints: [{ pricing: { prompt: '0.0000001', completion: '0.0000002' } }] } }) };
     const data = JSON.parse(JSON.parse(init.body).messages[1].content.replace(/^DATA \(untrusted JSON\):\n/, ''));
     citedLaws.push(data.law.id);
     return response({ verdict: 'not_responsible', lawId: data.law.id, offenseCode: data.chargedOffense.code, evidenceIds: [],
@@ -261,6 +263,7 @@ console.log('R6: institutional proposals reach the legally defined electorate');
   assert.equal(db.ensureLegalRecoveryProposal(guild.id).id, proposal.id);
   let draftSawRecovery = false;
   globalThis.fetch = async (_url, init) => {
+  if (_url.endsWith('/endpoints')) return { ok: true, json: async () => ({ data: { endpoints: [{ pricing: { prompt: '0.0000001', completion: '0.0000002' } }] } }) };
     const messages = JSON.parse(init.body).messages;
     const system = messages[0].content;
     const input = JSON.parse(messages[1].content.replace(/^DATA \(untrusted JSON\):\n/, ''));

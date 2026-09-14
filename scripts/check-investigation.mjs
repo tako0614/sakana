@@ -143,6 +143,7 @@ let failTools = false;
 let requestCount = 0;
 const toolCallCounts = [];
 globalThis.fetch = async (_url, options) => {
+  if (_url.endsWith('/endpoints')) return { ok: true, json: async () => ({ data: { endpoints: [{ pricing: { prompt: '0.0000001', completion: '0.0000002' } }] } }) };
   const body = JSON.parse(options.body);
   requestCount += 1;
   if (body.tools?.length) {
@@ -272,6 +273,7 @@ assert.ok(
   // 憲法が許す最短の時間予算は1分。1手あたり9秒かかるproviderなら、20手を
   // 使い切るより先に時間で打ち切られる。
   globalThis.fetch = async (url, options) => {
+  if (url.endsWith('/endpoints')) return { ok: true, json: async () => ({ data: { endpoints: [{ pricing: { prompt: '0.0000001', completion: '0.0000002' } }] } }) };
     if (JSON.parse(options.body).tools?.length) await new Promise((r) => setTimeout(r, 9_000));
     return outer(url, options);
   };
@@ -319,6 +321,7 @@ failTools = false;
   let totalRequest = 0;
   const outer = globalThis.fetch;
   globalThis.fetch = async (url, options) => {
+  if (url.endsWith('/endpoints')) return { ok: true, json: async () => ({ data: { endpoints: [{ pricing: { prompt: '0.0000001', completion: '0.0000002' } }] } }) };
     largestRequest = Math.max(largestRequest, options.body.length);
     totalRequest += options.body.length;
     return outer(url, options);

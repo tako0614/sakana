@@ -1145,6 +1145,7 @@ let capturedRequest;
 // 次に結論を返す」実際の往復を再現する。
 let toolPlan = null;
 globalThis.fetch = async (_url, options) => {
+  if (_url.endsWith('/endpoints')) return { ok: true, json: async () => ({ data: { endpoints: [{ pricing: { prompt: '0.0000001', completion: '0.0000002' } }] } }) };
   capturedRequest = JSON.parse(options.body);
   const rawData = capturedRequest.messages[1].content.replace(/^DATA \(untrusted JSON\):\n/, '');
   const alreadyInvestigated = capturedRequest.messages.some((entry) => entry.role === 'tool');
