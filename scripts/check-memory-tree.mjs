@@ -99,6 +99,11 @@ const calls = [];
 let mode = 'ok';
 let inFlight = 0;
 let maxInFlight = 0;
+let slowLabel = null;
+let slowSeen = false;
+let slowActive = false;
+let finishedDuringSlow = false;
+let refillsDuringSlow = 0;
 const busyChannels = new Set();
 const fake = async ({ kind, user }) => {
   calls.push({ kind, user });
@@ -110,7 +115,13 @@ const fake = async ({ kind, user }) => {
   }
   inFlight += 1;
   maxInFlight = Math.max(maxInFlight, inFlight);
-  await new Promise((resolve) => setTimeout(resolve, 5));
+  // 遅い1本 (#wide0 の最初の区切り) が走っている間に、空いた枠へ次が入るか (作業プール)
+  const slow = slowLabel && labels.includes(slowLabel) && !slowSeen;
+  if (slow) { slowSeen = true; slowActive = true; }
+  else if (slowActive && finishedDuringSlow) refillsDuringSlow += 1;
+  await new Promise((resolve) => setTimeout(resolve, slow ? 150 : 5));
+  if (slow) slowActive = false;
+  else if (slowActive) finishedDuringSlow = true;
   inFlight -= 1;
   for (const label of labels) busyChannels.delete(label);
   if (mode === 'quota') throw new StopRun('無料枠の上限', 'quota');
@@ -256,7 +267,10 @@ for (const [i, id] of wideChannels.entries()) {
 }
 savePublicChannels(WIDE, wideChannels);
 maxInFlight = 0;
+slowLabel = '#wide0';
 const wide = await runBuild({ guildId: WIDE, call: fake });
+slowLabel = null;
+if (refillsDuringSlow < 1) fail('a slow call must not hold back the others (the pool must refill freed slots)');
 if (wide.stopped !== 'done') fail('the wide run must finish: ' + JSON.stringify(wide));
 if (maxInFlight < 2) fail('segments on different channels must run concurrently (max in flight ' + maxInFlight + ')');
 for (const id of wideChannels) if (!getCursor(WIDE, id)) fail('every channel must be read in the concurrent run');

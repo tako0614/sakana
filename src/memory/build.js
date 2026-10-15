@@ -47,8 +47,9 @@ export const treeConfig = {
   idleMs: Number(process.env.MEMORY_TREE_IDLE_MS || 12 * 3_600_000),
   // ページの統合待ちがこれだけ溜まったら書き直す。読み終えたら残りも書き直す
   integrateChars: Number(process.env.MEMORY_TREE_INTEGRATE_CHARS || 3000),
-  integrateBatchChars: 30000,
-  integratePages: 8,
+  // 1回の統合は小さめに (8ページ・3万字だと出力が長く、1回2〜3分かかった)
+  integrateBatchChars: 15000,
+  integratePages: 4,
   // ページ本文の上限。超えたら子ページへ分けさせる
   nodeChars: Number(process.env.MEMORY_TREE_NODE_CHARS || 6000),
   bodyChars: 3000,
@@ -57,7 +58,7 @@ export const treeConfig = {
   knownChars: 6000,
   timeoutMs: Number(process.env.MEMORY_TREE_TIMEOUT_MS || 300_000),
   // 同時に投げる呼び出しの数。区切りはチャンネルが、統合はページが重ならないように組む
-  concurrency: Math.max(1, Number(process.env.MEMORY_TREE_CONCURRENCY || 4)),
+  concurrency: Math.max(1, Number(process.env.MEMORY_TREE_CONCURRENCY || 8)),
   outputTokens: Number(process.env.MEMORY_TREE_OUTPUT_TOKENS || 16000),
   // これ以上待たされる 429 は日の上限とみなして止める
   maxWaitMs: 10 * 60_000,
@@ -601,47 +602,91 @@ export async function runBuild({
 
     let sinceRoot = getState(`root:${guildId}`)?.segments ?? 0;
     const width = treeConfig.concurrency;
-    while (!spent()) {
-      paused();
-      setState(`lock:${guildId}`, { pid: process.pid, host: hostname(), at: now() });
-
-      // 1回の波で、ページが重ならない統合 (波の半分まで) と、チャンネルが重ならない区切りを
-      // 同時に投げる。結果の反映はそれぞれのトランザクションで1つずつ (統合待ちは末尾に
-      // 足すだけなので、統合と区切りが同じページに触っても食い違わない)。
-      const tasks = [];
-      const room = () => tasks.length < width && stats.calls + tasks.length < maxCalls;
-      const pagesTaken = new Set(skip);
-      while (room() && tasks.length < Math.max(1, Math.floor(width / 2))) {
-        // 知識が溜まったページを先に書き直す (既知のページとして次の区切りに渡すため)
-        const batch = integrationBatch(guildId, { minChars: treeConfig.integrateChars, skip: pagesTaken });
+    // 作業プール: 1本終わるたびに、空いているチャンネル・ページから次の仕事を組んで投げる。
+    // (波ごとに全部の終わりを待つと、2〜3分かかる統合に速い区切りが待たされていた)
+    // 区切りはチャンネルが、統合はページが重ならないようにする。結果の反映はそれぞれの
+    // トランザクションで1つずつ (統合待ちは末尾に足すだけなので、統合と区切りが同じページに
+    // 触っても食い違わない)。
+    const inFlight = new Set();
+    const busyChannels = new Set();
+    const busyPages = new Set(skip);
+    let integrations = 0;
+    let rootRunning = false;
+    let stopError = null;
+    const room = () => !stopError && inFlight.size < width && !spent();
+    const launch = (work, release) => {
+      const task = (async () => {
+        try {
+          await work();
+        } catch (error) {
+          if (!(error instanceof StopRun)) throw error;
+          stopError ??= error;
+        } finally {
+          release();
+          inFlight.delete(task);
+        }
+      })();
+      inFlight.add(task);
+    };
+    const integrateLater = (batch) => {
+      for (const item of batch) busyPages.add(item.path);
+      integrations += 1;
+      launch(() => integrate(batch), () => {
+        integrations -= 1;
+        // この実行で失敗したページ (skip) は外したままにする
+        for (const item of batch) if (!skip.has(item.path)) busyPages.delete(item.path);
+      });
+    };
+    const fill = () => {
+      // 知識が溜まったページを先に書き直す (既知のページとして次の区切りに渡すため)。幅の半分まで
+      while (room() && integrations < Math.max(1, Math.floor(width / 2))) {
+        const batch = integrationBatch(guildId, { minChars: treeConfig.integrateChars, skip: busyPages });
         if (!batch) break;
-        for (const item of batch) pagesTaken.add(item.path);
-        tasks.push(() => integrate(batch));
+        integrateLater(batch);
       }
-      const channelsTaken = new Set();
+      let planned = 0;
       while (room()) {
         const pack = planPack({ guildId, channelIds, targetChars: treeConfig.segmentChars,
-          minChars: treeConfig.minChars, idleMs: treeConfig.idleMs, now: now(), exclude: channelsTaken });
+          minChars: treeConfig.minChars, idleMs: treeConfig.idleMs, now: now(), exclude: busyChannels });
         if (!pack) break;
-        for (const s of pack.segments) channelsTaken.add(s.channelId);
-        tasks.push(async () => { if (await segment(pack)) sinceRoot += 1; });
+        for (const s of pack.segments) busyChannels.add(s.channelId);
+        planned += 1;
+        launch(async () => {
+          if (await segment(pack)) {
+            sinceRoot += 1;
+            setState(`root:${guildId}`, { ...(getState(`root:${guildId}`) ?? {}), segments: sinceRoot });
+          }
+        }, () => { for (const s of pack.segments) busyChannels.delete(s.channelId); });
       }
-      // 読み終えたら、少ない統合待ちも書き直す
-      while (tasks.length === 0 || (channelsTaken.size === 0 && room())) {
-        const batch = integrationBatch(guildId, { minChars: 1, skip: pagesTaken });
-        if (!batch) break;
-        for (const item of batch) pagesTaken.add(item.path);
-        tasks.push(() => integrate(batch));
+      // 読むものが残っていなければ、少ない統合待ちも書き直す
+      if (planned === 0 && busyChannels.size === 0) {
+        while (room()) {
+          const batch = integrationBatch(guildId, { minChars: 1, skip: busyPages });
+          if (!batch) break;
+          integrateLater(batch);
+        }
       }
-      if (tasks.length === 0) break;
+      // 根は区切りが溜まったら書き直す (1本だけ)
+      if (sinceRoot >= treeConfig.rootEverySegments && !rootRunning && room()) {
+        rootRunning = true;
+        const counted = sinceRoot;
+        launch(() => rebuildRoot(guildId, call, stats, log), () => {
+          rootRunning = false;
+          sinceRoot = Math.max(0, sinceRoot - counted);
+          setState(`root:${guildId}`, { ...(getState(`root:${guildId}`) ?? {}), segments: sinceRoot });
+        });
+      }
+    };
 
-      await Promise.all(tasks.map((task) => task()));
-      setState(`root:${guildId}`, { ...(getState(`root:${guildId}`) ?? {}), segments: sinceRoot });
-      if (sinceRoot >= treeConfig.rootEverySegments && !spent()) {
-        await rebuildRoot(guildId, call, stats, log);
-        sinceRoot = 0;
-      }
+    for (;;) {
+      try { paused(); } catch (error) { stopError ??= error; }
+      setState(`lock:${guildId}`, { pid: process.pid, host: hostname(), at: now() });
+      fill();
+      if (inFlight.size === 0) break;
+      await Promise.race(inFlight);
     }
+    // 止める理由があっても、走っていた仕事は終わらせてから止める (上で待ち切っている)
+    if (stopError) throw stopError;
 
     if (spent()) stats.stopped = 'limit';
     const grown = memoryDb().prepare('SELECT 1 FROM nodes WHERE guild_id = ? AND weight > 0 LIMIT 1').get(guildId);
