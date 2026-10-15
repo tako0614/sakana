@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { EmbedBuilder, MessageFlags, SlashCommandBuilder } from 'discord.js';
 import { canManageIndex } from '../archive/permissions.js';
 import { pausedBy, setPaused, treeConfig } from './build.js';
+import { rootView, viewFor } from './explore.js';
 import { snapshotPublicChannels } from './snapshot.js';
 import { memoryStatus } from './status.js';
 import { includeChannel, includedChannels, removeIncluded } from './store.js';
@@ -66,6 +67,8 @@ export const memoryCommand = {
   data: new SlashCommandBuilder()
     .setName('memory')
     .setDescription('記憶の本 (過去ログを整理したもの) を見る')
+    .addSubcommand((sub) => sub.setName('explore').setDescription('記憶の本をメニューでたどって読む')
+      .addStringOption((option) => option.setName('path').setDescription('最初に開くページ。例: people/たこ。空なら根')))
     .addSubcommand((sub) => sub.setName('show').setDescription('ページを開く (説明・子・つながり・出来事)')
       .addStringOption((option) => option.setName('path').setDescription('例: people/たこ。空なら根')))
     .addSubcommand((sub) => sub.setName('search').setDescription('ページと出来事を探す')
@@ -130,6 +133,13 @@ export const memoryCommand = {
       }
       if (!hasMemory(guildId)) {
         await interaction.editReply('記憶の本はまだできていません。');
+        return;
+      }
+      if (sub === 'explore') {
+        const path = (interaction.options.getString('path') ?? '').replace(/^\/+|\/+$/g, '').trim();
+        const { getNode } = await import('./store.js');
+        const node = path ? getNode(guildId, path) : null;
+        await interaction.editReply(node ? viewFor(guildId, `n:${node.id}`) : rootView(guildId));
         return;
       }
       const refs = { entries: [], add(entry) { this.entries.push(entry); return this.entries.length; } };

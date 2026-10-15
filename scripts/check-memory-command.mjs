@@ -116,6 +116,45 @@ const search = interaction({ sub: 'search', admin: false, options: { query: '統
 await memoryCommand.execute(search);
 assert.match(embedText(search.calls[1][1]), /統治機能を作った/);
 
+// explore: メニューでたどる。部品は Discord の制限内で組み立てられる
+const { handleMemoryComponent } = await import('../src/memory/explore.js');
+const explore = interaction({ sub: 'explore', admin: false, options: { path: '' } });
+await memoryCommand.execute(explore);
+const first = explore.calls[1][1];
+const json = (view) => ({ embeds: view.embeds.map((e) => e.toJSON()), components: view.components.map((c) => c.toJSON()) });
+const rootJson = json(first);
+assert.match(rootJson.embeds[0].title, /記憶の本/);
+const menu = rootJson.components.find((row) => row.components[0].type === 3).components[0];
+const peopleOption = menu.options.find((option) => /people/.test(option.label));
+assert.ok(peopleOption, 'the root menu lists top-level pages');
+
+const click = (fields) => {
+  const updates = [];
+  return { updates, guildId: GUILD, isButton: () => !fields.values, isStringSelectMenu: () => Boolean(fields.values),
+    update: async (view) => { updates.push(view); }, reply: async () => { throw new Error('should update in place'); },
+    deferUpdate: async () => {}, ...fields };
+};
+const people = click({ customId: 'memx:open', values: [peopleOption.value] });
+assert.equal(await handleMemoryComponent(people), true);
+const peopleJson = json(people.updates[0]);
+const takoOption = peopleJson.components.find((row) => row.components[0].type === 3).components[0].options.find((o) => /たこ/.test(o.label));
+const tako = click({ customId: 'memx:open', values: [takoOption.value] });
+await handleMemoryComponent(tako);
+const takoJson = json(tako.updates[0]);
+const ids = takoJson.components.flatMap((row) => row.components).map((c) => c.custom_id);
+assert.equal(new Set(ids).size, ids.length, 'component ids must be unique within a message: ' + ids.join(','));
+assert.match(takoJson.embeds[0].description, /sakana bot を作っている/);
+const episodeOption = takoJson.components.flatMap((row) => row.components).filter((c) => c.type === 3)
+  .flatMap((c) => c.options).find((o) => o.value.startsWith('e:'));
+assert.ok(episodeOption, 'a page lists the episodes it was part of');
+const openEpisode = click({ customId: 'memx:open', values: [episodeOption.value] });
+await handleMemoryComponent(openEpisode);
+assert.match(json(openEpisode.updates[0]).embeds[0].description, /discord\.com\/channels/, 'episode view links its sources');
+const back = click({ customId: 'memx:root' });
+await handleMemoryComponent(back);
+assert.match(json(back.updates[0]).embeds[0].title, /記憶の本/);
+assert.equal(await handleMemoryComponent(click({ customId: 'archive:reset:1' })), false, 'other components pass through');
+
 store.resetTree(GUILD);
 archive.prepare('DELETE FROM messages WHERE guild_id = ?').run(GUILD);
-console.log('memory command ok (status は管理者・先に受付・割合と見込みと費用 / pause で止まる / include・exclude / 誰でも開ける・根拠にリンク)');
+console.log('memory command ok (status は管理者・先に受付・割合と見込みと費用 / pause で止まる / include・exclude / explore でたどる / 誰でも開ける・根拠にリンク)');

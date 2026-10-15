@@ -13,6 +13,7 @@ import { enforceGuildAllowlist, isAllowedGuild } from './guilds.js';
 import { handleEmotionRequest, isEmotionRequest } from './emotion.js';
 import { addTextXP, addVoiceXP, getTopXP } from './db.js';
 import { handleArchiveComponent } from './archive/commands.js';
+import { handleMemoryComponent } from './memory/explore.js';
 import { setVisibilityClient } from './archive/visibility.js';
 import { startMemorySnapshots } from './memory/snapshot.js';
 import {
@@ -478,6 +479,9 @@ async function handleInteractionCreate(interaction) {
     }
     return;
   }
+
+  // 記憶の本の閲覧 (/memory explore) のメニューとボタン
+  if ((interaction.isButton() || interaction.isStringSelectMenu()) && await handleMemoryComponent(interaction)) return;
 
   const governanceComponent = interaction.isButton()
     || interaction.isModalSubmit()
