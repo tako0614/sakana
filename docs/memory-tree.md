@@ -125,6 +125,9 @@ node scripts/memory-tree.mjs root     --guild ID   # system に入る文面
 node scripts/memory-tree.mjs estimate --guild ID   # 未読の量と呼び出し回数の目安 (アーカイブを走査するので重い)
 node scripts/memory-tree.mjs export   --guild ID --out DIR   # ページを Markdown に、出来事を episodes.md に
 node scripts/memory-tree.mjs reset    --guild ID --yes
+node scripts/memory-tree.mjs reopen-empty --guild ID [--yes]   # 出来事が1つも無いまま「完了」になった長い区切りを読み直しに回す
 ```
+
+provider の当たり外れ: OpenRouter は同じモデルを複数の provider に回す。2026-10-15 には glm-5.3-flash の一部の provider が、3万トークン読ませても空の JSON だけを返したり、出力の上限まで暴走したりした。builder は長い区切り (`MEMORY_TREE_EMPTY_CHARS`、既定 4000 字) で出来事も知識も空なら読めていないとみなし、その provider と途中で切れた provider を3時間外して送り直す。最初から外したい provider は `MEMORY_TREE_IGNORE_PROVIDERS` に書く。
 
 `--guild` を省くと `MEMORY_TREE_GUILD` を使う。builder は同時に1つだけ動く (ロック)。本番では `deploy/sakana-memory.service` を `deploy/sakana-memory.timer` で起動する。溜まっている分は読み切るまで続け、読み終えたら1時間おきに新着を読む。モデルを決める前に `try --model` で同じ区切りを候補ごとに読ませ、出来事の切り方・知識の書き方・捨てられた数を比べる。
