@@ -109,7 +109,8 @@ export function pageView(guildId, node, { offset = 0 } = {}) {
   const totalChildren = countChildren(guildId, node.path);
   const children = listChildren(guildId, node.path, offset + CHILDREN_PER_PAGE).slice(offset);
   if (isRoot) {
-    const tops = topLevels(guildId).map((path) => `📁 **${path}** (${pageCount(guildId, path)}) ${getNode(guildId, path)?.summary ?? ''}`);
+    // 説明が長いと 1024 字で後ろの分類が切れるので短く
+    const tops = topLevels(guildId).map((path) => `📁 **${path}** (${pageCount(guildId, path)}) ${clip(getNode(guildId, path)?.summary ?? '', 36)}`);
     if (tops.length) embed.addFields({ name: '分類', value: clip(tops.join('\n'), 1024) });
   } else if (totalChildren) {
     embed.addFields({ name: `子ページ (${totalChildren})`, value: clip(children.slice(0, 12).map((child) => nameOf(child.path)).join(' · '), 1024), inline: false });
@@ -184,7 +185,7 @@ export function episodeView(guildId, id, { fromId = 0 } = {}) {
   const highlighted = new Set(episode.highlights ?? []);
   const quotes = rows.filter((row) => highlighted.has(row.message_id));
   const evidence = rows.filter((row) => !highlighted.has(row.message_id));
-  const lines = [episode.summary];
+  const lines = [renderText(episode.summary)];
   if (quotes.length) {
     lines.push('', ...quotes.map((row) => `> 「${clip(row.content.replace(/\s*\n\s*/g, ' / '), 200)}」\n> — ${row.author_name} [↗](${link(row)})`));
   }
@@ -224,7 +225,7 @@ export function timelineView(guildId, node, { offset = 0 } = {}) {
     .setAuthor({ name: clip(breadcrumb(node.path), 250) })
     .setTitle(clip(`🕒 ${nameOf(node.path) || '記憶の本'} の年表`, 250))
     .setDescription(rows.length
-      ? clip(rows.map((episode) => `${kindEmoji(episode.kind)} **${day(episode.at_ms)}** ${episode.title}\n-# ${clip(episode.summary, 110)}`).join('\n'), 3800)
+      ? clip(rows.map((episode) => `${kindEmoji(episode.kind)} **${day(episode.at_ms)}** ${episode.title}\n-# ${clip(renderText(episode.summary), 110)}`).join('\n'), 3800)
       : 'まだ出来事がありません。')
     .setFooter({ text: `${total ? `${offset + 1}〜${offset + rows.length} / ${total} 件` : '0 件'} · 古い順` });
   const components = [];
