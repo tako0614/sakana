@@ -587,7 +587,9 @@ async function catchupGuilds(client) {
     if (!state) continue;
 
     // 再起動で打ち切られた /index build は「実行中」のまま残る。ジョブは
-    // プロセス内にしか無いので、/index status が嘘をつかないよう中断に直す。
+    // プロセス内にしか無いので、中断に直して、追いつきの後にやり直す
+    // (まだ回っていなかったチャンネル・新しく見つかったスレッドを取りこぼさない)。
+    const interrupted = state.status === 'running' && !getRunningJob(guild.id) && state.mode === 'full';
     if (state.status === 'running' && !getRunningJob(guild.id)) {
       setGuildState(guild.id, { status: 'interrupted', finished_at: Date.now(), current_channel: null });
     }
@@ -597,10 +599,18 @@ async function catchupGuilds(client) {
       if (job?.messagesIndexed > 0) {
         console.log(`Catch-up indexed ${job.messagesIndexed} message(s) in ${guild.name}.`);
       }
-      const resumed = await resumeIncomplete(guild);
-      if (resumed) {
-        console.log(`Resumed ${resumed.channelsDone}/${resumed.channelsTotal} unfinished channel(s) in ${guild.name}: `
-          + `${resumed.messagesIndexed} message(s).`);
+      if (interrupted) {
+        // 済んだチャンネルは新着を見るだけ、未完了のものは続きから遡る
+        console.log(`Restarting the interrupted /index build for ${guild.name}.`);
+        const rerun = await runIndexJob(guild, { mode: 'full' });
+        console.log(`Interrupted /index build finished for ${guild.name}: ${rerun.channelsDone}/${rerun.channelsTotal} channel(s), `
+          + `${rerun.messagesIndexed} message(s), ${rerun.errors.length} error(s).`);
+      } else {
+        const resumed = await resumeIncomplete(guild);
+        if (resumed) {
+          console.log(`Resumed ${resumed.channelsDone}/${resumed.channelsTotal} unfinished channel(s) in ${guild.name}: `
+            + `${resumed.messagesIndexed} message(s).`);
+        }
       }
     } catch (error) {
       console.error(`Catch-up failed for ${guild.id}:`, error);

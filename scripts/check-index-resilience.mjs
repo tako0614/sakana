@@ -133,7 +133,7 @@ const guild = { id: GUILD, name: 'resume', channels: { cache: new Map([[STUCK, s
 stuck.guild = guild;
 
 db.prepare('DELETE FROM messages WHERE guild_id = ?').run(GUILD);
-setGuildState(GUILD, { status: 'running', mode: 'full' });   // 再起動で打ち切られたジョブの名残
+setGuildState(GUILD, { status: 'idle', mode: 'full' });
 upsertChannel({ channel_id: STUCK, guild_id: GUILD, parent_id: null, name: 'nsfw', type: 0, is_thread: 0, is_private: 0 });
 // 最新の50件だけ取って、ロックで落ちた状態
 const recent = history.slice(-50);
@@ -143,12 +143,22 @@ savePage(STUCK, recent.map((m) => ({ message_id: m.id, guild_id: GUILD, channel_
   [recent[0].id, recent.at(-1).id], { oldest_id: recent[0].id, newest_id: recent.at(-1).id });
 updateChannelState(STUCK, { last_error: 'database is locked', complete: 0 });
 
+stuck.threads = { fetchActive: async () => ({ threads: new Map() }), fetchArchived: async () => ({ threads: new Map(), hasMore: false }) };
 await catchupAllGuilds({ guilds: { cache: new Map([[GUILD, guild]]) } });
 const resumed = getChannelState(STUCK);
 const have = db.prepare('SELECT COUNT(*) AS c FROM messages WHERE channel_id = ?').get(STUCK).c;
 if (have !== 250) fail(`an unfinished channel must be backfilled on startup (have ${have}/250)`);
 if (resumed.complete !== 1 || resumed.last_error) fail('a resumed channel must end complete without an error: ' + JSON.stringify(resumed));
-if (getGuildState(GUILD).status !== 'interrupted') fail('a job cut off by a restart must not stay "running"');
+
+// 再起動で打ち切られた /index build は、起動後にやり直して終わらせる
+db.prepare('DELETE FROM messages WHERE channel_id = ?').run(STUCK);
+db.prepare('DELETE FROM channel_spans WHERE channel_id = ?').run(STUCK);
+updateChannelState(STUCK, { complete: 0, oldest_id: null, newest_id: null, last_error: null });
+setGuildState(GUILD, { status: 'running', mode: 'full' });   // 前のプロセスのジョブの名残
+await catchupAllGuilds({ guilds: { cache: new Map([[GUILD, guild]]) } });
+const rerunHave = db.prepare('SELECT COUNT(*) AS c FROM messages WHERE channel_id = ?').get(STUCK).c;
+if (rerunHave !== 250) fail(`an interrupted /index build must be rerun on startup (have ${rerunHave}/250)`);
+if (getGuildState(GUILD).status !== 'idle') fail('the rerun build must finish and leave the guild idle: ' + getGuildState(GUILD).status);
 
 // ジョブ中にロックで落ちても、待って続きから取り直す (ジョブのエラーにしない)
 db.prepare('DELETE FROM messages WHERE channel_id = ?').run(STUCK);
@@ -166,4 +176,4 @@ db.prepare('DELETE FROM guild_index_state WHERE guild_id = ?').run(GUILD);
 db.prepare('DELETE FROM messages WHERE channel_id = ?').run(CHANNEL);
 db.prepare('DELETE FROM channel_spans WHERE channel_id = ?').run(CHANNEL);
 db.prepare('DELETE FROM channels WHERE channel_id = ?').run(CHANNEL);
-console.log(`index resilience ok (ロック中も ${waited}ms 待って書けた / 台帳が待ち時間を下げない / やり直し / 1ページ1トランザクション / 止まったチャンネルを起動時に取り直す / ジョブ中のロックを続きから / 投票の当て布)`);
+console.log(`index resilience ok (ロック中も ${waited}ms 待って書けた / 台帳が待ち時間を下げない / やり直し / 1ページ1トランザクション / 止まったチャンネルを起動時に取り直す / 中断された build をやり直す / ジョブ中のロックを続きから / 投票の当て布)`);
