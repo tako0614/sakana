@@ -108,14 +108,23 @@ export async function refreshModelRates(model, signal) {
       if (free) cacheFreeFailure(model,error);
       throw error;
     }
-    const prices = endpoints.map(endpoint => endpoint?.pricing);
-    if (prices.some(price => !price || ['prompt','completion'].some(key =>
+    const bases = endpoints.map(endpoint => endpoint?.pricing);
+    if (bases.some(price => !price || ['prompt','completion'].some(key =>
       price[key] == null || !Number.isFinite(Number(price[key])) || Number(price[key]) < 0)))
       throw priceError(model,'OpenRouter returned incomplete endpoint pricing');
-    if (prices.some(price => Object.values(price).some(value => value != null && value !== ''
-      && (!Number.isFinite(Number(value)) || Number(value) < 0))))
+    // 時間帯で値段が変わる提供元は overrides に別の価格を持つ (2026-10 に Alibaba が追加)。
+    // 配列を「不正な値」として扱うとモデルごと呼べなくなる。各時間帯の価格も1つの価格として
+    // 数え、いちばん高いものを上限・見積もりに使う。欠けている項目は基本の価格で埋める。
+    const overrideError = bases.some(price => price.overrides != null && (!Array.isArray(price.overrides)
+      || price.overrides.some(entry => !entry || typeof entry !== 'object' || Array.isArray(entry))));
+    if (overrideError) throw priceError(model,'OpenRouter returned invalid endpoint pricing overrides');
+    const prices = bases.flatMap(price => [price, ...(price.overrides ?? []).map(entry => ({ ...price, ...entry }))]);
+    // 値段の欄はすべて数値。overrides 自体と時間帯の境目 (utc_start/utc_end) は値段ではない
+    const scalar = ([key, value]) => key !== 'overrides' && !key.startsWith('utc_') && value != null && value !== '';
+    if (prices.some(price => Object.entries(price).filter(scalar).some(([, value]) =>
+      typeof value === 'object' || !Number.isFinite(Number(value)) || Number(value) < 0)))
       throw priceError(model,'OpenRouter returned invalid endpoint pricing');
-    if (free && prices.some(price => Object.values(price).some(value => value != null && value !== '' && Number(value) !== 0)))
+    if (free && prices.some(price => Object.entries(price).filter(scalar).some(([key, value]) => key !== 'discount' && Number(value) !== 0)))
       throw priceError(model,'Exact free route returned nonzero endpoint pricing');
     const maximum = key => Math.max(...prices.map(price => Number(price[key] ?? 0)));
     const bound = value => Math.ceil(value*1e12)/1e12;
