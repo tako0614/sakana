@@ -6,6 +6,7 @@
 //
 // 呼ばれた時点で直近の会話を渡してしまうので、多くの場合ツールを1回も呼ばずに答える。
 
+import { DEFAULT_AGENT_ENGINE, agentModelFor, isAgentEngine } from './engines.js';
 import { recallFor } from '../memory/recall.js';
 import { AttachmentBuilder } from 'discord.js';
 import {
@@ -28,14 +29,15 @@ import { runAgent } from './llm.js';
 import { buildSystemPrompt, buildUserContent } from './prompt.js';
 import {
   finalizeCall,
+  getTunable,
   isAgentReply,
   recordToolCalls,
   releaseCall,
   remainingFor,
   rememberAgentReply,
   reserveCall,
-  usdToTokens,
-  weighTokens
+  usdToBudget,
+  weighCost
 } from './ratelimit.js';
 import { isSelfHosted } from '../mimic/client.js';
 import { engineFor } from '../mimic/prefs.js';
@@ -180,8 +182,8 @@ function canUseFullBrowser(member) {
  * 以前はハイフンを空白にしていたが、自作モデル側が `evex-ft-1-preview` の形なので
  * そちらと揃える。`/model` の表示・フッター・env の値が全部同じ綴りになる。
  */
-function modelLabel() {
-  return agentConfig.model;
+function modelLabel(model = agentConfig.model) {
+  return model;
 }
 
 function limitMessage(reservation) {
@@ -305,6 +307,9 @@ export async function handleAgentRequest(message, client) {
   const governanceTopic = Boolean(getGovernanceGuild(guild.id))
     && isGovernanceAgentTopic(message.content);
   const chosen = engineFor(message.author.id, guild.id);
+  // 会話 agent のモデルはその人が /model で選んだもの (ling / glm / qwen)。
+  // 自作モデルを選んでいる人が統治の話をしたときは既定のモデルで答える
+  const model = agentModelFor(isAgentEngine(chosen) ? chosen : DEFAULT_AGENT_ENGINE);
   // 自作モデル側はどれも「会話の続きを1発言書く」だけ。道具も検索も使えない。
   //
   // 名前を並べていたら evex-1 を足したときに書き足し忘れ、選んだ人が黙って
@@ -440,6 +445,7 @@ export async function handleAgentRequest(message, client) {
     });
 
     const result = await runAgent({
+      model,
       guildId: guild.id,
       // Discord input identity survives a process restart, so an unfinished
       // run resumes from its checkpoint instead of starting over. Completed
@@ -451,17 +457,17 @@ export async function handleAgentRequest(message, client) {
       userContent,
       toolset,
       usage,
-      // 止めるのはトークンだけ。上限はドルで持っているのでここで換算する。
+      // 予算は実際の請求額 (OpenRouter の usage.cost) で数える。単位はマイクロドル。
       // 1回ぶんの暴走ガードと、その人の残りのうち小さい方。
       // 管理者は残りが Infinity なので、暴走ガードだけが効く。
       budget: Math.min(
-        usdToTokens(agentConfig.requestUsd),
+        usdToBudget(getTunable('request_usd')),
         remainingFor(message.author.id, admin, { skipUserLimit: attempt.governed })
       ),
       // 時間の壁。トークンが余っていても、同時実行の枠を何時間も押さえさせない。
       // 超えてもツールが外れるだけなので、答えはその場の材料で必ず書かれる。
       deadlineAt: Date.now() + agentConfig.deadlineMs,
-      weigh: weighTokens,
+      weigh: weighCost,
       onToolCall: (name, args) => indicator.setStatus(toolLabel(name, args))
     });
 
@@ -478,7 +484,7 @@ export async function handleAgentRequest(message, client) {
     await indicator.stop();
 
     const answer = result.text?.trim()
-      ? expandCitations(result.text.trim(), refs, { label: modelLabel() })
+      ? expandCitations(result.text.trim(), refs, { label: modelLabel(model) })
       : 'うまく答えをまとめられませんでした。条件を絞ってもう一度聞いてください。';
 
     // 撮ったのに貼れないときは黙らない (画像が出ている前提で読まれる)

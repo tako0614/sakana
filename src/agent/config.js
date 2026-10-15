@@ -21,7 +21,8 @@ export const agentConfig = {
   model: process.env.AGENT_MODEL || providerConfig.model,
 
   // 公式のツマミは low / high / max。真ん中の high を既定にする。
-  reasoningEffort: process.env.AGENT_REASONING_EFFORT ?? 'high',
+  // flash 系は high だと考えるだけで分単位になる (2026-10 の比較)。既定は medium
+  reasoningEffort: process.env.AGENT_REASONING_EFFORT ?? 'medium',
   thinking: flag(process.env.AGENT_THINKING, true),
 
   // --- 1回の実行に使える量 ---

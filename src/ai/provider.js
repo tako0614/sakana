@@ -3,7 +3,8 @@ import { modelRates, saveModelRates, reserveModelCall, finishModelCall } from '.
 export const providerConfig = {
   apiKey: process.env.OPENROUTER_API_KEY || '',
   baseUrl: 'https://openrouter.ai/api/v1',
-  model: process.env.AI_MODEL || 'deepseek/deepseek-v4-flash-0731',
+  // 統治 (国会・裁判・警察) と、モデルを指定しない呼び出しの既定。会話 agent は agent/engines.js
+  model: process.env.AI_MODEL || 'z-ai/glm-5.3-flash',
 };
 
 export class ProviderError extends Error {

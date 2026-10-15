@@ -1,7 +1,8 @@
 import { tmpdir } from 'node:os';
 // 使用量の上限の検証 (npm run check から呼ぶ)。
 //
-// 「ドルで決めてトークンで数える」の変換と、管理者の素通り、個別付与、移動窓を固定する。
+// 実際の請求額 (OpenRouter の usage.cost) で数えることと、実費の無い古い記録の見積もり、
+// 管理者の素通り、個別付与、移動窓を固定する。
 // 一時DBだけに書く。本番設定や既存利用履歴には触れない。
 
 import { rmSync } from 'node:fs';
@@ -15,6 +16,7 @@ process.on('exit', () => {
 
 const { db } = await import('../src/db.js');
 const {
+  costOf,
   dailyUsdFor,
   finalizeCall,
   getTunable,
@@ -23,9 +25,8 @@ const {
   remainingFor,
   reserveCall,
   resetUsage,
-  tokensToUsd,
-  usdToTokens,
-  weighTokens
+  usdToBudget,
+  weighCost
 } = await import('../src/agent/ratelimit.js');
 
 const USERS = ['check-normal', 'check-admin', 'check-granted'];
@@ -46,27 +47,39 @@ cleanup();
 const DEFAULT_DAILY = dailyUsdFor('check-normal');
 
 try {
-  // --- 変換の往復 ---
-  const round = tokensToUsd(usdToTokens(0.5));
-  assert(Math.abs(round - 0.5) < 1e-9, `usd roundtrip broken: ${round}`);
+  // --- 実費で数える。予算の単位はマイクロドル ---
+  assert(usdToBudget(0.02) === 20_000, 'budget is in micro-dollars');
+  const heavy = { prompt_tokens: 100_000, prompt_cache_hit_tokens: 80_000, completion_tokens: 20_000, cost: 0.004 };
+  const usd = costOf(heavy);
+  assert(usd === 0.004, `the real cost must be used when OpenRouter returns it, got ${usd}`);
+  assert(weighCost(heavy) === 4000, 'weigh returns micro-dollars');
+  // 有料モデルでトークンを使ったのに 0 なら、返ってこなかったとみなして見積もる (素通しさせない)
+  assert(Math.abs(costOf({ ...heavy, cost: 0 }) - 0.01064) < 1e-9, 'a zero cost with tokens must be estimated');
+  assert(costOf({ prompt_tokens: 0, completion_tokens: 0, cost: 0 }) === 0, 'no work costs nothing');
 
-  // --- 1回のコスト (重み 1 / 0.2 / 2.0) ---
-  const heavy = { prompt_tokens: 100_000, prompt_cache_hit_tokens: 80_000, completion_tokens: 20_000 };
-  const tokens = weighTokens(heavy);
-  assert(tokens === 76_000, `weighted tokens should be 76000, got ${tokens}`);
-  const usd = tokensToUsd(tokens);
-  assert(Math.abs(usd - 0.01064) < 1e-9, `heavy request should cost $0.01064, got ${usd}`);
+  // --- 実費が返らなかったときだけ、固定の単価と重み (1 / 0.2 / 2.0) で見積もる ---
+  const legacy = { prompt_tokens: 100_000, prompt_cache_hit_tokens: 80_000, completion_tokens: 20_000 };
+  assert(Math.abs(costOf(legacy) - 0.01064) < 1e-9, `legacy estimate should be $0.01064, got ${costOf(legacy)}`);
+  {
+    const r = reserveCall({ guildId: 'g', channelId: 'c', userId: 'check-granted' });
+    finalizeCall(r.id, { status: 'ok', rounds: 1, usage: legacy });
+    assert(db.prepare('SELECT cost_usd FROM agent_calls WHERE id = ?').get(r.id).cost_usd === null, 'unknown cost is stored as NULL');
+    const spent = getUsage('check-granted').userUsd;
+    assert(Math.abs(spent - 0.01064) < 1e-9, `a row without cost must be estimated in the window (${spent})`);
+    db.prepare('DELETE FROM agent_calls WHERE id = ?').run(r.id);
+  }
 
   // --- 移動窓: 25時間前の記録は数えない ---
   // 全体カウンタが空のうちに測る。あとの volume テストで全体が埋まると、
   // remainingFor が全体側で 0 を返してこの判定ができなくなる。
   const old = reserveCall({ guildId: 'g', channelId: 'c', userId: 'check-granted' });
   finalizeCall(old.id, { status: 'ok', rounds: 9, usage: heavy });
-  assert(remainingFor('check-granted') < usdToTokens(DEFAULT_DAILY), 'a fresh call must consume the window');
+  assert(remainingFor('check-granted') < usdToBudget(DEFAULT_DAILY), 'a fresh call must consume the window');
+  assert(db.prepare('SELECT cost_usd FROM agent_calls WHERE id = ?').get(old.id).cost_usd === 0.004, 'the real cost is stored');
   db.prepare('UPDATE agent_calls SET created_at = ? WHERE id = ?')
     .run(Date.now() - 25 * 3_600_000, old.id);
   const left = remainingFor('check-granted');
-  assert(Math.abs(left - usdToTokens(DEFAULT_DAILY)) < 1, `a 25h-old call must age out of the window (left ${left})`);
+  assert(Math.abs(left - usdToBudget(DEFAULT_DAILY)) < 1, `a 25h-old call must age out of the window (left ${left})`);
 
   // --- 一般ユーザーは既定の上限で止まる ---
   let count = 0;
@@ -161,7 +174,7 @@ try {
   grantDailyUsd('check-granted', null, 'check');
   assert(dailyUsdFor('check-granted') === DEFAULT_DAILY, 'revoking must fall back to the default');
 
-  console.log(`limits ok (heavy request = $${usd.toFixed(5)}, wall after ${count} of them)`);
+  console.log(`limits ok (実費で数える / 実費の無い古い記録は見積もる / heavy request = $${usd.toFixed(4)}, wall after ${count} of them)`);
 } finally {
   cleanup();
 }

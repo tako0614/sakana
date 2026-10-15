@@ -130,7 +130,7 @@ try {
   await assert.rejects(runAgent({ ...ackOptions, usage: firstAckUsage }), /use notification interrupted/);
   releaseCall(firstAckReservation.id, firstAckUsage);
   assert.deepEqual(firstAckUsage,
-    { prompt_tokens: 12, completion_tokens: 4, prompt_cache_hit_tokens: 3, rounds: 1 },
+    { prompt_tokens: 12, completion_tokens: 4, prompt_cache_hit_tokens: 3, cost: 0, rounds: 1 },
     'the failed invocation exposes exactly the provider work it observed');
   const retryAckUsage = { prompt_tokens: 0, completion_tokens: 0, prompt_cache_hit_tokens: 0 };
   const retryAckReservation = reserveCall({ guildId: 'g', channelId: 'c', userId: 'runtime-use-ledger', admin: true });
@@ -142,13 +142,13 @@ try {
   assert.equal(savedAnswer.text, 'saved answer');
   assert.equal(savedAnswer.rounds, 1);
   assert.deepEqual(savedAnswer.usage,
-    { prompt_tokens: 12, completion_tokens: 4, prompt_cache_hit_tokens: 3 },
+    { prompt_tokens: 12, completion_tokens: 4, prompt_cache_hit_tokens: 3, cost: 0 },
     'the durable result retains cumulative usage');
   assert.deepEqual(savedAnswer.invocation,
-    { rounds: 0, usage: { prompt_tokens: 0, completion_tokens: 0, prompt_cache_hit_tokens: 0 } },
+    { rounds: 0, usage: { prompt_tokens: 0, completion_tokens: 0, prompt_cache_hit_tokens: 0, cost: 0 } },
     'an ack-only resume has no newly chargeable provider work');
   assert.deepEqual(retryAckUsage,
-    { prompt_tokens: 0, completion_tokens: 0, prompt_cache_hit_tokens: 0, rounds: 0 });
+    { prompt_tokens: 0, completion_tokens: 0, prompt_cache_hit_tokens: 0, cost: 0, rounds: 0 });
   assert.deepEqual(mainDb.prepare(`SELECT status,rounds,prompt_tokens,completion_tokens,cached_tokens
     FROM agent_calls WHERE id IN (?,?) ORDER BY id`).all(firstAckReservation.id, retryAckReservation.id), [
     { status: 'error', rounds: 1, prompt_tokens: 12, completion_tokens: 4, cached_tokens: 3 },
@@ -206,18 +206,18 @@ try {
   const firstToolUsage = { prompt_tokens: 0, completion_tokens: 0, prompt_cache_hit_tokens: 0 };
   await assert.rejects(runAgent({ ...toolAckOptions, usage: firstToolUsage }), /tool response notification interrupted/);
   assert.deepEqual(firstToolUsage,
-    { prompt_tokens: 20, completion_tokens: 2, prompt_cache_hit_tokens: 5, rounds: 1 });
+    { prompt_tokens: 20, completion_tokens: 2, prompt_cache_hit_tokens: 5, cost: 0, rounds: 1 });
   const retryToolUsage = { prompt_tokens: 0, completion_tokens: 0, prompt_cache_hit_tokens: 0 };
   const toolAnswer = await runAgent({ ...toolAckOptions, memory: toolMemory(), usage: retryToolUsage });
   assert.equal(toolAnswer.text, 'tool-assisted answer');
   assert.deepEqual(toolAnswer.usage,
-    { prompt_tokens: 27, completion_tokens: 5, prompt_cache_hit_tokens: 6 },
+    { prompt_tokens: 27, completion_tokens: 5, prompt_cache_hit_tokens: 6, cost: 0 },
     'the durable tool result remains cumulative across both provider rounds');
   assert.deepEqual(toolAnswer.invocation,
-    { rounds: 1, usage: { prompt_tokens: 7, completion_tokens: 3, prompt_cache_hit_tokens: 1 } },
+    { rounds: 1, usage: { prompt_tokens: 7, completion_tokens: 3, prompt_cache_hit_tokens: 1, cost: 0 } },
     'the resumed invocation charges only its new post-tool model round');
   assert.deepEqual(retryToolUsage,
-    { prompt_tokens: 7, completion_tokens: 3, prompt_cache_hit_tokens: 1, rounds: 1 });
+    { prompt_tokens: 7, completion_tokens: 3, prompt_cache_hit_tokens: 1, cost: 0, rounds: 1 });
   assert.equal(toolAckRequests, 2, 'a saved tool-call response resumes without repeating its provider round');
   assert.equal(toolAckCalls, 1);
   assert.equal(toolAccounted.size, 3,

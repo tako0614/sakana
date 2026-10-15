@@ -1,3 +1,4 @@
+import { agentModelFor, isAgentEngine } from '../src/agent/engines.js';
 import { tmpdir } from 'node:os';
 // 自作モデル (evex) 側の検証。
 //
@@ -255,7 +256,17 @@ const clear = () => db.prepare('DELETE FROM agent_engine WHERE user_id = ?').run
 
 clear();
 try {
-  if (engineFor(USER, TEST_GUILD) !== DEFAULT_ENGINE) fail('既定は deepseek');
+  if (engineFor(USER, TEST_GUILD) !== DEFAULT_ENGINE) fail('既定は ling');
+  if (DEFAULT_ENGINE !== 'ling') fail('既定のエンジンは ling');
+  // deepseek は廃止。選んでいた人は既定へ読み替える (黙って別物に落ちない)
+  db.prepare('INSERT OR REPLACE INTO agent_engine (guild_id, user_id, engine, updated_at) VALUES (?, ?, ?, ?)').run(TEST_GUILD, USER, 'deepseek', Date.now());
+  if (engineFor(USER, TEST_GUILD) !== 'ling') fail('deepseek を選んでいた人は ling に読み替える');
+  clear();
+  for (const key of ['ling', 'glm', 'qwen']) {
+    if (!ENGINES[key] || !isAgentEngine(key)) fail(`${key} を会話 agent として選べない`);
+    if (!agentModelFor(key).includes('/')) fail(`${key} の OpenRouter モデルが無い`);
+  }
+  if (ENGINES.deepseek) fail('deepseek は選択肢から消す');
   if (!ENGINES[DEFAULT_ENGINE]) fail('既定のエンジンが ENGINES に無い');
 
   if (!setEngine(USER, 'evex', TEST_GUILD)) fail('evex を選べない');
@@ -273,10 +284,12 @@ try {
   // 並べていたので、evex-1 を足したときに書き足しを落とし、選んだ人が黙って
   // DeepSeek に回っていた。選択肢を足したら必ずここで気付く形にする。
   for (const key of Object.keys(ENGINES)) {
-    if (key === DEFAULT_ENGINE) continue;
+    if (isAgentEngine(key)) {
+      if (isSelfHosted(key)) fail(`${key} を自作モデル扱いにしてはいけない`);
+      continue;
+    }
     if (!isSelfHosted(key)) fail(`${key} に接続先が無い (ENDPOINTS に足す)`);
   }
-  if (isSelfHosted(DEFAULT_ENGINE)) fail('deepseek を自作モデル扱いにしてはいけない');
   if (isSelfHosted('gpt-9')) fail('知らないエンジンを自作モデル扱いにしてはいけない');
 
   console.log(

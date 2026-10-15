@@ -3,8 +3,9 @@
 // 上限を env だけで持つと、変えるたびに再起動が必要で、
 // 「今いくら使っているのか」も分からない。実行中に見て触れるようにする。
 //
-// 表示はドル。内部の勘定は換算トークンなので、突き合わせたいときのために
-// トークンも括弧で添える。単価も必ず出す (入れ間違いに気付けるように)。
+// 表示も勘定も実際の請求額 (OpenRouter の usage.cost、USD)。モデルを選べるので
+// 固定の単価でトークンを換算すると請求とずれる。単価と重みは、実費が返らなかった
+// 古い記録を見積もるときだけ使う。
 
 import {
   EmbedBuilder,
@@ -23,26 +24,19 @@ import {
   listGrants,
   listTunables,
   resetUsage,
-  setTunable,
-  usdToTokens
+  setTunable
 } from './ratelimit.js';
+import { AGENT_ENGINES } from './engines.js';
 
 const KEY_LABELS = {
   user_daily_usd: '1人あたり/日 ($)',
   global_daily_usd: '全体/日 ($)',
   request_usd: '1リクエストの上限 ($)',
-  price_in: '単価: 入力 ($/1Mトークン)',
-  weight_cached: '重み: キャッシュヒット入力',
-  weight_output: '重み: 出力',
+  price_in: '古い記録の見積もり用: 入力単価 ($/1Mトークン)',
+  weight_cached: '古い記録の見積もり用: キャッシュ入力の重み',
+  weight_output: '古い記録の見積もり用: 出力の重み',
   max_concurrent: '同時実行数'
 };
-
-function compactTokens(value) {
-  if (!Number.isFinite(value)) return '無制限';
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
-  if (value >= 1000) return `${Math.round(value / 1000)}k`;
-  return String(Math.round(value));
-}
 
 function usageEmbed(userId) {
   const usage = getUsage(userId);
@@ -53,26 +47,14 @@ function usageEmbed(userId) {
     limit > 0 ? `$${used.toFixed(3)} / $${limit.toFixed(2)}` : `$${used.toFixed(3)} / 無制限`
   );
 
-  const priceIn = getTunable('price_in');
-
   const embed = new EmbedBuilder()
     .setColor('#2b2d31')
     .setTitle('🧮 エージェントの使用量')
-    .setDescription([
-      '勘定はトークン、上限はドル。',
-      `換算トークン1個 = キャッシュミス入力1トークン = $${(priceIn / 1_000_000).toExponential(2)}。`
-    ].join(''))
+    .setDescription('上限も使用量も OpenRouter の実際の請求額 (USD)。モデルは /model で選ぶ: '
+      + Object.entries(AGENT_ENGINES).map(([key, model]) => `${key} = \`${model}\``).join(' / '))
     .addFields(
-      {
-        name: `あなた (${window})`,
-        value: `${line(usage.userUsd, usage.userLimitUsd)}\n(${compactTokens(usage.userTokens)} / ${compactTokens(usage.userLimitTokens)} 換算トークン)`,
-        inline: true
-      },
-      {
-        name: `全体 (${window})`,
-        value: `${line(usage.globalUsd, usage.globalLimitUsd)}\n(${compactTokens(usage.globalTokens)} 換算トークン)`,
-        inline: true
-      },
+      { name: `あなた (${window})`, value: line(usage.userUsd, usage.userLimitUsd), inline: true },
+      { name: `全体 (${window})`, value: line(usage.globalUsd, usage.globalLimitUsd), inline: true },
       { name: '実行中', value: String(usage.running), inline: true }
     );
 
@@ -93,13 +75,8 @@ function usageEmbed(userId) {
       .join('\n')
   });
 
-  // 1リクエストの上限はトークンにも直して出す (llm 側はこの数字で止める)
-  const requestUsd = getTunable('request_usd');
-  embed.addFields({
-    name: '1リクエストの暴走ガード',
-    value: `$${requestUsd} (${compactTokens(usdToTokens(requestUsd))} 換算トークン)`,
-    inline: true
-  });
+  // 1リクエストの上限 (実行中はこの額で道具を外して答えさせる)
+  embed.addFields({ name: '1リクエストの暴走ガード', value: `$${getTunable('request_usd')}`, inline: true });
 
   const grants = listGrants();
   if (grants.length > 0) {
@@ -111,7 +88,7 @@ function usageEmbed(userId) {
 
   embed.setFooter({
     text: '未初期化サーバーの管理者は金額上限を通りません。統治初期化後はManageGuildを信頼根拠にせず、設定した特別有権者ロールの回数枠を別に適用します。'
-      + '金額は見積りで、請求と一致する保証はありません。'
+      + '金額は OpenRouter が返した実費。実費の返らなかった古い記録だけ単価と重みで見積もっています。'
   });
 
   return embed;

@@ -1,11 +1,11 @@
 // エージェントの使用量制限と記録。
 //
-// 勘定はトークン、意思決定はドル。
-//   - 保存するのは生のトークン数 (prompt / completion / cached)。値上げされても
-//     過去の記録の意味が変わらないようにするため
-//   - 集計は「換算トークン」(キャッシュミス入力1トークン = 1 に正規化した重み付き合計)
-//   - 上限はドルで設定して、判定の直前にトークンへ直す。換算トークン1個の値段が
-//     そのまま換算レートになる (= キャッシュミス入力1トークンの単価)
+// 勘定は実際の請求額 (OpenRouter が返す usage.cost、USD)。
+//   - モデルを選べる (ling / glm / qwen) ので、固定の単価でトークンを換算すると
+//     請求とずれる。1回ごとに返る実費を cost_usd に保存して、その合計で判定する
+//   - 実費が無い古い記録 (2026-10-15 より前) だけ、従来どおりトークンを固定の単価と
+//     重みで換算して数える (price_in / weight_* はそのための値)
+//   - 実行中の予算の単位はマイクロドル (runtime の weigh / budget に渡す)
 //
 // 回数で数えないのは、軽い一言と全期間の調査が同じ「1回」になって費用と合わないから。
 //
@@ -81,6 +81,10 @@ db.exec(`
 if (!db.pragma('table_info(agent_calls)').some((row) => row.name === 'counted')) {
   db.exec('ALTER TABLE agent_calls ADD COLUMN counted INTEGER NOT NULL DEFAULT 1');
 }
+// 実際の請求額。NULL は「分からない」(古い記録・usage.cost が返らなかった実行)
+if (!db.pragma('table_info(agent_calls)').some((row) => row.name === 'cost_usd')) {
+  db.exec('ALTER TABLE agent_calls ADD COLUMN cost_usd REAL');
+}
 
 // 起動した時点で走っている実行は無い。status='running' で残っているのは、
 // 途中でプロセスが死んで finalizeCall / releaseCall に来られなかったぶん。
@@ -93,13 +97,13 @@ if (!db.pragma('table_info(agent_calls)').some((row) => row.name === 'counted'))
   }
 }
 
-// 換算トークンの合計。SQL 側で重みを掛ける (行を JS に運ばずに済む)。
+// 使った額 (USD) の合計。実費があればそれ、無い行だけトークンを換算して足す。
 const WEIGHTED_SUM = `
-  COALESCE(SUM(
+  COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL THEN cost_usd ELSE (
     MAX(prompt_tokens - cached_tokens, 0) * @w_in
     + cached_tokens * @w_cached
     + completion_tokens * @w_out
-  ), 0) AS total
+  ) * @price_in / 1000000.0 END), 0) AS total
 `;
 
 const sumUserStmt = db.prepare(
@@ -132,7 +136,8 @@ const finalizeStmt = db.prepare(`
       rounds = @rounds,
       prompt_tokens = @prompt_tokens,
       completion_tokens = @completion_tokens,
-      cached_tokens = @cached_tokens
+      cached_tokens = @cached_tokens,
+      cost_usd = @cost_usd
   WHERE id = @id
 `);
 const releaseStmt = db.prepare('DELETE FROM agent_calls WHERE id = ?');
@@ -206,22 +211,40 @@ function weights() {
     // 入力 (キャッシュミス) は正規化の基準なので常に 1
     w_in: 1,
     w_cached: getTunable('weight_cached'),
-    w_out: getTunable('weight_output')
+    w_out: getTunable('weight_output'),
+    price_in: getTunable('price_in')
   };
 }
 
-/**
- * ドル ↔ 換算トークン。
- * 換算トークン1個は「キャッシュミス入力1トークン」なので、その単価が換算レート。
- */
-export function usdToTokens(usd) {
-  const rate = getTunable('price_in') / 1_000_000;
-  if (!Number.isFinite(rate) || rate <= 0) return Infinity;
-  return usd / rate;
+const MICRO = 1_000_000;
+
+/** 実行中の予算 (マイクロドル)。 */
+export function usdToBudget(usd) {
+  return Number.isFinite(usd) && usd > 0 ? usd * MICRO : Infinity;
 }
 
-export function tokensToUsd(tokens) {
-  return tokens * (getTunable('price_in') / 1_000_000);
+/**
+ * 実費が分かっているか。会話 agent は有料モデルだけなので、トークンを使ったのに
+ * 請求額が 0 なのは「返ってこなかった」とみなす (無料扱いにして素通しさせない)。
+ */
+function costKnown(usage) {
+  const tokens = (usage.prompt_tokens ?? 0) + (usage.completion_tokens ?? 0);
+  return Number.isFinite(usage.cost) && (usage.cost > 0 || tokens === 0);
+}
+
+/** usage の実費 (USD)。分からないときだけトークンを固定の単価と重みで換算する。 */
+export function costOf(usage = {}) {
+  if (costKnown(usage)) return Math.max(0, usage.cost);
+  const { w_in, w_cached, w_out, price_in } = weights();
+  const prompt = usage.prompt_tokens ?? 0;
+  const cached = usage.prompt_cache_hit_tokens ?? usage.cached_tokens ?? 0;
+  const completion = usage.completion_tokens ?? 0;
+  return ((Math.max(0, prompt - cached) * w_in + cached * w_cached + completion * w_out) * price_in) / MICRO;
+}
+
+/** runtime の weigh に渡す (マイクロドル)。 */
+export function weighCost(usage = {}) {
+  return costOf(usage) * MICRO;
 }
 
 /** その人の1日上限 (ドル)。付与があればそれ、無ければ既定。 */
@@ -299,16 +322,6 @@ export function listGrants() {
     .map((row) => ({ userId: row.key.slice(GRANT_PREFIX.length), usd: row.value, by: row.updated_by }));
 }
 
-/** usage 1件を換算トークンにする。表示にも使う。 */
-export function weighTokens(usage = {}) {
-  const { w_in, w_cached, w_out } = weights();
-  const prompt = usage.prompt_tokens ?? 0;
-  const cached = usage.prompt_cache_hit_tokens ?? usage.cached_tokens ?? 0;
-  const completion = usage.completion_tokens ?? 0;
-
-  return Math.max(0, prompt - cached) * w_in + cached * w_cached + completion * w_out;
-}
-
 function isExempt(userId, admin = false) {
   // 管理者は完全に素通り。上限は荒らしを止める壁で、運営を縛るものではない。
   return admin || agentConfig.exemptUsers.includes(userId);
@@ -334,19 +347,18 @@ export function reserveCall({ guildId, channelId, userId, admin = false, skipUse
   }
 
   if (!exempt) {
-    // 上限はドルで持っているので、判定の直前にトークンへ直す
+    // 上限も使用量もドル (実費)
     if (!skipUserLimit) {
       const userUsd = dailyUsdFor(userId);
-      const userLimit = userUsd > 0 ? usdToTokens(userUsd) : 0;
       const userSince = now - agentConfig.userWindowMs;
       const userUsed = sumUserStmt.get({ user_id: userId, since: userSince, ...weights() }).total;
 
-      if (userLimit > 0 && userUsed >= userLimit) {
+      if (userUsd > 0 && userUsed >= userUsd) {
         const oldest = oldestUserStmt.get(userId, userSince).at ?? now;
         return {
           ok: false,
           scope: 'user',
-          usedUsd: tokensToUsd(userUsed),
+          usedUsd: userUsed,
           limitUsd: userUsd,
           windowMs: agentConfig.userWindowMs,
           retryAt: oldest + agentConfig.userWindowMs
@@ -355,16 +367,15 @@ export function reserveCall({ guildId, channelId, userId, admin = false, skipUse
     }
 
     const globalUsd = getTunable('global_daily_usd');
-    const globalLimit = globalUsd > 0 ? usdToTokens(globalUsd) : 0;
     const globalSince = now - agentConfig.globalWindowMs;
     const globalUsed = sumGlobalStmt.get({ since: globalSince, ...weights() }).total;
 
-    if (globalLimit > 0 && globalUsed >= globalLimit) {
+    if (globalUsd > 0 && globalUsed >= globalUsd) {
       const oldest = oldestGlobalStmt.get(globalSince).at ?? now;
       return {
         ok: false,
         scope: 'global',
-        usedUsd: tokensToUsd(globalUsed),
+        usedUsd: globalUsed,
         limitUsd: globalUsd,
         windowMs: agentConfig.globalWindowMs,
         retryAt: oldest + agentConfig.globalWindowMs
@@ -394,7 +405,8 @@ export function finalizeCall(id, { status = 'ok', rounds = 0, usage = {} } = {})
       rounds,
       prompt_tokens: usage.prompt_tokens ?? 0,
       completion_tokens: usage.completion_tokens ?? 0,
-      cached_tokens: usage.prompt_cache_hit_tokens ?? usage.cached_tokens ?? 0
+      cached_tokens: usage.prompt_cache_hit_tokens ?? usage.cached_tokens ?? 0,
+      cost_usd: costKnown(usage) ? usage.cost : null
     });
   } catch (error) {
     console.error('Failed to finalize agent call:', error);
@@ -412,7 +424,7 @@ export function releaseCall(id, usage = null) {
   running = Math.max(0, running - 1);
 
   try {
-    const spent = usage ? weighTokens(usage) : 0;
+    const spent = usage ? costOf(usage) + (usage.prompt_tokens ?? 0) + (usage.completion_tokens ?? 0) : 0;
     if (spent <= 0) {
       releaseStmt.run(id);
       return;
@@ -425,7 +437,8 @@ export function releaseCall(id, usage = null) {
       rounds: usage.rounds ?? 0,
       prompt_tokens: usage.prompt_tokens ?? 0,
       completion_tokens: usage.completion_tokens ?? 0,
-      cached_tokens: usage.prompt_cache_hit_tokens ?? usage.cached_tokens ?? 0
+      cached_tokens: usage.prompt_cache_hit_tokens ?? usage.cached_tokens ?? 0,
+      cost_usd: costKnown(usage) ? usage.cost : null
     });
   } catch (error) {
     console.error('Failed to release agent call:', error);
@@ -463,11 +476,12 @@ export function remainingFor(userId, admin = false, { skipUserLimit = false } = 
   const userUsd = dailyUsdFor(userId);
   const globalUsd = getTunable('global_daily_usd');
 
+  // 戻り値は実行中の予算と同じマイクロドル
   const userLeft = !skipUserLimit && userUsd > 0
-    ? usdToTokens(userUsd) - sumUserStmt.get({ user_id: userId, since: now - agentConfig.userWindowMs, ...w }).total
+    ? (userUsd - sumUserStmt.get({ user_id: userId, since: now - agentConfig.userWindowMs, ...w }).total) * MICRO
     : Infinity;
   const globalLeft = globalUsd > 0
-    ? usdToTokens(globalUsd) - sumGlobalStmt.get({ since: now - agentConfig.globalWindowMs, ...w }).total
+    ? (globalUsd - sumGlobalStmt.get({ since: now - agentConfig.globalWindowMs, ...w }).total) * MICRO
     : Infinity;
 
   return Math.max(0, Math.min(userLeft, globalLeft));
@@ -477,8 +491,8 @@ export function getUsage(userId) {
   const now = Date.now();
   const w = weights();
 
-  const userTokens = sumUserStmt.get({ user_id: userId, since: now - agentConfig.userWindowMs, ...w }).total;
-  const globalTokens = sumGlobalStmt.get({ since: now - agentConfig.globalWindowMs, ...w }).total;
+  const userSpent = sumUserStmt.get({ user_id: userId, since: now - agentConfig.userWindowMs, ...w }).total;
+  const globalSpent = sumGlobalStmt.get({ since: now - agentConfig.globalWindowMs, ...w }).total;
   const userUsd = dailyUsdFor(userId);
   const globalUsd = getTunable('global_daily_usd');
 
@@ -488,16 +502,13 @@ export function getUsage(userId) {
   const globalBilled = sumBilledStmt.get({ since: now - agentConfig.globalWindowMs, ...w }).total;
 
   return {
-    // 表示はドル、突き合わせ用にトークンも返す (内部の勘定はトークンなので)
-    userUsd: tokensToUsd(userTokens),
+    // どれも実費 (USD)。実費の無い古い行だけ換算した見積もりが混ざる
+    userUsd: userSpent,
     userLimitUsd: userUsd,
-    userTokens,
-    userLimitTokens: userUsd > 0 ? usdToTokens(userUsd) : Infinity,
-    globalUsd: tokensToUsd(globalTokens),
+    globalUsd: globalSpent,
     globalLimitUsd: globalUsd,
-    globalTokens,
-    userBilledUsd: tokensToUsd(userBilled),
-    globalBilledUsd: tokensToUsd(globalBilled),
+    userBilledUsd: userBilled,
+    globalBilledUsd: globalBilled,
     running
   };
 }

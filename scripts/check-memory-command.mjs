@@ -141,6 +141,13 @@ const takoOption = peopleJson.components.find((row) => row.components[0].type ==
 const tako = click({ customId: 'memx:open', values: [takoOption.value] });
 await handleMemoryComponent(tako);
 const takoJson = json(tako.updates[0]);
+// 1つのメニューの中で値が重複すると Discord が拒否する (親ページで同じ出来事が子ページ経由で重複した)
+for (const view of [rootJson, peopleJson, takoJson]) {
+  for (const menu of view.components.flatMap((row) => row.components).filter((c) => c.type === 3)) {
+    const values = menu.options.map((o) => o.value);
+    assert.equal(new Set(values).size, values.length, 'select option values must be unique: ' + values.join(','));
+  }
+}
 const ids = takoJson.components.flatMap((row) => row.components).map((c) => c.custom_id);
 assert.equal(new Set(ids).size, ids.length, 'component ids must be unique within a message: ' + ids.join(','));
 assert.match(takoJson.embeds[0].description, /sakana bot を作っている/);

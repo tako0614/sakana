@@ -60,7 +60,8 @@ function providerMessage(message) {
 const memoryStateTool = { type: 'function', function: { name: 'memory_focus',
   description: '次の推論で探す記憶の焦点を設定する。文脈と、明示できる短い検討状態を使う。事実認定や外部操作は行わない。',
   parameters: { type: 'object', properties: { context: { type: 'string', maxLength: 3000 }, thought: { type: 'string', maxLength: 3000 } }, additionalProperties: false } } };
-const emptyUsage = () => ({ prompt_tokens: 0, completion_tokens: 0, prompt_cache_hit_tokens: 0 });
+// cost は OpenRouter の実際の請求額 (USD)。会話 agent の上限はこれで数える
+const emptyUsage = () => ({ prompt_tokens: 0, completion_tokens: 0, prompt_cache_hit_tokens: 0, cost: 0 });
 const usageKeys = Object.keys(emptyUsage());
 
 function liveMemoryContext(state) {

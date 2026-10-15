@@ -306,7 +306,7 @@ system prompt は毎ターン送り直すので短さがそのまま費用です
 
 ### モデルとトークン
 
-`deepseek-v4-flash` を OpenAI 互換の ChatCompletions で呼びます (`thinking` 有効 / `reasoning_effort=high`)。`low / high / max` の真ん中が `high` です。
+OpenRouter の安いモデルを人ごとに `/model` で選びます。既定は `ling` (`inclusionai/ling-3.0-flash`)、ほかに `glm` (`z-ai/glm-5.3-flash`) と `qwen` (`qwen/qwen3.7-flash`)。思考は `reasoning.effort=medium` です (flash 系は `high` だと考えるだけで分単位になる)。2026-10-15 に DeepSeek v4 flash から切り替えました。
 
 トークンを使わないための作りが何点かあります。
 
@@ -632,15 +632,18 @@ URL の判定は**名前ではなく解決した IP** で行います (`src/agen
 
 ```env
 OPENROUTER_API_KEY=sk-or-...             # これが無ければエージェントは無効 (他の機能は動く)
-AI_MODEL=deepseek/deepseek-v4-flash-0731
-MEMORY_TREE_MODELS=google/gemma-4-31b-it:free,nvidia/nemotron-3-super-120b-a12b:free  # 記憶の木を作るモデル (docs/memory-tree.md)
-AGENT_REASONING_EFFORT=high         # low / high / max の真ん中
+AI_MODEL=z-ai/glm-5.3-flash         # 統治と、モデルを指定しない呼び出しの既定
+AGENT_MODEL_LING=inclusionai/ling-3.0-flash   # /model ling (既定)
+AGENT_MODEL_GLM=z-ai/glm-5.3-flash            # /model glm
+AGENT_MODEL_QWEN=qwen/qwen3.7-flash           # /model qwen
+MEMORY_TREE_MODELS=z-ai/glm-5.3-flash,inclusionai/ling-3.0-flash  # 記憶の本を作るモデル (docs/memory-tree.md)
+AGENT_REASONING_EFFORT=medium       # low / medium / high
 AGENT_THINKING=true
 
-AGENT_TOKEN_WEIGHT_CACHED=0.2       # 固定の使用量換算比。請求額とは別
-AGENT_TOKEN_WEIGHT_OUTPUT=2.0       # 固定の使用量換算比
-AGENT_PRICE_IN_PER_MTOK=0.14        # ドル ↔ 換算トークンの換算レート
-AGENT_REQUEST_USD=0.02              # 1リクエストの暴走ガード
+AGENT_TOKEN_WEIGHT_CACHED=0.2       # 実費が返らなかった記録の見積もり用
+AGENT_TOKEN_WEIGHT_OUTPUT=2.0       # 同上
+AGENT_PRICE_IN_PER_MTOK=0.14        # 同上
+AGENT_REQUEST_USD=0.02              # 1リクエストの暴走ガード (実費)
 AGENT_USER_DAILY_USD=0.05           # 1人あたり
 AGENT_USER_WINDOW_MS=86400000       # の 24 時間 (移動窓) で
 AGENT_GLOBAL_DAILY_USD=0.5          # 全体
@@ -666,11 +669,13 @@ AGENT_BROWSER_ALLOW_LOCAL=false     # 内部ネットワークへの到達を許
 
 #### 使用量の数え方
 
-**勘定はトークン、意思決定はドル**です。
+**勘定も上限も、OpenRouter が1回ごとに返す実際の請求額 (`usage.cost`) です** (2026-10-15 から)。
 
-トークンで数えるのは、軽い一言と全期間の調査が同じ「1回」として数えられて費用と合わないから。**ドルで設定する**のは、「換算トークン500万」では高いか安いか判断できないからです。保存するのは生のトークン数なので、値上げされても過去の記録の意味が変わりません。
+モデルを人ごとに選べるので、固定の単価でトークンを換算すると請求とずれます。1回ごとの実費を `agent_calls.cost_usd` に保存して、1人あたり・全体の24時間 (移動窓) の合計で判定し、実行中は1リクエストの上限と残りの小さい方を予算にします (単位はマイクロドル)。
 
-換算トークン1個は「キャッシュミス入力1トークン」で、重みは実単価の比です。`deepseek-v4-flash` は1Mトークンあたり 入力 $0.14 / キャッシュ $0.028 / 出力 $0.28 なので **0.2 と 2.0**。上限はこの換算レート (`AGENT_PRICE_IN_PER_MTOK`) でドルからトークンに直します。
+実費が返らなかった記録 (2026-10-15 より前の DeepSeek 時代の行・`usage.cost` が無い応答) だけ、従来どおり「キャッシュミス入力1トークン」を基準にした重み (0.2 / 2.0) と単価 `AGENT_PRICE_IN_PER_MTOK` で見積もります。有料モデルでトークンを使ったのに請求額が 0 の応答も、返ってこなかったとみなして見積もります (無料扱いで素通しさせない)。
+
+以下は DeepSeek v4 flash 時代の実測です。
 
 本番の実測 (`agent_calls`)。プロンプトを直す前後で1回あたりの費用が変わりました。
 

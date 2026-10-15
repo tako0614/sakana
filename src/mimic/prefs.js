@@ -1,4 +1,4 @@
-import { agentConfig } from '../agent/config.js';
+import { AGENT_ENGINES, DEFAULT_AGENT_ENGINE } from '../agent/engines.js';
 // どのモデルで答えるかの選択。誰でも自分のぶんだけ変えられる。
 //
 // agent_settings は value が REAL なので文字列を入れられない。数値に符号化すると
@@ -18,14 +18,23 @@ const countStmt = db.prepare('SELECT engine, COUNT(*) n FROM agent_engine WHERE 
 /**
  * 選べるエンジン。
  *
- * 別物なのは「モデル名が違う」だけではない。deepseek は道具を持ったエージェントで、
+ * 別物なのは「モデル名が違う」だけではない。ling / glm / qwen は道具を持ったエージェントで、
  * evex は 94万件から作った 5.87M の言語モデルで、道具も system プロンプトも使えず
  * 会話の続きを書くだけ。答えの形そのものが変わる。
  */
 export const ENGINES = {
-  deepseek: {
-    label: agentConfig.model,
-    summary: '検索・read・web・引用つきのエージェント。事実を調べて答える'
+  // 道具を持ったエージェント (検索・read・web・記憶・引用)。モデルだけが違う
+  ling: {
+    label: AGENT_ENGINES.ling,
+    summary: '検索・read・web・記憶・引用つきのエージェント (既定)。いちばん安い'
+  },
+  glm: {
+    label: AGENT_ENGINES.glm,
+    summary: '同じエージェントを glm-5.3-flash で。ling より少し高いが、日付や固有名に強い'
+  },
+  qwen: {
+    label: AGENT_ENGINES.qwen,
+    summary: '同じエージェントを qwen3.7-flash で'
   },
   evex: {
     label: 'evex-2',
@@ -102,12 +111,13 @@ export const ENGINES = {
   }
 };
 
-export const DEFAULT_ENGINE = 'deepseek';
+export const DEFAULT_ENGINE = DEFAULT_AGENT_ENGINE;
 
 // **消したエンジンの読み替え先。**選択は DB に残るので、名前を消しただけだと
-// `ENGINES[row.engine]` が undefined になって**黙って deepseek に落ちる**。
+// `ENGINES[row.engine]` が undefined になって**黙って既定に落ちる**。
 // 選び直しを強いるのも筋が違うので、後継に読み替える
-const RENAMED = { 'evex-5.2-a': 'evex-5.2', 'evex-5.2-b': 'evex-5.2' };
+// deepseek は 2026-10-15 に廃止 (OpenRouter の安いモデルへ)。選んでいた人は既定の ling へ
+const RENAMED = { 'evex-5.2-a': 'evex-5.2', 'evex-5.2-b': 'evex-5.2', deepseek: DEFAULT_AGENT_ENGINE };
 
 export function engineFor(userId, guildId) {
   const row = getStmt.get(requireGuildId(guildId), String(userId));

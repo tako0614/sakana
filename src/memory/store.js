@@ -434,11 +434,15 @@ export function getEpisode(guildId, id) {
 
 /** ページに関わる出来事。重要なもの・新しいものから。 */
 export function episodesFor(guildId, path, limit = 8) {
+  // 子ページ経由で同じ出来事が何度も当たるので1件ずつにまとめる
+  // (重複したまま /memory explore のメニューに並べると Discord が拒否した)
   return memoryDb().prepare(`
-    SELECT e.id, e.title, e.summary, e.at_ms, e.importance FROM episode_nodes n JOIN episodes e ON e.id = n.episode_id
-    WHERE n.guild_id = ? AND (n.path = ? OR n.path LIKE ? ESCAPE '\\')
+    SELECT e.id, e.title, e.summary, e.at_ms, e.importance FROM episodes e
+    WHERE e.guild_id = ? AND e.id IN (
+      SELECT n.episode_id FROM episode_nodes n WHERE n.guild_id = ? AND (n.path = ? OR n.path LIKE ? ESCAPE '\\')
+    )
     ORDER BY e.importance DESC, e.at_ms DESC LIMIT ?
-  `).all(guildId, path, `${path.replace(/[%_\\]/g, (c) => `\\${c}`)}/%`, limit);
+  `).all(guildId, guildId, path, `${path.replace(/[%_\\]/g, (c) => `\\${c}`)}/%`, limit);
 }
 
 /** 2つのページが両方関わった出来事 (時系列)。 */

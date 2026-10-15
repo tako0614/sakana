@@ -23,7 +23,7 @@ import {
   refreshStale,
   saveChunkVectors
 } from './chunks.js';
-import { getEmbedState, listEmbedGuilds, setEmbedState } from './db.js';
+import { db, getEmbedState, listEmbedGuilds, setEmbedState } from './db.js';
 import { claimJob, getRunningJob, releaseJob } from './indexer.js';
 import { ensureModelId } from './vectors.js';
 
@@ -38,6 +38,19 @@ let cachedModel = null;
  */
 export async function resolveModel() {
   if (cachedModel) return cachedModel;
+
+  // 登録済みならそれを使う。以前は毎回まず1件埋め込んで次元を確かめていたので、
+  // 再起動後の最初のメンションで Python (torch と E5) の起動を待ち、HDD の本番では
+  // 返事まで2分かかっていた (2026-10-15)。
+  const known = db.prepare(`
+    SELECT model_id, dim FROM embed_models
+    WHERE name = ? AND quant = 'int8' AND prefix_query = 'query: ' AND prefix_passage = 'passage: '
+    ORDER BY model_id DESC LIMIT 1
+  `).get(embedConfig.modelName);
+  if (known) {
+    cachedModel = { modelId: known.model_id, dim: known.dim, name: embedConfig.modelName };
+    return cachedModel;
+  }
 
   // 1件だけ埋め込んで ready の情報を取る
   const probe = await embedTexts(['モデルの次元を確かめるための文'], { kind: 'passage' });
