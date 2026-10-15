@@ -132,8 +132,8 @@ const fake = async ({ kind, user }) => {
     if (log.includes('統治機能')) {
       return { model: 'fake', json: {
         episodes: [
-          { title: '統治機能の実装を始めた', summary: 'たこが sakana bot に国会の仕組みを入れ始め、さばが裁判所も欲しいと言った。',
-            lines: [1, 2], nodes: ['people/たこ', 'people/さば', 'projects/sakana-bot'], importance: 3 },
+          { kind: 'レスバ 気味の決定', title: '統治機能の実装を始めた', summary: 'たこが sakana bot に国会の仕組みを入れ始め、さばが裁判所も欲しいと言った。',
+            lines: [1, 2], quotes: [2, 999], nodes: ['people/たこ', 'people/さば', 'projects/sakana-bot', 'debates/統治の作り方'], importance: 3 },
           { title: '存在しない行', summary: '根拠の行が実在しない', lines: [999], nodes: ['people/たこ'] }
         ],
         facts: [
@@ -147,7 +147,7 @@ const fake = async ({ kind, user }) => {
       } };
     }
     if (log.includes('裁判所の実装')) {
-      const known = /e(\d+) \d{4}-\d{2}-\d{2} 統治機能の実装を始めた/.exec(user);
+      const known = /e(\d+) \d{4}-\d{2}-\d{2}(?: \[[^\]]*\])? 統治機能の実装を始めた/.exec(user);
       return { model: 'fake', json: {
         episodes: [{ title: '裁判所を実装した', summary: 'さばが sakana bot の裁判所を実装し、テストが通った。', lines: [1, 3],
           nodes: ['people/さば', 'sakana'], related: known ? [`e${known[1]}`] : [], importance: 2 }],
@@ -202,6 +202,9 @@ const counts = memoryCounts(GUILD);
 // 雑談は区切りの大きさ次第で2回に分かれるので、件数は下限だけ見る
 if (counts.episodes < 2) fail('at least two episodes expected: ' + JSON.stringify(counts));
 const start = getEpisode(GUILD, 1);
+if (start.kind !== 'レスバ 気味の決定') fail('episode kind must be stored: ' + start.kind);
+if (start.highlights.length !== 1 || start.highlights[0] !== reply) fail('quotes must be stored as the real message ids of the cited lines: ' + JSON.stringify(start.highlights));
+if (!getNode(GUILD, 'debates/統治の作り方')) fail('debates is a top level the writer can use');
 if (!start.sources.includes(first) || !start.sources.includes(reply)) fail('episode sources must be the cited messages: ' + JSON.stringify(start.sources));
 if (start.at_ms !== T0) fail('episode time must come from the messages, not the model');
 for (const path of ['people/たこ', 'people/さば', 'projects/sakana-bot']) {
@@ -288,8 +291,11 @@ if (!page.includes('e2') || !page.includes('[[people/たこ]]')) fail('a page mu
 const both = runMemoryTool(ctx, { path: 'people/たこ', with: 'people/さば' });
 if (!both.includes('統治機能の実装を始めた')) fail('with must list episodes shared by both pages:\n' + both);
 const opened = runMemoryTool(ctx, { episode: 'e1' });
+if (!opened.includes('★') || !opened.includes('いいね、裁判所も欲しい') || !opened.includes('[レスバ 気味の決定]')) fail('an episode must show its kind and highlighted quote verbatim:\n' + opened);
+if (!runMemoryTool(ctx, { query: 'レスバ' }).includes('統治機能の実装を始めた')) fail('episodes must be searchable by kind');
 if (!opened.includes('1) ') || !opened.includes('sakana bot の統治機能を作ってる')) fail('an episode must open its source messages with citation numbers:\n' + opened);
-if (refs.entries[0]?.messageId !== first) fail('cited sources must be registered for citation');
+// 決め台詞は先に並ぶので順番は問わない。根拠の発言が引用番号として登録されていること
+if (!refs.entries.some((entry) => entry.messageId === first) || refs.entries[0]?.messageId !== reply) fail('cited sources must be registered for citation, highlights first');
 if (!opened.includes('後の出来事: e2')) fail('an episode must show what followed');
 const found = runMemoryTool(ctx, { query: '裁判所' });
 if (!found.includes('裁判所を実装した')) fail('query must find episodes:\n' + found);
@@ -318,7 +324,19 @@ if (memoryRootPrompt('nobody') !== '') fail('a guild without memory must add not
 
 if (normalizePath('/people//たこ/') !== 'people/たこ') fail('slashes must collapse');
 if (normalizePath('[[people/たこ]]') !== 'people/たこ') fail('wiki links must normalize');
-if (normalizePath('../../etc') !== 'topics/etc') fail('.. must be dropped');
+if (normalizePath('../../etc') !== 'etc') fail('.. must be dropped');
+if (normalizePath('Debates/x') !== 'debates/x') fail('ASCII top levels are lowercased');
+// 新しい最上位は上限まで。超えたら topics の下に入れて根を散らかさない
+{
+  const { placeTopLevel, MAX_TOP_LEVEL, ensureNode, topLevels } = await import('../src/memory/store.js');
+  const CAP = '900000000000000003';
+  resetTree(CAP);
+  for (let i = 0; i < MAX_TOP_LEVEL; i += 1) ensureNode(CAP, `cat${i}`);
+  if (placeTopLevel(CAP, 'cat3/x') !== 'cat3/x') fail('an existing top level stays');
+  if (placeTopLevel(CAP, 'brandnew/x') !== 'topics/brandnew/x') fail('past the cap a new top level goes under topics');
+  if (topLevels(CAP).length !== MAX_TOP_LEVEL) fail('topLevels lists the root children');
+  resetTree(CAP);
+}
 if (normalizePath('a/b/c/d/e/f').split('/').length > 4) fail('depth must be capped');
 if (copiedRatio('まったく別の言い方でまとめた説明文になっている', 'たこ:sakanabotの統治機能を作ってる') > 0.2) fail('paraphrase must not count as a copy');
 if (!segmentPrompt(GUILD, { text: 'x', lineMap: new Map() }).includes('JSON だけ')) fail('segment prompt must end with the output reminder');

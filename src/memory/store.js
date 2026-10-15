@@ -17,14 +17,18 @@ import { tuneSqlite } from '../sqlite.js';
 
 const dbPath = process.env.MEMORY_DB_PATH ?? 'memory.sqlite';
 
-// 根の直下。モデルが勝手に増やすと根が散らかるので、知らないものは topics に入れる。
+// 根の直下の種。型に押し込まないよう、モデルが必要なら新しい最上位を作ってよい
+// (MAX_TOP_LEVEL まで。それを超えたら topics の下に入れて、根を散らかさない)。
 export const TOP_LEVEL = [
-  ['people', '人物 (役割・得意なこと・作ったもの・好み・関係)'],
+  ['people', '人物 (性格・立場や意見・得意なこと・作ったもの・口癖・人との関係)'],
   ['projects', '作っているもの (bot・サービス・作品・リポジトリ)'],
   ['topics', 'よく出る話題・技術的な知見・議論の結論'],
-  ['events', '大きな出来事のまとめ (移行・企画・事件)'],
-  ['server', 'サーバーのルール・チャンネル・文化・用語・内輪ネタ']
+  ['events', '大きな出来事のまとめ (移行・企画・事件・炎上)'],
+  ['debates', 'レスバ・議論・揉め事 (誰と誰が何で、それぞれの主張、どう終わったか)'],
+  ['culture', 'ネタ・ミーム・名言/迷言・内輪のノリ'],
+  ['server', 'サーバーのルール・チャンネル・用語']
 ];
+export const MAX_TOP_LEVEL = 12;
 
 export const MAX_DEPTH = 4;
 const MAX_PART = 48;
@@ -76,8 +80,10 @@ export function memoryDb() {
     CREATE TABLE IF NOT EXISTS episodes (
       id INTEGER PRIMARY KEY,
       guild_id TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT '',   -- 自由な種類名 (レスバ / ネタ / 事件 / 決定 / 近況 …)
       title TEXT NOT NULL,
       summary TEXT NOT NULL,
+      highlights TEXT NOT NULL DEFAULT '[]', -- 決め台詞・名言として残す発言の message_id (原文はアーカイブから引く)
       channel_id TEXT NOT NULL,
       at_ms INTEGER NOT NULL,          -- 根拠の発言の最初と最後 (モデルの書いた日付ではなく原文の時刻)
       end_ms INTEGER NOT NULL,
@@ -86,15 +92,6 @@ export function memoryDb() {
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_episodes_time ON episodes(guild_id, at_ms);
-    CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
-      title, summary, content='episodes', content_rowid='id', tokenize='trigram'
-    );
-    CREATE TRIGGER IF NOT EXISTS episodes_ai AFTER INSERT ON episodes BEGIN
-      INSERT INTO episodes_fts(rowid, title, summary) VALUES (new.id, new.title, new.summary);
-    END;
-    CREATE TRIGGER IF NOT EXISTS episodes_ad AFTER DELETE ON episodes BEGIN
-      INSERT INTO episodes_fts(episodes_fts, rowid, title, summary) VALUES ('delete', old.id, old.title, old.summary);
-    END;
 
     -- 出来事に関わったページ。ページ → 出来事 → 別のページ、とたどる結び目。
     CREATE TABLE IF NOT EXISTS episode_nodes (
@@ -172,6 +169,32 @@ export function memoryDb() {
 
     CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   `);
+
+  // 種類名と決め台詞の列 (2026-10-15 に追加)。古い DB には足す
+  const columns = new Set(db.pragma('table_info(episodes)').map((row) => row.name));
+  if (!columns.has('kind')) db.exec("ALTER TABLE episodes ADD COLUMN kind TEXT NOT NULL DEFAULT ''");
+  if (!columns.has('highlights')) db.exec("ALTER TABLE episodes ADD COLUMN highlights TEXT NOT NULL DEFAULT '[]'");
+  // 出来事の全文検索は種類名も引く (「レスバ」で探せるように)。列が違えば作り直す
+  const ftsColumns = db.pragma('table_info(episodes_fts)').map((row) => row.name);
+  if (!ftsColumns.includes('kind')) {
+    db.exec(`
+      DROP TRIGGER IF EXISTS episodes_ai;
+      DROP TRIGGER IF EXISTS episodes_ad;
+      DROP TABLE IF EXISTS episodes_fts;
+      CREATE VIRTUAL TABLE episodes_fts USING fts5(
+        title, summary, kind, content='episodes', content_rowid='id', tokenize='trigram'
+      );
+      INSERT INTO episodes_fts(episodes_fts) VALUES ('rebuild');
+    `);
+  }
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS episodes_ai AFTER INSERT ON episodes BEGIN
+      INSERT INTO episodes_fts(rowid, title, summary, kind) VALUES (new.id, new.title, new.summary, new.kind);
+    END;
+    CREATE TRIGGER IF NOT EXISTS episodes_ad AFTER DELETE ON episodes BEGIN
+      INSERT INTO episodes_fts(episodes_fts, rowid, title, summary, kind) VALUES ('delete', old.id, old.title, old.summary, old.kind);
+    END;
+  `);
   return db;
 }
 
@@ -185,8 +208,8 @@ const json = (text, fallback) => { try { return JSON.parse(text); } catch { retu
 // ---- パス -----------------------------------------------------------------
 
 /**
- * モデルが書いたパスを木の中の位置に直す。空・`..`・深すぎるものは null。
- * 知らない最上位は topics の下に入れる (根の直下を増やさない)。
+ * モデルが書いたパスを木の中の位置に直す。空・`..` は null、深すぎる分は切る。
+ * 英字の最上位は小文字にそろえる。新しい最上位を許すかは placeTopLevel が決める。
  */
 export function normalizePath(raw) {
   const parts = String(raw ?? '')
@@ -196,10 +219,27 @@ export function normalizePath(raw) {
     .map((part) => part.replace(/[\s　]+/g, ' ').replace(/[#`*<>|?"[\]]/g, '').trim().slice(0, MAX_PART))
     .filter((part) => part && part !== '.' && part !== '..');
   if (parts.length === 0) return null;
-  const top = TOP_LEVEL.find(([name]) => name === parts[0].toLowerCase());
-  if (top) parts[0] = top[0];
-  else parts.unshift('topics');
+  if (/^[\x20-\x7e]+$/.test(parts[0])) parts[0] = parts[0].toLowerCase();
   return parts.slice(0, MAX_DEPTH).join('/');
+}
+
+/**
+ * 新しい最上位を作ってよいか。既にある最上位ならそのまま、まだ MAX_TOP_LEVEL に
+ * 達していなければ新しく作ってよい。超えていたら topics の下に入れる。
+ */
+export function placeTopLevel(guildId, path) {
+  if (!path) return path;
+  const top = path.split('/')[0];
+  const d = memoryDb();
+  if (d.prepare("SELECT 1 FROM nodes WHERE guild_id = ? AND path = ?").get(guildId, top)) return path;
+  const count = d.prepare("SELECT COUNT(*) AS c FROM nodes WHERE guild_id = ? AND parent = ''").get(guildId).c;
+  if (count < MAX_TOP_LEVEL) return path;
+  return ['topics', ...path.split('/')].slice(0, MAX_DEPTH).join('/');
+}
+
+/** 根の直下 (種と、モデルが作ったもの)。重い順。 */
+export function topLevels(guildId, limit = MAX_TOP_LEVEL) {
+  return listChildren(guildId, '', limit).map((row) => row.path);
 }
 
 export const parentOf = (path) => (path === '' ? null : path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
@@ -374,11 +414,11 @@ export function nodeNames(guildId) {
 
 // ---- 出来事 ---------------------------------------------------------------
 
-export function insertEpisode(guildId, { title, summary, channelId, atMs, endMs, sources, importance, now = Date.now() }) {
+export function insertEpisode(guildId, { kind = '', title, summary, channelId, atMs, endMs, sources, highlights = [], importance, now = Date.now() }) {
   return Number(memoryDb().prepare(`
-    INSERT INTO episodes (guild_id, title, summary, channel_id, at_ms, end_ms, sources, importance, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(guildId, title, summary, channelId, atMs, endMs, JSON.stringify(sources), importance, now).lastInsertRowid);
+    INSERT INTO episodes (guild_id, kind, title, summary, channel_id, at_ms, end_ms, sources, highlights, importance, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(guildId, kind, title, summary, channelId, atMs, endMs, JSON.stringify(sources), JSON.stringify(highlights), importance, now).lastInsertRowid);
 }
 
 export function linkEpisodeNodes(guildId, episodeId, paths, at) {
@@ -424,10 +464,11 @@ export function getEpisode(guildId, id) {
   return {
     ...row,
     sources: json(row.sources, []),
+    highlights: json(row.highlights, []),
     nodes: d.prepare('SELECT path FROM episode_nodes WHERE episode_id = ?').all(id).map((r) => r.path),
-    before: d.prepare(`SELECT e.id, e.title, e.at_ms FROM episode_links l JOIN episodes e ON e.id = l.to_id
+    before: d.prepare(`SELECT e.id, e.kind, e.title, e.at_ms FROM episode_links l JOIN episodes e ON e.id = l.to_id
       WHERE l.guild_id = ? AND l.from_id = ? ORDER BY e.at_ms`).all(guildId, id),
-    after: d.prepare(`SELECT e.id, e.title, e.at_ms FROM episode_links l JOIN episodes e ON e.id = l.from_id
+    after: d.prepare(`SELECT e.id, e.kind, e.title, e.at_ms FROM episode_links l JOIN episodes e ON e.id = l.from_id
       WHERE l.guild_id = ? AND l.to_id = ? ORDER BY e.at_ms`).all(guildId, id)
   };
 }
@@ -437,7 +478,7 @@ export function episodesFor(guildId, path, limit = 8) {
   // 子ページ経由で同じ出来事が何度も当たるので1件ずつにまとめる
   // (重複したまま /memory explore のメニューに並べると Discord が拒否した)
   return memoryDb().prepare(`
-    SELECT e.id, e.title, e.summary, e.at_ms, e.importance FROM episodes e
+    SELECT e.id, e.kind, e.title, e.summary, e.at_ms, e.importance FROM episodes e
     WHERE e.guild_id = ? AND e.id IN (
       SELECT n.episode_id FROM episode_nodes n WHERE n.guild_id = ? AND (n.path = ? OR n.path LIKE ? ESCAPE '\\')
     )
@@ -448,7 +489,7 @@ export function episodesFor(guildId, path, limit = 8) {
 /** 2つのページが両方関わった出来事 (時系列)。 */
 export function sharedEpisodes(guildId, a, b, limit = 15) {
   return memoryDb().prepare(`
-    SELECT e.id, e.title, e.summary, e.at_ms FROM episodes e
+    SELECT e.id, e.kind, e.title, e.summary, e.at_ms FROM episodes e
     WHERE e.guild_id = ?
       AND EXISTS (SELECT 1 FROM episode_nodes x WHERE x.episode_id = e.id AND x.path = ?)
       AND EXISTS (SELECT 1 FROM episode_nodes y WHERE y.episode_id = e.id AND y.path = ?)
@@ -469,7 +510,7 @@ export function linkedPages(guildId, path, limit = 8) {
 /** 区切りを書く前に渡す「最近の出来事」。続きの出来事を前のものと結ばせる。 */
 export function recentEpisodesFor(guildId, path, limit = 3) {
   return memoryDb().prepare(`
-    SELECT e.id, e.title, e.at_ms FROM episode_nodes n JOIN episodes e ON e.id = n.episode_id
+    SELECT e.id, e.kind, e.title, e.at_ms FROM episode_nodes n JOIN episodes e ON e.id = n.episode_id
     WHERE n.guild_id = ? AND n.path = ? ORDER BY e.at_ms DESC LIMIT ?
   `).all(guildId, path, limit);
 }
@@ -517,15 +558,15 @@ export function searchNodes(guildId, query, limit = 8) {
 export function searchEpisodes(guildId, query, limit = 8) {
   const terms = splitTerms(query);
   const rows = ftsSearch(`
-    SELECT e.id, e.title, e.summary, e.at_ms FROM episodes_fts JOIN episodes e ON e.id = episodes_fts.rowid
-    WHERE episodes_fts MATCH ? AND e.guild_id = ? ORDER BY bm25(episodes_fts, 3.0, 1.0) LIMIT ?
+    SELECT e.id, e.kind, e.title, e.summary, e.at_ms FROM episodes_fts JOIN episodes e ON e.id = episodes_fts.rowid
+    WHERE episodes_fts MATCH ? AND e.guild_id = ? ORDER BY bm25(episodes_fts, 3.0, 1.0, 2.0) LIMIT ?
   `, terms, [guildId], limit);
   const short = terms.filter((t) => [...t].length < 3);
   if (rows.length < limit && short.length > 0) {
-    const where = short.map(() => '(title LIKE ? OR summary LIKE ?)').join(' AND ');
-    const params = short.flatMap((t) => { const p = `%${t.replace(/[%_]/g, '')}%`; return [p, p]; });
+    const where = short.map(() => '(title LIKE ? OR summary LIKE ? OR kind LIKE ?)').join(' AND ');
+    const params = short.flatMap((t) => { const p = `%${t.replace(/[%_]/g, '')}%`; return [p, p, p]; });
     const seen = new Set(rows.map((row) => row.id));
-    for (const row of memoryDb().prepare(`SELECT id, title, summary, at_ms FROM episodes WHERE guild_id = ? AND ${where}
+    for (const row of memoryDb().prepare(`SELECT id, kind, title, summary, at_ms FROM episodes WHERE guild_id = ? AND ${where}
       ORDER BY importance DESC, at_ms DESC LIMIT ?`).all(guildId, ...params, limit)) {
       if (!seen.has(row.id)) rows.push(row);
     }

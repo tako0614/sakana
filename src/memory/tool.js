@@ -1,6 +1,6 @@
 import { db as archive } from '../archive/db.js';
 import {
-  TOP_LEVEL, episodesFor, getEpisode, getNode, hasTree, linkedPages, listChildren, loadPublicChannels, nameOf,
+  topLevels, episodesFor, getEpisode, getNode, hasTree, linkedPages, listChildren, loadPublicChannels, nameOf,
   normalizePath, searchEpisodes, searchNodes, sharedEpisodes
 } from './store.js';
 
@@ -37,7 +37,7 @@ export function hasMemory(guildId) {
   try { return hasTree(guildId); } catch { return false; }
 }
 
-const episodeLine = (episode) => `e${episode.id} ${day(episode.at_ms)} ${episode.title}`;
+const episodeLine = (episode) => `e${episode.id} ${day(episode.at_ms)}${episode.kind ? ` [${episode.kind}]` : ''} ${episode.title}`;
 
 function openPage(guildId, node) {
   const lines = [`# ${node.path || '(根)'}${node.summary ? ` — ${node.summary}` : ''}`];
@@ -74,7 +74,7 @@ function openEpisode(ctx, id) {
   if (!episode) return `出来事 e${id} はありません。`;
   const channel = archive.prepare('SELECT name FROM channels WHERE channel_id = ?').get(episode.channel_id);
   const lines = [
-    `e${episode.id} ${day(episode.at_ms)} #${channel?.name ?? episode.channel_id} — ${episode.title}`,
+    `e${episode.id} ${day(episode.at_ms)} #${channel?.name ?? episode.channel_id}${episode.kind ? ` [${episode.kind}]` : ''} — ${episode.title}`,
     episode.summary,
     `関わり: ${episode.nodes.map((path) => `[[${path}]]`).join(' ') || '-'}`
   ];
@@ -83,7 +83,7 @@ function openEpisode(ctx, id) {
 
   // 根拠の発言。いま公開のチャンネルで、消されていないものだけ
   const open = new Set(loadPublicChannels(ctx.guildId)?.channelIds ?? []);
-  const ids = episode.sources.slice(0, 10);
+  const ids = [...new Set([...(episode.highlights ?? []), ...episode.sources])].slice(0, 12);
   const rows = ids.length ? archive.prepare(`
     SELECT m.message_id, m.channel_id, m.author_id, m.author_name, m.content, m.created_at, c.name AS channel_name
     FROM messages m LEFT JOIN channels c ON c.channel_id = m.channel_id
@@ -93,7 +93,10 @@ function openEpisode(ctx, id) {
   if (visible.length === 0) {
     lines.push('根拠の発言: (消されたか、非公開になって開けません)');
   } else {
-    lines.push('根拠の発言:');
+    // 決め台詞・名言として残した発言を先に (原文そのまま)
+    const highlighted = new Set(episode.highlights ?? []);
+    visible.sort((a, b) => Number(highlighted.has(b.message_id)) - Number(highlighted.has(a.message_id)) || a.created_at - b.created_at);
+    lines.push('根拠の発言 (★ は決め台詞として残したもの):');
     for (const row of visible) {
       const ref = ctx.refs?.add({
         guildId: ctx.guildId, channelId: row.channel_id, channelName: row.channel_name ?? row.channel_id,
@@ -101,7 +104,7 @@ function openEpisode(ctx, id) {
         content: row.content, createdAt: row.created_at
       });
       const text = row.content.replace(/\s*\n\s*/g, ' / ').slice(0, 300);
-      lines.push(`${ref ? `${ref}) ` : ''}${minute(row.created_at)} ${row.author_name}: ${text}`);
+      lines.push(`${highlighted.has(row.message_id) ? '★ ' : ''}${ref ? `${ref}) ` : ''}${minute(row.created_at)} ${row.author_name}: ${text}`);
     }
   }
   return lines.join('\n');
@@ -160,7 +163,7 @@ export function memoryRootPrompt(guildId) {
   ];
   if (root?.body) lines.push('', root.body);
   lines.push('');
-  for (const [top] of TOP_LEVEL) {
+  for (const top of topLevels(guildId)) {
     const children = listChildren(guildId, top, 30);
     if (children.length === 0) continue;
     let line = `- ${top}/ (${children.length >= 30 ? '30+' : children.length}):`;

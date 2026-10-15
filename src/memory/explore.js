@@ -65,7 +65,7 @@ export function pageView(guildId, node) {
   const episodes = node.path ? episodesFor(guildId, node.path, 25) : [];
   if (episodes.length) {
     components.push(select(`${PREFIX}:open:episodes`, '📜 関わった出来事を開く', episodes.map((episode) => ({
-      label: clip(`e${episode.id} ${episode.title}`, 100), description: clip(`${day(episode.at_ms)} ${episode.summary}`, 100), value: `e:${episode.id}`
+      label: clip(`e${episode.id}${episode.kind ? ` [${episode.kind}]` : ''} ${episode.title}`, 100), description: clip(`${day(episode.at_ms)} ${episode.summary}`, 100), value: `e:${episode.id}`
     }))));
   }
   components.push(navigation(guildId, node));
@@ -77,7 +77,8 @@ export function episodeView(guildId, id) {
   if (!episode) return { content: `出来事 e${id} はありません。`, embeds: [], components: [navigation(guildId, null)] };
   const channel = archive.prepare('SELECT name FROM channels WHERE channel_id = ?').get(episode.channel_id);
   const open = new Set(loadPublicChannels(guildId)?.channelIds ?? []);
-  const ids = episode.sources.slice(0, 10);
+  const ids = [...new Set([...(episode.highlights ?? []), ...episode.sources])].slice(0, 12);
+  const highlighted = new Set(episode.highlights ?? []);
   const sources = ids.length ? archive.prepare(`
     SELECT message_id, channel_id, author_name, content, created_at FROM messages
     WHERE message_id IN (${ids.map(() => '?').join(',')}) AND deleted = 0 ORDER BY created_at
@@ -85,13 +86,15 @@ export function episodeView(guildId, id) {
   const lines = [
     episode.summary,
     '',
-    ...(sources.length ? ['**根拠の発言**', ...sources.map((row) =>
-      `[${new Date(row.created_at + TZ_MS).toISOString().slice(5, 16).replace('T', ' ')}](https://discord.com/channels/${guildId}/${row.channel_id}/${row.message_id}) ${row.author_name}: ${clip(row.content.replace(/\s*\n\s*/g, ' / '), 160)}`)]
+    ...(sources.length ? ['**根拠の発言** (★ は決め台詞)', ...sources
+      .sort((a, b) => Number(highlighted.has(b.message_id)) - Number(highlighted.has(a.message_id)) || a.created_at - b.created_at)
+      .map((row) =>
+        `${highlighted.has(row.message_id) ? '★ ' : ''}[${new Date(row.created_at + TZ_MS).toISOString().slice(5, 16).replace('T', ' ')}](https://discord.com/channels/${guildId}/${row.channel_id}/${row.message_id}) ${row.author_name}: ${clip(row.content.replace(/\s*\n\s*/g, ' / '), 160)}`)]
       : ['根拠の発言: (消されたか、読めないチャンネルになりました)'])
   ];
   const embed = new EmbedBuilder().setColor('#2b2d31')
     .setTitle(clip(`📜 e${episode.id} ${episode.title}`, 250))
-    .setAuthor({ name: `${day(episode.at_ms)} #${channel?.name ?? episode.channel_id}` })
+    .setAuthor({ name: `${day(episode.at_ms)} #${channel?.name ?? episode.channel_id}${episode.kind ? ` · ${episode.kind}` : ''}` })
     .setDescription(clip(lines.join('\n'), 4000));
 
   const options = [];

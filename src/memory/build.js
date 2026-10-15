@@ -4,7 +4,7 @@ import { requestModel } from '../ai/provider.js';
 import { db as archive } from '../archive/db.js';
 import { ensureModelBudget } from '../ai/cost.js';
 import {
-  MAX_DEPTH, TOP_LEVEL, addAliases, addPending, depthOf, ensureNode, ensureSeeds, flushPendingRaw, getNode, getState,
+  MAX_DEPTH, TOP_LEVEL, addAliases, placeTopLevel, topLevels, addPending, depthOf, ensureNode, ensureSeeds, flushPendingRaw, getNode, getState,
   insertEpisode, linkEpisodeNodes, linkEpisodes, linkPageMentions, listChildren, loadPublicChannels, memoryDb, nameOf,
   normalizePath, pendingNodes, recordSegment, resolveExisting, setCursor, setState, treeIndex, writePage
 } from './store.js';
@@ -69,43 +69,48 @@ export const treeConfig = {
 };
 
 const TOPS = TOP_LEVEL.map(([name]) => name).join(' / ');
+const KIND_CHARS = 16;
 
-export const SEGMENT_SYSTEM = `あなたは Discord サーバーの「記憶の本」を書く記録係です。会話ログの区切りを読み、(1) 出来事 と (2) そこから分かった長く役立つ知識 を書きます。ログを写すのではなく、後で「何があったか」「あの人・あのものは何か」に答えられるように整理します。
+export const SEGMENT_SYSTEM = `あなたは Discord サーバーの「記憶の本」を書く記録係です。会話ログの区切りを読み、後で誰かが「あの時さ」と話題にできること、bot が会話やジャッジで使えることを残します。決まった型に当てはめず、このサーバーらしいことを自由に拾ってください。ログを写すのではなく、何があったか・誰がどういう人かが後で分かるように整理します。
 
-## 出来事 (episodes)
-- 1つの出来事 = 同じ話題の一連のやりとり。決定、議論の結論、作ったもの・変えたもの、トラブルと解決、告知、企画、人の近況など。
-- 挨拶・相槌・中身の無い雑談だけの部分は出来事にしない。
-- title は30字以内。summary は1〜3文で「誰が・何を・なぜ・どうなったか」。発言の引用を並べない。
+## 出来事 (episodes) — 種類は問わない
+- 決定・作ったもの・事件・告知・企画に限らない。レスバや口論・議論 (誰と誰が何で揉め、それぞれ何を主張し、どう終わったか・誰が折れたか)、ネタ・ミーム、名言や迷言、盛り上がった雑談、人間関係の変化、炎上、賭けや予言とその結末なども出来事にする。
+- kind は短い種類名 (例: レスバ / 議論 / ネタ / 名言 / 事件 / 決定 / 告知 / 近況 / 技術 / 企画)。合うものが無ければ自由に付ける。
+- title は30字以内。summary は1〜4文で「誰が・何を・なぜ・どうなったか」。レスバなら双方の言い分と結末まで書く。発言の引用を並べない。
 - lines は根拠の行番号 (行頭の数字)。要所を1〜6個。
-- nodes は関わった人物・もの・話題のページ (2〜6個)。既知のページ・索引から選び、無ければ新しいパスを作って new に書く。
-- related は「既知のページ」に出ている過去の出来事 (e12 など) の続き・原因・結果なら、その番号。
-- importance: 1=小ネタ 2=普通 3=重要 (決定・大きな変化・事件)。
+- quotes は記録に残したい決め台詞・名言・迷言・失言の行番号 (0〜3個)。原文はこちらで残すので、summary に写さない。
+- nodes は関わった人物・もの・話題のページ (1〜6個)。既知のページ・索引から選び、無ければ新しいパスを作って new に書く。
+- related は「既知のページ」に出ている過去の出来事 (e12 など) の続き・原因・結果・蒸し返しなら、その番号。
+- importance: 1=小ネタ 2=普通 3=重要 (決定・大きな変化・事件・大きく揉めた)。
+- 挨拶だけ・相槌だけの部分は出来事にしなくてよい。
 
 ## 知識 (facts)
-- 出来事から分かる、そのページの説明に足すべきこと。性質・役割・状態・関係・決まったこと・好み。
-- ページの説明として書く (「〜の作者」「〜を担当している」「〜が好き」)。「〜と言った」の形にしない。日付は変化を表すときだけ。
+- 出来事から分かる、そのページの説明に足すべきこと。人物なら性格・立場や意見 (何について何派か)・口癖・得意不得意・作ったもの・誰と仲が良いか・誰とよく揉めるか。もの・話題・用語・ネタならその説明と由来。
+- ページの説明として書く (「〜派」「〜の作者」「〜とよく言い合う」「〜が口癖」)。「〜と言った」の形にしない。
+- 意見や立場には時期を付ける (「2025-03 時点で〜派」)。後で言っていることが変わったか比べられるように。
 - 既知のページに既に書いてあることは繰り返さない。変わったなら「〜から〜に変わった」と書く。
-- 意見・冗談・推測は事実と区別する (「〜と考えている」「冗談で〜」)。
+- 冗談・皮肉・推測は事実と区別する (「冗談で〜」「〜と考えている」)。
 - episode はこの出力の episodes の番号 (0始まり)。根拠の無い知識は書かない。
 
 ## ページのパス
-- 最上位は ${TOPS} のどれか。深さは3まで。人物は people/<ログ中の名前>。
+- 最上位は ${TOPS} を基本にする。どれにも合わないまとまりなら新しい最上位を作ってよいが、似たものを増やさない。深さは3まで。人物は people/<ログ中の名前>。
 - 同じものに別の名前が付いていたら、既存のページを使い new の aliases に別名を書く。
 
 ## 書かないもの
-連絡先・パスワード・本名などの機微情報、ログに無い推測。
+連絡先・パスワード・本名・住所などの機微情報、ログに無い推測。
 
 出力は JSON だけ:
-{"episodes":[{"title":"統治機能の実装を始めた","summary":"たこが sakana bot に国会と裁判所の仕組みを入れ始め、さばが賛成した。国会は72時間ごとに開く設計。","lines":[1,2],"nodes":["people/たこ","people/さば","projects/sakana-bot"],"related":[],"importance":2}],
- "facts":[{"path":"projects/sakana-bot","text":"国会を72時間ごとに開く統治の仕組みを持つ","episode":0},{"path":"people/たこ","text":"sakana bot の作者で、統治機能を実装している","episode":0}],
- "new":[{"path":"projects/sakana-bot","summary":"たこが作っている Discord の統治 bot","aliases":["sakana","さかな"]}]}
+{"episodes":[{"kind":"レスバ","title":"Go と Rust どっちが上か","summary":"たこが Go の手軽さを推し、さばが Rust の型安全を譲らず1時間言い合った。最後はさばの「ビルド待ちも思考時間」で笑って終わった。","lines":[3,8,15],"quotes":[15],"nodes":["people/たこ","people/さば","topics/Go vs Rust"],"related":[],"importance":2}],
+ "facts":[{"path":"people/さば","text":"Rust 派で、型安全の話になると引かない (2025-03 時点)","episode":0},{"path":"people/たこ","text":"Go の手軽さを推す (2025-03 時点)","episode":0}],
+ "new":[{"path":"topics/Go vs Rust","summary":"たびたび蒸し返される言語論争","aliases":["GoRust論争"]}]}
 書くことが無ければ {"episodes":[],"facts":[],"new":[]}。`;
 
 const INTEGRATE_SYSTEM = `あなたは Discord サーバーの「記憶の本」の編集者です。各ページに新しく分かった知識を統合して、ページを書き直します。
 
 ## ページの書き方
 - ページはその人・もの・話題の説明。ログの写しや日記にしない。「何者か / 何をしているか / 今どうなっているか / 誰・何とどう関わるか」を現在形でまとめる。
-- 先頭に1〜2文の概要。必要なら「## 現在」「## 経緯」「## 関わり」「## 未解決」の見出しを使う (無理に全部書かない)。
+- 先頭に1〜2文の概要。見出しはページに合わせて自由に付ける (例: 人物なら「## 立場と意見」「## よくやること」「## 関係」「## 名言」、レスバなら「## 争点」「## 双方の言い分」「## 結末」)。無理に埋めない。
+- 人物の立場や意見は時期つきで残す。前と変わったなら両方を書く (後でダブスタかどうか比べるため)。
 - 経緯は出来事を日付順に並べず、流れを短く語る。個々の出来事は [e12] で指せば足りる。
 - 変化は上書きせず「以前は〜、YYYY-MM から〜」と書く。食い違う情報は両方を日付つきで残す。
 - 各主張の終わりに根拠の出来事 [e12] を残す (新しい知識に付いているもの・本文に元からあるもの)。根拠の無い主張を足さない。
@@ -227,7 +232,7 @@ export function copiedRatio(text, flatTranscript) {
 const linesOf = (value) => (Array.isArray(value) ? value : [value]).filter((item) => typeof item === 'string' && item.trim());
 const pathOf = (guildId, raw) => {
   const normalized = normalizePath(raw);
-  return normalized ? resolveExisting(guildId, normalized) : null;
+  return normalized ? resolveExisting(guildId, placeTopLevel(guildId, normalized)) : null;
 };
 
 /**
@@ -261,9 +266,14 @@ export function applySegmentResult(guildId, pack, result, { model, now = Date.no
       if (cited.length === 0 || !title || !summary) { ids.push(null); report.dropped.noSource += 1; continue; }
       const at = Math.min(...cited.map((line) => line.firstMs));
       const end = Math.max(...cited.map((line) => line.lastMs));
+      // 決め台詞は行番号で指させて、原文はアーカイブの発言をそのまま使う (写させない)
+      const highlights = [...new Set((Array.isArray(episode.quotes) ? episode.quotes : [])
+        .map((n) => pack.lineMap.get(Number(n))?.ids[0]).filter(Boolean))].slice(0, 3);
       const id = insertEpisode(guildId, {
+        kind: String(episode.kind ?? '').replace(/[\s\n]+/g, ' ').trim().slice(0, KIND_CHARS),
         title, summary, channelId: cited[0].channelId, atMs: at, endMs: end,
-        sources: [...new Set(cited.flatMap((line) => line.ids.slice(0, 2)))].slice(0, 10),
+        sources: [...new Set([...cited.flatMap((line) => line.ids.slice(0, 2)), ...highlights])].slice(0, 12),
+        highlights,
         importance: [1, 2, 3].includes(Number(episode.importance)) ? Number(episode.importance) : 2, now
       });
       ids.push({ id, at, end });
@@ -421,7 +431,7 @@ function integratePrompt(guildId, batch) {
 function rootPrompt(guildId) {
   const parts = [];
   let used = 0;
-  for (const [top] of TOP_LEVEL) {
+  for (const top of topLevels(guildId)) {
     const node = getNode(guildId, top);
     if (!node) continue;
     const lines = [`## ${top} — ${node.summary}`];

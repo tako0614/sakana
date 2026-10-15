@@ -84,7 +84,7 @@ export function recallFor(guildId, { request = '', context = '', maxChars = 1800
     const episodes = episodesFor(guildId, path, 2).filter((episode) => !shown.has(episode.id));
     for (const episode of episodes) {
       shown.add(episode.id);
-      lines.push(`  e${episode.id} ${date(episode.at_ms)} ${episode.title}`);
+      lines.push(`  e${episode.id} ${date(episode.at_ms)}${episode.kind ? ` [${episode.kind}]` : ''} ${episode.title}`);
     }
   }
   // 2つ以上思い出したら、その間で起きたこと (複数のページをまたぐ出来事)
@@ -115,7 +115,7 @@ export function knownPagesFor(guildId, transcript, { limit = 12, maxChars = 6000
     const node = getNode(guildId, path);
     if (!node) continue;
     const head = node.body.split('\n').filter(Boolean).slice(0, 4).join('\n').slice(0, 320);
-    const recent = recentEpisodesFor(guildId, path, 3).map((episode) => `e${episode.id} ${date(episode.at_ms)} ${episode.title}`);
+    const recent = recentEpisodesFor(guildId, path, 3).map((episode) => `e${episode.id} ${date(episode.at_ms)}${episode.kind ? ` [${episode.kind}]` : ''} ${episode.title}`);
     const links = linkedPages(guildId, path, 4).map((row) => row.path);
     const block = [
       `### ${path}${node.summary ? ` — ${node.summary}` : ''}`,
