@@ -64,7 +64,20 @@
 
 ## モデルと無料枠
 
-`MEMORY_TREE_MODELS` を前から試す (既定は `google/gemma-4-31b-it:free`、次に `nvidia/nemotron-3-super-120b-a12b:free`)。:free の枠は1分20回・1日50回で、OpenRouter でクレジットを累計10ドル以上買っていれば1日1000回。待てば済む 429 は待ち、10分より先まで待たされる 429 は日の上限とみなして止まる。次の timer 起動で続きから読む。
+`MEMORY_TREE_MODELS` を前から試す (既定は `z-ai/glm-5.3-flash`、次に `inclusionai/ling-3.0-flash`)。2026-10-15 に本番の同じ区切り (約2.3万トークン) を読ませて比べた結果:
+
+|モデル|1回の費用|時間|結果|
+|---|---|---|---|
+|glm-5.3-flash|$0.0033|63秒|出来事18・知識17。日付・固有名が正確で、別名 (えだまめ = EdamAmex) も見抜いた|
+|ling-3.0-flash|$0.0015|42秒|出来事26・知識18。細かいがページの振り分けが雑|
+|qwen3.7-flash|$0.0016|74秒|出来事5。粗い|
+|deepseek-v4-flash / gpt-oss-120b|―|―|思考で出力枠を使い切って失敗|
+|nemotron-3-ultra:free|0|264秒|出来事42。良いが遅い|
+|gemma-4:free|―|―|混雑で 429|
+
+全履歴 (Evex の人間の発言 約129万件・2,267万字、台本で約3,200万字) は glm-5.3-flash で区切り約800回・統合を含めて約1,100回、約4〜5ドル、順に読んで15〜20時間。思考は `MEMORY_TREE_REASONING=low` (既定) で抑える。
+
+:free の枠は1分20回・1日50回で、OpenRouter でクレジットを累計10ドル以上買っていれば1日1000回。待てば済む 429 は待ち、10分より先まで待たされる 429 は日の上限とみなして止まる。次の timer 起動で続きから読む。
 
 有料モデルを混ぜるときは `MEMORY_TREE_BUDGET_USD` に累計の上限を置く。0 のままだと `:free` 以外の route を拒否する。
 
@@ -96,4 +109,4 @@ node scripts/memory-tree.mjs export   --guild ID --out DIR   # ページを Mark
 node scripts/memory-tree.mjs reset    --guild ID --yes
 ```
 
-`--guild` を省くと `MEMORY_TREE_GUILD` を使う。builder は同時に1つだけ動く (ロック)。本番では `deploy/sakana-memory.service` を `deploy/sakana-memory.timer` で1時間ごとに起動する。モデルを決める前に `try --model` で同じ区切りを候補ごとに読ませ、出来事の切り方・知識の書き方・捨てられた数を比べる。
+`--guild` を省くと `MEMORY_TREE_GUILD` を使う。builder は同時に1つだけ動く (ロック)。本番では `deploy/sakana-memory.service` を `deploy/sakana-memory.timer` で起動する。溜まっている分は読み切るまで続け、読み終えたら1時間おきに新着を読む。モデルを決める前に `try --model` で同じ区切りを候補ごとに読ませ、出来事の切り方・知識の書き方・捨てられた数を比べる。

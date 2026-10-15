@@ -8,8 +8,9 @@ Type=oneshot
 # .env (OPENROUTER_API_KEY, MEMORY_TREE_GUILD, MEMORY_TREE_MODELS ...) は dotenv が作業ディレクトリから読む。
 # リリースを切り替えるときは sakana.service と同じく drop-in (90-release.conf) で ExecStart を差し替える。
 WorkingDirectory=/root/sakana
-ExecStart=/usr/bin/node scripts/memory-tree.mjs run --max-minutes 50
-TimeoutStartSec=1h
+# 溜まっている分は読み切るまで続ける (初回の全履歴は十数時間)。読み終えたら timer が1時間おきに新着を読む
+ExecStart=/usr/bin/node scripts/memory-tree.mjs run
+TimeoutStartSec=infinity
 Nice=10
 # idle クラスは bot の取り込みに負けて止まる (実測) ので best-effort の最低優先度
 IOSchedulingClass=best-effort

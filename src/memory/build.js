@@ -23,15 +23,23 @@ import { cursorBefore, packOf, planPack, renderSegment } from './transcript.js';
 // 知っていることを繰り返さず、変化として書かせ、続きの出来事を前の出来事と結ばせる。
 // 出力は機械的に検査する: ログの丸写し・根拠の無い知識・存在しない行番号は捨てて数える。
 //
-// 無料モデル (:free) は 1分20回・1日50回 (クレジット購入が累計10ドル以上なら1000回)。
-// 日の上限に当たったら止めて、次の起動で続きから読む。
+// 既定は安い有料モデル (2026-10 に実データの区切りで比べて glm-5.3-flash が最良: 1回約 $0.003)。
+// 無料モデル (:free) も使えるが、1分20回・1日50回 (購入累計10ドル以上で1000回) で、
+// 混雑の 429 や思考で出力枠を使い切るものが多かった。日の上限に当たったら止めて、次の起動で続きから読む。
+
+const REASONING = {
+  low: { effort: 'low', exclude: true },   // 考えすぎて出力枠を使い切るモデルがあった (deepseek-v4-flash・gpt-oss)
+  off: { enabled: false },
+  default: undefined
+};
 
 const list = (value, fallback) => (value || fallback).split(',').map((item) => item.trim()).filter(Boolean);
 
 export const treeConfig = {
-  models: list(process.env.MEMORY_TREE_MODELS, 'google/gemma-4-31b-it:free,nvidia/nemotron-3-super-120b-a12b:free'),
-  // 0 なら無料の route しか使わない。有料を混ぜるなら上限 (累計USD) を置く。
+  models: list(process.env.MEMORY_TREE_MODELS, 'z-ai/glm-5.3-flash,inclusionai/ling-3.0-flash'),
+  // 有料の route を使うには累計の上限 (USD) が要る。0 なら :free しか使わない。
   budgetUsd: Number(process.env.MEMORY_TREE_BUDGET_USD || 0),
+  reasoning: REASONING[process.env.MEMORY_TREE_REASONING || 'low'] ?? REASONING.low,
   segmentChars: Number(process.env.MEMORY_TREE_SEGMENT_CHARS || 40000),
   // 新着の尻尾がこれ未満で、まだ会話が続いていそうなら次の起動まで貯める
   minChars: Number(process.env.MEMORY_TREE_MIN_CHARS || 6000),
@@ -168,7 +176,7 @@ export function openRouterCaller({ guildId, models = treeConfig.models, runId = 
           model: models[0], fallbackModels: models.slice(1),
           messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
           maxOutputTokens: treeConfig.outputTokens, timeoutMs: treeConfig.timeoutMs,
-          guildId, role: `memory-${kind}`, runId, budgetId, temperature: 0.2
+          guildId, role: `memory-${kind}`, runId, budgetId, temperature: 0.2, reasoning: treeConfig.reasoning
         });
         const message = data.choices[0].message;
         return { json: parseModelJson(message.content), model: data.model ?? models[0], usage: data.usage };
