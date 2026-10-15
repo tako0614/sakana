@@ -187,16 +187,23 @@ function budgetFor(guildId, models) {
 // 2026-10-15、OpenRouter が glm-5.3-flash を回す先のうち OpenInference は3万トークン読ませても
 // {"episodes":[]} だけ (17トークン) を返し、Morph は半数が 16000 トークンまで暴走した。
 // どちらも「完了」に見えるので、空の区切りが静かに積み上がっていた。
-const badProviders = new Map();
+// builder は1時間ごとに起動し直すので、外した provider は記憶の DB に控える (プロセスの中だけだと毎回踏み直す)。
+const BAD_PROVIDERS = 'bad-providers';
 const BAD_PROVIDER_MS = 3 * 3_600_000;
 
 export function avoidedProviders(now = Date.now()) {
-  for (const [name, until] of badProviders) if (until <= now) badProviders.delete(name);
-  return [...new Set([...treeConfig.ignoreProviders, ...badProviders.keys()])];
+  const saved = getState(BAD_PROVIDERS) ?? {};
+  const live = Object.fromEntries(Object.entries(saved).filter(([, until]) => until > now));
+  if (Object.keys(live).length !== Object.keys(saved).length) setState(BAD_PROVIDERS, Object.keys(live).length ? live : null);
+  return [...new Set([...treeConfig.ignoreProviders, ...Object.keys(live)])];
 }
 
 export function avoidProvider(name, now = Date.now()) {
-  if (name) badProviders.set(name, now + BAD_PROVIDER_MS);
+  if (name) setState(BAD_PROVIDERS, { ...(getState(BAD_PROVIDERS) ?? {}), [name]: now + BAD_PROVIDER_MS });
+}
+
+export function forgetAvoidedProviders() {
+  setState(BAD_PROVIDERS, null);
 }
 
 /**
@@ -208,8 +215,9 @@ export function avoidProvider(name, now = Date.now()) {
 export function openRouterCaller({ guildId, models = treeConfig.models, runId = randomUUID() } = {}) {
   const budgetId = budgetFor(guildId, models);
   return async function call({ kind, system, user, check }) {
-    for (let transient = 0, swapped = 0; ; transient += 1) {
+    for (let transient = 0, swapped = 0, cleared = false; ; transient += 1) {
       let provider = null;
+      const ignored = avoidedProviders();
       try {
         const data = await requestModel({
           model: models[0], fallbackModels: models.slice(1),
@@ -217,7 +225,7 @@ export function openRouterCaller({ guildId, models = treeConfig.models, runId = 
           maxOutputTokens: treeConfig.outputTokens, timeoutMs: treeConfig.timeoutMs,
           guildId, role: `memory-${kind}`, runId, budgetId, temperature: 0.2, reasoning: treeConfig.reasoning,
           // JSON 専用モード。glm-5.3-flash で約20回に1回 JSON が壊れていた
-          jsonOnly: true, ignoreProviders: avoidedProviders()
+          jsonOnly: true, ignoreProviders: ignored
         });
         provider = data.provider ?? null;
         const message = data.choices[0].message;
@@ -233,6 +241,12 @@ export function openRouterCaller({ guildId, models = treeConfig.models, runId = 
           continue;
         }
         if (error.code === 'BAD_OUTPUT' || /truncated/.test(error.message)) throw error;
+        // 外しすぎて回す先が無くなった (404) ら、外したものを忘れて1回だけ送り直す
+        if (error.status === 404 && ignored.length > treeConfig.ignoreProviders.length && !cleared) {
+          forgetAvoidedProviders();
+          cleared = true;
+          continue;
+        }
         if ([401, 402, 403].includes(error.status)) throw new StopRun(`OpenRouter HTTP ${error.status}`, 'auth');
         if (/BUDGET/.test(error.code ?? '')) throw new StopRun(error.message, 'budget');
         const wait = Number.isFinite(error.retryAt) ? error.retryAt - Date.now() : null;
@@ -782,24 +796,37 @@ async function rebuildRoot(guildId, call, stats, log) {
 
 async function retryFailedSegments(guildId, channelIds, segment, spent, log) {
   const allowed = new Set(channelIds);
-  const rows = memoryDb().prepare("SELECT * FROM segments WHERE guild_id = ? AND status = 'failed' ORDER BY from_ms").all(guildId);
-  for (const row of rows) {
-    if (spent()) return;
-    if (!allowed.has(row.channel_id)) continue;   // 非公開になったチャンネルは読み直さない
-    // 内容ごと拒否される区切りを毎回読み直して払い続けない (3回までで諦め、failed のまま残す)
-    const key = `retry:${guildId}:${row.channel_id}:${row.from_id}`;
-    const tried = getState(key)?.count ?? 0;
-    if (tried >= treeConfig.failuresBeforeSkip) continue;
-    const rendered = renderSegment({ guildId, channelId: row.channel_id, cursor: cursorBefore(row.from_id, row.from_ms),
-      maxChars: Infinity, until: { id: row.to_id, ms: row.to_ms } });
-    if (!rendered) continue;
-    // 元の区切りの記録 (from_id) を上書きする。cursor はとっくに先へ進んでいるので戻さない
-    const pack = packOf([{ ...rendered, fromId: row.from_id }]);
-    if (await segment(pack, { advance: false })) {
-      setState(key, null);
-      log(`retried ${rendered.label} ${row.from_id}`);
-    } else {
-      setState(key, { count: tried + 1 });
+  const rows = memoryDb().prepare("SELECT * FROM segments WHERE guild_id = ? AND status = 'failed' ORDER BY from_ms").all(guildId)
+    .filter((row) => allowed.has(row.channel_id));   // 非公開になったチャンネルは読み直さない
+  // チャンネルごとに古い順、チャンネルどうしは並べて読む (1本ずつだと66区切りに2時間かかった)
+  const byChannel = new Map();
+  for (const row of rows) byChannel.set(row.channel_id, [...(byChannel.get(row.channel_id) ?? []), row]);
+  const queues = [...byChannel.values()];
+  const worker = async () => {
+    for (let queue = queues.shift(); queue; queue = queues.shift()) {
+      for (const row of queue) {
+        if (spent()) return;
+        await retryOne(guildId, row, segment, log);
+      }
     }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, treeConfig.concurrency) }, worker));
+}
+
+async function retryOne(guildId, row, segment, log) {
+  // 内容ごと拒否される区切りを毎回読み直して払い続けない (3回までで諦め、failed のまま残す)
+  const key = `retry:${guildId}:${row.channel_id}:${row.from_id}`;
+  const tried = getState(key)?.count ?? 0;
+  if (tried >= treeConfig.failuresBeforeSkip) return;
+  const rendered = renderSegment({ guildId, channelId: row.channel_id, cursor: cursorBefore(row.from_id, row.from_ms),
+    maxChars: Infinity, until: { id: row.to_id, ms: row.to_ms } });
+  if (!rendered) return;
+  // 元の区切りの記録 (from_id) を上書きする。cursor はとっくに先へ進んでいるので戻さない
+  const pack = packOf([{ ...rendered, fromId: row.from_id }]);
+  if (await segment(pack, { advance: false })) {
+    setState(key, null);
+    log(`retried ${rendered.label} ${row.from_id}`);
+  } else {
+    setState(key, { count: tried + 1 });
   }
 }

@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 process.env.OPENROUTER_API_KEY ||= 'check';
 process.env.MEMORY_TREE_BUDGET_USD = '1';
 process.env.MEMORY_TREE_MODELS = 'check/memory-model';
-const { avoidedProviders, checkSegmentOutput, openRouterCaller, treeConfig } = await import('../src/memory/build.js');
+const { avoidProvider, avoidedProviders, checkSegmentOutput, openRouterCaller, treeConfig } = await import('../src/memory/build.js');
 
 const sent = [];
 // provider ごとの返事: 空の JSON・暴走 (length で切れる)・まともな結果
@@ -53,11 +53,35 @@ assert.equal(result.provider, 'Good');
 assert.equal(result.json.episodes.length, 1);
 assert.deepEqual(sent, [[], ['Empty'], ['Empty', 'Runaway']], 'each bad provider is ignored on the next try: ' + JSON.stringify(sent));
 assert.deepEqual(avoidedProviders().sort(), ['Empty', 'Runaway'], 'bad providers stay avoided');
+// builder は1時間ごとに起動し直すので DB に控える。期限が過ぎたら戻す
+const { getState: savedState } = await import('../src/memory/store.js');
+assert.deepEqual(Object.keys(savedState('bad-providers')).sort(), ['Empty', 'Runaway'], 'avoided providers survive a restart');
+assert.deepEqual(avoidedProviders(Date.now() + 4 * 3_600_000), [], 'they come back after three hours');
+avoidProvider('Empty'); avoidProvider('Runaway');
 
 // --- 次の呼び出しも最初から外したまま送る ---
 sent.length = 0;
 await call({ kind: 'segment', system: 's', user: 'u', check: (json) => checkSegmentOutput(longPack, json) });
 assert.deepEqual(sent, [['Empty', 'Runaway']], 'later calls keep ignoring them');
+
+// --- 外しすぎて回す先が無い (404) なら、外したものを忘れて送り直す ---
+const realFetch = globalThis.fetch;
+let noEndpoint = true;
+sent.length = 0;
+globalThis.fetch = async (url, init) => {
+  if (!String(url).includes('/endpoints') && JSON.parse(init.body).provider?.ignore?.length && noEndpoint) {
+    sent.push('404');
+    return { ok: false, status: 404, headers: new Map(), json: async () => ({ error: { code: 404, message: 'No endpoints found' } }) };
+  }
+  return realFetch(url, init);
+};
+order = ['Good'];
+const recovered = await call({ kind: 'segment', system: 's', user: 'u', check: (json) => checkSegmentOutput(longPack, json) });
+assert.equal(recovered.provider, 'Good');
+assert.deepEqual(sent, ['404', []], 'a 404 from ignoring too much clears the list and resends: ' + JSON.stringify(sent));
+assert.deepEqual(avoidedProviders(), []);
+globalThis.fetch = realFetch;
+avoidProvider('Empty'); avoidProvider('Runaway');
 
 // --- どこも空なら、2回取り直したあとで失敗として返す (完了にしない) ---
 order = ['Empty', 'Empty2', 'Empty3', 'Empty4'];
@@ -82,4 +106,4 @@ assert.equal(memoryDb().prepare("SELECT status FROM segments WHERE guild_id = ? 
 assert.equal(getState(`retry:${G}:c1:200`), null, 'the retry counter starts over');
 assert.equal(reopenEmptySegments(G, { minChars: 4000 }).length, 0);
 
-console.log('memory providers ok (空のまま完了した区切りを読み直しに回す / 長い区切りの空は失敗 / 空・暴走の provider を外して取り直す / 外したまま次も送る / 取り直しは2回まで)');
+console.log('memory providers ok (空のまま完了した区切りを読み直しに回す / 外した provider は DB に控えて3時間 / 回す先が無くなったら忘れる / 長い区切りの空は失敗 / 空・暴走の provider を外して取り直す / 外したまま次も送る / 取り直しは2回まで)');

@@ -188,9 +188,14 @@ if (garbage.failed === 0) fail('three unreadable outputs must mark the pack fail
 if (!segmentStats(GUILD).some((row) => row.status === 'failed')) fail('failed segments must be recorded');
 
 // 通常 (failed もやり直す)
+// 読み直しはチャンネルどうし並べて読むので、ここでは1本ずつにして古い順を保つ
+// (2つのチャンネルの区切りが1つの pack で失敗している。後の区切りが前の区切りの出来事を見るか、を下で確かめる)
 mode = 'ok';
 calls.length = 0;
+const width = treeConfig.concurrency;
+treeConfig.concurrency = 1;
 const done = await runBuild({ guildId: GUILD, call: fake, retryFailed: true });
+treeConfig.concurrency = width;
 if (done.stopped !== 'done') fail('run must finish: ' + JSON.stringify(done));
 if (calls.some((c) => c.user.includes('非公開の相談'))) fail('a channel missing from the public snapshot must never be sent');
 if (done.dropped.copied !== 1) fail('a fact copied from the log must be dropped: ' + JSON.stringify(done.dropped));
