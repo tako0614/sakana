@@ -589,7 +589,8 @@ async function catchupGuilds(client) {
     // 再起動で打ち切られた /index build は「実行中」のまま残る。ジョブは
     // プロセス内にしか無いので、中断に直して、追いつきの後にやり直す
     // (まだ回っていなかったチャンネル・新しく見つかったスレッドを取りこぼさない)。
-    const interrupted = state.status === 'running' && !getRunningJob(guild.id) && state.mode === 'full';
+    // 「中断」のままのものも含める: やり直しの途中でまた再起動されても、終わるまで続ける
+    const interrupted = ['running', 'interrupted'].includes(state.status) && !getRunningJob(guild.id) && state.mode === 'full';
     if (state.status === 'running' && !getRunningJob(guild.id)) {
       setGuildState(guild.id, { status: 'interrupted', finished_at: Date.now(), current_channel: null });
     }

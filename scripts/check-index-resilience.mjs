@@ -160,6 +160,15 @@ const rerunHave = db.prepare('SELECT COUNT(*) AS c FROM messages WHERE channel_i
 if (rerunHave !== 250) fail(`an interrupted /index build must be rerun on startup (have ${rerunHave}/250)`);
 if (getGuildState(GUILD).status !== 'idle') fail('the rerun build must finish and leave the guild idle: ' + getGuildState(GUILD).status);
 
+// やり直しの途中でまた再起動された (印はもう「中断」) ときも、やり直す
+db.prepare('DELETE FROM messages WHERE channel_id = ?').run(STUCK);
+db.prepare('DELETE FROM channel_spans WHERE channel_id = ?').run(STUCK);
+updateChannelState(STUCK, { complete: 0, oldest_id: null, newest_id: null, last_error: null });
+setGuildState(GUILD, { status: 'interrupted', mode: 'full' });
+await catchupAllGuilds({ guilds: { cache: new Map([[GUILD, guild]]) } });
+if (db.prepare('SELECT COUNT(*) AS c FROM messages WHERE channel_id = ?').get(STUCK).c !== 250) fail('an interrupted rerun must run again after another restart');
+if (getGuildState(GUILD).status !== 'idle') fail('the second rerun must finish');
+
 // ジョブ中にロックで落ちても、待って続きから取り直す (ジョブのエラーにしない)
 db.prepare('DELETE FROM messages WHERE channel_id = ?').run(STUCK);
 db.prepare('DELETE FROM channel_spans WHERE channel_id = ?').run(STUCK);
