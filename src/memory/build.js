@@ -4,7 +4,7 @@ import { requestModel } from '../ai/provider.js';
 import { db as archive } from '../archive/db.js';
 import { ensureModelBudget } from '../ai/cost.js';
 import {
-  MAX_DEPTH, TOP_LEVEL, addAliases, placeTopLevel, topLevels, addPending, depthOf, ensureNode, ensureSeeds, flushPendingRaw, getNode, getState,
+  MAX_DEPTH, addAliases, placeTopLevel, topLevels, addPending, depthOf, ensureNode, ensureSeeds, flushPendingRaw, getNode, getState,
   insertEpisode, linkEpisodeNodes, linkEpisodes, linkPageMentions, listChildren, loadPublicChannels, memoryDb, nameOf,
   normalizePath, pendingNodes, recordSegment, resolveExisting, setCursor, setState, treeIndex, writePage
 } from './store.js';
@@ -68,7 +68,6 @@ export const treeConfig = {
   copyRatio: 0.8
 };
 
-const TOPS = TOP_LEVEL.map(([name]) => name).join(' / ');
 const KIND_CHARS = 16;
 
 export const SEGMENT_SYSTEM = `あなたは Discord サーバーの「記憶の本」を書く記録係です。会話ログの区切りを読み、後で誰かが「あの時さ」と話題にできること、bot が会話やジャッジで使えることを残します。決まった型に当てはめず、このサーバーらしいことを自由に拾ってください。ログを写すのではなく、何があったか・誰がどういう人かが後で分かるように整理します。
@@ -93,7 +92,8 @@ export const SEGMENT_SYSTEM = `あなたは Discord サーバーの「記憶の�
 - episode はこの出力の episodes の番号 (0始まり)。根拠の無い知識は書かない。
 
 ## ページのパス
-- 最上位は ${TOPS} を基本にする。どれにも合わないまとまりなら新しい最上位を作ってよいが、似たものを増やさない。深さは3まで。人物は people/<ログ中の名前>。
+- 最上位は「最上位の一覧」から必ず選ぶ。どれにも合わなければ others に入れる。最上位は増やさない。
+- 最上位の下は自由に作ってよい (子・孫まで、名前も自由)。人物は people/<ログ中の名前>。
 - 同じものに別の名前が付いていたら、既存のページを使い new の aliases に別名を書く。
 
 ## 書かないもの
@@ -395,7 +395,11 @@ export function applyIntegrateResult(guildId, batch, result, { now = Date.now() 
 export function segmentPrompt(guildId, pack) {
   const index = treeIndex(guildId, treeConfig.indexChars);
   const known = knownPagesFor(guildId, pack.text, { maxChars: treeConfig.knownChars });
+  const tops = topLevels(guildId).map((path) => `${path} — ${getNode(guildId, path)?.summary ?? ''}`);
   return [
+    '最上位の一覧 (ここから必ず選ぶ。合わなければ others):',
+    tops.join('\n'),
+    '',
     `木の索引 (パス — 説明。全${index.total}件中${index.shown}件):`,
     index.text || '(まだ空)',
     '',

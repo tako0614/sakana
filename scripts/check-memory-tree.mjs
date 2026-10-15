@@ -326,15 +326,40 @@ if (normalizePath('/people//たこ/') !== 'people/たこ') fail('slashes must co
 if (normalizePath('[[people/たこ]]') !== 'people/たこ') fail('wiki links must normalize');
 if (normalizePath('../../etc') !== 'etc') fail('.. must be dropped');
 if (normalizePath('Debates/x') !== 'debates/x') fail('ASCII top levels are lowercased');
-// 新しい最上位は上限まで。超えたら topics の下に入れて根を散らかさない
+// 最上位は必ずどれかに分類する: 知らない最上位は others の下。最上位を増やす・消すのは管理者
 {
-  const { placeTopLevel, MAX_TOP_LEVEL, ensureNode, topLevels } = await import('../src/memory/store.js');
+  const st = await import('../src/memory/store.js');
   const CAP = '900000000000000003';
   resetTree(CAP);
-  for (let i = 0; i < MAX_TOP_LEVEL; i += 1) ensureNode(CAP, `cat${i}`);
-  if (placeTopLevel(CAP, 'cat3/x') !== 'cat3/x') fail('an existing top level stays');
-  if (placeTopLevel(CAP, 'brandnew/x') !== 'topics/brandnew/x') fail('past the cap a new top level goes under topics');
-  if (topLevels(CAP).length !== MAX_TOP_LEVEL) fail('topLevels lists the root children');
+  st.ensureSeeds(CAP);
+  if (st.placeTopLevel(CAP, 'people/x') !== 'people/x') fail('an existing top level stays');
+  if (st.placeTopLevel(CAP, 'brandnew/x') !== 'others/brandnew/x') fail('an unknown top level goes under others');
+  // others に育ったまとまりを昇格: ページ・出来事のつながり・本文のリンクごと移る
+  st.ensureNode(CAP, 'others/レスバ集/GoとRust');
+  st.addPending(CAP, 'others/レスバ集/GoとRust', ['毎月蒸し返される [e1]']);
+  st.ensureNode(CAP, 'people/たこ');
+  st.writePage(CAP, 'people/たこ', { body: '常連。[[others/レスバ集/GoとRust]] の当事者 [e1]' });
+  const ep = st.insertEpisode(CAP, { kind: 'レスバ', title: 't', summary: 's', channelId: 'c', atMs: 1, endMs: 2, sources: [], importance: 2 });
+  st.linkEpisodeNodes(CAP, ep, ['others/レスバ集/GoとRust', 'people/たこ'], 1);
+  st.addTopLevel(CAP, 'flamewars', 'レスバの記録');
+  const moved = st.moveSubtree(CAP, 'others/レスバ集', 'flamewars/レスバ集');
+  if (moved !== 2) fail('the subtree (2 pages) must move: ' + moved);
+  if (!st.getNode(CAP, 'flamewars/レスバ集/GoとRust') || st.getNode(CAP, 'others/レスバ集')) fail('pages must move to the promoted top level');
+  if (!st.getEpisode(CAP, ep).nodes.includes('flamewars/レスバ集/GoとRust')) fail('episode links must follow the move');
+  if (!st.getNode(CAP, 'people/たこ').body.includes('[[flamewars/レスバ集/GoとRust]]')) fail('[[links]] in bodies must follow the move');
+  if (!st.linkedPages(CAP, 'people/たこ').some((row) => row.path === 'flamewars/レスバ集/GoとRust')) fail('page links must follow the move');
+  // 最上位を消すと中身は others の下へ。消した種は作り直さない
+  st.removeTopLevel(CAP, 'culture');
+  if (st.getNode(CAP, 'culture') || !st.getNode(CAP, 'others/culture')) fail('a removed top level moves under others');
+  st.ensureSeeds(CAP);
+  if (st.getNode(CAP, 'culture')) fail('a removed seed must not come back');
+  let refused = false;
+  try { st.removeTopLevel(CAP, 'others'); } catch { refused = true; }
+  if (!refused) fail('others cannot be removed');
+  for (let i = st.topLevels(CAP, 99).length; i < st.MAX_TOP_LEVEL; i += 1) st.addTopLevel(CAP, `cat${i}`);
+  refused = false;
+  try { st.addTopLevel(CAP, 'onemore'); } catch { refused = true; }
+  if (!refused) fail(`top levels are capped at ${st.MAX_TOP_LEVEL}`);
   resetTree(CAP);
 }
 if (normalizePath('a/b/c/d/e/f').split('/').length > 4) fail('depth must be capped');

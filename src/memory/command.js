@@ -5,7 +5,10 @@ import { pausedBy, setPaused, treeConfig } from './build.js';
 import { rootView, viewFor } from './explore.js';
 import { snapshotPublicChannels } from './snapshot.js';
 import { memoryStatus } from './status.js';
-import { includeChannel, includedChannels, removeIncluded } from './store.js';
+import {
+  OTHERS, addTopLevel, includeChannel, includedChannels, listChildren, memoryDb, moveSubtree, normalizePath, removeIncluded,
+  removeTopLevel, topLevels
+} from './store.js';
 import { hasMemory, runMemoryTool } from './tool.js';
 
 // /memory: 記憶の本の進み具合を見る・止める (管理者)、ページや出来事を開く (誰でも)。
@@ -13,7 +16,17 @@ import { hasMemory, runMemoryTool } from './tool.js';
 // 返事は本人にだけ見える形にする (チャンネルを流さない)。
 
 const UNIT = process.env.MEMORY_TREE_SYSTEMD_UNIT ?? 'sakana-memory.service';
-const ADMIN_ONLY = new Set(['status', 'pause', 'resume', 'include', 'exclude']);
+const ADMIN_ONLY = new Set(['status', 'pause', 'resume', 'include', 'exclude', 'list', 'add', 'remove']);
+
+/** 最上位の一覧と、その下のページ数。 */
+function categoryList(guildId) {
+  const count = memoryDb().prepare("SELECT COUNT(*) AS c FROM nodes WHERE guild_id = ? AND path LIKE ? ESCAPE '\\'");
+  return topLevels(guildId).map((path) => {
+    const node = listChildren(guildId, '', 50).find((row) => row.path === path);
+    const pages = count.get(guildId, `${path.replace(/[%_\\]/g, (c) => `\\${c}`)}/%`).c;
+    return `- **${path}** (${pages}) ${node?.summary ?? ''}${path === OTHERS ? ' ← 受け皿' : ''}`;
+  }).join('\n');
+}
 const number = (value) => Number(value ?? 0).toLocaleString('en-US');
 const percent = (part, whole) => (whole > 0 ? `${Math.min(100, (part / whole) * 100).toFixed(1)}%` : '-');
 const ago = (ms) => (ms ? `<t:${Math.floor(ms / 1000)}:R>` : '-');
@@ -81,7 +94,15 @@ export const memoryCommand = {
     .addSubcommand((sub) => sub.setName('include').setDescription('@everyone が見られないチャンネルも記憶に入れる (管理者)')
       .addChannelOption((option) => option.setName('channel').setDescription('入れるチャンネル (その下のスレッドも入る)').setRequired(true)))
     .addSubcommand((sub) => sub.setName('exclude').setDescription('追加したチャンネルを外す。読んだ分は残る (管理者)')
-      .addChannelOption((option) => option.setName('channel').setDescription('外すチャンネル').setRequired(true))),
+      .addChannelOption((option) => option.setName('channel').setDescription('外すチャンネル').setRequired(true)))
+    .addSubcommandGroup((group) => group.setName('category').setDescription('最上位の分類を見る・増やす・消す (管理者)')
+      .addSubcommand((sub) => sub.setName('list').setDescription('最上位の一覧'))
+      .addSubcommand((sub) => sub.setName('add').setDescription('最上位を作る。from で others の下などから昇格')
+        .addStringOption((option) => option.setName('name').setDescription('最上位の名前 (例: debates)').setRequired(true))
+        .addStringOption((option) => option.setName('description').setDescription('何を入れる分類か (書き手が振り分けに使う)'))
+        .addStringOption((option) => option.setName('from').setDescription('昇格させるページ (例: others/レスバ集)')))
+      .addSubcommand((sub) => sub.setName('remove').setDescription('最上位を消す。中身は others の下へ移す')
+        .addStringOption((option) => option.setName('name').setDescription('消す最上位').setRequired(true)))),
 
   async execute(interaction) {
     if (!interaction.guildId) {
@@ -105,6 +126,29 @@ export const memoryCommand = {
         const status = { ...memoryStatus(guildId, { budgetUsd: treeConfig.budgetUsd }), included: includedChannels(guildId) };
         await interaction.editReply({ embeds: [statusEmbed(status)] });
         return;
+      }
+      if (interaction.options.getSubcommandGroup?.(false) === 'category') {
+        if (sub === 'list') {
+          await interaction.editReply({ embeds: [new EmbedBuilder().setColor('#2b2d31').setTitle('記憶の本の最上位')
+            .setDescription(`${categoryList(guildId)}\n\n書き手は必ずこの中から選び、合わなければ ${OTHERS} に入れる。最上位の下は自由。`)] });
+          return;
+        }
+        if (sub === 'add') {
+          const name = normalizePath(interaction.options.getString('name') ?? '');
+          const from = (interaction.options.getString('from') ?? '').replace(/^\/+|\/+$/g, '').trim();
+          if (!name || name.includes('/')) throw new Error('最上位の名前に / は使えません');
+          const path = addTopLevel(guildId, name, interaction.options.getString('description') ?? '');
+          let moved = 0;
+          if (from) moved = moveSubtree(guildId, from, path);
+          await interaction.editReply(`最上位 **${path}** を作りました。${from ? ` ${from} の ${moved} ページを移しました。` : ''}次の区切りから書き手が使います。`);
+          return;
+        }
+        if (sub === 'remove') {
+          const name = interaction.options.getString('name') ?? '';
+          const moved = removeTopLevel(guildId, name);
+          await interaction.editReply(`最上位 **${normalizePath(name)}** を消し、中身 ${moved} ページを ${OTHERS}/${normalizePath(name)} に移しました。`);
+          return;
+        }
       }
       if (sub === 'include' || sub === 'exclude') {
         const channel = interaction.options.getChannel('channel');

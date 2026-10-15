@@ -17,8 +17,10 @@ import { tuneSqlite } from '../sqlite.js';
 
 const dbPath = process.env.MEMORY_DB_PATH ?? 'memory.sqlite';
 
-// 根の直下の種。型に押し込まないよう、モデルが必要なら新しい最上位を作ってよい
-// (MAX_TOP_LEVEL まで。それを超えたら topics の下に入れて、根を散らかさない)。
+// 根の直下 (最上位) の種。書き手は索引にある最上位から必ず選び、どれにも合わなければ
+// others に入れる (最上位を勝手に増やさない)。最上位を増やす・消すのは管理者 (/memory category)。
+// others に育ったまとまりは、そのまま最上位に昇格できる (moveSubtree)。
+export const OTHERS = 'others';
 export const TOP_LEVEL = [
   ['people', '人物 (性格・立場や意見・得意なこと・作ったもの・口癖・人との関係)'],
   ['projects', '作っているもの (bot・サービス・作品・リポジトリ)'],
@@ -26,9 +28,11 @@ export const TOP_LEVEL = [
   ['events', '大きな出来事のまとめ (移行・企画・事件・炎上)'],
   ['debates', 'レスバ・議論・揉め事 (誰と誰が何で、それぞれの主張、どう終わったか)'],
   ['culture', 'ネタ・ミーム・名言/迷言・内輪のノリ'],
-  ['server', 'サーバーのルール・チャンネル・用語']
+  ['server', 'サーバーのルール・チャンネル・用語'],
+  [OTHERS, 'どこにも当てはまらないもの (まとまりが育ったら最上位に上げる)']
 ];
-export const MAX_TOP_LEVEL = 12;
+// Discord のメニュー (25件) に根の一覧が収まるように
+export const MAX_TOP_LEVEL = 20;
 
 export const MAX_DEPTH = 4;
 const MAX_PART = 48;
@@ -224,17 +228,85 @@ export function normalizePath(raw) {
 }
 
 /**
- * 新しい最上位を作ってよいか。既にある最上位ならそのまま、まだ MAX_TOP_LEVEL に
- * 達していなければ新しく作ってよい。超えていたら topics の下に入れる。
+ * 書き手が書いたパスを、必ずどれかの最上位の下に置く。既にある最上位ならそのまま、
+ * 知らない最上位なら others の下へ (最上位は管理者だけが増やす)。
  */
 export function placeTopLevel(guildId, path) {
   if (!path) return path;
   const top = path.split('/')[0];
+  if (memoryDb().prepare("SELECT 1 FROM nodes WHERE guild_id = ? AND parent = '' AND path = ?").get(guildId, top)) return path;
+  return [OTHERS, ...path.split('/')].slice(0, MAX_DEPTH).join('/');
+}
+
+/** 最上位を足す (管理者)。既にあれば説明だけ直す。 */
+export function addTopLevel(guildId, name, summary = '', now = Date.now()) {
+  const path = normalizePath(name);
+  if (!path || path.includes('/')) throw new Error('最上位の名前に / は使えません');
+  const exists = getNode(guildId, path);
+  if (!exists && topLevels(guildId, MAX_TOP_LEVEL + 1).length >= MAX_TOP_LEVEL) {
+    throw new Error(`最上位は ${MAX_TOP_LEVEL} 個までです`);
+  }
+  ensureNode(guildId, path, { summary, now });
+  if (summary) memoryDb().prepare('UPDATE nodes SET summary = ? WHERE guild_id = ? AND path = ?').run(summary, guildId, path);
+  const removed = (getState(`removed-top:${guildId}`) ?? []).filter((item) => item !== path);
+  setState(`removed-top:${guildId}`, removed.length ? removed : null);
+  return path;
+}
+
+/**
+ * 部分木ごと別の場所へ移す (others に育ったまとまりの昇格・最上位の削除)。
+ * ページのパス・親、出来事とのつながり、ページどうしのつながり、本文と統合待ちの [[リンク]] を書き換える。
+ */
+export function moveSubtree(guildId, from, to, now = Date.now()) {
   const d = memoryDb();
-  if (d.prepare("SELECT 1 FROM nodes WHERE guild_id = ? AND path = ?").get(guildId, top)) return path;
-  const count = d.prepare("SELECT COUNT(*) AS c FROM nodes WHERE guild_id = ? AND parent = ''").get(guildId).c;
-  if (count < MAX_TOP_LEVEL) return path;
-  return ['topics', ...path.split('/')].slice(0, MAX_DEPTH).join('/');
+  if (!getNode(guildId, from)) throw new Error(`ページ ${from} はありません`);
+  if (to === from || to.startsWith(`${from}/`)) throw new Error('自分の下には移せません');
+  const rewrite = (path) => (path === from ? to : path.startsWith(`${from}/`) ? `${to}${path.slice(from.length)}` : path);
+  const escapeLike = (text) => text.replace(/[%_\\]/g, (c) => `\\${c}`);
+  const rows = d.prepare(`SELECT path FROM nodes WHERE guild_id = ? AND (path = ? OR path LIKE ? ESCAPE '\\') ORDER BY length(path)`)
+    .all(guildId, from, `${escapeLike(from)}/%`);
+  d.transaction(() => {
+    // 移し先の途中のページ (新しい最上位など) を先に作る
+    if (parentOf(to)) ensureNode(guildId, parentOf(to), { now });
+    for (const { path } of rows) {
+      const target = rewrite(path);
+      if (getNode(guildId, target)) {
+        // 同じ名前のページが移し先にあれば、本文を統合待ちに回して1つにする
+        const moving = getNode(guildId, path);
+        if (moving.body || moving.pending) addPending(guildId, target, `${moving.body}\n${moving.pending}`.split('\n'), { now });
+        d.prepare('DELETE FROM nodes WHERE guild_id = ? AND path = ?').run(guildId, path);
+      } else {
+        d.prepare('UPDATE nodes SET path = ?, parent = ?, updated_at = ? WHERE guild_id = ? AND path = ?')
+          .run(target, parentOf(target), now, guildId, path);
+      }
+      d.prepare('UPDATE OR IGNORE episode_nodes SET path = ? WHERE guild_id = ? AND path = ?').run(target, guildId, path);
+      d.prepare('DELETE FROM episode_nodes WHERE guild_id = ? AND path = ?').run(guildId, path);
+      d.prepare('UPDATE OR IGNORE links SET src = ? WHERE guild_id = ? AND src = ?').run(target, guildId, path);
+      d.prepare('UPDATE OR IGNORE links SET dst = ? WHERE guild_id = ? AND dst = ?').run(target, guildId, path);
+      d.prepare('DELETE FROM links WHERE guild_id = ? AND (src = ? OR dst = ?)').run(guildId, path, path);
+    }
+    // 本文と統合待ちに書かれた [[リンク]] も追いかける
+    const link = new RegExp(`\\[\\[${from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=[\\]/])`, 'g');
+    for (const node of d.prepare('SELECT path, body, pending FROM nodes WHERE guild_id = ? AND (body LIKE ? OR pending LIKE ?)')
+      .all(guildId, `%[[${from}%`, `%[[${from}%`)) {
+      d.prepare('UPDATE nodes SET body = ?, pending = ? WHERE guild_id = ? AND path = ?')
+        .run(node.body.replace(link, `[[${to}`), node.pending.replace(link, `[[${to}`), guildId, node.path);
+    }
+  })();
+  return rows.length;
+}
+
+/** 最上位を消す (管理者)。中身は others の下へ移すので失わない。others は消せない。 */
+export function removeTopLevel(guildId, name) {
+  const path = normalizePath(name);
+  if (!path || path.includes('/') || !getNode(guildId, path)) throw new Error(`最上位 ${name} はありません`);
+  if (path === OTHERS) throw new Error('others は受け皿なので消せません');
+  ensureNode(guildId, OTHERS);
+  const moved = moveSubtree(guildId, path, `${OTHERS}/${path}`);
+  if (TOP_LEVEL.some(([seed]) => seed === path)) {
+    setState(`removed-top:${guildId}`, [...new Set([...(getState(`removed-top:${guildId}`) ?? []), path])]);
+  }
+  return moved;
 }
 
 /** 根の直下 (種と、モデルが作ったもの)。重い順。 */
@@ -253,9 +325,13 @@ export function ensureSeeds(guildId, now = Date.now()) {
   const insert = d.prepare(`
     INSERT OR IGNORE INTO nodes (guild_id, path, parent, summary, updated_at) VALUES (?, ?, ?, ?, ?)
   `);
+  // 管理者が消した種は作り直さない (others だけは受け皿なので必ず置く)
+  const removed = new Set(getState(`removed-top:${guildId}`) ?? []);
   d.transaction(() => {
     insert.run(guildId, '', null, 'このサーバーの記憶の根', now);
-    for (const [name, summary] of TOP_LEVEL) insert.run(guildId, name, '', summary, now);
+    for (const [name, summary] of TOP_LEVEL) {
+      if (name === OTHERS || !removed.has(name)) insert.run(guildId, name, '', summary, now);
+    }
   })();
 }
 

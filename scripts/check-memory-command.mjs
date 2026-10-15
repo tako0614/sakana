@@ -105,6 +105,30 @@ await memoryCommand.execute(excluded);
 assert.match(excluded.calls[1][1], /外しました/);
 assert.deepEqual(store.includedChannels(GUILD), []);
 
+// /memory category: 一覧・昇格・削除 (管理者)
+const category = (sub, options) => {
+  const it = interaction({ sub, options });
+  it.options.getSubcommandGroup = () => 'category';
+  return it;
+};
+store.ensureSeeds(GUILD);
+store.ensureNode(GUILD, 'others/レスバ集');
+const listed = category('list', {});
+await memoryCommand.execute(listed);
+assert.match(embedText(listed.calls[1][1]), /others/);
+const promote = category('add', { name: 'flamewars', description: 'レスバの記録', from: 'others/レスバ集' });
+await memoryCommand.execute(promote);
+assert.match(promote.calls[1][1], /flamewars.*1 ページを移しました/);
+// 昇格: others/レスバ集 そのものが最上位 flamewars になる (中身は直下へ)
+assert.ok(store.getNode(GUILD, 'flamewars') && !store.getNode(GUILD, 'others/レスバ集'), 'add with from must promote the subtree to the new top level');
+const drop = category('remove', { name: 'flamewars' });
+await memoryCommand.execute(drop);
+assert.ok(store.getNode(GUILD, 'others/flamewars'), 'remove must keep the pages under others');
+const outsiderCategory = interaction({ sub: 'add', admin: false, options: { name: 'x' } });
+outsiderCategory.options.getSubcommandGroup = () => 'category';
+await memoryCommand.execute(outsiderCategory);
+assert.deepEqual(outsiderCategory.calls.map((c) => c[0]), ['reply'], 'only admins can change categories');
+
 // 誰でも開ける。根拠の発言にリンクが付く
 const show = interaction({ sub: 'show', admin: false, options: { path: 'people/たこ' } });
 await memoryCommand.execute(show);
@@ -164,4 +188,4 @@ assert.equal(await handleMemoryComponent(click({ customId: 'archive:reset:1' }))
 
 store.resetTree(GUILD);
 archive.prepare('DELETE FROM messages WHERE guild_id = ?').run(GUILD);
-console.log('memory command ok (status は管理者・先に受付・割合と見込みと費用 / pause で止まる / include・exclude / explore でたどる / 誰でも開ける・根拠にリンク)');
+console.log('memory command ok (status は管理者・先に受付・割合と見込みと費用 / pause で止まる / include・exclude / category / explore でたどる / 誰でも開ける・根拠にリンク)');
