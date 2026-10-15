@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { requestModel } from '../ai/provider.js';
+import { db as archive } from '../archive/db.js';
 import { ensureModelBudget } from '../ai/cost.js';
 import {
   MAX_DEPTH, TOP_LEVEL, addAliases, addPending, depthOf, ensureNode, ensureSeeds, flushPendingRaw, getNode, getState,
@@ -445,6 +446,33 @@ export function acquireLock(guildId, now = Date.now()) {
   }).immediate();
 }
 
+// ---- 一時停止と進捗の分母 ---------------------------------------------------
+
+/** Discord の /memory pause が書く。builder は区切りの境目で止まる (読みかけは失わない)。 */
+export function setPaused(guildId, by, now = Date.now()) {
+  setState(`pause:${guildId}`, by ? { by, at: now } : null);
+}
+
+export function pausedBy(guildId) {
+  return getState(`pause:${guildId}`);
+}
+
+/**
+ * 読む対象 (公開チャンネルの人間の発言) の総数。/memory status の分母。
+ * 全件を数えるので bot ではなく builder が6時間に1回だけ数えて控える。
+ */
+export function refreshTotals(guildId, channelIds, now = Date.now()) {
+  const key = `totals:${guildId}`;
+  const held = getState(key);
+  if (held && now - held.at < 6 * 3_600_000 && held.channels === channelIds.length) return held;
+  const count = archive.prepare('SELECT COUNT(*) AS n FROM messages WHERE channel_id = ? AND deleted = 0 AND is_bot = 0');
+  let messages = 0;
+  for (const channelId of channelIds) messages += count.get(channelId).n;
+  const totals = { messages, channels: channelIds.length, at: now };
+  setState(key, totals);
+  return totals;
+}
+
 // ---- 実行 ------------------------------------------------------------------
 
 /**
@@ -553,10 +581,17 @@ export async function runBuild({
       throw new StopRun('公開チャンネルの控えがありません (bot を起動すると書かれます)', 'no-channels');
     }
     const channelIds = publicChannels.channelIds;
+    const paused = () => {
+      const by = pausedBy(guildId);
+      if (by) throw new StopRun(`一時停止中 (${by.by})`, 'paused');
+    };
+    paused();
+    refreshTotals(guildId, channelIds, now());
     if (retryFailed) await retryFailedSegments(guildId, channelIds, segment, spent, log);
 
     let sinceRoot = getState(`root:${guildId}`)?.segments ?? 0;
     while (!spent()) {
+      paused();
       setState(`lock:${guildId}`, { pid: process.pid, host: hostname(), at: now() });
 
       // 1) 知識が溜まったページを先に書き直す (既知のページとして次の区切りに渡すため)

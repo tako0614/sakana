@@ -3,6 +3,7 @@ import { getTopXP, getUserRank } from './db.js';
 import { archiveCommands } from './archive/commands.js';
 import { agentCommands } from './agent/commands.js';
 import { mimicCommands } from './mimic/command.js';
+import { memoryCommands } from './memory/command.js';
 import { governanceConfig } from './governance/config.js';
 import { governanceCommands } from './governance/commands.js';
 
@@ -10,6 +11,7 @@ export const commands = [
   ...archiveCommands,
   ...agentCommands,
   ...mimicCommands,
+  ...memoryCommands,
   ...(governanceConfig.enabled ? governanceCommands : []),
   {
     data: new SlashCommandBuilder()
