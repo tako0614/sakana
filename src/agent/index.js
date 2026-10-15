@@ -484,7 +484,7 @@ export async function handleAgentRequest(message, client) {
     await indicator.stop();
 
     const answer = result.text?.trim()
-      ? expandCitations(result.text.trim(), refs, { label: modelLabel(model) })
+      ? expandCitations(result.text.trim(), refs, { label: modelLabel(model), selfId: client.user?.id })
       : 'うまく答えをまとめられませんでした。条件を絞ってもう一度聞いてください。';
 
     // 撮ったのに貼れないときは黙らない (画像が出ている前提で読まれる)

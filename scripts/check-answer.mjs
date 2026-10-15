@@ -95,6 +95,16 @@ function tableOf(count) {
   // どのモデルが書いたかは毎回出す。引用があるときは同じ subtext に混ぜる
   // (行を2本にすると会話の邪魔になる)。
   const refs = tableOf(2);
+  // 自分の発言を指す番号は根拠にならないので、番号ごと消してリンクも出さない
+  {
+    const selfRefs = new RefTable();
+    selfRefs.add({ guildId: 'g', channelId: 'c', messageId: '111111111111111111', authorId: 'bot', authorName: 'me', content: 'x', createdAt: 1 });
+    selfRefs.add({ guildId: 'g', channelId: 'c', messageId: '222222222222222222', authorId: 'u', authorName: 'さば', content: 'y', createdAt: 2 });
+    const cited = expandCitations('前に言った通り [1]。さばも書いてる [2]。', selfRefs, { label: 'm', selfId: 'bot' });
+    if (cited.includes('111111111111111111')) fail('自分の発言へのリンクを出してはいけない: ' + cited);
+    if (!cited.includes('222222222222222222')) fail('他人の発言へのリンクは残す: ' + cited);
+    if (/\[1\]/.test(cited)) fail('自分の発言の番号は本文から消す: ' + cited);
+  }
   const withUrls = expandCitations('4月に書いてる [1]。', refs, { label: 'deepseek v4 flash' });
   const footer = withUrls.split('-# ')[1];
   if (!footer.startsWith('deepseek v4 flash ')) fail(`モデル名が先頭に来ていない: ${footer}`);

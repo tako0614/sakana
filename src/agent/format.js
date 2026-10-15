@@ -118,7 +118,7 @@ export function messageLink(entry) {
  * 入っているので、全部並べると数百行になる。
  * 引けなかった番号は本文から消すだけで、末尾には出さない (リンク切れを作らない)。
  */
-export function expandCitations(text, refs, { label = null } = {}) {
+export function expandCitations(text, refs, { label = null, selfId = null } = {}) {
   const raw = String(text ?? '');
   const urls = [];
   const seen = new Set();
@@ -127,7 +127,11 @@ export function expandCitations(text, refs, { label = null } = {}) {
   // 全角スペースも食う (日本語で書かせているので混ざる)。
   const body = raw.replace(/[ \t　]*\[(\d{1,4})\]/g, (match, digits, offset) => {
     const ref = Number(digits);
-    const url = messageLink(refs.get(ref));
+    const entry = refs.get(ref);
+    const url = messageLink(entry);
+
+    // 自分の発言は根拠にならない (プロンプトで禁じても flash 系は番号を付けた)。番号だけ消す
+    if (url && selfId && String(entry?.authorId) === String(selfId)) return '';
 
     // 引けない番号は触らない。無条件に消していたら `[2024] の話ね` が
     // `の話ね` になっていた (数字の括弧は引用とは限らない)。
