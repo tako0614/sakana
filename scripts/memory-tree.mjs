@@ -5,7 +5,7 @@ import { db as archive } from '../src/archive/db.js';
 import { modelBudgetStatus } from '../src/ai/cost.js';
 import { StopRun, openRouterCaller, runBuild, segmentPrompt, treeConfig } from '../src/memory/build.js';
 import {
-  getCursor, getNode, getState, loadPublicChannels, memoryCounts, memoryDb, resetTree, segmentStats
+  getCursor, getNode, getState, loadPublicChannels, memoryCounts, memoryDb, reopenEmptySegments, resetTree, segmentStats
 } from '../src/memory/store.js';
 import { recallFor } from '../src/memory/recall.js';
 import { memoryRootPrompt, runMemoryTool } from '../src/memory/tool.js';
@@ -24,6 +24,7 @@ import { planPack } from '../src/memory/transcript.js';
 //   node scripts/memory-tree.mjs estimate --guild ID              未読の量 (アーカイブを走査するので重い)
 //   node scripts/memory-tree.mjs export  --guild ID --out DIR     Markdown に書き出す
 //   node scripts/memory-tree.mjs reset   --guild ID --yes         記憶を消す (原文には触らない)
+//   node scripts/memory-tree.mjs reopen-empty --guild ID [--yes]  出来事が1つも無い長い区切りを読み直しに回す
 
 const [command, ...rest] = process.argv.slice(2);
 const args = {};
@@ -34,7 +35,7 @@ for (let i = 0; i < rest.length; i += 1) {
 }
 const guildId = String(args.guild ?? process.env.MEMORY_TREE_GUILD ?? '');
 if (!command || !guildId) {
-  console.error('usage: node scripts/memory-tree.mjs <status|run|try|show|episode|search|recall|root|estimate|export|reset> --guild ID');
+  console.error('usage: node scripts/memory-tree.mjs <status|run|try|show|episode|search|recall|root|estimate|export|reset|reopen-empty> --guild ID');
   process.exit(2);
 }
 
@@ -165,6 +166,12 @@ switch (command) {
   case 'recall': console.log(recallFor(guildId, { request: String(args.text ?? '') }) || '(何も思い出さない)'); break;
   case 'root': console.log(memoryRootPrompt(guildId) || '(まだ木がありません)'); break;
   case 'export': exportTree(); break;
+  case 'reopen-empty': {
+    const rows = reopenEmptySegments(guildId, { minChars: Number(args['min-chars'] ?? treeConfig.emptyChars), apply: Boolean(args.yes) });
+    const messages = rows.reduce((sum, row) => sum + row.messages, 0);
+    console.log(`${args.yes ? '読み直しに回した' : '読み直しに回す (--yes で実行)'}: ${rows.length} 区切り / ${messages} 発言`);
+    break;
+  }
   case 'reset':
     if (args.yes !== true) { console.error('記憶を消すには --yes を付けてください (原文のアーカイブは残ります)'); process.exit(2); }
     resetTree(guildId);

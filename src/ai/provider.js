@@ -172,7 +172,7 @@ function validateRoutes(model, fallbackModels) {
 /** All requests share transport and accounting; the host runtime owns tools and effects. */
 export async function requestModel({ model = providerConfig.model,fallbackModels = [],messages,tools,jsonOnly = false,
   maxOutputTokens = 8000,timeoutMs = 120000,deadlineAt = Infinity,reasoning,temperature,
-  guildId = null,role = 'chat',runId = null,retries = 0,budgetId = null,consumeRequest,beforeSend }) {
+  guildId = null,role = 'chat',runId = null,retries = 0,budgetId = null,consumeRequest,beforeSend,ignoreProviders = [] }) {
   if (!providerConfig.apiKey) throw new Error('OPENROUTER_API_KEY is not configured');
   if (!Number.isInteger(retries) || retries < 0) throw new Error('retries must be a nonnegative integer');
   const routes = validateRoutes(model,fallbackModels);
@@ -212,6 +212,7 @@ export async function requestModel({ model = providerConfig.model,fallbackModels
             headers:{'content-type':'application/json',authorization:`Bearer ${providerConfig.apiKey}`},
             body:JSON.stringify({ model:route,messages,stream:false,max_tokens:maxOutputTokens,
               provider:{sort:'price',require_parameters:true,allow_fallbacks:true,
+                ...(ignoreProviders.length ? {ignore:ignoreProviders} : {}),
                 ...(reservation.capped ? {max_price:{prompt:reservation.rates.input,
                   completion:reservation.rates.output,request:reservation.rates.request ?? 0}} : {})},
               ...(tools?.length ? {tools,tool_choice:'auto'} : {}),
@@ -238,7 +239,8 @@ export async function requestModel({ model = providerConfig.model,fallbackModels
           throw error;
         }
         data = {...data,usage:normalizeUsage(data.usage)};
-        if (data.choices?.[0]?.finish_reason === 'length') throw new Error('AI output was truncated');
+        // どの provider で切れたかを呼び出し側へ渡す (暴走する provider を外すため)
+        if (data.choices?.[0]?.finish_reason === 'length') throw Object.assign(new Error('AI output was truncated'),{provider:data.provider});
         if (!data.choices?.[0]?.message) throw new Error('OpenRouter returned no message');
         if (free && !Number.isFinite(data.usage.cost)) { noCharge = true; finishStatus = 'verified_free'; }
         return data;

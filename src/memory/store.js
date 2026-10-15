@@ -694,6 +694,31 @@ export function recordSegment(guildId, segment, { status, model = null, error = 
     segment.messages, segment.chars, status, model, error, now);
 }
 
+/**
+ * 読み終えたことになっているのに出来事が1つも無い長い区切りを failed に戻す
+ * (次の run --retry-failed で読み直す)。provider が空の結果を返していた期間の後始末。
+ */
+export function reopenEmptySegments(guildId, { minChars = 4000, apply = false, now = Date.now() } = {}) {
+  const d = memoryDb();
+  const rows = d.prepare(`
+    SELECT s.channel_id, s.from_id, s.messages, s.chars FROM segments s
+    WHERE s.guild_id = ? AND s.status = 'done' AND s.chars >= ?
+      AND NOT EXISTS (SELECT 1 FROM episodes e WHERE e.guild_id = s.guild_id AND e.channel_id = s.channel_id
+        AND e.at_ms <= s.to_ms AND e.end_ms >= s.from_ms)
+  `).all(guildId, minChars);
+  if (apply) {
+    const mark = d.prepare(`UPDATE segments SET status = 'failed', error = 'empty output (reopened)', done_at = ?
+      WHERE guild_id = ? AND channel_id = ? AND from_id = ?`);
+    d.transaction(() => {
+      for (const row of rows) {
+        mark.run(now, guildId, row.channel_id, row.from_id);
+        setState(`retry:${guildId}:${row.channel_id}:${row.from_id}`, null);
+      }
+    })();
+  }
+  return rows;
+}
+
 export function segmentStats(guildId) {
   return memoryDb().prepare(`
     SELECT status, COUNT(*) AS segments, COALESCE(SUM(messages), 0) AS messages, COALESCE(SUM(chars), 0) AS chars,

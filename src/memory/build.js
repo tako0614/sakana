@@ -61,6 +61,10 @@ export const treeConfig = {
   // 同時に投げる呼び出しの数。区切りはチャンネルが、統合はページが重ならないように組む
   concurrency: Math.max(1, Number(process.env.MEMORY_TREE_CONCURRENCY || 8)),
   outputTokens: Number(process.env.MEMORY_TREE_OUTPUT_TOKENS || 16000),
+  // 最初から外しておく provider (カンマ区切り)。壊れた出力を返したものは自動でも外す
+  ignoreProviders: list(process.env.MEMORY_TREE_IGNORE_PROVIDERS, ''),
+  // これより長い区切りで出来事も知識も1つも無ければ、読めていないとみなす
+  emptyChars: Number(process.env.MEMORY_TREE_EMPTY_CHARS || 4000),
   // これ以上待たされる 429 は日の上限とみなして止める
   maxWaitMs: 10 * 60_000,
   failuresBeforeSkip: 3,
@@ -179,14 +183,33 @@ function budgetFor(guildId, models) {
   return id;
 }
 
+// 壊れた出力を返す provider をしばらく外す。
+// 2026-10-15、OpenRouter が glm-5.3-flash を回す先のうち OpenInference は3万トークン読ませても
+// {"episodes":[]} だけ (17トークン) を返し、Morph は半数が 16000 トークンまで暴走した。
+// どちらも「完了」に見えるので、空の区切りが静かに積み上がっていた。
+const badProviders = new Map();
+const BAD_PROVIDER_MS = 3 * 3_600_000;
+
+export function avoidedProviders(now = Date.now()) {
+  for (const [name, until] of badProviders) if (until <= now) badProviders.delete(name);
+  return [...new Set([...treeConfig.ignoreProviders, ...badProviders.keys()])];
+}
+
+export function avoidProvider(name, now = Date.now()) {
+  if (name) badProviders.set(name, now + BAD_PROVIDER_MS);
+}
+
 /**
  * 1回の呼び出し。待てば済む 429 は待って同じ入力を送り直し、日の上限・認証・
  * 残高は StopRun にする。出力が読めないものはそのまま投げる (呼び出し側が数える)。
+ * check は読めた JSON の検査 (空の結果など)。落ちたら、または途中で切れたら、
+ * その provider を外してすぐ送り直す (2回まで)。
  */
 export function openRouterCaller({ guildId, models = treeConfig.models, runId = randomUUID() } = {}) {
   const budgetId = budgetFor(guildId, models);
-  return async function call({ kind, system, user }) {
-    for (let transient = 0; ; transient += 1) {
+  return async function call({ kind, system, user, check }) {
+    for (let transient = 0, swapped = 0; ; transient += 1) {
+      let provider = null;
       try {
         const data = await requestModel({
           model: models[0], fallbackModels: models.slice(1),
@@ -194,11 +217,21 @@ export function openRouterCaller({ guildId, models = treeConfig.models, runId = 
           maxOutputTokens: treeConfig.outputTokens, timeoutMs: treeConfig.timeoutMs,
           guildId, role: `memory-${kind}`, runId, budgetId, temperature: 0.2, reasoning: treeConfig.reasoning,
           // JSON 専用モード。glm-5.3-flash で約20回に1回 JSON が壊れていた
-          jsonOnly: true
+          jsonOnly: true, ignoreProviders: avoidedProviders()
         });
+        provider = data.provider ?? null;
         const message = data.choices[0].message;
-        return { json: parseModelJson(message.content), model: data.model ?? models[0], usage: data.usage };
+        const json = parseModelJson(message.content);
+        check?.(json);
+        return { json, model: data.model ?? models[0], provider, usage: data.usage };
       } catch (error) {
+        const blame = provider ?? error.provider;
+        if ((error.code === 'BAD_OUTPUT' || /truncated/.test(error.message)) && blame && swapped < 2) {
+          avoidProvider(blame);
+          swapped += 1;
+          console.warn(`memory: ${blame} を ${BAD_PROVIDER_MS / 3_600_000} 時間外す (${error.message})`);
+          continue;
+        }
         if (error.code === 'BAD_OUTPUT' || /truncated/.test(error.message)) throw error;
         if ([401, 402, 403].includes(error.status)) throw new StopRun(`OpenRouter HTTP ${error.status}`, 'auth');
         if (/BUDGET/.test(error.code ?? '')) throw new StopRun(error.message, 'budget');
@@ -235,6 +268,14 @@ const pathOf = (guildId, raw) => {
   const normalized = normalizePath(raw);
   return normalized ? resolveExisting(guildId, placeTopLevel(guildId, normalized)) : null;
 };
+
+/** 長い区切りなのに出来事も知識も空なら、読めていない (provider が空の JSON を返した)。 */
+export function checkSegmentOutput(pack, json) {
+  const count = (value) => (Array.isArray(value) ? value.length : 0);
+  if (pack.text.length >= treeConfig.emptyChars && count(json?.episodes) === 0 && count(json?.facts) === 0) {
+    throw badOutput(`segment output was empty for ${pack.text.length} chars`);
+  }
+}
 
 /**
  * 区切りの結果を、区切りの記録・cursor と同じトランザクションで入れる。
@@ -554,7 +595,10 @@ export async function runBuild({
     const key = `pack-fail:${guildId}:${pack.segments[0].channelId}:${pack.segments[0].fromId}`;
     stats.calls += 1;
     try {
-      const result = await call({ kind: 'segment', system: SEGMENT_SYSTEM, user: segmentPrompt(guildId, pack) });
+      const result = await call({ kind: 'segment', system: SEGMENT_SYSTEM, user: segmentPrompt(guildId, pack),
+        check: (json) => checkSegmentOutput(pack, json) });
+      // 呼び出し側が check を使わない (差し替えた call) ときもここで止める。空を「完了」にしない
+      checkSegmentOutput(pack, result.json);
       const applied = applySegmentResult(guildId, pack, result.json, { model: result.model, now: now(), advance });
       setState(key, null);
       stats.segments += pack.segments.length;
