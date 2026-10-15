@@ -97,8 +97,22 @@ Object.assign(treeConfig, { segmentChars: 900, minChars: 0, idleMs: 0, integrate
 
 const calls = [];
 let mode = 'ok';
+let inFlight = 0;
+let maxInFlight = 0;
+const busyChannels = new Set();
 const fake = async ({ kind, user }) => {
   calls.push({ kind, user });
+  // 同時に何本走ったか、同じ波の区切りがチャンネルを取り合っていないかを見る
+  const labels = kind === 'segment' ? [...new Set([...(user.split('会話ログ')[1] ?? '').matchAll(/^## (#\S+)/gm)].map((m) => m[1]))] : [];
+  for (const label of labels) {
+    if (busyChannels.has(label)) fail('two concurrent segments read the same channel: ' + label);
+    busyChannels.add(label);
+  }
+  inFlight += 1;
+  maxInFlight = Math.max(maxInFlight, inFlight);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  inFlight -= 1;
+  for (const label of labels) busyChannels.delete(label);
   if (mode === 'quota') throw new StopRun('無料枠の上限', 'quota');
   if (kind === 'segment') {
     if (mode === 'garbage') return { json: parseModelJson('すみません、できません'), model: 'fake' };
@@ -226,6 +240,30 @@ if (planPack({ guildId: GUILD, channelIds: [OPEN, TALK], targetChars: 900, minCh
 const idleTail = planPack({ guildId: GUILD, channelIds: [OPEN, TALK], targetChars: 900, minChars: 5000, idleMs: 6 * 3_600_000, now: Date.now() + 7 * 3_600_000 });
 if (!idleTail || idleTail.segments[0].toId !== fresh) fail('an idle tail must be read');
 
+// ---- 並行: チャンネルが重ならない区切りを同時に投げる ---------------------------
+
+const WIDE = '900000000000000002';
+const wideChannels = ['900000000000000020', '900000000000000021', '900000000000000022'];
+resetTree(WIDE);
+archive.prepare('DELETE FROM messages WHERE guild_id = ?').run(WIDE);
+for (const [i, id] of wideChannels.entries()) {
+  archive.prepare('INSERT OR REPLACE INTO channels (channel_id, guild_id, name) VALUES (?, ?, ?)').run(id, WIDE, `wide${i}`);
+  for (let j = 0; j < 40; j += 1) {
+    seq += 1n;
+    insert.run((1350000000000000000n + seq).toString(), WIDE, id, `70000000000000000${i}`, `user${i}`, 0,
+      `チャンネル${i}の話題 ${j} についての長めの発言をここに書く`, T0 + j * 20 * 60_000, null, 0, '', 20, 0);
+  }
+}
+savePublicChannels(WIDE, wideChannels);
+maxInFlight = 0;
+const wide = await runBuild({ guildId: WIDE, call: fake });
+if (wide.stopped !== 'done') fail('the wide run must finish: ' + JSON.stringify(wide));
+if (maxInFlight < 2) fail('segments on different channels must run concurrently (max in flight ' + maxInFlight + ')');
+for (const id of wideChannels) if (!getCursor(WIDE, id)) fail('every channel must be read in the concurrent run');
+resetTree(WIDE);
+archive.prepare('DELETE FROM messages WHERE guild_id = ?').run(WIDE);
+archive.prepare('DELETE FROM channels WHERE guild_id = ?').run(WIDE);
+
 // ---- たどる -----------------------------------------------------------------
 
 forgetNames(GUILD);
@@ -280,4 +318,4 @@ setState(`lock:${GUILD}`, null);
 resetTree(GUILD);
 archive.prepare('DELETE FROM messages WHERE guild_id = ?').run(GUILD);
 archive.prepare('DELETE FROM channels WHERE guild_id = ?').run(GUILD);
-console.log('memory ok (台本と行番号 / 出来事と根拠 / 丸写し・根拠なしを捨てる / 統合と[e]・[[リンク]] / 続きの出来事 / 2つの間の出来事 / 想起 / 再開・無料枠・失敗)');
+console.log('memory ok (台本と行番号 / 並行 / 出来事と根拠 / 丸写し・根拠なしを捨てる / 統合と[e]・[[リンク]] / 続きの出来事 / 2つの間の出来事 / 想起 / 再開・無料枠・失敗)');

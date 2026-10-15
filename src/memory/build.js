@@ -56,6 +56,8 @@ export const treeConfig = {
   indexChars: 6000,
   knownChars: 6000,
   timeoutMs: Number(process.env.MEMORY_TREE_TIMEOUT_MS || 300_000),
+  // 同時に投げる呼び出しの数。区切りはチャンネルが、統合はページが重ならないように組む
+  concurrency: Math.max(1, Number(process.env.MEMORY_TREE_CONCURRENCY || 4)),
   outputTokens: Number(process.env.MEMORY_TREE_OUTPUT_TOKENS || 16000),
   // これ以上待たされる 429 は日の上限とみなして止める
   maxWaitMs: 10 * 60_000,
@@ -141,10 +143,16 @@ export function parseModelJson(content) {
   const start = text.indexOf('{');
   const end = text.lastIndexOf('}');
   if (start < 0 || end <= start) throw badOutput('model output had no JSON object');
+  const body = text.slice(start, end + 1);
   try {
-    return JSON.parse(text.slice(start, end + 1));
+    return JSON.parse(body);
   } catch (cause) {
-    throw badOutput('model output was not valid JSON', cause);
+    // よくある崩れ (末尾のカンマ・文字列中の生の改行) だけは直して読む
+    try {
+      return JSON.parse(body.replace(/,\s*([}\]])/g, '$1').replace(/[\u0000-\u001f]+/g, ' '));
+    } catch {
+      throw badOutput('model output was not valid JSON', cause);
+    }
   }
 }
 
@@ -177,7 +185,9 @@ export function openRouterCaller({ guildId, models = treeConfig.models, runId = 
           model: models[0], fallbackModels: models.slice(1),
           messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
           maxOutputTokens: treeConfig.outputTokens, timeoutMs: treeConfig.timeoutMs,
-          guildId, role: `memory-${kind}`, runId, budgetId, temperature: 0.2, reasoning: treeConfig.reasoning
+          guildId, role: `memory-${kind}`, runId, budgetId, temperature: 0.2, reasoning: treeConfig.reasoning,
+          // JSON 専用モード。glm-5.3-flash で約20回に1回 JSON が壊れていた
+          jsonOnly: true
         });
         const message = data.choices[0].message;
         return { json: parseModelJson(message.content), model: data.model ?? models[0], usage: data.usage };
@@ -590,33 +600,47 @@ export async function runBuild({
     if (retryFailed) await retryFailedSegments(guildId, channelIds, segment, spent, log);
 
     let sinceRoot = getState(`root:${guildId}`)?.segments ?? 0;
+    const width = treeConfig.concurrency;
     while (!spent()) {
       paused();
       setState(`lock:${guildId}`, { pid: process.pid, host: hostname(), at: now() });
 
-      // 1) 知識が溜まったページを先に書き直す (既知のページとして次の区切りに渡すため)
-      const ready = integrationBatch(guildId, { minChars: treeConfig.integrateChars, skip });
-      if (ready) { await integrate(ready); continue; }
-
-      // 2) 次の区切り
-      const pack = planPack({ guildId, channelIds, targetChars: treeConfig.segmentChars,
-        minChars: treeConfig.minChars, idleMs: treeConfig.idleMs, now: now() });
-      if (pack) {
-        if (await segment(pack)) {
-          sinceRoot += 1;
-          setState(`root:${guildId}`, { ...(getState(`root:${guildId}`) ?? {}), segments: sinceRoot });
-          if (sinceRoot >= treeConfig.rootEverySegments && !spent()) {
-            await rebuildRoot(guildId, call, stats, log);
-            sinceRoot = 0;
-          }
-        }
-        continue;
+      // 1回の波で、ページが重ならない統合 (波の半分まで) と、チャンネルが重ならない区切りを
+      // 同時に投げる。結果の反映はそれぞれのトランザクションで1つずつ (統合待ちは末尾に
+      // 足すだけなので、統合と区切りが同じページに触っても食い違わない)。
+      const tasks = [];
+      const room = () => tasks.length < width && stats.calls + tasks.length < maxCalls;
+      const pagesTaken = new Set(skip);
+      while (room() && tasks.length < Math.max(1, Math.floor(width / 2))) {
+        // 知識が溜まったページを先に書き直す (既知のページとして次の区切りに渡すため)
+        const batch = integrationBatch(guildId, { minChars: treeConfig.integrateChars, skip: pagesTaken });
+        if (!batch) break;
+        for (const item of batch) pagesTaken.add(item.path);
+        tasks.push(() => integrate(batch));
       }
+      const channelsTaken = new Set();
+      while (room()) {
+        const pack = planPack({ guildId, channelIds, targetChars: treeConfig.segmentChars,
+          minChars: treeConfig.minChars, idleMs: treeConfig.idleMs, now: now(), exclude: channelsTaken });
+        if (!pack) break;
+        for (const s of pack.segments) channelsTaken.add(s.channelId);
+        tasks.push(async () => { if (await segment(pack)) sinceRoot += 1; });
+      }
+      // 読み終えたら、少ない統合待ちも書き直す
+      while (tasks.length === 0 || (channelsTaken.size === 0 && room())) {
+        const batch = integrationBatch(guildId, { minChars: 1, skip: pagesTaken });
+        if (!batch) break;
+        for (const item of batch) pagesTaken.add(item.path);
+        tasks.push(() => integrate(batch));
+      }
+      if (tasks.length === 0) break;
 
-      // 3) 読み終えたら、少ない統合待ちも書き直す
-      const rest = integrationBatch(guildId, { minChars: 1, skip });
-      if (rest) { await integrate(rest); continue; }
-      break;
+      await Promise.all(tasks.map((task) => task()));
+      setState(`root:${guildId}`, { ...(getState(`root:${guildId}`) ?? {}), segments: sinceRoot });
+      if (sinceRoot >= treeConfig.rootEverySegments && !spent()) {
+        await rebuildRoot(guildId, call, stats, log);
+        sinceRoot = 0;
+      }
     }
 
     if (spent()) stats.stopped = 'limit';
@@ -658,11 +682,20 @@ async function retryFailedSegments(guildId, channelIds, segment, spent, log) {
   for (const row of rows) {
     if (spent()) return;
     if (!allowed.has(row.channel_id)) continue;   // 非公開になったチャンネルは読み直さない
+    // 内容ごと拒否される区切りを毎回読み直して払い続けない (3回までで諦め、failed のまま残す)
+    const key = `retry:${guildId}:${row.channel_id}:${row.from_id}`;
+    const tried = getState(key)?.count ?? 0;
+    if (tried >= treeConfig.failuresBeforeSkip) continue;
     const rendered = renderSegment({ guildId, channelId: row.channel_id, cursor: cursorBefore(row.from_id, row.from_ms),
       maxChars: Infinity, until: { id: row.to_id, ms: row.to_ms } });
     if (!rendered) continue;
     // 元の区切りの記録 (from_id) を上書きする。cursor はとっくに先へ進んでいるので戻さない
     const pack = packOf([{ ...rendered, fromId: row.from_id }]);
-    if (await segment(pack, { advance: false })) log(`retried ${rendered.label} ${row.from_id}`);
+    if (await segment(pack, { advance: false })) {
+      setState(key, null);
+      log(`retried ${rendered.label} ${row.from_id}`);
+    } else {
+      setState(key, { count: tried + 1 });
+    }
   }
 }

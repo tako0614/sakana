@@ -2,7 +2,9 @@ import { execFile } from 'node:child_process';
 import { EmbedBuilder, MessageFlags, SlashCommandBuilder } from 'discord.js';
 import { canManageIndex } from '../archive/permissions.js';
 import { pausedBy, setPaused, treeConfig } from './build.js';
+import { snapshotPublicChannels } from './snapshot.js';
 import { memoryStatus } from './status.js';
+import { includeChannel, includedChannels, removeIncluded } from './store.js';
 import { hasMemory, runMemoryTool } from './tool.js';
 
 // /memory: 記憶の本の進み具合を見る・止める (管理者)、ページや出来事を開く (誰でも)。
@@ -10,7 +12,7 @@ import { hasMemory, runMemoryTool } from './tool.js';
 // 返事は本人にだけ見える形にする (チャンネルを流さない)。
 
 const UNIT = process.env.MEMORY_TREE_SYSTEMD_UNIT ?? 'sakana-memory.service';
-const ADMIN_ONLY = new Set(['status', 'pause', 'resume']);
+const ADMIN_ONLY = new Set(['status', 'pause', 'resume', 'include', 'exclude']);
 const number = (value) => Number(value ?? 0).toLocaleString('en-US');
 const percent = (part, whole) => (whole > 0 ? `${Math.min(100, (part / whole) * 100).toFixed(1)}%` : '-');
 const ago = (ms) => (ms ? `<t:${Math.floor(ms / 1000)}:R>` : '-');
@@ -38,7 +40,9 @@ function statusEmbed(status) {
       { name: '記憶', value: `ページ ${number(status.memory.pages)} / 出来事 ${number(status.memory.episodes)} / つながり ${number(status.memory.links)}`
         + (status.memory.pendingPages ? ` / 統合待ち ${status.memory.pendingPages} ページ` : '') },
       { name: '費用', value: `$${status.spentUsd.toFixed(3)}${budget} (${number(status.calls)} 回)`, inline: true },
-      { name: 'モデル', value: treeConfig.models.join(' → ').slice(0, 1000), inline: true }
+      { name: 'モデル', value: treeConfig.models.join(' → ').slice(0, 1000), inline: true },
+      { name: '追加したチャンネル (@everyone 以外)', value: status.included.length
+        ? status.included.map((id) => `<#${id}>`).join(' ').slice(0, 1000) : 'なし (公開チャンネルだけ)' }
     );
 }
 
@@ -70,7 +74,11 @@ export const memoryCommand = {
       .addStringOption((option) => option.setName('id').setDescription('出来事の番号。例: e12').setRequired(true)))
     .addSubcommand((sub) => sub.setName('status').setDescription('読み込みの進み具合と費用 (管理者)'))
     .addSubcommand((sub) => sub.setName('pause').setDescription('読み込みを一時停止する (管理者)'))
-    .addSubcommand((sub) => sub.setName('resume').setDescription('読み込みを再開する (管理者)')),
+    .addSubcommand((sub) => sub.setName('resume').setDescription('読み込みを再開する (管理者)'))
+    .addSubcommand((sub) => sub.setName('include').setDescription('@everyone が見られないチャンネルも記憶に入れる (管理者)')
+      .addChannelOption((option) => option.setName('channel').setDescription('入れるチャンネル (その下のスレッドも入る)').setRequired(true)))
+    .addSubcommand((sub) => sub.setName('exclude').setDescription('追加したチャンネルを外す。読んだ分は残る (管理者)')
+      .addChannelOption((option) => option.setName('channel').setDescription('外すチャンネル').setRequired(true))),
 
   async execute(interaction) {
     if (!interaction.guildId) {
@@ -91,7 +99,21 @@ export const memoryCommand = {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       if (sub === 'status') {
-        await interaction.editReply({ embeds: [statusEmbed(memoryStatus(guildId, { budgetUsd: treeConfig.budgetUsd }))] });
+        const status = { ...memoryStatus(guildId, { budgetUsd: treeConfig.budgetUsd }), included: includedChannels(guildId) };
+        await interaction.editReply({ embeds: [statusEmbed(status)] });
+        return;
+      }
+      if (sub === 'include' || sub === 'exclude') {
+        const channel = interaction.options.getChannel('channel');
+        if (sub === 'include') includeChannel(guildId, channel.id, interaction.user.username);
+        const removed = sub === 'exclude' && removeIncluded(guildId, channel.id);
+        // 控えをすぐ書き直して builder を起こす (次の区切りから読む / 読まない)
+        snapshotPublicChannels(interaction.client);
+        const woke = sub === 'include' && await wakeBuilder();
+        await interaction.editReply(sub === 'include'
+          ? `<#${channel.id}> とその下のスレッドを記憶に入れます。このチャンネルを見られない人にも思い出されます。${woke ? '読み込みを起動しました。' : ''}`
+          : removed ? `<#${channel.id}> を外しました。これから先は読みません (読んだ分の記憶は残ります)。`
+            : `<#${channel.id}> は追加したチャンネルではありません (公開チャンネルは外せません)。`);
         return;
       }
       if (sub === 'pause') {

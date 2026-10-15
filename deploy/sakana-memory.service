@@ -9,7 +9,8 @@ Type=oneshot
 # リリースを切り替えるときは sakana.service と同じく drop-in (90-release.conf) で ExecStart を差し替える。
 WorkingDirectory=/root/sakana
 # 溜まっている分は読み切るまで続ける (初回の全履歴は十数時間)。読み終えたら timer が1時間おきに新着を読む
-ExecStart=/usr/bin/node scripts/memory-tree.mjs run
+# 失敗した区切りは起動のたびに読み直す (1区切り3回まで)
+ExecStart=/usr/bin/node scripts/memory-tree.mjs run --retry-failed
 TimeoutStartSec=infinity
 Nice=10
 # idle クラスは bot の取り込みに負けて止まる (実測) ので best-effort の最低優先度

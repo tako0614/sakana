@@ -160,6 +160,16 @@ export function memoryDb() {
       PRIMARY KEY (guild_id, channel_id)
     );
 
+    -- @everyone からは見えないが、管理者が記憶に入れると決めたチャンネル (/memory include)。
+    -- その下の非公開でないスレッドも入る。
+    CREATE TABLE IF NOT EXISTS included_channels (
+      guild_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      added_by TEXT,
+      added_at INTEGER NOT NULL,
+      PRIMARY KEY (guild_id, channel_id)
+    );
+
     CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   `);
   return db;
@@ -595,6 +605,23 @@ export function loadPublicChannels(guildId) {
   const ids = memoryDb().prepare('SELECT channel_id FROM public_channels WHERE guild_id = ?').all(guildId)
     .map((row) => row.channel_id);
   return { at: meta.at, channelIds: ids };
+}
+
+export function includeChannel(guildId, channelId, by = null, now = Date.now()) {
+  memoryDb().prepare(`
+    INSERT INTO included_channels (guild_id, channel_id, added_by, added_at) VALUES (?, ?, ?, ?)
+    ON CONFLICT(guild_id, channel_id) DO NOTHING
+  `).run(guildId, String(channelId), by, now);
+}
+
+export function removeIncluded(guildId, channelId) {
+  return memoryDb().prepare('DELETE FROM included_channels WHERE guild_id = ? AND channel_id = ?')
+    .run(guildId, String(channelId)).changes > 0;
+}
+
+export function includedChannels(guildId) {
+  return memoryDb().prepare('SELECT channel_id FROM included_channels WHERE guild_id = ? ORDER BY added_at')
+    .all(guildId).map((row) => row.channel_id);
 }
 
 /** 記憶を作り直す。原文 (アーカイブ) と公開チャンネルの控えには触らない。 */

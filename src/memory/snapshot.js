@@ -1,17 +1,43 @@
+import { db as archive } from '../archive/db.js';
 import { publicChannels } from '../archive/visibility.js';
-import { savePublicChannels } from './store.js';
+import { includedChannels, savePublicChannels } from './store.js';
 
 // builder は Discord につながらないので、どのチャンネルを読んでよいかは bot が控えておく。
 // 権限が変わったら次の控えで反映される (非公開になったチャンネルは以後読まない)。
-// nsfw のチャンネルも公開なら読む (サーバーの判断)。提供元が拒否した区切りは
-// failed として記録され、--retry-failed で読み直せる。
+//
+// 読むのは @everyone と bot の両方が読めるチャンネルと、管理者が /memory include で
+// 入れたチャンネル (ロールが要るチャンネルなど) とその下の非公開でないスレッド。
+// nsfw も区別しない。記憶は誰に聞かれても答えるので、入れたチャンネルの内容は
+// そのチャンネルを見られない人にも思い出される (入れるのはサーバーの判断)。
 
 const INTERVAL_MS = 30 * 60_000;
+const PRIVATE_THREAD = 12;
+
+let threadStatement = null;
+const archivedThreads = (guildId, parentId) => {
+  threadStatement ??= archive.prepare(
+    'SELECT channel_id FROM channels WHERE guild_id = ? AND parent_id = ? AND is_thread = 1 AND is_private = 0'
+  );
+  return threadStatement.all(guildId, parentId).map((row) => row.channel_id);
+};
+
+/** 公開チャンネルと、追加したチャンネル (とその下の非公開でないスレッド)。 */
+export function readableChannels(guild, { included = includedChannels(guild.id), threadsOf = (id) => archivedThreads(guild.id, id) } = {}) {
+  const ids = new Set(publicChannels(guild.id, guild));
+  for (const id of included) {
+    ids.add(id);
+    for (const channel of guild.channels.cache.values()) {
+      if (channel.parentId === id && channel.isThread?.() && channel.type !== PRIVATE_THREAD) ids.add(channel.id);
+    }
+    for (const threadId of threadsOf(id)) ids.add(threadId);
+  }
+  return [...ids];
+}
 
 export function snapshotPublicChannels(client) {
   for (const guild of client.guilds.cache.values()) {
     try {
-      const ids = publicChannels(guild.id, guild);
+      const ids = readableChannels(guild);
       // 空の控えで「全部読むな」と上書きしない (キャッシュが揃う前の起動直後など)
       if (ids.length > 0) savePublicChannels(guild.id, ids);
     } catch (error) {

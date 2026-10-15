@@ -229,9 +229,10 @@ export function renderSegment({ guildId, channelId, cursor, maxChars, until = nu
  * 新着の尻尾は貯まるまで待つ: 合計が minChars 未満で、どの区切りも
  * idleMs 以内に発言があったなら null (呼び出しの回数を新着の件数に比例させない)。
  */
-export function planPack({ guildId, channelIds, targetChars, minChars = 0, idleMs = 0, now = Date.now() }) {
+export function planPack({ guildId, channelIds, targetChars, minChars = 0, idleMs = 0, now = Date.now(), exclude = null }) {
   const queue = [];
   for (const channelId of channelIds) {
+    if (exclude?.has(channelId)) continue;   // 同じ波で別の区切りが読んでいるチャンネル
     const cursor = getCursor(guildId, channelId);
     const at = nextMessageAt(channelId, cursor);
     if (at !== null) queue.push({ channelId, cursor, at });

@@ -80,6 +80,31 @@ assert.match(resume.calls[1][1], /再開しました/);
 assert.equal(store.getState(`pause:${GUILD}`), null);
 setPaused(GUILD, null);
 
+// 追加したチャンネル: @everyone が見られないチャンネルとその下のスレッドを控えに入れる
+const { readableChannels } = await import('../src/memory/snapshot.js');
+const ROLE_GATED = '910000000000000020';
+const THREAD = '910000000000000021';
+const PRIVATE_THREAD = '910000000000000022';
+const guild = { id: GUILD, channels: { cache: new Map([
+  [THREAD, { id: THREAD, parentId: ROLE_GATED, isThread: () => true, type: 11 }],
+  [PRIVATE_THREAD, { id: PRIVATE_THREAD, parentId: ROLE_GATED, isThread: () => true, type: 12 }]
+]) }, roles: {}, members: {} };
+const include = interaction({ sub: 'include', options: {} });
+include.options.getChannel = () => ({ id: ROLE_GATED });
+include.client = { guilds: { cache: new Map() } };
+await memoryCommand.execute(include);
+assert.match(include.calls[1][1], /記憶に入れます/);
+assert.deepEqual(store.includedChannels(GUILD), [ROLE_GATED]);
+const readable = readableChannels(guild, { threadsOf: () => ['910000000000000023'] });
+assert.ok(readable.includes(ROLE_GATED) && readable.includes(THREAD) && readable.includes('910000000000000023'), 'included channels bring their public threads');
+assert.ok(!readable.includes(PRIVATE_THREAD), 'private threads under an included channel stay out');
+const excluded = interaction({ sub: 'exclude', options: {} });
+excluded.options.getChannel = () => ({ id: ROLE_GATED });
+excluded.client = include.client;
+await memoryCommand.execute(excluded);
+assert.match(excluded.calls[1][1], /外しました/);
+assert.deepEqual(store.includedChannels(GUILD), []);
+
 // 誰でも開ける。根拠の発言にリンクが付く
 const show = interaction({ sub: 'show', admin: false, options: { path: 'people/たこ' } });
 await memoryCommand.execute(show);
@@ -93,4 +118,4 @@ assert.match(embedText(search.calls[1][1]), /統治機能を作った/);
 
 store.resetTree(GUILD);
 archive.prepare('DELETE FROM messages WHERE guild_id = ?').run(GUILD);
-console.log('memory command ok (status は管理者・先に受付・割合と見込みと費用 / pause で止まる / 誰でも開ける・根拠にリンク)');
+console.log('memory command ok (status は管理者・先に受付・割合と見込みと費用 / pause で止まる / include・exclude / 誰でも開ける・根拠にリンク)');
