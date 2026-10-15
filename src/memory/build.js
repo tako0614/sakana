@@ -283,11 +283,18 @@ const pathOf = (guildId, raw) => {
   return normalized ? resolveExisting(guildId, placeTopLevel(guildId, normalized)) : null;
 };
 
-/** 長い区切りなのに出来事も知識も空なら、読めていない (provider が空の JSON を返した)。 */
+/**
+ * 長い区切りなのに、根拠の行が実在する出来事が1つも無ければ読めていない。
+ * provider が空の JSON を返した、または実在しない行番号の出来事を1件だけ返した
+ * (Morph がそうした。知識は出来事にぶら下がるので、出来事が無ければ全部捨てられる)。
+ */
 export function checkSegmentOutput(pack, json) {
-  const count = (value) => (Array.isArray(value) ? value.length : 0);
-  if (pack.text.length >= treeConfig.emptyChars && count(json?.episodes) === 0 && count(json?.facts) === 0) {
-    throw badOutput(`segment output was empty for ${pack.text.length} chars`);
+  if (pack.text.length < treeConfig.emptyChars) return;
+  const episodes = Array.isArray(json?.episodes) ? json.episodes : [];
+  const usable = episodes.filter((episode) => String(episode?.title ?? '').trim() && String(episode?.summary ?? '').trim()
+    && (Array.isArray(episode?.lines) ? episode.lines : []).some((n) => pack.lineMap?.has(Number(n))));
+  if (usable.length === 0) {
+    throw badOutput(`segment output had no usable episode for ${pack.text.length} chars (${episodes.length} returned)`);
   }
 }
 

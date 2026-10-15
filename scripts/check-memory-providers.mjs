@@ -41,10 +41,14 @@ globalThis.fetch = async (url, init) => {
 };
 
 // --- 長い区切りの空の結果は読めていない。短い区切りなら空でもよい ---
-const longPack = { text: 'x'.repeat(treeConfig.emptyChars) };
-assert.throws(() => checkSegmentOutput(longPack, { episodes: [], facts: [] }), /empty/, 'an empty result for a long segment is a failure');
-assert.doesNotThrow(() => checkSegmentOutput({ text: 'x'.repeat(100) }, { episodes: [], facts: [] }), 'a short segment may be empty');
-assert.doesNotThrow(() => checkSegmentOutput(longPack, { episodes: [], facts: [{ path: 'people/a', text: 'b', episode: 0 }] }));
+const longPack = { text: 'x'.repeat(treeConfig.emptyChars), lineMap: new Map([[1, { ids: ['1'] }], [2, { ids: ['2'] }]]) };
+const usable = { title: 't', summary: 's', lines: [2] };
+assert.throws(() => checkSegmentOutput(longPack, { episodes: [], facts: [] }), /no usable episode/, 'an empty result for a long segment is a failure');
+assert.doesNotThrow(() => checkSegmentOutput({ text: 'x'.repeat(100), lineMap: new Map() }, { episodes: [], facts: [] }), 'a short segment may be empty');
+// 実在しない行の出来事1件だけ (Morph がそうした) も、知識は全部捨てられるので読めていない
+assert.throws(() => checkSegmentOutput(longPack, { episodes: [{ title: 't', summary: 's', lines: [999] }], facts: [{ path: 'people/a', text: 'b', episode: 0 }] }), /no usable episode/);
+assert.throws(() => checkSegmentOutput(longPack, { episodes: [{ title: '', summary: 's', lines: [1] }] }), /no usable episode/, 'an untitled episode is dropped too');
+assert.doesNotThrow(() => checkSegmentOutput(longPack, { episodes: [{ title: 't', summary: 's', lines: [999] }, usable] }));
 
 // --- 空・暴走の provider を外して、3回目でまともな結果を取る ---
 const call = openRouterCaller({ guildId: 'check-guild' });
@@ -87,7 +91,7 @@ avoidProvider('Empty'); avoidProvider('Runaway');
 order = ['Empty', 'Empty2', 'Empty3', 'Empty4'];
 replies.Empty2 = replies.Empty3 = replies.Empty4 = replies.Empty;
 sent.length = 0;
-await assert.rejects(call({ kind: 'segment', system: 's', user: 'u', check: (json) => checkSegmentOutput(longPack, json) }), /empty/);
+await assert.rejects(call({ kind: 'segment', system: 's', user: 'u', check: (json) => checkSegmentOutput(longPack, json) }), /no usable episode/);
 assert.equal(sent.length, 3, 'two swaps, then give up');
 
 // --- 空のまま「完了」になった長い区切りを読み直しに回す ---
