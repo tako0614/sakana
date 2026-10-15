@@ -103,7 +103,67 @@ const broken = 'this.channelId = data.channel_id ?? channel.id;';
 if (patchPollSource(broken).state !== 'patched' || patchPollSource('something else').state !== 'unknown') fail('patcher must be idempotent and conservative');
 await client.destroy();
 
+// ---- 途中で止まったチャンネルを起動時に取り直す ------------------------------
+// #nsfw は /index build の途中でロックに当たり、最新の一部だけ取ったまま放置された。
+
+process.env.ARCHIVE_FETCH_DELAY_MS = '0';
+const { catchupAllGuilds, runIndexJob } = await import('../src/archive/indexer.js');
+const { setGuildState, upsertChannel, updateChannelState, getGuildState } = await import('../src/archive/db.js');
+const GUILD = 'check-resume-guild';
+const STUCK = '1255767179022962749';
+const history = Array.from({ length: 250 }, (_, i) => ({
+  id: (1300000000000000000n + BigInt(i) * 1000n).toString(), guildId: GUILD, channelId: STUCK,
+  content: `old ${i}`, author: { id: 'u', username: 'u' }, createdTimestamp: 1_700_000_000_000 + i * 1000, attachments: new Map()
+}));
+const page = (list) => new Map(list.map((message) => [message.id, message]));
+let busyOnce = 0;
+const stuck = {
+  id: STUCK, name: 'nsfw', guildId: GUILD, type: 0, isThread: () => false, isTextBased: () => true,
+  permissionsFor: () => ({ has: () => true }), appliedTags: [], topic: '',
+  messages: {
+    fetch: async ({ after, before, limit = 100 }) => {
+      if (busyOnce-- === 1) throw Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' });
+      if (after) return page(history.filter((m) => BigInt(m.id) > BigInt(after)).slice(0, limit));
+      const older = history.filter((m) => !before || BigInt(m.id) < BigInt(before));
+      return page(older.slice(-limit).reverse());
+    }
+  }
+};
+const guild = { id: GUILD, name: 'resume', channels: { cache: new Map([[STUCK, stuck]]), fetch: async () => null }, members: { me: { id: 'bot' } } };
+stuck.guild = guild;
+
+db.prepare('DELETE FROM messages WHERE guild_id = ?').run(GUILD);
+setGuildState(GUILD, { status: 'running', mode: 'full' });   // 再起動で打ち切られたジョブの名残
+upsertChannel({ channel_id: STUCK, guild_id: GUILD, parent_id: null, name: 'nsfw', type: 0, is_thread: 0, is_private: 0 });
+// 最新の50件だけ取って、ロックで落ちた状態
+const recent = history.slice(-50);
+savePage(STUCK, recent.map((m) => ({ message_id: m.id, guild_id: GUILD, channel_id: STUCK, parent_id: null, author_id: 'u', author_name: 'u',
+  is_bot: 0, content: m.content, extra: '', created_at: m.createdTimestamp, edited_at: null, reply_to: null, attachment_count: 0,
+  attachment_kinds: '', embed_count: 0, sticker_count: 0, link_count: 0, reaction_count: 0, char_count: 5, pinned: 0 })),
+  [recent[0].id, recent.at(-1).id], { oldest_id: recent[0].id, newest_id: recent.at(-1).id });
+updateChannelState(STUCK, { last_error: 'database is locked', complete: 0 });
+
+await catchupAllGuilds({ guilds: { cache: new Map([[GUILD, guild]]) } });
+const resumed = getChannelState(STUCK);
+const have = db.prepare('SELECT COUNT(*) AS c FROM messages WHERE channel_id = ?').get(STUCK).c;
+if (have !== 250) fail(`an unfinished channel must be backfilled on startup (have ${have}/250)`);
+if (resumed.complete !== 1 || resumed.last_error) fail('a resumed channel must end complete without an error: ' + JSON.stringify(resumed));
+if (getGuildState(GUILD).status !== 'interrupted') fail('a job cut off by a restart must not stay "running"');
+
+// ジョブ中にロックで落ちても、待って続きから取り直す (ジョブのエラーにしない)
+db.prepare('DELETE FROM messages WHERE channel_id = ?').run(STUCK);
+db.prepare('DELETE FROM channel_spans WHERE channel_id = ?').run(STUCK);
+updateChannelState(STUCK, { complete: 0, oldest_id: null, newest_id: null, last_error: null });
+stuck.threads = { fetchActive: async () => ({ threads: new Map() }), fetchArchived: async () => ({ threads: new Map(), hasMore: false }) };
+busyOnce = 1;
+const job = await runIndexJob(guild, { mode: 'full' });
+const after = db.prepare('SELECT COUNT(*) AS c FROM messages WHERE channel_id = ?').get(STUCK).c;
+if (job.errors.length || after !== 250) fail(`a locked page must be retried inside the job (errors ${JSON.stringify(job.errors)}, have ${after})`);
+db.prepare('DELETE FROM messages WHERE guild_id = ?').run(GUILD);
+db.prepare('DELETE FROM channels WHERE guild_id = ?').run(GUILD);
+db.prepare('DELETE FROM guild_index_state WHERE guild_id = ?').run(GUILD);
+
 db.prepare('DELETE FROM messages WHERE channel_id = ?').run(CHANNEL);
 db.prepare('DELETE FROM channel_spans WHERE channel_id = ?').run(CHANNEL);
 db.prepare('DELETE FROM channels WHERE channel_id = ?').run(CHANNEL);
-console.log(`index resilience ok (ロック中も ${waited}ms 待って書けた / 台帳が待ち時間を下げない / やり直し / 1ページ1トランザクション / 投票の当て布)`);
+console.log(`index resilience ok (ロック中も ${waited}ms 待って書けた / 台帳が待ち時間を下げない / やり直し / 1ページ1トランザクション / 止まったチャンネルを起動時に取り直す / ジョブ中のロックを続きから / 投票の当て布)`);

@@ -583,16 +583,71 @@ export async function catchupAllGuilds(client) {
 
 async function catchupGuilds(client) {
   for (const guild of client.guilds.cache.values()) {
-    if (!getGuildState(guild.id)) continue;
+    const state = getGuildState(guild.id);
+    if (!state) continue;
+
+    // 再起動で打ち切られた /index build は「実行中」のまま残る。ジョブは
+    // プロセス内にしか無いので、/index status が嘘をつかないよう中断に直す。
+    if (state.status === 'running' && !getRunningJob(guild.id)) {
+      setGuildState(guild.id, { status: 'interrupted', finished_at: Date.now(), current_channel: null });
+    }
 
     try {
       const job = await runCoverageJob(guild, { mode: 'catchup' });
       if (job?.messagesIndexed > 0) {
         console.log(`Catch-up indexed ${job.messagesIndexed} message(s) in ${guild.name}.`);
       }
+      const resumed = await resumeIncomplete(guild);
+      if (resumed) {
+        console.log(`Resumed ${resumed.channelsDone}/${resumed.channelsTotal} unfinished channel(s) in ${guild.name}: `
+          + `${resumed.messagesIndexed} message(s).`);
+      }
     } catch (error) {
       console.error(`Catch-up failed for ${guild.id}:`, error);
     }
+  }
+}
+
+/**
+ * 途中で止まったチャンネル (ロック・不具合・再起動で打ち切られた /index build) を、
+ * 起動時に続きから取り直す。位置はページごとに保存してあるので、取り直しは続きから。
+ * 全チャンネルを回す verify より軽い (未完了とエラーのものだけ)。
+ * 2026-10 に #nsfw がロックで約2年分を取り損ねたまま、誰も取り直さなかった。
+ */
+export async function resumeIncomplete(guild) {
+  const rows = listChannelStates(guild.id).filter((row) => row.complete !== 1 || row.last_error);
+  if (rows.length === 0) return null;
+
+  const job = {
+    guildId: guild.id,
+    mode: 'resume',
+    cancelled: false,
+    startedAt: Date.now(),
+    messagesIndexed: 0,
+    channelsDone: 0,
+    channelsTotal: rows.length,
+    currentChannel: null
+  };
+  claimJob(guild.id, job);
+  try {
+    for (const row of rows) {
+      if (job.cancelled) break;
+      const channel = guild.channels.cache.get(row.channel_id)
+        ?? await guild.channels.fetch(row.channel_id).catch(() => null);
+      if (channel && typeof channel.messages?.fetch === 'function') {
+        job.currentChannel = channel.name ?? channel.id;
+        try {
+          await retryBusy(() => indexChannel(channel, { mode: 'full', job }), { label: `resume ${channel.id}` });
+        } catch (error) {
+          console.error(`Failed to resume channel ${channel.id}:`, error);
+          updateChannelState(channel.id, { last_error: String(error.message ?? error).slice(0, 300) });
+        }
+      }
+      job.channelsDone += 1;
+    }
+    return job;
+  } finally {
+    releaseJob(guild.id);
   }
 }
 

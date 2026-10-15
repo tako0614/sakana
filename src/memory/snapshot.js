@@ -3,6 +3,8 @@ import { savePublicChannels } from './store.js';
 
 // builder は Discord につながらないので、どのチャンネルを読んでよいかは bot が控えておく。
 // 権限が変わったら次の控えで反映される (非公開になったチャンネルは以後読まない)。
+// nsfw のチャンネルも公開なら読む (サーバーの判断)。提供元が拒否した区切りは
+// failed として記録され、--retry-failed で読み直せる。
 
 const INTERVAL_MS = 30 * 60_000;
 
