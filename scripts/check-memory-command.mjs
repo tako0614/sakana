@@ -154,10 +154,32 @@ assert.ok(peopleOption, 'the root menu lists top-level pages');
 
 const click = (fields) => {
   const updates = [];
-  return { updates, guildId: GUILD, isButton: () => !fields.values, isStringSelectMenu: () => Boolean(fields.values),
+  const modals = [];
+  return { updates, modals, guildId: GUILD, isButton: () => !fields.values && !fields.fields, isStringSelectMenu: () => Boolean(fields.values),
+    isModalSubmit: () => Boolean(fields.fields),
     update: async (view) => { updates.push(view); }, reply: async () => { throw new Error('should update in place'); },
-    deferUpdate: async () => {}, ...fields };
+    showModal: async (modal) => { modals.push(modal); }, deferUpdate: async () => {}, ...fields };
 };
+// Discord の制限: 部品の ID は1つのメッセージで重複しない・選択肢の値は1つのメニューで重複しない・
+// 選択肢は25件まで・ID は100字まで・embed は合計6000字まで
+const checkLimits = (view, label) => {
+  const all = view.components.flatMap((row) => row.components);
+  const ids = all.map((c) => c.custom_id);
+  assert.equal(new Set(ids).size, ids.length, `${label}: component ids must be unique within a message: ${ids.join(',')}`);
+  for (const id of ids) assert.ok(id.length <= 100, `${label}: custom id too long: ${id}`);
+  for (const menu of all.filter((c) => c.type === 3)) {
+    const values = menu.options.map((o) => o.value);
+    assert.equal(new Set(values).size, values.length, `${label}: select option values must be unique: ${values.join(',')}`);
+    assert.ok(values.length >= 1 && values.length <= 25, `${label}: 1-25 options`);
+  }
+  for (const embed of view.embeds) {
+    const size = (embed.title?.length ?? 0) + (embed.description?.length ?? 0) + (embed.author?.name?.length ?? 0)
+      + (embed.footer?.text?.length ?? 0) + (embed.fields ?? []).reduce((sum, f) => sum + f.name.length + f.value.length, 0);
+    assert.ok(size <= 6000, `${label}: embed is ${size} chars`);
+  }
+  assert.ok(view.components.length <= 5, `${label}: at most 5 rows`);
+};
+const buttonsOf = (view) => view.components.flatMap((row) => row.components).filter((c) => c.type === 2);
 const people = click({ customId: 'memx:open', values: [peopleOption.value] });
 assert.equal(await handleMemoryComponent(people), true);
 const peopleJson = json(people.updates[0]);
@@ -166,21 +188,47 @@ const tako = click({ customId: 'memx:open', values: [takoOption.value] });
 await handleMemoryComponent(tako);
 const takoJson = json(tako.updates[0]);
 // 1つのメニューの中で値が重複すると Discord が拒否する (親ページで同じ出来事が子ページ経由で重複した)
-for (const view of [rootJson, peopleJson, takoJson]) {
-  for (const menu of view.components.flatMap((row) => row.components).filter((c) => c.type === 3)) {
-    const values = menu.options.map((o) => o.value);
-    assert.equal(new Set(values).size, values.length, 'select option values must be unique: ' + values.join(','));
-  }
-}
-const ids = takoJson.components.flatMap((row) => row.components).map((c) => c.custom_id);
-assert.equal(new Set(ids).size, ids.length, 'component ids must be unique within a message: ' + ids.join(','));
+for (const [label, view] of [['root', rootJson], ['people', peopleJson], ['tako', takoJson]]) checkLimits(view, label);
 assert.match(takoJson.embeds[0].description, /sakana bot を作っている/);
+// 本文の [[リンク]] は太字の名前に、[e12] は消して読みやすく
+assert.doesNotMatch(takoJson.embeds[0].description, /\[\[|\[e\d+\]/, 'links and citations are rendered for people');
+assert.match(takoJson.embeds[0].author.name, /記憶の本 › people › たこ/, 'a page shows where it is');
+assert.ok(buttonsOf(takoJson).some((b) => b.custom_id === `memx:n:${peopleOption.value.split(':')[1]}`), 'up goes to the parent');
 const episodeOption = takoJson.components.flatMap((row) => row.components).filter((c) => c.type === 3)
   .flatMap((c) => c.options).find((o) => o.value.startsWith('e:'));
 assert.ok(episodeOption, 'a page lists the episodes it was part of');
 const openEpisode = click({ customId: 'memx:open', values: [episodeOption.value] });
 await handleMemoryComponent(openEpisode);
-assert.match(json(openEpisode.updates[0]).embeds[0].description, /discord\.com\/channels/, 'episode view links its sources');
+const episodeJson = json(openEpisode.updates[0]);
+checkLimits(episodeJson, 'episode');
+assert.match(episodeJson.embeds[0].description, /discord\.com\/channels/, 'episode view links its sources');
+// 開いたページへ戻れる
+const takoId = takoOption.value.split(':')[1];
+assert.ok(buttonsOf(episodeJson).some((b) => b.custom_id === `memx:n:${takoId}` && /たこ/.test(b.label)), 'the episode leads back to the page it was opened from');
+
+// 年表: 古い順に並び、ページから開ける
+const timelineButton = buttonsOf(takoJson).find((b) => b.custom_id.startsWith('memx:t:'));
+assert.ok(timelineButton, 'a page with episodes offers a timeline');
+const timeline = click({ customId: timelineButton.custom_id });
+await handleMemoryComponent(timeline);
+const timelineJson = json(timeline.updates[0]);
+checkLimits(timelineJson, 'timeline');
+assert.match(timelineJson.embeds[0].title, /年表/);
+const days = [...timelineJson.embeds[0].description.matchAll(/\*\*(\d{4}-\d{2}-\d{2})\*\*/g)].map((m) => m[1]);
+assert.ok(days.length >= 1 && days.every((d, i) => i === 0 || days[i - 1] <= d), 'the timeline runs oldest first: ' + days.join(','));
+
+// 探す: ボタンで入力欄を出し、送られた語で結果を出す
+const searchButton = click({ customId: 'memx:s' });
+await handleMemoryComponent(searchButton);
+assert.equal(searchButton.modals.length, 1, 'search opens a modal');
+assert.equal(searchButton.modals[0].toJSON().custom_id, 'memx:q');
+const submitted = click({ customId: 'memx:q', fields: { getTextInputValue: (id) => (id === 'query' ? 'たこ' : '') } });
+assert.equal(await handleMemoryComponent(submitted), true);
+const searchJson = json(submitted.updates[0]);
+checkLimits(searchJson, 'search');
+assert.match(searchJson.embeds[0].description, /たこ/, 'search finds the page');
+const found = searchJson.components.find((row) => row.components[0].type === 3)?.components[0].options.find((o) => o.value === takoOption.value);
+assert.ok(found, 'search results can be opened');
 const back = click({ customId: 'memx:root' });
 await handleMemoryComponent(back);
 assert.match(json(back.updates[0]).embeds[0].title, /記憶の本/);
@@ -188,4 +236,4 @@ assert.equal(await handleMemoryComponent(click({ customId: 'archive:reset:1' }))
 
 store.resetTree(GUILD);
 archive.prepare('DELETE FROM messages WHERE guild_id = ?').run(GUILD);
-console.log('memory command ok (status は管理者・先に受付・割合と見込みと費用 / pause で止まる / include・exclude / category / explore でたどる / 誰でも開ける・根拠にリンク)');
+console.log('memory command ok (status は管理者・先に受付・割合と見込みと費用 / pause で止まる / include・exclude / category / explore でたどる・年表・探す / 誰でも開ける・根拠にリンク)');

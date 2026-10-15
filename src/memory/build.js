@@ -46,7 +46,8 @@ export const treeConfig = {
   minChars: Number(process.env.MEMORY_TREE_MIN_CHARS || 6000),
   idleMs: Number(process.env.MEMORY_TREE_IDLE_MS || 12 * 3_600_000),
   // ページの統合待ちがこれだけ溜まったら書き直す。読み終えたら残りも書き直す
-  integrateChars: Number(process.env.MEMORY_TREE_INTEGRATE_CHARS || 3000),
+  // (3000 だと人のページの 149 件中 1 件しか本文にならず、ほとんど「まとめ中」のままだった)
+  integrateChars: Number(process.env.MEMORY_TREE_INTEGRATE_CHARS || 1200),
   // 1回の統合は小さめに (8ページ・3万字だと出力が長く、1回2〜3分かかった)
   integrateBatchChars: 15000,
   integratePages: 4,

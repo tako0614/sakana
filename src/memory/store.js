@@ -562,6 +562,25 @@ export function episodesFor(guildId, path, limit = 8) {
   `).all(guildId, guildId, path, `${path.replace(/[%_\\]/g, (c) => `\\${c}`)}/%`, limit);
 }
 
+/** ページ (と子ページ) に関わる出来事を古い順に。年表用。件数も返す。 */
+export function episodeTimeline(guildId, path, { offset = 0, limit = 10 } = {}) {
+  const like = `${path.replace(/[%_\\]/g, (c) => `\\${c}`)}/%`;
+  const where = `e.guild_id = ? AND e.id IN (
+    SELECT n.episode_id FROM episode_nodes n WHERE n.guild_id = ? AND (n.path = ? OR n.path LIKE ? ESCAPE '\\')
+  )`;
+  const d = memoryDb();
+  return {
+    total: d.prepare(`SELECT COUNT(*) AS c FROM episodes e WHERE ${where}`).get(guildId, guildId, path, like).c,
+    rows: d.prepare(`SELECT e.id, e.kind, e.title, e.summary, e.at_ms, e.importance FROM episodes e WHERE ${where}
+      ORDER BY e.at_ms, e.id LIMIT ? OFFSET ?`).all(guildId, guildId, path, like, limit, offset)
+  };
+}
+
+/** 子ページの数 (explore のページ送り用)。 */
+export function countChildren(guildId, path) {
+  return memoryDb().prepare('SELECT COUNT(*) AS c FROM nodes WHERE guild_id = ? AND parent = ?').get(guildId, path).c;
+}
+
 /** 2つのページが両方関わった出来事 (時系列)。 */
 export function sharedEpisodes(guildId, a, b, limit = 15) {
   return memoryDb().prepare(`

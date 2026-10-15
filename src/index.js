@@ -480,8 +480,9 @@ async function handleInteractionCreate(interaction) {
     return;
   }
 
-  // 記憶の本の閲覧 (/memory explore) のメニューとボタン
-  if ((interaction.isButton() || interaction.isStringSelectMenu()) && await handleMemoryComponent(interaction)) return;
+  // 記憶の本の閲覧 (/memory explore) のメニュー・ボタン・探す入力欄
+  if ((interaction.isButton() || interaction.isStringSelectMenu() || interaction.isModalSubmit())
+    && await handleMemoryComponent(interaction)) return;
 
   const governanceComponent = interaction.isButton()
     || interaction.isModalSubmit()
