@@ -1,21 +1,18 @@
-process.env.MEMORY_EMBEDDINGS = '0';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
 
 const directory = mkdtempSync(join(tmpdir(), 'sakana-agents-'));
 process.env.DATABASE_PATH = join(directory, 'main.sqlite');
 process.env.ARCHIVE_DB_PATH = join(directory, 'archive.sqlite');
 process.env.AGENT_RUNTIME_PATH = join(directory, 'runs.sqlite');
-process.env.ATOM_MEMORY_PATH = join(directory, 'atoms.sqlite');
 process.env.OPENROUTER_API_KEY = 'check';
 const { db, saveMessage, markMessageDeleted } = await import('../src/archive/db.js');
 const { toRecord } = await import('../src/archive/indexer.js');
 const { RefTable, formatMessages, fromDiscordMessage, fromArchiveRow } = await import('../src/agent/format.js');
 const { chatRunId, fetchReplyChain } = await import('../src/agent/index.js');
-const { conversationMemory, syncConversationMemory, memoryStatus } = await import('../src/conversation/memory.js');
+const { archiveEnvelope } = await import('../src/conversation/message.js');
 const { attachMemoryDelivery, runAgent } = await import('../src/ai/runtime.js');
 const { db: mainDb } = await import('../src/db.js');
 const { finalizeCall, releaseCall, reserveCall } = await import('../src/agent/ratelimit.js');
@@ -52,52 +49,25 @@ try {
   const threadMessage = message('thread', 'thread body', { channel: { isThread: () => true, parentId: 'forum', name: 'topic', archived: true, locked: false } });
   assert.equal(fromDiscordMessage(threadMessage).structure.thread.parentChannelId, 'forum');
 
-  for (const row of [parent, reply, forward, message('memory', 'golden_needlememory current source'),
-    message('private', 'golden_needlememory PRIVATE', { channelId: 'private' }),
-    message('other-guild', 'golden_needlememory OTHER GUILD', { guildId: 'other' })]) saveMessage(toRecord(row));
-  assert.doesNotThrow(() => saveMessage(toRecord(parent)), 'reindexing an already queued message must be idempotent');
-  const { SqliteStorage } = await import('../subprojects/atom-memory/dist/adapters/sqlite.js');
-  const flush = SqliteStorage.prototype.flush;
-  SqliteStorage.prototype.flush = () => { throw new Error('durability barrier failed'); };
-  try {
-    await assert.rejects(syncConversationMemory(), /durability barrier failed/);
-    assert.equal(memoryStatus().pending, 6, 'failed durable flush must not acknowledge any source');
-  } finally { SqliteStorage.prototype.flush = flush; }
-  await syncConversationMemory();
-  assert.equal(memoryStatus().pending, 0);
-  let allowed = true;
-  const channel = { id: 'c', guild: { id: 'g', members: { me: { id: 'bot' } } }, permissionsFor: () => ({ has: () => allowed }) };
-  // Automatic recall is driven by the live context, not a constructor query.
-  const memory = conversationMemory({ guildId: 'g', channel, member: { id: 'reader' } });
-  const recalled = await memory.read({ context: 'golden_needlememory' });
-  assert.match(recalled.text, /current source/);
-  assert.doesNotMatch(recalled.text, /PRIVATE|OTHER GUILD/);
-  allowed = false;
-  await assert.rejects(memory.assertCurrent(), /permission changed|ACCESS_DENIED/);
-  memory.close(); allowed = true;
-  const beforeEdit = conversationMemory({ guildId: 'g', channel, member: { id: 'reader' } });
-  await beforeEdit.read({ context: 'golden_needlememory' });
-  saveMessage(toRecord(message('memory', 'golden_needlememory corrected source', { editedTimestamp: Date.now() })));
-  await assert.rejects(beforeEdit.assertCurrent(), /changed|ACCESS_DENIED|STALE|REVOKED/);
-  beforeEdit.close();
-  const pendingEdit = conversationMemory({ guildId: 'g', channel, member: { id: 'reader' } });
-  assert.doesNotMatch((await pendingEdit.read({ context: 'golden_needlememory' })).text, /current source/, 'queued edits must hide old sources without blocking on ingestion');
-  pendingEdit.close();
-  await syncConversationMemory();
-  const afterEdit = conversationMemory({ guildId: 'g', channel, member: { id: 'reader' } });
-  const corrected = await afterEdit.read({ context: 'golden_needlememory' });
-  assert.match(corrected.text, /corrected source/);
-  assert.doesNotMatch(corrected.text, /current source/);
-  markMessageDeleted('memory');
-  await assert.rejects(afterEdit.assertCurrent(), /changed|ACCESS_DENIED|STALE|REVOKED/);
-  afterEdit.close();
-  assert.equal(db.prepare('SELECT count(*) n FROM message_versions WHERE message_id = ?').get('memory').n, 2);
-  const restart = spawnSync(process.execPath, ['--input-type=module', '-e', `
-    const { syncConversationMemory, memoryStatus } = await import('./src/conversation/memory.js');
-    await syncConversationMemory(); console.log(JSON.stringify(memoryStatus()));
-  `], { cwd: process.cwd(), env: process.env, encoding: 'utf8' });
-  assert.equal(restart.status, 0, restart.stderr);
-  assert.equal(JSON.parse(restart.stdout.trim()).pending, 0);
+  for (const row of [parent, reply, forward, message('edited', 'golden_needle current source')]) saveMessage(toRecord(row));
+  assert.doesNotThrow(() => saveMessage(toRecord(parent)), 'reindexing an already archived message must be idempotent');
+  const versions = (id) => db.prepare('SELECT count(*) n FROM message_versions WHERE message_id = ?').get(id).n;
+  assert.equal(versions('parent'), 0, 'an unchanged re-fetch is not an edit');
+  // Embed-only notifications keep their card text as supplemental source
+  // material, and an edit keeps the previous card in the audit trail.
+  saveMessage(toRecord(message('embed-only', '', { author: { id: 'notifier', username: 'notifier', bot: true },
+    embeds: [{ title: 'Deploy', fields: [{ name: 'result', value: 'EMBED_FIELD_PROOF' }] }] })));
+  const embedRow = db.prepare('SELECT * FROM messages WHERE message_id = ?').get('embed-only');
+  assert.match(archiveEnvelope(embedRow).supplemental.text, /EMBED_FIELD_PROOF/);
+  assert.match(fromArchiveRow(embedRow).extra, /EMBED_FIELD_PROOF/);
+  db.prepare('UPDATE messages SET extra = ? WHERE message_id = ?').run('EMBED_EDITED', 'embed-only');
+  assert.match(db.prepare('SELECT extra FROM message_versions WHERE message_id = ? ORDER BY id DESC LIMIT 1')
+    .get('embed-only').extra, /EMBED_FIELD_PROOF/);
+  saveMessage(toRecord(message('edited', 'golden_needle corrected source', { editedTimestamp: Date.now() })));
+  markMessageDeleted('edited');
+  assert.equal(versions('edited'), 2, 'the edit and the deletion each keep the version they replaced');
+  assert.deepEqual(db.prepare('SELECT content FROM message_versions WHERE message_id = ? ORDER BY id').all('edited')
+    .map((row) => row.content), ['golden_needle current source', 'golden_needle corrected source']);
 
   let tools = 0;
   let staleSent = false;
@@ -286,5 +256,5 @@ try {
   await assert.rejects(runAgent(effectOptions), /connection lost/);
   await assert.rejects(runAgent(effectOptions), /automatic replay is disabled/);
   assert.equal(effects, 1, 'an uncertain external effect cannot be replayed on resume');
-  console.log('agent-runtime ok (Discord edges, source attribution, Atom persistence, ACL, edits, deletion, durable response/use retry)');
+  console.log('agent-runtime ok (Discord edges, source attribution, edit/deletion audit, durable response/use retry)');
 } finally { db.close(); rmSync(directory, { recursive: true, force: true }); }

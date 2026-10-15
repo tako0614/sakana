@@ -6,11 +6,11 @@ Proxmoxへ再接続し、100%だったCT102のrootfsを既存ストレージ内�
 
 ## 2026-09-14: Atom 0.9と継続Writerの統合検証
 
-ライブラリとSakanaの実装・一式のチェックは完了。[検証記録](writer-validation.md)に、再送・権限変更・索引待ち・遅れて届く再生成要求の試験を残した。本番Botは未切替。SSH認証とProxmoxの操作接続を回復した後、以下の停止・バックアップ・切替・読戻し手順を実行する。npmとDocsの公開状態は[ライブラリの公開manifest](https://atom-memory.takos.jp/release.json)を確認する。
+ライブラリとSakanaの実装・一式のチェックは完了。検証記録 (廃止。git 履歴を参照)に、再送・権限変更・索引待ち・遅れて届く再生成要求の試験を残した。本番Botは未切替。SSH認証とProxmoxの操作接続を回復した後、以下の停止・バックアップ・切替・読戻し手順を実行する。npmとDocsの公開状態は[ライブラリの公開manifest](https://atom-memory.takos.jp/release.json)を確認する。
 
 ## 2026-09-13: Evex Dreamの実装（本番切替未確認）
 
-[Dream運用](dreaming.md)に、Ling 3.0 Flashによる全履歴・新着・定期見直しと、OpenRouter Qwen3 Embedding 8Bへの切替をまとめた。原資料・索引workerとAI workerは既存Bot内で分離し、Evexの永続30 USD枠へ両モデルを計上する。
+Dream運用 (廃止。git 履歴を参照)に、Ling 3.0 Flashによる全履歴・新着・定期見直しと、OpenRouter Qwen3 Embedding 8Bへの切替をまとめた。原資料・索引workerとAI workerは既存Bot内で分離し、Evexの永続30 USD枠へ両モデルを計上する。
 
 以下の日付付き記録は過去の本番確認であり、今回の実行版の証拠にはしない。今回の切替にはservice・配置ファイル・新設定・初回取得証明・ジョブ状態の読み戻しが必要。
 
@@ -33,7 +33,7 @@ Proxmoxへ再接続し、100%だったCT102のrootfsを既存ストレージ内�
 
 ## AIによる意味の整理
 
-新しいリリースでは `deepseek-v4-flash` のWriterを有効にし、既存履歴と新着を継続的に整理する。説明・話題のまとまり・役割付き関係をAtomへ保存し、会話・警察・裁判・議会が共通の想起経路で読む。[構造と再処理の契約](agent-architecture.md)を参照。
+新しいリリースでは `deepseek-v4-flash` のWriterを有効にし、既存履歴と新着を継続的に整理する。説明・話題のまとまり・役割付き関係をAtomへ保存し、会話・警察・裁判・議会が共通の想起経路で読む。構造と再処理の契約 (廃止。git 履歴を参照)を参照。
 
 原文同期とAI整理は一つのworkerが担当する。既定は最大60発言・60KB、同時に一バッチ。モデルの結果と確定状態を保存し、再起動時はチェックポイントから再開する。新しい外部DBやGPUは追加していない。
 
@@ -67,7 +67,7 @@ takoserverの管理対象Botロール `Evex 公式` には、Discord側ではKic
 
 ## 9月12日のライブラリ・Sakana更新（本番未反映）
 
-Atomの差分索引API・SQLiteのベクトル候補取得と、Sakanaの共有埋め込み・Writer改訂・明示的な記憶焦点・Writer費用記録を追加した。AtomはJSライブラリのままで、常駐処理はSakanaが担当する。[費用と設定](memory-cost.md)を参照。
+Atomの差分索引API・SQLiteのベクトル候補取得と、Sakanaの共有埋め込み・Writer改訂・明示的な記憶焦点・Writer費用記録を追加した。AtomはJSライブラリのままで、常駐処理はSakanaが担当する。費用と設定 (廃止。git 履歴を参照)を参照。
 
 0.5の境界テスト、ドキュメント例、ドキュメントビルド、Sakana側のWriter lineage検査は進行中で、最終件数や実モデルの品質差は未確定である。このローカル環境にはDeepSeekのAPIキーがなく、今回の実DeepSeek試験と本番切替は未実施。
 
@@ -97,7 +97,7 @@ SakanaのWriterは30分の固定区切りを最大7日・60件・60KBの入力�
 
 Atomのモデル実行・自動再生成・後継採用APIを外し、Sakanaの既存runAgent/Writerへ役割を集約した。stale通知から同じスコープのWriterキューへ再処理を要求する。readはstale候補をcurrent sourceへ代用せず、通常の候補取得・構造展開で独立に見つかったものだけを返す。Writerは公開receiptを実行中プロセスで認可確認に使い、receipt自体はcheckpointへ保存しない。checkpointには採用した既存Atomのentry・sourceと正確なbatch・Atom refを保存する。応答後とcommit直前にheadと認可を再検証し、最終editで採用refを再検査する。checkpoint復元時は正確な採用refを再束縛し、明示的なrevise対象はrevision CASで扱う。原文が同じ再整理も新しい仕事として識別するため、Writerのbatch IDにqueued_atを加えた。旧版の未完了runと新しい仕事のIDが異なる場合があり、切替前に処理状態と費用を確認する。
 
-npm・公開Docs・稼働Botへの反映は未実施。ソースと公開版を混同しない。ライブラリの破壊的変更は `subprojects/atom-memory/docs/migration.md`、責務は [agent-architecture.md](agent-architecture.md) を参照。
+npm・公開Docs・稼働Botへの反映は未実施。ソースと公開版を混同しない。ライブラリの破壊的変更は `subprojects/atom-memory/docs/migration.md`、責務は agent-architecture.md (廃止。git 履歴を参照) を参照。
 
 ## Atom 0.6の統合（2026-09-13、Bot本番切替は未実施）
 
@@ -122,7 +122,7 @@ npm・公開Docs・稼働Botへの反映は未実施。ソースと公開版を�
 
 ## Atom 0.9と継続Writer（2026-09-13）
 
-採用契約と作業ツリーは[Writer設計](writer-design.md)、現在の設定は[Dream運用](dreaming.md)を正本とする。旧節は各時点の記録であり、公開状態を表さない。
+採用契約と作業ツリーはWriter設計 (廃止。git 履歴を参照)、現在の設定はDream運用 (廃止。git 履歴を参照)を正本とする。旧節は各時点の記録であり、公開状態を表さない。
 
 公開APIは一括writeと一段inspectへ移行し、旧callback editを除去する。Sakanaはモデル呼び出し単位のInputTokenを保存するため、同じ入力の変更を再送できる。保存済みAtom本文を無条件に消す移行は行わない。旧Dream admissionを含む投影hashは内容だけのhashへ更新し、変更された投影とその依存生成は再整理対象になる。アーカイブ原文、旧見直し記録、累計費用は保持する。
 

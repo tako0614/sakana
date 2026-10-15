@@ -1,12 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
+import { tuneSqlite } from '../sqlite.js';
 
 let db;
 function journal() {
   if (db) return db;
-  db = new Database(process.env.AGENT_RUNTIME_PATH ?? `${process.env.DATABASE_PATH ?? 'database.sqlite'}.agents.sqlite`);
+  db = new Database(process.env.AGENT_RUNTIME_PATH ?? `${process.env.DATABASE_PATH ?? 'database.sqlite'}.agents.sqlite`, { timeout: 30_000 });
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = FULL');
+  tuneSqlite(db, { cacheMiB: 16, mmapMiB: 256, label: 'agent runtime' });
   db.exec(`CREATE TABLE IF NOT EXISTS agent_runs (
     id TEXT PRIMARY KEY, input_hash TEXT NOT NULL, state TEXT NOT NULL, updated_at INTEGER NOT NULL
   );

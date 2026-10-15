@@ -24,7 +24,7 @@ import { contextRelevance } from './context.js';
 import { IMPLEMENTED_TOOLS } from './rules.js';
 import { archiveEnvelope } from '../conversation/message.js';
 import { db as archive } from '../archive/db.js';
-import { hasConversationClient, publicMemoryChannels } from '../conversation/memory.js';
+import { hasVisibilityClient, publicChannels as publicChannelIds } from '../archive/visibility.js';
 import { normalizeActivityContent, sha256 } from './policy.js';
 
 const DAY_MS = 86_400_000;
@@ -368,19 +368,18 @@ export function buildToolset({ guildId, allowed, caseId = null, constitution = n
   const trace = [];
   let spentBytes = 0;
   const pages = new Map();
-  const memoryInterpretations = new Set();
   const record = (entry) => { trace.push(entry); onStep?.(entry); };
   return {
     readOnly: true,
     call(name, args) { return this.run(name, args); },
     exhausted: () => spentBytes >= maximumOutputBytes,
-    checkpoint: () => ({ trace, retrieved: [...retrieved], spentBytes, pages: [...pages], memoryInterpretations: [...memoryInterpretations] }),
+    checkpoint: () => ({ trace, retrieved: [...retrieved], spentBytes, pages: [...pages] }),
     assertCurrent() {
-      const publicChannels = new Set(publicMemoryChannels(guildId));
+      const publicChannels = new Set(publicChannelIds(guildId));
       const invalid = (message) => Object.assign(new Error(message), { code: 'AGENT_CONTEXT_INVALIDATED' });
       for (const row of retrieved.values()) {
-        if (row.source !== 'atom_memory' && row.source !== 'archive') continue;
-        if (hasConversationClient() && !publicChannels.has(String(row.channelId))) throw invalid('Investigative source is no longer public');
+        if (row.source !== 'archive') continue;
+        if (hasVisibilityClient() && !publicChannels.has(String(row.channelId))) throw invalid('Investigative source is no longer public');
         const source = archive.prepare('SELECT content, deleted FROM messages WHERE guild_id = ? AND message_id = ?')
           .get(String(guildId), row.messageId);
         if (!source || source.deleted || source.content !== row.content) throw invalid('Investigative source changed; the record must be refreshed');
@@ -391,27 +390,7 @@ export function buildToolset({ guildId, allowed, caseId = null, constitution = n
       trace.splice(0, trace.length, ...saved.trace);
       for (const [id, row] of saved.retrieved) retrieved.set(id, row);
       for (const [id, entry] of saved.pages ?? []) pages.set(id, entry);
-      for (const ref of saved.memoryInterpretations ?? []) memoryInterpretations.add(ref);
       spentBytes = saved.spentBytes;
-    },
-    observeMemoryInterpretation(ref, bytes) {
-      if (memoryInterpretations.has(ref)) return true;
-      if (spentBytes + bytes > maximumOutputBytes) return false;
-      spentBytes += bytes; memoryInterpretations.add(ref);
-      return true;
-    },
-    observeMemory(envelope, bytes = Buffer.byteLength(JSON.stringify(envelope))) {
-      if (!envelope.body?.complete || envelope.state?.deleted) return false;
-      if (!retrieved.has(String(envelope.id))) {
-        if (spentBytes + bytes > maximumOutputBytes) return false;
-        spentBytes += bytes;
-        record({ step: trace.length + 1, tool: 'search_messages', arguments: { source: 'atom_memory', messageId: envelope.id },
-          count: 1, detail: '構造化した原文の参照', error: null, result: envelope });
-      }
-      retrieved.set(String(envelope.id), { messageId: String(envelope.id), channelId: envelope.location.channelId,
-        authorId: envelope.author.id, content: envelope.body.text, contentHash: sha256(normalizeActivityContent(envelope.body.text)), occurredAt: envelope.state.createdAt,
-        source: 'atom_memory' });
-      return true;
     },
     definitions: toolDefinitions([...permitted]),
     retrieved,
@@ -446,8 +425,8 @@ export function buildToolset({ guildId, allowed, caseId = null, constitution = n
       let raw = TOOLS[name].run(context, args);
       // Prefer the full archived source only within currently public channels.
       if (TOOLS[name].rows && Array.isArray(raw)) {
-        const channels = new Set(publicMemoryChannels(guildId));
-        if (hasConversationClient()) raw = raw.filter((row) => channels.has(String(row.channel_id)));
+        const channels = new Set(publicChannelIds(guildId));
+        if (hasVisibilityClient()) raw = raw.filter((row) => channels.has(String(row.channel_id)));
         raw = raw.map((row) => {
           if (!channels.has(String(row.channel_id))) return row;
           const source = archive.prepare('SELECT * FROM messages WHERE guild_id = ? AND message_id = ? AND deleted = 0')

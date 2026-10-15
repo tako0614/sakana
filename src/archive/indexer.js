@@ -8,13 +8,15 @@ import {
   countChannelMessages,
   getChannelState,
   getGuildState,
+  isBusy,
   listChannelStates,
   listSpans,
   markMessageDeleted,
   recordSpan,
   replaceReactions,
+  retryBusy,
   saveMessage,
-  saveMessages,
+  savePage,
   setGuildState,
   snowflakeToMs,
   updateChannelState,
@@ -306,9 +308,7 @@ async function indexChannel(channel, { mode, job }) {
   const state = getChannelState(channel.id) ?? {};
   let indexed = 0;
 
-  const persist = (messages) => {
-    if (messages.length === 0) return;
-    saveMessages(messages.map(toRecord));
+  const counted = (messages) => {
     indexed += messages.length;
     job.messagesIndexed += messages.length;
   };
@@ -324,13 +324,13 @@ async function indexChannel(channel, { mode, job }) {
       if (batch.size === 0) break;
 
       const messages = [...batch.values()].sort((a, b) => (a.createdTimestamp - b.createdTimestamp));
-      persist(messages);
+      const last = messages[messages.length - 1].id;
 
-      // 区間はページごとに書く。落ちても直前のページまでは「取った」と言える。
-      recordSpan(channel.id, newest, messages[messages.length - 1].id);
-
-      newest = messages[messages.length - 1].id;
-      updateChannelState(channel.id, { newest_id: newest });
+      // 発言・区間・位置をページごとに1トランザクションで書く。落ちても直前のページまでは
+      // 「取った」と言え、やり直しは同じページを取り直して上書きするだけ。
+      savePage(channel.id, messages.map(toRecord), [newest, last], { newest_id: last });
+      counted(messages);
+      newest = last;
 
       if (batch.size < PAGE_SIZE) break;
       await sleep(FETCH_DELAY_MS);
@@ -353,24 +353,21 @@ async function indexChannel(channel, { mode, job }) {
       }
 
       const messages = [...batch.values()].sort((a, b) => (b.createdTimestamp - a.createdTimestamp));
-      persist(messages);
+      const oldest = messages[messages.length - 1].id;
+      const reachedStart = batch.size < PAGE_SIZE;
 
       // 新しい側の端は before (無ければ今回の最新)。ページ内は連続しているので
-      // その範囲を1区間として記録する。
-      recordSpan(channel.id, messages[messages.length - 1].id, before ?? messages[0].id);
+      // その範囲を1区間として記録する。発言・区間・位置は1トランザクションで書く。
+      savePage(channel.id, messages.map(toRecord), [oldest, before ?? messages[0].id], {
+        oldest_id: oldest,
+        ...(newest ? {} : { newest_id: messages[0].id }),
+        ...(reachedStart ? { complete: 1 } : {})
+      });
+      counted(messages);
+      newest ??= messages[0].id;
+      before = oldest;
 
-      if (!newest) {
-        newest = messages[0].id;
-        updateChannelState(channel.id, { newest_id: newest });
-      }
-
-      before = messages[messages.length - 1].id;
-      updateChannelState(channel.id, { oldest_id: before });
-
-      if (batch.size < PAGE_SIZE) {
-        updateChannelState(channel.id, { complete: 1 });
-        break;
-      }
+      if (reachedStart) break;
 
       if (!needsBackfill) break; // update モードでは初回分だけ入れて終わり
 
@@ -437,13 +434,11 @@ async function catchupChannel(channel, { job }) {
     if (batch.size === 0) break;
 
     const messages = [...batch.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-    saveMessages(messages.map(toRecord));
+    const last = messages[messages.length - 1].id;
+    savePage(channel.id, messages.map(toRecord), [cursor, last], { newest_id: last });
     indexed += messages.length;
     job.messagesIndexed += messages.length;
-
-    recordSpan(channel.id, cursor, messages[messages.length - 1].id);
-    cursor = messages[messages.length - 1].id;
-    updateChannelState(channel.id, { newest_id: cursor });
+    cursor = last;
 
     if (batch.size < PAGE_SIZE) break;
     await sleep(FETCH_DELAY_MS);
@@ -474,12 +469,10 @@ async function fillGaps(channel, { job }) {
       if (batch.size === 0) break;
 
       const messages = [...batch.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-      saveMessages(messages.map(toRecord));
+      const last = messages[messages.length - 1].id;
+      savePage(channel.id, messages.map(toRecord), [cursor, last], null);
       filled += messages.length;
       job.messagesIndexed += messages.length;
-
-      const last = messages[messages.length - 1].id;
-      recordSpan(channel.id, cursor, last);
       cursor = last;
 
       // 穴の向こう側に届いたら、recordSpan が両側を1本にまとめている
@@ -537,15 +530,16 @@ export async function runCoverageJob(guild, { mode = 'catchup', onProgress = () 
           // 末尾の未検証ぶんも「穴」として数える (停止中の欠損はここに出る)
           const countGaps = () => channelGaps(channel.id).length + (channelTailGap(channel.id) ? 1 : 0);
           const before = countGaps();
-          await catchupChannel(channel, { job });
+          // ロックで落ちても、位置はページごとに保存してあるので続きからやり直せる
+          await retryBusy(() => catchupChannel(channel, { job }), { label: `catch-up ${channel.id}` });
 
           if (mode === 'verify') {
-            await fillGaps(channel, { job });
+            await retryBusy(() => fillGaps(channel, { job }), { label: `gap fill ${channel.id}` });
 
             // 先頭まで遡れていないチャンネルは、区間の隙間としては見えないので
             // ここで続きを取る。indexChannel の後方走査が oldest_id から再開する。
             if (getChannelState(channel.id)?.complete !== 1) {
-              await indexChannel(channel, { mode: 'full', job });
+              await retryBusy(() => indexChannel(channel, { mode: 'full', job }), { label: `index ${channel.id}` });
             }
           }
 
@@ -612,7 +606,7 @@ const HEAD_TOLERANCE_MS = 86_400_000;
 export function coverageReport(guildId) {
   const channels = listChannelStates(guildId);
   let enumeration;
-  try { enumeration=JSON.parse(db.prepare('SELECT value FROM memory_projection_state WHERE key=?').get(`archive-full-coverage:${guildId}`)?.value??'null'); } catch { enumeration=null; }
+  try { enumeration=JSON.parse(db.prepare('SELECT value FROM archive_state WHERE key=?').get(`archive-full-coverage:${guildId}`)?.value??'null'); } catch { enumeration=null; }
   const verifiedChannelIds = Array.isArray(enumeration?.channelIds) ? enumeration.channelIds : [];
   const verifiedFull = Boolean(enumeration?.schema===1 && enumeration.guildId===guildId && enumeration.complete
     && enumeration.mode==='full' && verifiedChannelIds.length && !enumeration.errors?.length
@@ -711,7 +705,7 @@ export async function runIndexJob(guild, { mode = 'full', onProgress = () => {} 
   };
   const saveEnumeration = (complete=false) => {
     if (mode !== 'full') return;
-    db.prepare(`INSERT INTO memory_projection_state(key,value) VALUES(?,?)
+    db.prepare(`INSERT INTO archive_state(key,value) VALUES(?,?)
       ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(`archive-full-coverage:${guild.id}`,
       JSON.stringify({schema:1,guildId:guild.id,mode,startedAt:job.startedAt,finishedAt:complete?Date.now():null,
         complete,channelIds:job.channelIds??[],skipped:job.skipped??[],errors:job.errors??[]}));
@@ -741,6 +735,11 @@ export async function runIndexJob(guild, { mode = 'full', onProgress = () => {} 
     setGuildState(guild.id, { channels_total: channels.length });
     onProgress(job);
 
+    // ロックの取り合いは待ってやり直す。位置はページごとに保存してあるので、
+    // やり直しは続きから。1チャンネルの失敗でジョブ全体の「全件取得」を落とさない。
+    const indexOne = (channel) => retryBusy(() => indexChannel(channel, { mode, job }), { label: `index ${channel.id}` });
+    const failed = [];
+
     for (const channel of channels) {
       if (job.cancelled) break;
 
@@ -748,12 +747,10 @@ export async function runIndexJob(guild, { mode = 'full', onProgress = () => {} 
       onProgress(job);
 
       try {
-        await indexChannel(channel, { mode, job });
+        await indexOne(channel);
       } catch (error) {
-        job.errors.push({channelId:channel.id,stage:'messages',code:error.code??error.status??'unavailable'});
-        console.error(`Failed to index channel ${channel.id}:`, error);
-        upsertChannel(channelRow(channel));
-        updateChannelState(channel.id, { last_error: String(error.message ?? error).slice(0, 300) });
+        console.error(`Failed to index channel ${channel.id} (will retry once at the end):`, error);
+        failed.push(channel);
       }
 
       job.channelsDone += 1;
@@ -763,6 +760,21 @@ export async function runIndexJob(guild, { mode = 'full', onProgress = () => {} 
         current_channel: job.currentChannel
       });
       onProgress(job);
+    }
+
+    // 一時的な失敗 (ロック・Discord の一時エラー) は、最後にもう一周すると通ることが多い
+    for (const channel of failed) {
+      if (job.cancelled) break;
+      job.currentChannel = `${channel.name ?? channel.id} (再試行)`;
+      onProgress(job);
+      try {
+        await indexOne(channel);
+      } catch (error) {
+        job.errors.push({channelId:channel.id,stage:'messages',code:error.code??error.status??'unavailable'});
+        console.error(`Failed to index channel ${channel.id}:`, error);
+        upsertChannel(channelRow(channel));
+        updateChannelState(channel.id, { last_error: String(error.message ?? error).slice(0, 300) });
+      }
     }
 
     setGuildState(guild.id, {
@@ -791,7 +803,17 @@ export async function runIndexJob(guild, { mode = 'full', onProgress = () => {} 
  * インデックス済みのサーバーでは、新着メッセージをそのまま追記していく。
  * これがないと /index を回すたびに差分を取りに行くことになる。
  */
-export function indexLiveMessage(message) {
+// 新着の書き込みがロックで失敗したら、少し待って入れ直す (取りこぼさない)。
+const LIVE_RETRIES = 5;
+function retryLive(label, attempt, run) {
+  if (attempt >= LIVE_RETRIES) {
+    console.error(`${label}: database stayed locked, giving up (the next catch-up will fill it)`);
+    return;
+  }
+  setTimeout(run, 2000 * 2 ** attempt).unref?.();
+}
+
+export function indexLiveMessage(message, attempt = 0) {
   if (!message.guildId) return;
   if (!getGuildState(message.guildId)) return;
 
@@ -812,22 +834,24 @@ export function indexLiveMessage(message) {
       recordSpan(message.channelId, previous, message.id);
     }
   } catch (error) {
+    if (isBusy(error)) return retryLive('live message', attempt, () => indexLiveMessage(message, attempt + 1));
     console.error('Failed to index live message:', error);
   }
 }
 
-export function indexLiveEdit(message) {
+export function indexLiveEdit(message, attempt = 0) {
   if (!message.guildId || !message.author) return;
   if (!getGuildState(message.guildId)) return;
 
   try {
     saveMessage(toRecord(message));
   } catch (error) {
+    if (isBusy(error)) return retryLive('live edit', attempt, () => indexLiveEdit(message, attempt + 1));
     console.error('Failed to index edited message:', error);
   }
 }
 
-export function markLiveDelete(message) {
+export function markLiveDelete(message, attempt = 0) {
   // 削除イベントは partial で届くことがあるので guildId を複数経路から拾う
   const guildId = message.guildId ?? message.guild?.id ?? message.channel?.guildId;
   if (!guildId || !getGuildState(guildId)) return;
@@ -835,6 +859,7 @@ export function markLiveDelete(message) {
   try {
     markMessageDeleted(message.id);
   } catch (error) {
+    if (isBusy(error)) return retryLive('live delete', attempt, () => markLiveDelete(message, attempt + 1));
     console.error('Failed to mark message deleted:', error);
   }
 }
@@ -874,7 +899,7 @@ export async function syncLiveReactions(message) {
       reactions.push(users ? { emoji, count, users } : { emoji, count });
     }
 
-    replaceReactions(message.id, reactions);
+    await retryBusy(() => replaceReactions(message.id, reactions), { label: 'reactions' });
   } catch (error) {
     console.error('Failed to sync reactions:', error);
   }

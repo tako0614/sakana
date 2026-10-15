@@ -12,7 +12,7 @@
 // 見せると「0.79 も高いから似ている」と誤読するので、順位と併記し、
 // 相対値であることを明記する。
 
-import { chunkCoverage, chunkMessages } from '../archive/chunks.js';
+import { chunkCoverage, chunkMessages, hasChunkVectors } from '../archive/chunks.js';
 import { fetchChunks, scanChunksTopK } from '../archive/vectors.js';
 import { resolveModel } from '../archive/embed-job.js';
 import { embedConfig } from '../embed/config.js';
@@ -26,7 +26,7 @@ export async function semanticAvailable(guildId) {
 
   try {
     const { modelId } = await resolveModel();
-    return chunkCoverage(guildId, modelId).done > 0;
+    return hasChunkVectors(guildId, modelId);
   } catch {
     return false;
   }

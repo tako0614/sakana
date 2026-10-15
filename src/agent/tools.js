@@ -4,6 +4,7 @@
 // 全往復ぶんのトークンが増える。使えないツールは最初から出さない
 // (アーカイブ未構築なら検索系を出さない / Chrome が居なければブラウザを出さない)。
 
+import { hasMemory, memoryToolDefinition, runMemoryTool } from '../memory/tool.js';
 import { db as archiveDb, getGuildState, msToSnowflake, snowflakeToMs } from '../archive/db.js';
 import { MESSAGE_CHANNEL_TYPES, canRead, isForumType, isThreadType } from '../archive/permissions.js';
 import { QueryError, collectTerms, parseDateRange, parseQuery } from '../archive/query.js';
@@ -1707,6 +1708,8 @@ async function aggregateMessages(ctx, args) {
  */
 export async function buildToolset(ctx) {
   const archiveAvailable = Boolean(getGuildState(ctx.guild.id));
+  // 記憶の本ができているサーバーだけ。根は system に、残りはこのツールでたどる
+  const memoryAvailable = hasMemory(ctx.guild.id);
   const browserAvailable = await cdpAvailable();
   const governanceAvailable = Boolean(getGovernanceGuild(ctx.guild.id));
 
@@ -1731,6 +1734,9 @@ export async function buildToolset(ctx) {
       ? [{ definition: governanceDefinition, handler: (args) => runGovernanceInfo(ctx, args) }]
       : []),
     { definition: infoDefinition, handler: (args) => runInfo(ctx, args) },
+    ...(memoryAvailable
+      ? [{ definition: memoryToolDefinition, handler: (args) => runMemoryTool({ guildId: ctx.guild.id, refs: ctx.refs }, args) }]
+      : []),
     ...(browserAvailable
       ? [{ definition: browserToolDefinition(ctx.browserFull), handler: (args) => runBrowserAction(ctx, args) }]
       : [])
@@ -1744,6 +1750,7 @@ export async function buildToolset(ctx) {
     archiveAvailable,
     browserAvailable,
     governanceAvailable,
+    memoryAvailable,
     semanticAvailable: semanticReady,
 
     async call(name, args) {

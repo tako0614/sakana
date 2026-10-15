@@ -33,7 +33,7 @@ async function childMode() {
   try {
     if (mode === '--reserve-child') {
       const reservation = cost.reserveModelCall({ model:'test/concurrent',messages:[{ role:'user',content:'x' }],
-        tools:null,outputTokens:0,guildId:'g',role:'dream',runId:process.pid.toString(),budgetId });
+        tools:null,outputTokens:0,guildId:'g',role:'job',runId:process.pid.toString(),budgetId });
       process.stdout.write(JSON.stringify({ ok:true,id:reservation.id,budgetId:reservation.budgetId }));
     } else if (mode === '--status-child') {
       process.stdout.write(JSON.stringify(cost.modelBudgetStatus(budgetId)));
@@ -80,11 +80,10 @@ const freeModel = 'inclusionai/ling-3.0-flash:free';
 const paidModel = 'inclusionai/ling-3.0-flash';
 
 async function main() {
-  const directory = mkdtempSync(join(tmpdir(),'sakana-dream-cost-'));
+  const directory = mkdtempSync(join(tmpdir(),'sakana-model-budget-'));
   process.env.ARCHIVE_DB_PATH = join(directory,'archive.sqlite');
   process.env.AGENT_RUNTIME_PATH = join(directory,'runs.sqlite');
   process.env.OPENROUTER_API_KEY = 'test-key';
-  process.env.MEMORY_WRITER_DAILY_USD = '0';
   const { db } = await import('../src/archive/db.js');
   // Reproduce the pre-counter schema before cost.js initializes. Its one-time
   // migration must derive cumulative values from the immutable call ledger.
@@ -100,10 +99,10 @@ async function main() {
     );
     INSERT INTO ai_model_budgets VALUES('legacy-budget','g',10,0,NULL,1,1);
     INSERT INTO ai_model_calls VALUES
-      ('legacy-reported',1,'g','dream',NULL,'legacy/model',NULL,NULL,'reported',0.5,'{}',NULL,0.2,NULL,'legacy-budget'),
-      ('legacy-estimated',2,'g','dream',NULL,'legacy/model',NULL,NULL,'estimated',0.3,'{}',NULL,NULL,0.25,'legacy-budget'),
-      ('legacy-unknown',3,'g','dream',NULL,'legacy/model',NULL,NULL,'unknown',0.4,'{}',NULL,NULL,NULL,'legacy-budget'),
-      ('legacy-free',4,'g','dream',NULL,'legacy/model',NULL,NULL,'no_charge',0.1,'{}',NULL,0,NULL,'legacy-budget');`);
+      ('legacy-reported',1,'g','job',NULL,'legacy/model',NULL,NULL,'reported',0.5,'{}',NULL,0.2,NULL,'legacy-budget'),
+      ('legacy-estimated',2,'g','job',NULL,'legacy/model',NULL,NULL,'estimated',0.3,'{}',NULL,NULL,0.25,'legacy-budget'),
+      ('legacy-unknown',3,'g','job',NULL,'legacy/model',NULL,NULL,'unknown',0.4,'{}',NULL,NULL,NULL,'legacy-budget'),
+      ('legacy-free',4,'g','job',NULL,'legacy/model',NULL,NULL,'no_charge',0.1,'{}',NULL,0,NULL,'legacy-budget');`);
   const cost = await import('../src/ai/cost.js');
   const providerAbsent = await import('../src/ai/provider.js');
   const { attachMemoryDelivery, runAgent } = await import('../src/ai/runtime.js');
@@ -185,7 +184,7 @@ async function main() {
         choices:[{ message:{ content:'paid answer' } }] });
     };
     const absent = await providerAbsent.requestModel({ model:freeModel,fallbackModels:[paidModel],messages:[{ role:'user',content:'u' }],
-      maxOutputTokens:20,guildId:'g',role:'writer',budgetId:'absent-free',
+      maxOutputTokens:20,guildId:'g',role:'job',budgetId:'absent-free',
       consumeRequest:({ model }) => { absentConsumes.push(model); } });
     assert.equal(absent.choices[0].message.content,'paid answer');
     assert.deepEqual(absentConsumes,[paidModel],'an absent free endpoint is not a completion attempt');
@@ -194,7 +193,7 @@ async function main() {
     assert.ok(Math.abs(absentPosts[0].provider.max_price.completion-0.4) < 1e-12);
     assert.equal(absentPosts[0].provider.max_price.request,0);
     assert.equal(cost.modelBudgetStatus('absent-free').spentUsd,0.01,
-      'a job budget bypasses the writer daily cap and records actual cost');
+      'a job budget records the actual reported cost');
 
     // Zero is trusted only after an exact :free route exposes all-zero endpoint pricing.
     const providerZero = await import(`../src/ai/provider.js?zero=${Date.now()}`);
@@ -206,7 +205,7 @@ async function main() {
       return jsonResponse({ id:'free-success',provider:'FreeFixture',choices:[{ message:{ content:'free answer' } }] });
     };
     await providerZero.requestModel({ model:freeModel,messages:[{ role:'user',content:'u' }],maxOutputTokens:20,
-      guildId:'g',role:'dream',budgetId:'verified-free' });
+      guildId:'g',role:'job',budgetId:'verified-free' });
     assert.deepEqual(freeBodies[0].provider.max_price,{ prompt:0,completion:0,request:0 });
     const freeStatus = cost.modelBudgetStatus('verified-free');
     assert.equal(freeStatus.committedUsd,0);
@@ -230,7 +229,7 @@ async function main() {
         choices:[{ message:{ content:'fallback answer' } }] });
     };
     const limitedInput = { model:freeModel,fallbackModels:[paidModel],messages:[{ role:'user',content:'u' }],maxOutputTokens:20,
-      guildId:'g',role:'dream',budgetId:'limited-free',consumeRequest:({ model }) => { limitedConsumes.push(model); } };
+      guildId:'g',role:'job',budgetId:'limited-free',consumeRequest:({ model }) => { limitedConsumes.push(model); } };
     await providerLimited.requestModel(limitedInput);
     await providerLimited.requestModel(limitedInput);
     assert.deepEqual(limitedPosts,[freeModel,paidModel,paidModel],
@@ -321,7 +320,7 @@ async function main() {
       assertCurrent:async () => {},
       recordUse:() => { if (failAck) { failAck = false; throw new Error('simulated use acknowledgement crash'); } }
     });
-    const replayOptions = { guildId:'g',runId:'dream-replay',budgetId:'runtime-budget',maximumRequests:1,
+    const replayOptions = { guildId:'g',runId:'budget-replay',budgetId:'runtime-budget',maximumRequests:1,
       system:'s',userContent:'u',memory:replayMemory(),request:async ({ budgetId,consumeRequest }) => {
         assert.equal(budgetId,'runtime-budget');
         consumeRequest({ model:paidModel }); responseCalls += 1;
@@ -339,7 +338,7 @@ async function main() {
     // Validation retries share the same durable request ceiling, including a
     // later invocation; tool maximumSteps remains a separate limit.
     let validationPosts = 0;
-    const validationOptions = { guildId:'g',runId:'dream-validation-ceiling',system:'s',userContent:'u',maximumRequests:2,
+    const validationOptions = { guildId:'g',runId:'budget-validation-ceiling',system:'s',userContent:'u',maximumRequests:2,
       maximumSteps:99,validate:() => { throw new Error('invalid response'); },request:async ({ consumeRequest }) => {
         consumeRequest({ model:paidModel }); validationPosts += 1;
         return { choices:[{ message:{ content:'invalid' } }] };
@@ -358,7 +357,7 @@ async function main() {
     assert.equal(separate.text,'final despite zero tools');
     assert.equal(finalRequests,1);
 
-    console.log('dream cost/provider/runtime: lifetime cap, verified free fallback, cooldown, accounting and durable request ceiling passed');
+    console.log('model budget/provider/runtime: lifetime cap, verified free fallback, cooldown, accounting and durable request ceiling passed');
   } finally {
     globalThis.fetch = originalFetch;
     db.close();

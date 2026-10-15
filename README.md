@@ -2,7 +2,7 @@
 
 `discord.js` で動く、憲法・立法・司法・行政執行を備えたAIコミュニティ統治botです。
 
-Evex Developersでの全履歴整理・新着処理・定期的な見直しは[Dream運用](docs/dreaming.md)を参照。Ling 3.0 Flashで整理し、OpenRouterのQwen3 Embedding 8Bで現在の文脈からAtomを想起します。
+過去ログは[記憶の本](docs/memory-tree.md)にまとめます。公開チャンネルのログを区切りごとにOpenRouterの無料モデルへ渡し、根拠の発言を持つ出来事と、それを統合したページの木に整理します。会話では根だけを常駐させ、会話に出た名前から関係するページと出来事を思い出し、`memory`ツールでページ → 出来事 → 元の発言とたどります。
 
 ## Browser chat
 
@@ -633,7 +633,7 @@ URL の判定は**名前ではなく解決した IP** で行います (`src/agen
 ```env
 OPENROUTER_API_KEY=sk-or-...             # これが無ければエージェントは無効 (他の機能は動く)
 AI_MODEL=deepseek/deepseek-v4-flash-0731
-MEMORY_WRITER_MODEL=inclusionai/ling-3.0-flash
+MEMORY_TREE_MODELS=google/gemma-4-31b-it:free,nvidia/nemotron-3-super-120b-a12b:free  # 記憶の木を作るモデル (docs/memory-tree.md)
 AGENT_REASONING_EFFORT=high         # low / high / max の真ん中
 AGENT_THINKING=true
 
@@ -834,10 +834,9 @@ EMOTION_ANALYSIS_TIMEOUT_MS=180000
 
 ## Install
 
-Node.js 22.13以上が必要です。会話履歴はAtom Memoryへ構造化し、会話・統治agentは共通の実行基盤を使います。[構造・権限・履歴の移行手順](docs/agent-architecture.md)を参照してください。
+Node.js 22.13以上が必要です。会話・統治agentは共通の実行基盤を使います。過去ログの記憶は別プロセスの builder が[記憶の本](docs/memory-tree.md)に整理します。
 
 ```bash
-git submodule update --init subprojects/atom-memory
 npm install
 ```
 
@@ -916,4 +915,4 @@ evex 側 (20.1% / 32.2% / 10) に寄る。
 学習は t4-small で 88 分・$0.59 (batch 48 + `torch.compile` で 93,500 tok/s)。
 `torch.compile` は速いだけでなくメモリも減り、単体では OOM する batch 48 が通る。
 
-AIの接続・費用は[共通接続と費用記録](docs/memory-cost.md)、Atomの移行とライブラリ／Botそれぞれの反映状態は[運用メモ](docs/deployment.md)を参照してください。Writerの一括write、一段ずつのinspect、継続処理は[採用設計](docs/writer-design.md)、完了したチェックと本番反映の境界は[検証記録](docs/writer-validation.md)を参照してください。
+過去ログの記憶は[記憶の本](docs/memory-tree.md)、本番の反映状態は[運用メモ](docs/deployment.md)を参照してください。

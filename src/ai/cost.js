@@ -6,7 +6,8 @@ const BUDGET_TOTALS_VERSION = 1;
 
 function ledger() {
   if (ready) return;
-  db.pragma('busy_timeout = 5000');
+  // ロック待ちは archive/db.js の接続設定 (30秒) に任せる。ここで 5秒に下げると
+  // 同じ接続を使う取り込みまで巻き込んで SQLITE_BUSY で落ちる。
   db.transaction(() => {
     db.exec(`CREATE TABLE IF NOT EXISTS ai_model_calls (
       id TEXT PRIMARY KEY,started_at INTEGER NOT NULL,guild_id TEXT,role TEXT NOT NULL,run_id TEXT,
@@ -166,10 +167,7 @@ export function reserveModelCall({ model, messages, tools, outputTokens, guildId
     throw codedError('MODEL_BUDGET_INVALID', 'Model budget requires a nonempty id');
   if (budgetId) budgetId = budgetId.trim();
   const rates = modelRates(model);
-  const raw = !budgetId && role === 'writer' ? process.env.MEMORY_WRITER_DAILY_USD : undefined;
-  const cap = raw?.trim() ? Number(raw) : null;
-  if (cap !== null && (!Number.isFinite(cap) || cap < 0)) throw new Error('MEMORY_WRITER_DAILY_USD must be a nonnegative USD amount');
-  if ((cap !== null || budgetId) && (!rates || !Number.isFinite(rates.input) || !Number.isFinite(rates.output)))
+  if (budgetId && (!rates || !Number.isFinite(rates.input) || !Number.isFinite(rates.output)))
     throw new Error('A model budget requires current OpenRouter model pricing');
   if (!Number.isFinite(outputTokens) || outputTokens < 0) throw new Error('Model output token limit must be nonnegative');
   const inputRate = rates ? Math.max(rates.input,rates.cached ?? rates.input,rates.cacheWrite ?? rates.input) : 0;
@@ -179,7 +177,6 @@ export function reserveModelCall({ model, messages, tools, outputTokens, guildId
   // A floating-point representation must never round a reservation below the
   // verified price bound used to admit it.
   const upper = rates ? Math.ceil(rawUpper*1e12)/1e12 : 0;
-  const day = Math.floor(now/86400000)*86400000;
   const result = db.transaction(() => {
     if (budgetId) {
       const budget = budgetRow(budgetId);
@@ -197,14 +194,6 @@ export function reserveModelCall({ model, messages, tools, outputTokens, guildId
         }) };
       }
     }
-    if (cap !== null) {
-      const charged = db.prepare(`SELECT coalesce(sum(coalesce(reported_usd,estimated_usd,reserved_usd)),0) n
-        FROM ai_model_calls WHERE role=? AND budget_id IS NULL AND started_at>=? AND started_at<?`)
-        .get(role,day,day+86400000).n;
-      if (charged+upper > cap) return { error:Object.assign(new Error('Memory Writer daily budget reached'), {
-        code:'MEMORY_BUDGET_PAUSED',retryAt:day+86400000
-      }) };
-    }
     const id = randomUUID();
     db.prepare(`INSERT INTO ai_model_calls
       (id,started_at,guild_id,role,run_id,model,status,reserved_usd,rates,budget_id) VALUES(?,?,?,?,?,?,?,?,?,?)`)
@@ -212,7 +201,7 @@ export function reserveModelCall({ model, messages, tools, outputTokens, guildId
     if (budgetId) db.prepare(`UPDATE ai_model_budgets SET calls=calls+1,
       reserved_usd=reserved_usd+?,unknown_calls=unknown_calls+1,updated_at=? WHERE id=?`)
       .run(upper,now,budgetId);
-    return { id, rates, capped: cap !== null || !!budgetId, budgetId };
+    return { id, rates, capped: !!budgetId, budgetId };
   }).immediate();
   if (result.error) throw result.error;
   return result;

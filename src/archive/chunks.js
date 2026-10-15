@@ -371,22 +371,43 @@ export const saveChunkVectors = db.transaction((rows) => {
   return rows.length;
 });
 
+// 3本とも索引だけで答えが出る (idx_chunk_cover / idx_chunkvec_model)。
+// 以前は message_chunks の行と chunk_vectors の行 (vec の BLOB 込み) を全部読んでいた。
+// 計画の検査 (scripts/check-index-status.mjs) が同じ文を見られるよう公開しておく。
+export const COVERAGE_SQL = {
+  total: `
+    SELECT COUNT(*) AS total, COALESCE(SUM(msg_count), 0) AS messages
+    FROM message_chunks INDEXED BY idx_chunk_cover
+    WHERE guild_id = ? AND text_len > 0
+  `,
+  done: `
+    SELECT COUNT(*) AS done
+    FROM message_chunks c INDEXED BY idx_chunk_cover
+    WHERE c.guild_id = ? AND c.text_len > 0 AND EXISTS (
+      SELECT 1 FROM chunk_vectors v INDEXED BY idx_chunkvec_model
+      WHERE v.model_id = ? AND v.rowid = c.chunk_id
+    )
+  `,
+  // 件数は要らないので1件見つけた時点で返す。
+  any: `
+    SELECT 1 FROM message_chunks c INDEXED BY idx_chunk_cover
+    WHERE c.guild_id = ? AND c.text_len > 0 AND EXISTS (
+      SELECT 1 FROM chunk_vectors v INDEXED BY idx_chunkvec_model
+      WHERE v.model_id = ? AND v.rowid = c.chunk_id
+    )
+    LIMIT 1
+  `
+};
+
 export function chunkCoverage(guildId, modelId) {
-  const total = db.prepare(
-    'SELECT COUNT(*) AS count FROM message_chunks WHERE guild_id = ? AND text_len > 0'
-  ).get(guildId).count;
-
-  const done = db.prepare(`
-    SELECT COUNT(*) AS count FROM message_chunks c
-    JOIN chunk_vectors v ON v.chunk_id = c.chunk_id
-    WHERE c.guild_id = ? AND v.model_id = ? AND c.text_len > 0
-  `).get(guildId, modelId).count;
-
-  const messages = db.prepare(
-    'SELECT COALESCE(SUM(msg_count), 0) AS count FROM message_chunks WHERE guild_id = ? AND text_len > 0'
-  ).get(guildId).count;
-
+  const { total, messages } = db.prepare(COVERAGE_SQL.total).get(guildId);
+  const { done } = db.prepare(COVERAGE_SQL.done).get(guildId, modelId);
   return { total, done, messages, ratio: total > 0 ? done / total : 0 };
+}
+
+/** 意味検索のモードを出すか。chunkCoverage(...).done > 0 は全件を数えてから比べていた。 */
+export function hasChunkVectors(guildId, modelId) {
+  return Boolean(db.prepare(COVERAGE_SQL.any).get(guildId, modelId));
 }
 
 export function clearGuildChunks(guildId) {

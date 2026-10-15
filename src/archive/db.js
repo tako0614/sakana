@@ -1,12 +1,42 @@
 import Database from 'better-sqlite3';
+import { envMiB, scheduleOptimize, tuneSqlite } from '../sqlite.js';
 
 // メッセージアーカイブは XP 用の database.sqlite とは別ファイルに置く。
 // 巨大になりやすく、作り直し (再インデックス) も独立してできるようにするため。
 const dbPath = process.env.ARCHIVE_DB_PATH ?? 'archive.sqlite';
 
-export const db = new Database(dbPath);
+// 書き込みが重なったら最大30秒待つ。既定の5秒では、取り込みのページ書き込みと
+// 別プロセス (記憶の builder の費用台帳など) が重なったときに SQLITE_BUSY で
+// チャンネルごと取り込みが失敗していた (2026-10 の /index build で nsfw が落ちた)。
+export const BUSY_TIMEOUT_MS = 30_000;
+export const db = new Database(dbPath, { timeout: BUSY_TIMEOUT_MS });
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous = NORMAL');
+// 2.7GB の本体を毎回ディスクから読み直さない (src/sqlite.js)
+tuneSqlite(db, { cacheMiB: envMiB('ARCHIVE_SQLITE_CACHE_MIB', 128), mmapMiB: envMiB('ARCHIVE_SQLITE_MMAP_MIB', 4096), label: 'archive' });
+scheduleOptimize(db, { label: 'archive' });
+
+/** ロックの取り合いで失敗したか (待てば通る失敗)。 */
+export function isBusy(error) {
+  return /^SQLITE_(BUSY|LOCKED)/.test(error?.code ?? '') || /database (table )?is locked/i.test(error?.message ?? '');
+}
+
+/**
+ * 30秒待っても書けなかったときに、間を空けてやり直す。待てば通る失敗で
+ * 取り込みジョブやチャンネルを死なせない。それ以外の失敗はそのまま投げる。
+ */
+export async function retryBusy(fn, { attempts = 5, delayMs = 2000, label = 'archive write' } = {}) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (!isBusy(error) || attempt >= attempts) throw error;
+      const wait = Math.min(60_000, delayMs * 2 ** (attempt - 1));
+      console.warn(`${label}: database is locked, retrying in ${wait}ms (${attempt}/${attempts - 1})`);
+      await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+  }
+}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS messages (
@@ -244,6 +274,10 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_chunk_channel ON message_chunks(channel_id, from_ms);
   CREATE INDEX IF NOT EXISTS idx_chunk_guild ON message_chunks(guild_id, from_ms);
+  -- /index status と意味検索の被覆は件数と msg_count の合計しか要らない。
+  -- これが無いと idx_chunk_guild から行を1件ずつ引いて text_len を見る (行ぶん読む)。
+  -- chunk_id は rowid なので索引に含まれ、結合側も索引だけで済む。
+  CREATE INDEX IF NOT EXISTS idx_chunk_cover ON message_chunks(guild_id, text_len, msg_count);
 
   -- まとまりは複数人なので「その人の発言だけ」では絞れない。
   -- 「その人が参加しているまとまり」で絞る (相手の反論込みで読めるのでむしろ good)。
@@ -261,6 +295,8 @@ db.exec(`
     vec        BLOB NOT NULL,
     created_at INTEGER NOT NULL
   );
+  -- 「このモデルで埋まった数」を行 (vec の BLOB 込み) を読まずに数える。
+  CREATE INDEX IF NOT EXISTS idx_chunkvec_model ON chunk_vectors(model_id);
 
   -- まとまりを作り直したらベクトルと参加者も捨てる。残すと別の会話に
   -- 前の会話のベクトルが付く (chunk_id は AUTOINCREMENT なので再利用はされないが、
@@ -420,6 +456,17 @@ export const recordSpan = db.transaction((channelId, fromId, toId) => {
   insertSpanStmt.run(channelId, from.ms, to.ms, from.id, to.id);
 });
 
+/**
+ * 1ページぶん (発言・取った区間・チャンネルの位置) を1つのトランザクションで書く。
+ * ロックを取る回数が減り、途中で失敗しても「保存したのに位置が進んでいない」が起きない
+ * (やり直しは同じページを取り直して上書きするだけ)。
+ */
+export const savePage = db.transaction((channelId, records, span, state) => {
+  saveMessages(records);
+  if (span) recordSpan(channelId, span[0], span[1]);
+  if (state) updateChannelState(channelId, state);
+});
+
 export function listSpans(channelId) {
   return db.prepare(`
     SELECT from_ms, to_ms, from_id, to_id FROM channel_spans
@@ -496,15 +543,12 @@ db.function('regexp', { deterministic: true }, (pattern, value) => {
   }
 });
 
-// The source and its pending projection change together, including deletions.
-// Coalescing pending ids bounds the queue during a full history import.
+// Discord の関係 (返信・転送・スレッド・埋め込み) は structure_json に構造のまま持つ。
 if (!db.prepare('PRAGMA table_info(messages)').all().some((column) => column.name === 'structure_json')) {
   db.exec("ALTER TABLE messages ADD COLUMN structure_json TEXT NOT NULL DEFAULT '{}'");
 }
+// 編集・削除の監査。発言が書き換わる直前の版を残す (変わらない再取り込みでは残さない)。
 db.exec(`
-  CREATE TABLE IF NOT EXISTS memory_pending (message_id TEXT PRIMARY KEY);
-  CREATE TABLE IF NOT EXISTS memory_projection_priority (message_id TEXT PRIMARY KEY);
-  CREATE TABLE IF NOT EXISTS memory_projection_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS message_versions (
     id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT NOT NULL,
     content TEXT NOT NULL, structure_json TEXT NOT NULL, edited_at INTEGER,
@@ -517,25 +561,7 @@ db.exec(`
     INSERT INTO message_versions(message_id, content, structure_json, edited_at, deleted, observed_until)
       VALUES(old.message_id, old.content, old.structure_json, old.edited_at, old.deleted, unixepoch('subsec') * 1000);
   END;
-  DROP TRIGGER IF EXISTS messages_memory_ai;
-  CREATE TRIGGER messages_memory_ai AFTER INSERT ON messages BEGIN
-    INSERT INTO memory_pending VALUES (new.message_id) ON CONFLICT(message_id) DO NOTHING;
-  END;
-  DROP TRIGGER IF EXISTS messages_memory_au;
-  CREATE TRIGGER messages_memory_au AFTER UPDATE ON messages BEGIN
-    INSERT INTO memory_pending VALUES (new.message_id) ON CONFLICT(message_id) DO NOTHING;
-  END;
-  DROP TRIGGER IF EXISTS messages_memory_ad;
-  CREATE TRIGGER messages_memory_ad AFTER DELETE ON messages BEGIN
-    INSERT INTO memory_pending VALUES (old.message_id) ON CONFLICT(message_id) DO NOTHING;
-  END;
 `);
-if (!db.prepare("SELECT 1 FROM memory_projection_state WHERE key = 'seeded-v1'").get()) {
-  db.transaction(() => {
-    db.exec('INSERT OR IGNORE INTO memory_pending SELECT message_id FROM messages');
-    db.prepare('INSERT INTO memory_projection_state VALUES (?, ?)').run('seeded-v1', '1');
-  })();
-}
 
 // Older audit rows cannot recover discarded embed fields; retain them from this
 // migration onward. Install atomically so concurrent ingestion sees no gap.
@@ -557,64 +583,60 @@ db.transaction(() => {
   `);
 })();
 
-// Operational queues only. Semantic descriptions and relationships live in Atom,
-// not in a second summary database. Re-reading an edited input schedules every
-// conversation batch which observed it, including context/cross-batch references.
-db.exec(`
-  CREATE TABLE IF NOT EXISTS memory_writer_pending (
-    message_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
-    created_at INTEGER NOT NULL, queued_at INTEGER NOT NULL DEFAULT 0,
-    generation INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0,
-    attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT
-  );
-  CREATE INDEX IF NOT EXISTS idx_writer_ready ON memory_writer_pending(queued_at DESC, created_at DESC);
-  CREATE INDEX IF NOT EXISTS idx_writer_counts ON memory_writer_pending(guild_id, attempts);
-  CREATE INDEX IF NOT EXISTS idx_writer_channel ON memory_writer_pending(channel_id, created_at);
-  CREATE TABLE IF NOT EXISTS memory_writer_inputs (
-    batch_id TEXT NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(batch_id, message_id)
-  );
-  CREATE INDEX IF NOT EXISTS idx_writer_input ON memory_writer_inputs(message_id);
-  CREATE TABLE IF NOT EXISTS memory_writer_runs (
-    batch_id TEXT PRIMARY KEY, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL,
-    model TEXT NOT NULL, messages INTEGER NOT NULL, atoms INTEGER NOT NULL,
-    completed_at INTEGER NOT NULL, usage TEXT NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_writer_runs_channel ON memory_writer_runs(guild_id, channel_id, completed_at);
-  DROP INDEX IF EXISTS idx_writer_queue;
-`);
-db.transaction(() => {
-const writerUpdate = db.prepare("SELECT sql FROM sqlite_master WHERE name='messages_writer_update'").get()?.sql ?? '';
-if (writerUpdate && !writerUpdate.includes('old.extra')) db.exec('DROP TRIGGER messages_writer_update');
-for (const event of ['INSERT', 'UPDATE', 'DELETE']) {
-  const row = event === 'DELETE' ? 'old' : 'new';
-  const condition = event === 'UPDATE' ? `WHEN old.content IS NOT new.content
-    OR old.extra IS NOT new.extra OR old.is_bot IS NOT new.is_bot OR old.pinned IS NOT new.pinned
-    OR old.guild_id IS NOT new.guild_id OR old.channel_id IS NOT new.channel_id
-    OR old.author_id IS NOT new.author_id OR old.author_name IS NOT new.author_name
-    OR old.edited_at IS NOT new.edited_at OR old.deleted IS NOT new.deleted
-    OR old.reply_to IS NOT new.reply_to OR old.reaction_count IS NOT new.reaction_count
-    OR json_remove(old.structure_json, '$.observedAt') IS NOT json_remove(new.structure_json, '$.observedAt')` : '';
-  db.exec(`CREATE TRIGGER IF NOT EXISTS messages_writer_${event.toLowerCase()} AFTER ${event} ON messages ${condition} BEGIN
-    INSERT INTO memory_writer_pending(message_id, guild_id, channel_id, created_at, queued_at)
-      VALUES (${row}.message_id, ${row}.guild_id, ${row}.channel_id, ${row}.created_at, unixepoch('subsec') * 1000)
-      ON CONFLICT(message_id) DO UPDATE SET guild_id=excluded.guild_id, channel_id=excluded.channel_id,
-        generation=generation+1, queued_at=excluded.queued_at, retry_at=0;
-    INSERT INTO memory_writer_pending(message_id, guild_id, channel_id, created_at, queued_at)
-      SELECT m.message_id, m.guild_id, m.channel_id, m.created_at, unixepoch('subsec') * 1000
-      FROM messages m WHERE m.message_id IN (
-        SELECT i.message_id FROM memory_writer_inputs i WHERE i.batch_id IN (
-          SELECT batch_id FROM memory_writer_inputs WHERE message_id=${row}.message_id))
-      ON CONFLICT(message_id) DO UPDATE SET generation=generation+1, queued_at=excluded.queued_at, retry_at=0;
-  END;`);
-}
-})();
-if (!db.prepare("SELECT 1 FROM memory_projection_state WHERE key = 'writer-seeded-v1'").get()) {
-  db.transaction(() => {
-    db.exec(`INSERT INTO memory_writer_pending(message_id,guild_id,channel_id,created_at)
-      SELECT message_id,guild_id,channel_id,created_at FROM messages WHERE deleted=0
-      ON CONFLICT(message_id) DO NOTHING`);
-    db.prepare('INSERT INTO memory_projection_state VALUES (?, ?)').run('writer-seeded-v1', '1');
-  })();
+// アーカイブ自身の小さな状態 (key/value)。いまは「全履歴を最後まで列挙できたか」の
+// 記録 (archive-full-coverage:<guild>) だけ。
+db.exec('CREATE TABLE IF NOT EXISTS archive_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+
+// Atom の会話記憶 (Writer / Dream / 発言ごとの射影と埋め込み) は廃止した。
+// 旧版が messages に張ったトリガーは発言の追加・更新・削除のたびに待ち行列へ
+// 書き込み、全履歴の取り込みで書き込みを何倍にもして SQLITE_BUSY を招いていた。
+// 先にトリガーを外し (残すと消した表を参照して messages への書き込みが失敗する)、
+// 次に待ち行列と作業表を捨てる。何度走っても同じ結果になる。
+// memory_writer_calls はここでは消さない: ai/cost.js が費用の台帳へ移してから消す。
+const RETIRED_MEMORY_TRIGGERS = [
+  'messages_memory_ai', 'messages_memory_au', 'messages_memory_ad',
+  'messages_writer_insert', 'messages_writer_update', 'messages_writer_delete',
+  'dream_admission_message_update', 'dream_admission_human_reply', 'dream_admission_pin',
+  'dream_generation_insert', 'dream_generation_update', 'dream_generation_delete'
+];
+const RETIRED_MEMORY_INDEXES = ['idx_dream_messages_bot_scope', 'idx_dream_messages_reply_target'];
+const RETIRED_MEMORY_TABLES = [
+  'memory_pending', 'memory_projection_priority',
+  'memory_writer_pending', 'memory_writer_inputs', 'memory_writer_runs',
+  'dream_admissions', 'dream_jobs', 'dream_channels', 'dream_message_generations',
+  'dream_work', 'dream_work_legacy_queue', 'dream_legacy_promotions',
+  'dream_reviews', 'dream_review_legacy_audit', 'dream_review_passes',
+  'dream_review_targets', 'dream_semantic_reviews', 'dream_scheduler_migrations'
+];
+{
+  const present = (type, names) => names.filter((name) =>
+    db.prepare('SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?').get(type, name));
+  const retired = () => ({
+    projectionState: present('table', ['memory_projection_state']).length > 0,
+    triggers: present('trigger', RETIRED_MEMORY_TRIGGERS),
+    indexes: present('index', RETIRED_MEMORY_INDEXES),
+    tables: present('table', RETIRED_MEMORY_TABLES)
+  });
+  const pending = (found) => found.projectionState
+    || found.triggers.length > 0 || found.indexes.length > 0 || found.tables.length > 0;
+  // 移行済みなら書き込みロックを取らずに抜ける。中では取り直してから判定する
+  // (同じファイルを開く別プロセスが先に済ませていることがある)。
+  if (pending(retired())) {
+    db.transaction(() => {
+      const found = retired();
+      for (const name of found.triggers) db.exec(`DROP TRIGGER IF EXISTS ${name}`);
+      for (const name of found.indexes) db.exec(`DROP INDEX IF EXISTS ${name}`);
+      // 全履歴の列挙記録だけは旧表 (memory_projection_state) から引き継ぐ。
+      // 他の行 (seeded-v1 / writer-* など) は Atom の作業状態なので捨てる。
+      if (found.projectionState) {
+        db.exec(`INSERT INTO archive_state(key, value)
+          SELECT key, value FROM memory_projection_state WHERE key LIKE 'archive-full-coverage:%'
+          ON CONFLICT(key) DO NOTHING`);
+        db.exec('DROP TABLE memory_projection_state');
+      }
+      for (const name of found.tables) db.exec(`DROP TABLE IF EXISTS ${name}`);
+    }).immediate();
+  }
 }
 
 const upsertMessageStmt = db.prepare(`
@@ -779,6 +801,16 @@ export function isGuildIndexed(guildId) {
 
 export function countMessages(guildId) {
   return db.prepare('SELECT COUNT(*) AS count FROM messages WHERE guild_id = ?').get(guildId).count;
+}
+
+/**
+ * サーバー全体の発言数の概数。チャンネルごとの message_count の合計で、
+ * 取り込みジョブが終わった時点の値 (ジョブの間に来た live 発言は次の更新まで入らない)。
+ * countMessages は messages の全行を数えるので、100万件では状態表示に使えない。
+ */
+export function approximateMessageCount(guildId) {
+  return db.prepare('SELECT COALESCE(SUM(message_count), 0) AS count FROM channels WHERE guild_id = ?')
+    .get(guildId).count;
 }
 
 export function countChannelMessages(channelId) {

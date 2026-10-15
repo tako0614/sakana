@@ -1,4 +1,3 @@
-process.env.MEMORY_EMBEDDINGS = '0';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -8,8 +7,7 @@ const directory = mkdtempSync(join(tmpdir(), 'sakana-guild-isolation-'));
 process.env.DATABASE_PATH = join(directory, 'main.sqlite');
 process.env.ARCHIVE_DB_PATH = join(directory, 'archive.sqlite');
 process.env.AGENT_RUNTIME_PATH = join(directory, 'runs.sqlite');
-process.env.ATOM_MEMORY_PATH = join(directory, 'atoms.sqlite');
-const { db, saveMessage } = await import('../src/archive/db.js');
+const { db, saveMessage, upsertChannel } = await import('../src/archive/db.js');
 const { toRecord } = await import('../src/archive/indexer.js');
 const { runRead } = await import('../src/agent/tools.js');
 const { runInfo } = await import('../src/agent/info.js');
@@ -18,7 +16,7 @@ const { exampleTurns } = await import('../src/mimic/speakers.js');
 const { engineFor, setEngine, DEFAULT_ENGINE } = await import('../src/mimic/prefs.js');
 const { personaFor, setPersona, personaCounts } = await import('../src/mimic/persona.js');
 const { runAgent } = await import('../src/ai/runtime.js');
-const { conversationMemory, syncConversationMemory } = await import('../src/conversation/memory.js');
+const { hasVisibilityClient, publicChannels, setVisibilityClient } = await import('../src/archive/visibility.js');
 const failures = [];
 async function check(name, run) {
   try { await run(); console.log(`PASS ${name}`); }
@@ -75,15 +73,28 @@ try {
       return { choices: [{ message: { content: 'B answer' } }] };
     } });
   });
-  await check('memory does not expose other guild or hidden-channel counts', async () => {
-    await syncConversationMemory();
-    const channel = { id: 'public-a', guildId: 'guild-a', guild: { id: 'guild-a', members: { me: { id: 'bot' } } },
-      permissionsFor: () => ({ has: () => true }) };
-    const memory = conversationMemory({ guildId: 'guild-a', channel, member: { id: 'reader' } });
+  await check('public channels are limited to one guild and to what @everyone and the bot can read', () => {
+    const everyone = { id: 'guild-a' }, bot = { id: 'bot' };
+    const readable = { 'public-a': [everyone, bot], 'private-a': [bot], 'hidden-a': [everyone] };
+    const channel = (id, type = 0) => ({ id, type, isTextBased: () => true,
+      permissionsFor: (who) => ({ has: () => (readable[id] ?? []).includes(who) }) });
+    const guild = { id: 'guild-a', roles: { everyone }, members: { me: bot },
+      channels: { cache: new Map(['public-a', 'private-a', 'hidden-a'].map((id) => [id, channel(id)])) } };
+    // Archived threads are rarely cached; their parent's visibility decides.
+    for (const [channelId, guildId, parentId, isPrivate] of [
+      ['archived-public-thread', 'guild-a', 'public-a', 0], ['archived-private-thread', 'guild-a', 'public-a', 1],
+      ['archived-hidden-thread', 'guild-a', 'private-a', 0], ['foreign-thread', 'guild-b', 'public-a', 0]
+    ]) upsertChannel({ channel_id: channelId, guild_id: guildId, parent_id: parentId, name: channelId, type: 11,
+      is_thread: 1, is_private: isPrivate });
+    assert.deepEqual(publicChannels('guild-a', guild).sort(), ['archived-public-thread', 'public-a']);
+    assert.equal(hasVisibilityClient(), false);
+    assert.deepEqual(publicChannels('guild-a'), [], 'no client and no supplied guild means nothing is known to be public');
+    setVisibilityClient({ guilds: { cache: new Map([['guild-a', guild]]) } });
     try {
-      const output = JSON.parse((await memory.read({ context: 'LOCAL_PUBLIC_SENTINEL' })).text);
-      assert.equal(output.coverage.messages, 1);
-    } finally { memory.close(); }
+      assert.equal(hasVisibilityClient(), true);
+      assert.deepEqual(publicChannels('guild-a').sort(), ['archived-public-thread', 'public-a']);
+      assert.deepEqual(publicChannels('guild-b'), [], 'an uncached guild has no public channels');
+    } finally { setVisibilityClient(null); }
   });
   assert.deepEqual(failures, [], 'server information isolation regressions');
   console.log('check-guild-isolation: ok');

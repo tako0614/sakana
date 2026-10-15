@@ -1,0 +1,19 @@
+[Unit]
+Description=Sakana memory tree builder (one pass; resumes from its cursors)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# .env (OPENROUTER_API_KEY, MEMORY_TREE_GUILD, MEMORY_TREE_MODELS ...) は dotenv が作業ディレクトリから読む。
+# リリースを切り替えるときは sakana.service と同じく drop-in (90-release.conf) で ExecStart を差し替える。
+WorkingDirectory=/root/sakana
+ExecStart=/usr/bin/node scripts/memory-tree.mjs run --max-minutes 50
+TimeoutStartSec=1h
+Nice=10
+# idle クラスは bot の取り込みに負けて止まる (実測) ので best-effort の最低優先度
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sakana-memory

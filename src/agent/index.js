@@ -1,6 +1,3 @@
-import { conversationMemory } from '../conversation/memory.js';
-import { selectContextMessages } from '../conversation/admission.js';
-import { isDreamGuild } from '../conversation/dream-config.js';
 // メンションで呼ばれる AI エージェント。
 //
 //   @bot この議論まとめて
@@ -9,6 +6,7 @@ import { isDreamGuild } from '../conversation/dream-config.js';
 //
 // 呼ばれた時点で直近の会話を渡してしまうので、多くの場合ツールを1回も呼ばずに答える。
 
+import { recallFor } from '../memory/recall.js';
 import { AttachmentBuilder } from 'discord.js';
 import {
   canBotAttach,
@@ -233,7 +231,7 @@ async function fetchRecent(channel, { exclude, selfId, limit }) {
 
   try {
     // 経過表示のぶんだけ多めに取る。捨てる件数が読めないので少し余裕を持たせる。
-    const fetched = await channel.messages.fetch({ limit: isDreamGuild(channel.guildId ?? channel.guild?.id) ? 100 : Math.min(limit + 8, 100) });
+    const fetched = await channel.messages.fetch({ limit: Math.min(limit + 8, 100) });
     return [...fetched.values()]
       .filter((message) => !exclude.has(message.id))
       .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
@@ -241,7 +239,7 @@ async function fetchRecent(channel, { exclude, selfId, limit }) {
       // 自分の経過表示と断り文は会話ではない。混ぜると枠を食うし、自分の発言として
       // 読まれる。ID で除くだけでは足りない (落ちた実行が消し損ねたぶんが残っている)。
       .filter((message) => !isIndicatorMessage(message, selfId) && !isAgentNotice(message, selfId))
-      .slice(-(isDreamGuild(channel.guildId ?? channel.guild?.id) ? 100 : limit));
+      .slice(-limit);
   } catch (error) {
     console.error('Failed to preload recent messages:', error);
     return [];
@@ -420,41 +418,35 @@ export async function handleAgentRequest(message, client) {
 
     // 鎖に入ったものは背景から抜く。同じ発言を2回載せてもトークンだけ増える。
     const inChain = new Set(replyChain.map((entry) => entry.messageId));
-    const available = preloaded.filter((entry) => !inChain.has(entry.messageId));
-    const recent = isDreamGuild(guild.id)
-      ? selectContextMessages(available, { guildId: guild.id, channelId: message.channelId,
-          selfId: client.user?.id, maxUnits: agentConfig.preloadMessages, maxBytes: 60000 })
-        .map(unit => ({ ...unit.messages[0], contextMessages: unit.messages,
-          content: unit.messages.map(item => item.content).join('\n') }))
-      : available;
+    const recent = preloaded.filter((entry) => !inChain.has(entry.messageId));
 
     // query を省略した意味検索で「いまの会話」を使う
     ctx.recent = recent;
     ctx.thread = replyChain;
 
     const system = buildSystemPrompt(ctx, toolset);
+    const request = stripMention(message.content, client.user.id);
     const userContent = buildUserContent({
       ctx,
-      prompt: stripMention(message.content, client.user.id),
+      prompt: request,
       // 依頼に貼られた画像・埋め込み・スタンプ。中身は読めないが、存在を
       // 伝えないと「これ何？」に対して直近の会話の話をしてしまう。
       extras: describeExtras(message),
       recent,
       replyChain,
       requestMessage: { ...fromDiscordMessage(message), referenceState: replyChain.referenceState },
-      refs
+      refs,
+      recall: toolset.memoryAvailable ? recallSafely(guild.id, request, replyChain, recent) : ''
     });
 
-    const memory = conversationMemory({ guildId: guild.id, channel: message.channel, member });
     const result = await runAgent({
       guildId: guild.id,
-      // Discord input identity survives a process restart. An unfinished
-      // provider response can therefore finish its pending memory-use ack
-      // without another paid request. Completed runs still use the runtime's
-      // default reuseCompleted=false behavior if the event is handled again.
+      // Discord input identity survives a process restart, so an unfinished
+      // run resumes from its checkpoint instead of starting over. Completed
+      // runs still use the runtime's default reuseCompleted=false behavior if
+      // the event is handled again.
       runId: chatRunId({ guildId: guild.id, channelId: message.channelId,
         memberId: member.id, messageId: message.id }),
-      memory,
       system,
       userContent,
       toolset,
@@ -471,7 +463,7 @@ export async function handleAgentRequest(message, client) {
       deadlineAt: Date.now() + agentConfig.deadlineMs,
       weigh: weighTokens,
       onToolCall: (name, args) => indicator.setStatus(toolLabel(name, args))
-    }).finally(() => memory.close());
+    });
 
     finalizeCall(reservation.id, {
       status: 'ok',
@@ -538,5 +530,21 @@ export async function handleAgentRequest(message, client) {
     await indicator?.stop();
     // 隔離タブは実行ごとに捨てる。残すと次の人が中身を読める。
     if (ctx) await closeBrowserSandbox(ctx).catch(() => {});
+  }
+}
+
+/**
+ * 依頼と返信先を強い手がかり、直近の会話を弱い手がかりにして思い出す。
+ * 記憶が読めなくても会話は止めない。
+ */
+function recallSafely(guildId, request, replyChain, recent) {
+  try {
+    return recallFor(guildId, {
+      request: [request, ...replyChain.map((entry) => entry.content ?? '')].join('\n'),
+      context: recent.slice(-10).map((entry) => entry.content ?? '').join('\n')
+    });
+  } catch (error) {
+    console.error('Memory recall failed:', error);
+    return '';
   }
 }

@@ -10,6 +10,7 @@ import {
 
 import {
   checkFtsIntegrity,
+  approximateMessageCount,
   countMessages,
   getEmbedState,
   getGuildState,
@@ -252,13 +253,29 @@ const indexCommand = {
 async function showStatus(interaction) {
   const guildId = interaction.guildId;
   const state = getGuildState(guildId);
-  const job = getRunningJob(guildId);
-  const channels = listChannelStates(guildId);
 
   if (!state) {
     await interaction.reply({ embeds: [emptyArchiveEmbed()], flags: MessageFlags.Ephemeral });
     return;
   }
+
+  // better-sqlite3 は同期なので、ここから先の SQL が Discord の応答期限 (3秒) を
+  // 超えると返事が届かない。先に受け付けてから組み立てる。
+  await interaction.deferReply();
+
+  try {
+    await interaction.editReply({ embeds: [buildStatusEmbed(interaction, state)], allowedMentions: NO_MENTIONS });
+  } catch (error) {
+    console.error('index status failed:', error);
+    await interaction.editReply({ content: `状態を取得できませんでした: ${String(error?.message ?? error).slice(0, 200)}` })
+      .catch(() => {});
+  }
+}
+
+function buildStatusEmbed(interaction, state) {
+  const guildId = interaction.guildId;
+  const job = getRunningJob(guildId);
+  const channels = listChannelStates(guildId);
 
   const incomplete = channels.filter((channel) => channel.complete !== 1);
   const failed = channels.filter((channel) => channel.last_error);
@@ -268,7 +285,8 @@ async function showStatus(interaction) {
     .setTitle('📚 インデックスの状態')
     .addFields(
       { name: '状態', value: job ? `実行中 (${job.mode})` : state.status, inline: true },
-      { name: 'メッセージ数', value: formatNumber(countMessages(guildId)), inline: true },
+      // 全行を数えると100万件で分単位になる。取り込み終了時点のチャンネル別件数の合計。
+      { name: 'メッセージ数 (概数)', value: formatNumber(approximateMessageCount(guildId)), inline: true },
       { name: 'チャンネル数', value: formatNumber(channels.length), inline: true }
     );
 
@@ -368,7 +386,7 @@ async function showStatus(interaction) {
     });
   }
 
-  await interaction.reply({ embeds: [embed], allowedMentions: NO_MENTIONS });
+  return embed;
 }
 
 function formatDuration(ms) {

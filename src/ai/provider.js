@@ -4,7 +4,6 @@ export const providerConfig = {
   apiKey: process.env.OPENROUTER_API_KEY || '',
   baseUrl: 'https://openrouter.ai/api/v1',
   model: process.env.AI_MODEL || 'deepseek/deepseek-v4-flash-0731',
-  writerModel: process.env.MEMORY_WRITER_MODEL || 'inclusionai/ling-3.0-flash',
 };
 
 export class ProviderError extends Error {

@@ -3,8 +3,6 @@
 
 import { TZ_OFFSET_HOURS } from '../archive/query.js';
 import { archiveStructure, discordStructure, discordExtraText, messageEnvelope } from '../conversation/message.js';
-import { admissionFor } from '../conversation/admission.js';
-import { isDreamGuild } from '../conversation/dream-config.js';
 
 const TZ_OFFSET_MS = TZ_OFFSET_HOURS * 3_600_000;
 
@@ -192,7 +190,6 @@ export function fromArchiveRow(row, channelName) {
     isBot: Boolean(row.is_bot),
     content: row.content ?? '',
     extra: row.extra ?? '',
-    ...(isDreamGuild(row.guild_id) ? { memorySelection: admissionFor(row) } : {}),
     createdAt: row.created_at,
     editedAt: row.edited_at,
     deleted: Boolean(row.deleted),
@@ -293,23 +290,12 @@ export function formatMessages(
   { refs, showChannel = false, bodyChars = 300, tailOf = null, selfId = null } = {}
 ) {
   // Allocate references first: a reply can appear before its parent in search results.
-  for (const message of messages) for (const item of message.contextMessages ?? [message]) refs?.add(item);
+  for (const message of messages) refs?.add(message);
   return messages.map((message) => {
-    const parts = message.contextMessages ?? [message];
-    const first = parts[0];
-    const ref = refs?.add(first);
-    const envelope = messageEnvelope(first, {
+    const ref = refs?.add(message);
+    const envelope = messageEnvelope(message, {
       lookup: (id) => refs?.byMessageId.get(id), selfId, bodyChars
     });
-    if (parts.length > 1) {
-      envelope.contextGroup = { kind: 'consecutive_same_author', count: parts.length,
-        note: '表示上まとめた連投。各メッセージの本文・ID・実際の返信先は別。',
-        continuations: parts.slice(1).map(part => {
-          const item = messageEnvelope(part, { lookup: id => refs?.byMessageId.get(id), selfId, bodyChars });
-          const { schema, author, location, ...content } = item;
-          return { ref: refs?.add(part), ...content };
-        }) };
-    }
     if (!showChannel) delete envelope.location.channelName;
     const note = tailOf?.(message);
     if (note) envelope.contextNote = note;

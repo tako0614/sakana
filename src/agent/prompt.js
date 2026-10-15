@@ -4,6 +4,7 @@
 // (引数の意味や使える値) は重複させず、schema では表せない「順序」と
 // 「間違えやすい判断」だけを書く。使えないツールの説明も載せない。
 
+import { memoryRootPrompt } from '../memory/tool.js';
 import { agentConfig } from './config.js';
 import { formatMessages, shortTime } from './format.js';
 
@@ -52,7 +53,7 @@ export function buildSystemPrompt(ctx, toolset) {
     '  各行は discord.message.v1。reference.kind=reply だけが返信。reference.ref/messageId が宛先で、時系列・メンション・転送は返信ではない。',
     '  reference.availability が not_fetched / unavailable / deleted の場合、返信先の発言内容や意図を推定で補わない。',
     '  body.complete=false は抜粋。forwarded / embeds / 添付の内容は送信者自身の発言とは限らない。thread と channel の境界も守る。',
-    '  supplemental はカード・添付・引用の補足。contextGroup は同じ人の連投を表示上まとめたもの。続きの各ID・ref・返信先を使い分ける。',
+    '  supplemental はカード・添付・引用の補足。',
     '',
     '## 動き方',
     '- 直近の会話は最初から渡してある。それで答えられるなら道具を呼ばずに答える。',
@@ -108,6 +109,14 @@ export function buildSystemPrompt(ctx, toolset) {
   // ブラウザを「貼られたリンクを開く道具」としか書いていなかったので、
   // モデルは知らないことを記憶で埋めるか「分からない」で終わらせていた。
   // 使える場面 (ログの外の事実) の側から書く。
+  // 記憶の本。根は末尾に置く (毎回同じ文面なのでキャッシュの前方一致を壊さない)。
+  if (toolset.memoryAvailable) {
+    lines.push(
+      '- このサーバーの人・作っているもの・過去の出来事・用語は、まず「記憶」と入力の「思い出したこと」を見て、'
+        + '足りなければ `memory` でページ・つながり・出来事をたどる。言い切る・引用するときは `memory` の episode か search / read で元の発言を確かめる。'
+    );
+  }
+
   if (toolset.browserAvailable) {
     lines.push(
       '- サーバーの外のこと (時事・製品・仕様・エラー文・貼られたリンクの中身) はログを探しても出ない。'
@@ -118,6 +127,11 @@ export function buildSystemPrompt(ctx, toolset) {
     if (ctx.browserFull) {
       lines.push('- `browser` はクリック・入力・eval・生 CDP も使える。');
     }
+  }
+
+  if (toolset.memoryAvailable) {
+    const root = memoryRootPrompt(ctx.guild.id);
+    if (root) lines.push('', root);
   }
 
   return lines.join('\n');
@@ -131,7 +145,7 @@ const BACKGROUND_WITH_CHAIN = 10;
  * 最初のユーザーメッセージ。ここで直近の会話も一緒に渡してしまう。
  * ツールを1往復減らせるので、結果的にトークンが減る。
  */
-export function buildUserContent({ ctx, prompt, extras, recent, replyChain, requestMessage, refs }) {
+export function buildUserContent({ ctx, prompt, extras, recent, replyChain, requestMessage, refs, recall = '' }) {
   const sections = [];
   const selfId = ctx.client?.user?.id;
 
@@ -167,6 +181,9 @@ export function buildUserContent({ ctx, prompt, extras, recent, replyChain, requ
   }
 
   sections.push(head.join('\n'));
+
+  // 会話に出た名前から思い出したこと (記憶の本)。背景知識なので会話より前に置く。
+  if (recall) sections.push(`## ${recall}`);
 
   const hasChain = Boolean(replyChain?.length);
 

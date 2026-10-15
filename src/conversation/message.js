@@ -1,4 +1,4 @@
-// The same source envelope is used by live chat, search, and durable memory.
+// The same source envelope is used by live chat, search, and governance evidence.
 // Edges describe Discord's relationships; chronology, mentions and quotations
 // are never silently promoted to a reply or to an assertion by the sender.
 const values = (collection) => Array.isArray(collection) ? collection : [...(collection?.values?.() ?? [])];
@@ -98,11 +98,6 @@ export function messageEnvelope(message, { lookup, selfId, bodyChars = Infinity 
       attribution: 'embed_attachment_or_quoted_material',
       complete: String(message.extra ?? '').length <= bodyChars,
       characters: String(message.extra ?? '').length },
-    ...(message.contextGroup ? { contextGroup: message.contextGroup } : {}),
-    ...(message.memorySelection ? { memorySelection: {
-      state: message.memorySelection.state, reason: message.memorySelection.reason,
-      representativeId: message.memorySelection.representativeId ?? null
-    } } : {}),
     reference,
     ...(structure.replyChainState ? { replyChain: { termination: structure.replyChainState } } : {}),
     state: { createdAt: message.createdAt, editedAt: message.editedAt ?? null, deleted: Boolean(message.deleted),

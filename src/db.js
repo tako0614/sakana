@@ -1,9 +1,12 @@
 import Database from 'better-sqlite3';
+import { scheduleOptimize, tuneSqlite } from './sqlite.js';
 
 // dbファイルを /home/tako/Desktop/github/sakana などに保存
 // テストや複数instanceでは別DBへ逃がせるようにする。未指定時の保存先は従来どおり。
-export const db = new Database(process.env.DATABASE_PATH ?? 'database.sqlite');
+export const db = new Database(process.env.DATABASE_PATH ?? 'database.sqlite', { timeout: 30_000 });
 db.pragma('journal_mode = WAL');
+tuneSqlite(db, { cacheMiB: 16, mmapMiB: 128, label: 'database' });
+scheduleOptimize(db, { label: 'database' });
 
 // guild_id と user_id ごとのテキストとボイスXPを保持するテーブル
 db.exec(`

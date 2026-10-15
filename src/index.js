@@ -1,5 +1,4 @@
 import 'dotenv/config';
-import { startConversationMemory } from './conversation/memory.js';
 import {
   Client,
   Events,
@@ -14,6 +13,8 @@ import { enforceGuildAllowlist, isAllowedGuild } from './guilds.js';
 import { handleEmotionRequest, isEmotionRequest } from './emotion.js';
 import { addTextXP, addVoiceXP, getTopXP } from './db.js';
 import { handleArchiveComponent } from './archive/commands.js';
+import { setVisibilityClient } from './archive/visibility.js';
+import { startMemorySnapshots } from './memory/snapshot.js';
 import {
   catchupAllGuilds,
   indexLiveEdit,
@@ -143,7 +144,9 @@ client.on(Events.GuildCreate, (guild) => {
 
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
-  startConversationMemory(readyClient);
+  setVisibilityClient(readyClient);
+  // 記憶の本の builder (別プロセス) が読んでよいチャンネルの控え
+  startMemorySnapshots(readyClient);
   console.log(
     agentEnabled
       ? 'AI agent is enabled. Mention the bot to use it.'
