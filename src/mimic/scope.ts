@@ -1,13 +1,20 @@
-export function requireGuildId(guildId) {
+import type BetterSqlite3 from 'better-sqlite3';
+
+export function requireGuildId(guildId: unknown): string {
   if (typeof guildId !== 'string' || !guildId.trim()) throw new Error('A guildId is required');
   return guildId;
 }
 
-export function migrateGuildPreference(db, table, field) {
+/** PRAGMA table_info の1行 (使うのは列名だけ)。 */
+function columnName(row: unknown): string | null {
+  return typeof row === 'object' && row !== null && 'name' in row && typeof row.name === 'string' ? row.name : null;
+}
+
+export function migrateGuildPreference(db: BetterSqlite3.Database, table: string, field: string): void {
   if (!['agent_engine:engine', 'agent_persona:target_id'].includes(`${table}:${field}`)) throw new Error('Unknown preference table');
   db.transaction(() => {
     const columns = db.prepare(`PRAGMA table_info(${table})`).all();
-    if (columns.length && !columns.some((row) => row.name === 'guild_id')) {
+    if (columns.length && !columns.some((row) => columnName(row) === 'guild_id')) {
       // The source guild of a global preference cannot be reconstructed. Retain
       // the old records for migration review without applying them to any guild.
       db.exec(`ALTER TABLE ${table} RENAME TO ${table}_legacy_unscoped`);

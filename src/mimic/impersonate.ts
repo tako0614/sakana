@@ -14,10 +14,30 @@
 
 import { continuationOf, endpointFor, generate, roleScheme } from './client.js';
 import {
-  assignPlainRoles, buildPlainPrompt, isUnusableReply, labelFor, plainOwnTurns, plainText
+  assignPlainRoles, buildPlainPrompt, isUnusableReply, labelFor, plainOwnTurns, plainText, type PlainTurn
 } from './plain.js';
-import { buildPrompt, messageText, ownTurns } from './serialize.js';
-import { exampleTurns, hasOptedOut, tokenFor } from './speakers.js';
+import { buildPrompt, messageText, ownTurns, type PromptTurn } from './serialize.js';
+import { exampleTurns, hasOptedOut, tokenFor, type ChannelScope } from './speakers.js';
+
+/** どちらの手で作ったか。'token' / 'label' は重みに焼き付いた本人、'examples' は実発言から真似。 */
+export type ImpersonateHow = 'token' | 'label' | 'examples' | 'empty' | 'opted-out';
+
+export interface ImpersonateOptions {
+  guildId?: string | null;
+  channelScope?: ChannelScope | null;
+  topic?: string | null;
+  channelId?: string | null;
+  askerId?: string | null;
+  engine?: string;
+}
+
+interface BuiltPrompt {
+  prompt: string;
+  how: ImpersonateHow;
+  trailing: string;
+}
+
+type PromptOptions = Required<Pick<ImpersonateOptions, 'topic' | 'guildId' | 'channelScope'>>;
 
 // 短すぎる返答は引き直す。CPU で数秒かかるので回数は絞る。
 // respond.js と同じ既定 (3 字だと「うーん」「草」が通って単語だけの返答が流れる)
@@ -31,7 +51,7 @@ const MAX_TRIES = Number(process.env.MIMIC_MAX_TRIES ?? 3);
  * 一度も見ていない入力を受け取り、例外を出さずに静かに崩れる (evex-1 に <|a|> を
  * 渡して実際に壊した)。既定は推論サーバーの申告から判定し、env で上書きできる。
  */
-export async function mimicFormat(engine = 'evex') {
+export async function mimicFormat(engine = 'evex'): Promise<'plain' | 'tokens'> {
   const { format } = endpointFor(engine);
   if (format === 'plain' || format === 'tokens') return format;
 
@@ -42,7 +62,7 @@ export async function mimicFormat(engine = 'evex') {
 }
 
 /** その人の話者トークンが使えるか (上位48人 かつ 独自トークンの世代)。 */
-export async function canUseToken(userId, engine = 'evex') {
+export async function canUseToken(userId: string, engine = 'evex'): Promise<boolean> {
   if (await mimicFormat(engine) !== 'tokens') return false;
 
   const scheme = await roleScheme(engine);
@@ -54,7 +74,9 @@ export async function canUseToken(userId, engine = 'evex') {
 }
 
 /** 独自トークン形式のプロンプト。 */
-async function tokenPrompt(userId, { topic, engine, guildId, channelScope }) {
+async function tokenPrompt(
+  userId: string, { topic, engine, guildId, channelScope }: PromptOptions & { engine: string }
+): Promise<BuiltPrompt> {
   const scheme = await roleScheme(engine);
   const token = tokenFor(userId);
   const other = scheme?.overflow ?? '<|other|>';
@@ -67,7 +89,7 @@ async function tokenPrompt(userId, { topic, engine, guildId, channelScope }) {
 
   // 48人の外。実発言を例に出して、同じ調子の続きを書かせる
   const examples = exampleTurns(userId, { guildId, channelScope });
-  const turns = [];
+  const turns: PromptTurn[] = [];
   for (const example of examples) {
     if (example.prompt) turns.push({ token: other, reply: false, content: messageText(example.prompt) });
     turns.push({ token: other, reply: Boolean(example.prompt), content: messageText(example.reply) });
@@ -82,11 +104,15 @@ async function tokenPrompt(userId, { topic, engine, guildId, channelScope }) {
 }
 
 /** 素の日本語形式 (evex-ft-1) のプロンプト。 */
-function plainPrompt(userId, { topic, channelId, askerId, guildId, channelScope }) {
+function plainPrompt(
+  userId: string,
+  { topic, channelId, askerId, guildId, channelScope }: PromptOptions & Required<Pick<ImpersonateOptions, 'channelId' | 'askerId'>>
+): BuiltPrompt {
   const label = labelFor(userId);
   // 話しかける側も、ラベルを持っていれば本人の名前で置く。学習データは
   // 名前持ちと役が混在した会話なので、この形はそのまま分布の中にある
-  const asker = (askerId && labelFor(askerId)) || assignPlainRoles(['asker']).get('asker');
+  // 役が1つなら必ず 'A' が振られる (assignPlainRoles は既定の役から順に配る)
+  const asker = (askerId && labelFor(askerId)) || (assignPlainRoles(['asker']).get('asker') ?? 'A');
 
   if (label) {
     // 本命。ラベルを置くだけで、重みに入っている本人の口調が出る。
@@ -102,9 +128,10 @@ function plainPrompt(userId, { topic, channelId, askerId, guildId, channelScope 
   // 147人の外。実発言を例に出して、同じ調子の続きを書かせる。
   // 本人には役を割り当てる — 学習していない名前を置くと、モデルが一度も見ていない
   // ラベルになって崩れる
-  const me = assignPlainRoles(['target', 'asker']).get('target');
+  // 'target' は最初に並べたので必ず先頭の役 ('A') になる
+  const me = assignPlainRoles(['target', 'asker']).get('target') ?? 'A';
   const examples = exampleTurns(userId, { guildId, channelScope });
-  const turns = [];
+  const turns: PlainTurn[] = [];
   for (const example of examples) {
     if (example.prompt) turns.push({ role: asker, content: plainText(example.prompt) });
     turns.push({ role: me, content: plainText(example.reply) });
@@ -125,7 +152,10 @@ function plainPrompt(userId, { topic, channelId, askerId, guildId, channelScope 
  * 'examples' (実発言を例に真似) で、どちらで作ったかを表示に出す —
  * 深さが違うので、見た人が期待を合わせられる方がいい。
  */
-export async function impersonate(userId, { guildId, channelScope, topic = null, channelId = null, askerId = null, engine = 'evex' } = {}) {
+export async function impersonate(
+  userId: string,
+  { guildId = null, channelScope = null, topic = null, channelId = null, askerId = null, engine = 'evex' }: ImpersonateOptions = {}
+): Promise<{ text: string | null; how: ImpersonateHow }> {
   if (hasOptedOut(userId)) {
     return { text: null, how: 'opted-out' };
   }
@@ -139,8 +169,8 @@ export async function impersonate(userId, { guildId, channelScope, topic = null,
 
   // 同じ人の連投は残し、他人が喋り出したら切る。末尾に置いたラベルが要る
   const cut = format === 'plain'
-    ? (text) => plainOwnTurns(text, built.trailing)
-    : (text) => ownTurns(text, built.trailing);
+    ? (text: string) => plainOwnTurns(text, built.trailing)
+    : (text: string) => ownTurns(text, built.trailing);
 
   // 一番長い候補を残す。上書きにすると、引き直しで使える返答を捨てることがある
   // (1 回目が「うーん」で 3 回目が添付だけ → 空になる)

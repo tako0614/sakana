@@ -7,13 +7,35 @@ import { AGENT_ENGINES, DEFAULT_AGENT_ENGINE } from '../agent/engines.js';
 import { db } from '../db.js';
 import { migrateGuildPreference, requireGuildId } from './scope.js';
 
+/** /model に出す1行。 */
+export interface EngineInfo {
+  label: string;
+  summary: string;
+}
+
+/** agent_engine の内訳の1行。 */
+interface EngineCountRow {
+  engine: string;
+  n: number;
+}
+
+function engineColumn(row: unknown): string | null {
+  return typeof row === 'object' && row !== null && 'engine' in row && typeof row.engine === 'string' ? row.engine : null;
+}
+
+function isEngineCountRow(row: unknown): row is EngineCountRow {
+  return typeof row === 'object' && row !== null
+    && 'engine' in row && typeof row.engine === 'string'
+    && 'n' in row && typeof row.n === 'number';
+}
+
 migrateGuildPreference(db, 'agent_engine', 'engine');
-const getStmt = db.prepare('SELECT engine FROM agent_engine WHERE guild_id = ? AND user_id = ?');
-const setStmt = db.prepare(`
+const getStmt = db.prepare<[string, string]>('SELECT engine FROM agent_engine WHERE guild_id = ? AND user_id = ?');
+const setStmt = db.prepare<[string, string, string, number]>(`
   INSERT INTO agent_engine (guild_id, user_id, engine, updated_at) VALUES (?, ?, ?, ?)
   ON CONFLICT(guild_id, user_id) DO UPDATE SET engine = excluded.engine, updated_at = excluded.updated_at
 `);
-const countStmt = db.prepare('SELECT engine, COUNT(*) n FROM agent_engine WHERE guild_id = ? GROUP BY engine');
+const countStmt = db.prepare<[string]>('SELECT engine, COUNT(*) n FROM agent_engine WHERE guild_id = ? GROUP BY engine');
 
 /**
  * 選べるエンジン。
@@ -22,7 +44,7 @@ const countStmt = db.prepare('SELECT engine, COUNT(*) n FROM agent_engine WHERE 
  * evex は 94万件から作った 5.87M の言語モデルで、道具も system プロンプトも使えず
  * 会話の続きを書くだけ。答えの形そのものが変わる。
  */
-export const ENGINES = {
+export const ENGINES: Record<string, EngineInfo> = {
   // 道具を持ったエージェント (検索・read・web・記憶・引用)。モデルだけが違う
   ling: {
     label: AGENT_ENGINES.ling,
@@ -111,34 +133,49 @@ export const ENGINES = {
   }
 };
 
-export const DEFAULT_ENGINE = DEFAULT_AGENT_ENGINE;
+export const DEFAULT_ENGINE: string = DEFAULT_AGENT_ENGINE;
+
+/**
+ * 選べるエンジンの説明。知らない名前は null。
+ *
+ * **ENGINES[key] で直接引かない。**`toString` や `constructor` のように
+ * Object の継承プロパティと同じ名前が来ると、そのまま「ある」と判定してしまう
+ * (コマンドの選択肢は送り手が書き換えられるので、届いた値は検め直す)。
+ */
+export function engineInfo(engine: unknown): EngineInfo | null {
+  return typeof engine === 'string' && Object.hasOwn(ENGINES, engine) ? ENGINES[engine] ?? null : null;
+}
 
 // **消したエンジンの読み替え先。**選択は DB に残るので、名前を消しただけだと
 // `ENGINES[row.engine]` が undefined になって**黙って既定に落ちる**。
 // 選び直しを強いるのも筋が違うので、後継に読み替える
 // deepseek は 2026-10-15 に廃止 (OpenRouter の安いモデルへ)。選んでいた人は既定の ling へ
-const RENAMED = { 'evex-5.2-a': 'evex-5.2', 'evex-5.2-b': 'evex-5.2', deepseek: DEFAULT_AGENT_ENGINE };
+const RENAMED: Record<string, string> = { 'evex-5.2-a': 'evex-5.2', 'evex-5.2-b': 'evex-5.2', deepseek: DEFAULT_AGENT_ENGINE };
 
-export function engineFor(userId, guildId) {
-  const row = getStmt.get(requireGuildId(guildId), String(userId));
-  const engine = RENAMED[row?.engine] ?? row?.engine;
-  return ENGINES[engine] ? engine : DEFAULT_ENGINE;
+function renamed(engine: string): string {
+  return Object.hasOwn(RENAMED, engine) ? RENAMED[engine] ?? engine : engine;
 }
 
-export function setEngine(userId, engine, guildId) {
-  requireGuildId(guildId);
-  const target = RENAMED[engine] ?? engine;
-  if (!ENGINES[target]) return false;
-  setStmt.run(guildId, String(userId), target, Date.now());
+export function engineFor(userId: string, guildId: unknown): string {
+  const stored = engineColumn(getStmt.get(requireGuildId(guildId), String(userId)));
+  const engine = stored === null ? null : renamed(stored);
+  return engine !== null && engineInfo(engine) ? engine : DEFAULT_ENGINE;
+}
+
+export function setEngine(userId: string, engine: string, guildId: unknown): boolean {
+  const guild = requireGuildId(guildId);
+  const target = renamed(String(engine));
+  if (!engineInfo(target)) return false;
+  setStmt.run(guild, String(userId), target, Date.now());
   return true;
 }
 
 /** 誰がどれを使っているかの内訳。/model の表示に出す。 */
-export function engineCounts(guildId) {
+export function engineCounts(guildId: unknown): Array<{ engine: string; users: number }> {
   // 読み替えたぶんも足す。素の行のままだと消したエンジンの人が数から消える
-  const counts = new Map();
-  for (const row of countStmt.all(requireGuildId(guildId))) {
-    const key = RENAMED[row.engine] ?? row.engine;
+  const counts = new Map<string, number>();
+  for (const row of countStmt.all(requireGuildId(guildId)).filter(isEngineCountRow)) {
+    const key = renamed(row.engine);
     counts.set(key, (counts.get(key) ?? 0) + row.n);
   }
   return Object.keys(ENGINES).map((key) => ({ engine: key, users: counts.get(key) ?? 0 }));

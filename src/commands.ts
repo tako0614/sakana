@@ -1,5 +1,12 @@
-import { SlashCommandBuilder, EmbedBuilder, MessageFlags } from 'discord.js';
-import { getTopXP, getUserRank } from './db.js';
+import {
+  SlashCommandBuilder,
+  EmbedBuilder,
+  MessageFlags,
+  type AutocompleteInteraction,
+  type ChatInputCommandInteraction,
+  type RESTPostAPIChatInputApplicationCommandsJSONBody
+} from 'discord.js';
+import { getTopXP, getUserRank, type UserRank, type XpRow } from './db.js';
 import { archiveCommands } from './archive/commands.js';
 import { agentCommands } from './agent/commands.js';
 import { mimicCommands } from './mimic/command.js';
@@ -7,7 +14,17 @@ import { memoryCommands } from './memory/command.js';
 import { governanceConfig } from './governance/config.js';
 import { governanceCommands } from './governance/commands.js';
 
-export const commands = [
+/**
+ * スラッシュコマンド1つ。index.ts は名前で引いて execute / autocomplete を呼ぶ。
+ * data は SlashCommandBuilder (オプションを足した後の形も含む)。
+ */
+export interface Command {
+  data: { readonly name: string; toJSON(): RESTPostAPIChatInputApplicationCommandsJSONBody };
+  execute(interaction: ChatInputCommandInteraction): Promise<unknown>;
+  autocomplete?(interaction: AutocompleteInteraction): Promise<unknown>;
+}
+
+export const commands: Command[] = [
   ...archiveCommands,
   ...agentCommands,
   ...mimicCommands,
@@ -17,7 +34,7 @@ export const commands = [
     data: new SlashCommandBuilder()
       .setName('top')
       .setDescription('サーバーのスコアランキングを表示します。')
-      .addStringOption(option => 
+      .addStringOption(option =>
         option.setName('type')
           .setDescription('確認したいランキングの種類 (text/voice)')
           .setRequired(false)
@@ -26,7 +43,7 @@ export const commands = [
             { name: 'voice', value: 'voice' },
             { name: 'all', value: 'all' }
           ))
-      .addStringOption(option => 
+      .addStringOption(option =>
         option.setName('period')
           .setDescription('確認したい期間 (day/week/month/all)')
           .setRequired(false)
@@ -39,12 +56,13 @@ export const commands = [
     async execute(interaction) {
       const userId = interaction.user.id;
       const guildId = interaction.guildId;
-      
+
       if (!guildId) {
-        return interaction.reply({
+        await interaction.reply({
           content: 'このコマンドはサーバー内でのみ使用できます。',
           flags: MessageFlags.Ephemeral
         });
+        return;
       }
 
       // オプションの取得（デフォルトは両方表示の全期間）
@@ -55,7 +73,7 @@ export const commands = [
       const periodLabel = period === 'day' ? '(Past 24h)' : period === 'week' ? '(Past 7d)' : period === 'month' ? '(Past 30d)' : '';
 
       // ランキング表示用のフィールド値を生成するヘルパー
-      const buildFieldValue = (topList, userRank, listType) => {
+      const buildFieldValue = (topList: XpRow[], userRank: UserRank): string => {
         if (topList.length === 0) {
           // 誰もいない場合は「該当なし」＋自分の行（元の挙動を維持）
           const userLine = `**#${userRank.rank} | <@${userId}> XP:** \`${userRank.xp}\``;

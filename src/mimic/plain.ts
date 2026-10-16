@@ -19,7 +19,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { assignRoles } from './serialize.js';
+import { assignRoles, type RoleScheme } from './serialize.js';
 
 /**
  * 素の英字の役。**名前ラベルを持たない人だけ**がこれを使う。
@@ -28,21 +28,62 @@ import { assignRoles } from './serialize.js';
  * 1,062 人ぶんで、最多の人でも 10.4% (その人の全体シェア 9.4% とほぼ同じ)。
  * つまり A は「このサーバーの平均的な人」であって誰でもない。
  */
-export const PLAIN_SCHEME = { roles: ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'], overflow: 'Z' };
+export const PLAIN_SCHEME: RoleScheme = { roles: ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'], overflow: 'Z' };
+
+/** labels.json の1行 (scripts/llm/build-sft.mjs が書き出す形)。 */
+export interface LabelRow {
+  userId: string;
+  label: string;
+  name?: string;
+  count?: number;
+}
+
+/** 素の日本語形式の1発言。content は plainText を通した後のもの。 */
+export interface PlainTurn {
+  role: string | null;
+  content: string;
+}
+
+// ファイルの中身は型を保証しないので、使う欄だけ確かめて取り出す
+function toLabelRow(row: unknown): LabelRow | null {
+  if (typeof row !== 'object' || row === null) return null;
+  const userId = 'userId' in row ? row.userId : undefined;
+  const label = 'label' in row ? row.label : undefined;
+  if ((typeof userId !== 'string' && typeof userId !== 'number') || typeof label !== 'string') return null;
+  return {
+    userId: String(userId),
+    label,
+    ...('name' in row && typeof row.name === 'string' ? { name: row.name } : {}),
+    ...('count' in row && typeof row.count === 'number' ? { count: row.count } : {})
+  };
+}
+
+/** channels.json の1行から順位付けに使う欄だけ取る。形が違えばファイルごと捨てる。 */
+function toChannelRow(row: unknown): { id: string; count: number } {
+  if (typeof row !== 'object' || row === null) throw new Error('channels.json の行がオブジェクトでない');
+  return {
+    id: String('id' in row ? row.id : undefined),
+    // 数でなければ NaN にする (並べ替えでは同順として扱われる。前と同じ振る舞い)
+    count: Number('count' in row ? row.count : undefined)
+  };
+}
 
 // 200 件以上ある 147 人は表示名がそのままラベルになっている (発言の 96.6%)。
 // **学習側 (scripts/llm/build-sft.mjs) が書き出した表をそのまま読む。**
 // ここで名前から作り直すと、切り詰めや重複の連番がずれて、モデルが一度も見ていない
 // ラベルを渡すことになる (`vivacious_flamingo_38533` は 12 字で切られ、
 // 同名の 4 組には連番が付いている)。
-function loadLabels() {
+function loadLabels(): LabelRow[] {
   // mimic/ はデプロイ用に pack.mjs がまとめる場所。bot サーバーには sft/ が無い
   // (実 ID を含むので追跡していない) ので、evex-ft-1 を載せるときはここに置く。
   const files = [process.env.MIMIC_LABELS, 'mimic/labels.json', 'sft/labels.json'];
-  for (const file of files.filter(Boolean)) {
+  for (const file of files) {
+    if (!file) continue;
     try {
-      const rows = JSON.parse(readFileSync(path.resolve(file), 'utf8'));
-      if (Array.isArray(rows) && rows.length) return rows;
+      const rows: unknown = JSON.parse(readFileSync(path.resolve(file), 'utf8'));
+      if (Array.isArray(rows) && rows.length) {
+        return rows.map(toLabelRow).filter((row): row is LabelRow => row !== null);
+      }
     } catch {
       // 無ければ役だけで動く (なりきりはできない)
     }
@@ -54,12 +95,12 @@ const labelRows = loadLabels();
 const labelByUser = new Map(labelRows.map((row) => [String(row.userId), row.label]));
 
 /** その人の学習済みラベル。147人の外は null。 */
-export function labelFor(userId) {
+export function labelFor(userId: unknown): string | null {
   return labelByUser.get(String(userId)) ?? null;
 }
 
 /** ラベルを持つ人の一覧。/mimic の候補に出す。 */
-export function labelledSpeakers() {
+export function labelledSpeakers(): LabelRow[] {
   return labelRows.map((row) => ({ ...row, userId: String(row.userId) }));
 }
 
@@ -67,16 +108,17 @@ export function labelledSpeakers() {
 // build-sft.mjs と同じ順位付けでないと番号がずれるので、同じ入力から同じ手順で作る。
 const NAMED_CHANNELS = 16;
 
-function loadChannelRanks() {
+function loadChannelRanks(): Map<string, number> {
   // labels.json と同じ扱いにする。bot サーバーには corpus/ が無い (書き出しは
   // 開発機だけ) ので、mimic/ に置いたものを先に見る。無いと全部 #other になり、
   // モデルは学習データの 97% で見ていた話題の手がかりを失う
   const files = [process.env.MIMIC_CHANNELS, 'mimic/channels.json', 'corpus/channels.json'];
-  for (const file of files.filter(Boolean)) {
+  for (const file of files) {
+    if (!file) continue;
     try {
-      const rows = JSON.parse(readFileSync(path.resolve(file), 'utf8'));
+      const rows: unknown = JSON.parse(readFileSync(path.resolve(file), 'utf8'));
       if (!Array.isArray(rows) || !rows.length) continue;
-      const ranked = [...rows].sort((a, b) => b.count - a.count);
+      const ranked = rows.map(toChannelRow).sort((a, b) => b.count - a.count);
       // **順位だけを持つ。**表示の仕方 (`#ch3` / `<|c3|>`) は使う側が決める —
       // ft 系と evex 系で形が違うだけで、順位表は同じものでなければならない
       return new Map(ranked.map((c, rank) => [String(c.id), rank]));
@@ -96,18 +138,18 @@ const channelRanks = loadChannelRanks();
  * 入れ替わるので、載せているモデルを学習したときの channels.json を
  * mimic/ に置くこと ([[labels-follow-corpus]] と同じ罠)。
  */
-export function channelRankOf(channelId, top = NAMED_CHANNELS) {
+export function channelRankOf(channelId: unknown, top = NAMED_CHANNELS): number | null {
   const rank = channelRanks.get(String(channelId));
   return rank != null && rank < top ? rank : null;
 }
 
 /** そのチャンネルの学習時のラベル (ft 系 / 平文)。上位16の外は #other。 */
-export function channelLabel(channelId) {
+export function channelLabel(channelId: unknown): string {
   const rank = channelRankOf(channelId);
   return rank == null ? '#other' : `#ch${rank}`;
 }
 
-function shorten(url) {
+function shorten(url: string): string {
   try {
     return new URL(url).origin;
   } catch {
@@ -121,15 +163,15 @@ function shorten(url) {
  * メンションは会話の中に居る人だけ役に直す。外の人は落とす — 20桁の ID を残しても
  * 学ぶものが無く、名前に直すと身元が戻る。build-sft.mjs と同じ規則。
  */
-export function plainText(content, roleOf = () => null) {
+export function plainText(content: unknown, roleOf: (id: string) => string | null = () => null): string {
   let out = String(content ?? '');
 
-  out = out.replace(/<@!?(\d+)>/g, (match, id) => {
+  out = out.replace(/<@!?(\d+)>/g, (_match, id: string) => {
     const role = roleOf(id);
     return role ? `@${role}` : '';
   });
   out = out.replace(/<@&\d+>/g, '');
-  out = out.replace(/<#(\d+)>/g, (match, id) => channelLabel(id));
+  out = out.replace(/<#(\d+)>/g, (_match, id: string) => channelLabel(id));
   out = out.replace(/<a?:([\w~]+):\d+>/g, ':$1:');
   out = out.replace(/https?:\/\/\S+/g, shorten);
 
@@ -147,7 +189,10 @@ export function plainText(content, roleOf = () => null) {
  * turns は [{ role, content }] で、content は plainText を通した後のもの。
  * trailingRole を置くと、その役の発言として続きを書かせられる。
  */
-export function buildPlainPrompt(turns, { channelId = null, trailingRole = null } = {}) {
+export function buildPlainPrompt(
+  turns: readonly PlainTurn[],
+  { channelId = null, trailingRole = null }: { channelId?: string | null; trailingRole?: string | null } = {}
+): string {
   const lines = [channelLabel(channelId)];
 
   for (const turn of turns) {
@@ -187,13 +232,15 @@ const MAX_REPLY_CHARS = Number(process.env.MIMIC_MAX_REPLY_CHARS ?? 400);
  * label はプロンプトの末尾に置いた話者ラベル。省略すると 1 発言で切る
  * (誰として書かせたか分からないので、同じ人かどうかを判定できない)。
  */
-export function plainOwnTurns(text, label = null) {
+export function plainOwnTurns(text: unknown, label: string | null = null): string {
   // 学習データにチャンネル行が入っているので、続きに出てきたら会話の切れ目
-  let rest = String(text ?? '').split(/\n#(?:ch\d+|other)\b/)[0];
-  const turns = [];
+  // (split は必ず1つ以上返す)
+  let rest = String(text ?? '').split(/\n#(?:ch\d+|other)\b/)[0] ?? '';
+  const turns: string[] = [];
 
   for (let i = 0; i < Math.max(1, MAX_OWN_TURNS); i += 1) {
-    const found = rest.match(NEXT_TURN);
+    // exec は index を必ず持つ (グローバルでない正規表現なので lastIndex は使わない)
+    const found = NEXT_TURN.exec(rest);
     if (!found) {
       turns.push(rest);
       break;
@@ -237,11 +284,11 @@ const UNUSABLE_REPLY = new RegExp(
 );
 
 /** 返答として使えないもの (添付だけ / URL だけ / @名前 だけ) か。 */
-export function isUnusableReply(text) {
+export function isUnusableReply(text: unknown): boolean {
   return UNUSABLE_REPLY.test(String(text ?? '').trim());
 }
 
 /** 会話に居る人に役を振る。evex-1 側と同じ assignRoles を通す。 */
-export function assignPlainRoles(userIds) {
+export function assignPlainRoles<K>(userIds: Iterable<K>): Map<K, string> {
   return assignRoles(userIds, PLAIN_SCHEME);
 }
