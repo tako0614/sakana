@@ -1,4 +1,4 @@
-import { ChannelType } from 'discord.js';
+import { ChannelType, type Guild, type GuildBasedChannel, type Message } from 'discord.js';
 import {
   archiveLegacyGovernanceMessage,
   getGovernanceGuild,
@@ -19,6 +19,7 @@ import {
 import { syncLawSite } from './lawsite.js';
 import { ensureGovernanceUx } from './ux.js';
 import { ensurePublicCaseRecord } from './service.js';
+import type { GovernanceGuild, SurfaceMigration } from './types.js';
 
 const AUTHORITY_HEADINGS = [
   /統治機能を(?:開始|再開|一時停止)/,
@@ -36,12 +37,22 @@ const COURT_HEADINGS = [
   /裁判/
 ];
 
-function headingOf(content) {
-  return String(content ?? '').split('\n', 1)[0].replace(/^#+\s*/, '').trim();
+export interface LegacyClassification {
+  kind: 'unknown' | 'empty' | 'authority' | 'statute' | 'court';
+  heading: string;
+  text: string;
 }
 
-export function classifyLegacyGazetteContent(content, lawTitles = []) {
-  const text = withoutLegacyPublicIds(content);
+// discord.js はまだ JS で、既定値 (procedureMessage = null) から引数の型が null に狭く推論される。
+// TS へ移るまでの境界として、ここで渡す形の型を一度だけ与える。
+const ensureOperationsThread = ensureGovernanceOperationsThread as (guild: Guild, governance: GovernanceGuild, procedureMessage?: unknown) => ReturnType<typeof ensureGovernanceOperationsThread>;
+
+function headingOf(content: unknown): string {
+  return (String(content ?? '').split('\n', 1)[0] ?? '').replace(/^#+\s*/, '').trim();
+}
+
+export function classifyLegacyGazetteContent(content: unknown, lawTitles: readonly string[] = []): LegacyClassification {
+  const text = String(withoutLegacyPublicIds(content));
   const heading = headingOf(text);
   if (!heading) return { kind: 'unknown', heading, text };
   if (['行政行為はありません。', '現行法はありません。'].includes(heading)) {
@@ -56,10 +67,10 @@ export function classifyLegacyGazetteContent(content, lawTitles = []) {
   return { kind: 'unknown', heading, text };
 }
 
-async function fetchAllMessages(channel) {
+async function fetchAllMessages(channel: GuildBasedChannel | null | undefined): Promise<Message[]> {
   if (!channel?.isTextBased?.()) return [];
-  const messages = [];
-  let before;
+  const messages: Message[] = [];
+  let before: string | undefined;
   for (;;) {
     const batch = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
     if (batch.size === 0) break;
@@ -70,7 +81,7 @@ async function fetchAllMessages(channel) {
   return messages.sort((left, right) => left.createdTimestamp - right.createdTimestamp);
 }
 
-async function archivedAttachments(message) {
+async function archivedAttachments(message: Message) {
   const output = [];
   for (const attachment of message.attachments.values()) {
     if (attachment.size > 5_000_000) {
@@ -90,7 +101,7 @@ async function archivedAttachments(message) {
   return output;
 }
 
-function legacyAuthorityRecord(classification) {
+function legacyAuthorityRecord(classification: LegacyClassification): { heading: string; body: string } {
   const lines = classification.text.split('\n');
   const body = lines.slice(1)
     .filter((line) => !/詳細な監査情報は添付ファイル/.test(line))
@@ -100,13 +111,43 @@ function legacyAuthorityRecord(classification) {
   return { heading: classification.heading, body: body || '変更を記録しました。' };
 }
 
-async function inspect(guild) {
+interface ClassifiedMessage {
+  message: Message;
+  classification: LegacyClassification;
+}
+
+/** 移行が不要・完了済みのときは、旧公開面を読まない。 */
+interface IdleFields {
+  governance: GovernanceGuild;
+  blockers: string[];
+  guideMessages?: undefined;
+  gazetteMessages?: undefined;
+  counts?: undefined;
+}
+type IdleInspection =
+  | (IdleFields & { status: 'not-needed'; migration: null })
+  | (IdleFields & { status: 'completed'; migration: SurfaceMigration });
+
+interface PendingInspection {
+  governance: GovernanceGuild;
+  migration: SurfaceMigration;
+  status: 'blocked' | 'ready';
+  blockers: string[];
+  guide: GuildBasedChannel | null;
+  gazette: GuildBasedChannel | null;
+  guideMessages: Message[];
+  gazetteMessages: Message[];
+  classified: ClassifiedMessage[];
+  counts: Record<string, number>;
+}
+
+async function inspect(guild: Guild): Promise<IdleInspection | PendingInspection> {
   const governance = getGovernanceGuild(guild.id);
   if (!governance) throw new Error('統治機能が初期化されていません。');
   const migration = getGovernanceSurfaceMigration(guild.id);
-  if (!migration) return { governance, migration: null, status: 'not-needed', blockers: [], messages: [] };
+  if (!migration) return { governance, migration: null, status: 'not-needed', blockers: [] };
   if (migration.status === 'completed') {
-    return { governance, migration, status: 'completed', blockers: [], messages: [] };
+    return { governance, migration, status: 'completed', blockers: [] };
   }
   const guide = migration.legacy_guide_channel_id
     ? await guild.channels.fetch(migration.legacy_guide_channel_id).catch(() => null)
@@ -114,7 +155,7 @@ async function inspect(guild) {
   const gazette = migration.legacy_gazette_channel_id
     ? await guild.channels.fetch(migration.legacy_gazette_channel_id).catch(() => null)
     : null;
-  const blockers = [];
+  const blockers: string[] = [];
   const deleting = migration.status === 'running' && migration.detail?.phase === 'deleting';
   if (migration.legacy_guide_channel_id && !guide && !deleting) blockers.push('旧案内channelを読み戻せません。');
   if (migration.legacy_gazette_channel_id && !gazette && !deleting) blockers.push('旧官報channelを読み戻せません。');
@@ -158,14 +199,25 @@ async function inspect(guild) {
     guideMessages,
     gazetteMessages,
     classified,
-    counts: classified.reduce((counts, entry) => {
+    counts: classified.reduce<Record<string, number>>((counts, entry) => {
       counts[entry.classification.kind] = (counts[entry.classification.kind] ?? 0) + 1;
       return counts;
     }, {})
   };
 }
 
-export async function planGovernanceSurfaceMigration(guild) {
+export interface SurfaceMigrationPlan {
+  guildId: string;
+  status: string;
+  legacyGuideChannelId: string;
+  legacyGazetteChannelId: string;
+  guideMessages: number;
+  gazetteMessages: number;
+  classifications: Record<string, number>;
+  blockers: string[];
+}
+
+export async function planGovernanceSurfaceMigration(guild: Guild): Promise<SurfaceMigrationPlan> {
   const result = await inspect(guild);
   return {
     guildId: guild.id,
@@ -179,14 +231,19 @@ export async function planGovernanceSurfaceMigration(guild) {
   };
 }
 
-export async function applyGovernanceSurfaceMigration(guild) {
+function requireGovernance(governance: GovernanceGuild | null): GovernanceGuild {
+  if (!governance) throw new Error('統治機能が初期化されていません。');
+  return governance;
+}
+
+export async function applyGovernanceSurfaceMigration(guild: Guild): Promise<SurfaceMigrationPlan> {
   const inspected = await inspect(guild);
   if (inspected.status === 'not-needed' || inspected.status === 'completed') {
     return await planGovernanceSurfaceMigration(guild);
   }
   if (inspected.blockers.length) throw new Error(inspected.blockers.join(' / '));
   if (inspected.migration.status === 'running' && inspected.migration.detail?.phase === 'deleting') {
-    for (const channel of [inspected.guide, inspected.gazette].filter(Boolean)) {
+    for (const channel of [inspected.guide, inspected.gazette].filter((entry) => entry !== null)) {
       if (channel.id === inspected.governance.procedure_channel_id) throw new Error('手続channelを旧channelとして削除しようとしました。');
       await channel.delete(`${guild.name} governance: resume 4 surface migration`);
     }
@@ -207,16 +264,17 @@ export async function applyGovernanceSurfaceMigration(guild) {
     status: 'running',
     detail: { phase: 'publishing', classifications: inspected.counts }
   });
-  const ux = await ensureGovernanceUx(guild, inspected.governance);
-  let governance = ux.governance;
+  // ux.js・discord.js はまだ JS。ここで使う戻り値の形を明示する。
+  const ux: { governance: GovernanceGuild | null; procedureMessage: unknown } = await ensureGovernanceUx(guild, inspected.governance);
+  let governance = requireGovernance(ux.governance);
   syncLawSite(guild, { verifyExisting: true });
   for (const caseRecord of listCases(guild.id, { limit: 1_000 })) {
     if (caseRecord.summary.startsWith('[E2E:')) continue;
     if (!caseRecord.public_thread_id) await ensurePublicCaseRecord(guild, caseRecord);
   }
-  governance = getGovernanceGuild(guild.id);
+  governance = requireGovernance(getGovernanceGuild(guild.id));
   await syncGovernanceRecordUi(guild, governance);
-  const operations = await ensureGovernanceOperationsThread(guild, governance, ux.procedureMessage);
+  const operations: GuildBasedChannel | null = await ensureOperationsThread(guild, governance, ux.procedureMessage);
   const existingOperationMessages = new Set((await fetchAllMessages(operations)).map((message) => message.content));
 
   const allLegacyMessages = [...inspected.guideMessages, ...inspected.gazetteMessages];
@@ -247,7 +305,7 @@ export async function applyGovernanceSurfaceMigration(guild) {
     status: 'running',
     detail: { phase: 'deleting', classifications: inspected.counts, archivedMessages: allLegacyMessages.length }
   });
-  for (const channel of [inspected.guide, inspected.gazette].filter(Boolean)) {
+  for (const channel of [inspected.guide, inspected.gazette].filter((entry) => entry !== null)) {
     if (channel.id === governance.procedure_channel_id) throw new Error('手続channelを旧channelとして削除しようとしました。');
     await channel.delete(`${guild.name} governance: 4 surface migration`);
   }

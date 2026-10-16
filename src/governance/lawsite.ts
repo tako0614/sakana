@@ -9,30 +9,56 @@ import {
   upsertLawPublication,
   writeAudit
 } from './db.js';
+import type { Constitution, Law } from './types.js';
+
+const LAW_PUBLICATION_STATES: Readonly<Record<string, string>> = {
+  active: '現行法',
+  superseded: '旧法',
+  suspended: '停止',
+  unconstitutional: '違憲',
+  repealed: '廃止'
+};
 
 // 公開状態はWeb側の一覧タグと同じ語彙にそろえる。
-export function publicationState(instrumentType, status) {
+export function publicationState(instrumentType: string, status: string): string {
   if (instrumentType === 'constitution') return status === 'active' ? '現行憲法' : '旧憲法';
-  return ({
-    active: '現行法',
-    superseded: '旧法',
-    suspended: '停止',
-    unconstitutional: '違憲',
-    repealed: '廃止'
-  })[status] ?? status;
+  return LAW_PUBLICATION_STATES[status] ?? status;
 }
 
-export function lawSiteConfigured() {
+export function lawSiteConfigured(): boolean {
   return Boolean(governanceConfig.lawSiteUrl && governanceConfig.lawSiteToken);
 }
 
-export function lawSiteLink(guildId) {
+export function lawSiteLink(guildId: unknown): string | null {
   if (!governanceConfig.lawSitePublicUrl) return null;
   return `${governanceConfig.lawSitePublicUrl}/?guild=${encodeURIComponent(String(guildId))}`;
 }
 
-function instrumentPayload(guildId, instrumentType, instrument) {
-  if (instrumentType === 'constitution') {
+type Instrument =
+  | { instrumentType: 'constitution'; instrument: Constitution }
+  | { instrumentType: 'law'; instrument: Law };
+
+/** 法令サイト (Worker + D1) へ送る1件。 */
+export interface InstrumentPayload {
+  guildId: string;
+  type: 'constitution' | 'law';
+  instrumentId: string;
+  rootId: string;
+  code: string;
+  title: string;
+  version: number;
+  status: string;
+  publicationStatus: string;
+  text: string;
+  provisions: unknown;
+  contentHash: string;
+  effectiveAt: number;
+  endedAt: number | null;
+}
+
+function instrumentPayload(guildId: unknown, entry: Instrument): InstrumentPayload {
+  if (entry.instrumentType === 'constitution') {
+    const instrument = entry.instrument;
     return {
       guildId: String(guildId),
       type: 'constitution',
@@ -50,6 +76,7 @@ function instrumentPayload(guildId, instrumentType, instrument) {
       endedAt: null
     };
   }
+  const instrument = entry.instrument;
   return {
     guildId: String(guildId),
     type: 'law',
@@ -71,12 +98,12 @@ function instrumentPayload(guildId, instrumentType, instrument) {
   };
 }
 
-function instrumentsFor(guildId) {
+function instrumentsFor(guildId: string): Instrument[] {
   return [
     ...listConstitutions(guildId, { limit: 100 })
-      .map((entry) => ({ instrumentType: 'constitution', instrument: entry })),
+      .map((entry): Instrument => ({ instrumentType: 'constitution', instrument: entry })),
     ...listLaws(guildId, { activeOnly: false, limit: 500 })
-      .map((entry) => ({ instrumentType: 'law', instrument: entry }))
+      .map((entry): Instrument => ({ instrumentType: 'law', instrument: entry }))
   ];
 }
 
@@ -84,7 +111,7 @@ function instrumentsFor(guildId) {
  * 公開正本はWorker + D1側にある。ここでは差分だけをoutboxへ積み、
  * 実際のHTTPは既存のoutbox処理 (冪等・再試行つき) が行う。
  */
-export function syncLawSite(guild, { verifyExisting = false } = {}) {
+export function syncLawSite(guild: { id: string }, { verifyExisting = false }: { verifyExisting?: boolean } = {}): { queued: number; skipped: boolean } {
   if (!lawSiteConfigured()) return { queued: 0, skipped: true };
   let queued = 0;
   for (const { instrumentType, instrument } of instrumentsFor(guild.id)) {
@@ -108,7 +135,7 @@ export function syncLawSite(guild, { verifyExisting = false } = {}) {
   return { queued, skipped: false };
 }
 
-async function postInstrument(payload) {
+async function postInstrument(payload: InstrumentPayload): Promise<unknown> {
   const response = await fetch(`${governanceConfig.lawSiteUrl}/v1/instruments`, {
     method: 'POST',
     headers: {
@@ -125,20 +152,27 @@ async function postInstrument(payload) {
   return response.json().catch(() => ({}));
 }
 
-export async function publishInstrument(guildId, { instrumentType, instrumentId }) {
+function loadInstrument(instrumentType: unknown, instrumentId: number | string): Instrument | null {
+  if (instrumentType === 'constitution') {
+    const instrument = getConstitution(instrumentId);
+    return instrument ? { instrumentType: 'constitution', instrument } : null;
+  }
+  const instrument = getLaw(instrumentId);
+  return instrument ? { instrumentType: 'law', instrument } : null;
+}
+
+export async function publishInstrument(guildId: string, { instrumentType, instrumentId }: { instrumentType: string; instrumentId: number | string }): Promise<InstrumentPayload> {
   if (!lawSiteConfigured()) throw new Error('法令サイトの接続先が設定されていません。');
-  const instrument = instrumentType === 'constitution'
-    ? getConstitution(instrumentId)
-    : getLaw(instrumentId);
-  if (!instrument || String(instrument.guild_id) !== String(guildId)) {
+  const entry = loadInstrument(instrumentType, instrumentId);
+  if (!entry || String(entry.instrument.guild_id) !== String(guildId)) {
     throw new Error('公開対象の法令が見つかりません。');
   }
-  const payload = instrumentPayload(guildId, instrumentType, instrument);
+  const payload = instrumentPayload(guildId, entry);
   await postInstrument(payload);
   upsertLawPublication({
     guildId,
     instrumentType,
-    instrumentId: String(instrument.id),
+    instrumentId: String(entry.instrument.id),
     contentHash: payload.contentHash,
     publicationStatus: payload.publicationStatus
   });
@@ -147,7 +181,7 @@ export async function publishInstrument(guildId, { instrumentType, instrumentId 
     actorType: 'system',
     action: 'lawsite.published',
     targetType: instrumentType,
-    targetId: instrument.id,
+    targetId: entry.instrument.id,
     detail: { status: payload.status, publicationStatus: payload.publicationStatus, contentHash: payload.contentHash }
   });
   return payload;

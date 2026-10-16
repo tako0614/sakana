@@ -1,3 +1,4 @@
+import type { Guild } from 'discord.js';
 import {
   countParliamentSessions,
   createProposal,
@@ -24,55 +25,97 @@ import { compileConstitution } from './rules.js';
 import { retryPatch } from './service.js';
 import { advanceLegislation } from './legislation.js';
 import { dispatchInstitutionEvent } from './institutions.js';
+import { governanceActionAllowed } from './restrictions.js';
+import { AUTHORITY_SCHEMA } from './legal-system.js';
+import {
+  errorText,
+  isArray,
+  isRecord,
+  isStringArray,
+  type ActiveConstitution,
+  type Constitution,
+  type ConstitutionPolicy,
+  type GovernanceGuild,
+  type GovernanceRules,
+  type Proposal,
+  type WeeklyIssue,
+  type WorkflowKey
+} from './types.js';
 
 const SCAN_WINDOW_MS = 7 * 86_400_000;
 
-function constitutionRules(constitution) {
-  return constitution.rules ?? compileConstitution({ content: constitution.content }).rules;
+/** 議題1件の処理結果。議事録と監査に残す。 */
+export interface AgendaOutcome {
+  proposalId: number;
+  title: string;
+  decision: string;
+  voteEndsAt?: number;
+  deferrals?: number;
+  drafted?: boolean;
+  error?: string;
 }
 
-function agendaStateName(rules, key = 'law') {
+export interface ParliamentSessionResult {
+  agendaCount: number;
+  waiting: number;
+  outcomes: AgendaOutcome[];
+}
+
+function requireProposal(proposal: Proposal | null | undefined): Proposal {
+  if (!proposal) throw new Error('議題の記録が見つかりません。');
+  return proposal;
+}
+
+function constitutionRules(constitution: Constitution): GovernanceRules {
+  if (constitution.rules) return constitution.rules;
+  const compiled = compileConstitution({ content: constitution.content });
+  // 保存した実行規則の無い旧憲法だけがここへ来る。授権だけでは議題の手続を決められない。
+  if (compiled.rules.$schema === AUTHORITY_SCHEMA) throw new Error('憲法の実行規則を法令なしでは組み立てられません。');
+  return compiled.rules;
+}
+
+function agendaStateName(rules: GovernanceRules, key: WorkflowKey = 'law'): string {
   return rules.workflows[key].initial;
 }
 
 // 開会間隔・議題数・自律起案の可否は適用法令が定める。
-export function sessionIntervalMilliseconds(constitution) {
+export function sessionIntervalMilliseconds(constitution: { policy: ConstitutionPolicy }): number {
   return constitution.policy.legislation.sessionIntervalMilliseconds;
 }
 
-export function nextSessionAt(governance, constitution) {
+export function nextSessionAt(governance: Pick<GovernanceGuild, 'last_session_at'>, constitution: { policy: ConstitutionPolicy }): number {
   return Number(governance.last_session_at ?? 0) + sessionIntervalMilliseconds(constitution);
 }
 
-function agendaProposals(guildId, rules) {
+function agendaProposals(guildId: string, rules: GovernanceRules): Proposal[] {
   return listProposals(guildId, { limit: 200 })
     .filter((proposal) => proposal.workflow_handler && proposal.workflow_handler !== 'terminal')
     .filter((proposal) => !rules.recovery || proposal.source === 'constitutional_repair')
     .sort((left, right) => Number(left.updated_at) - Number(right.updated_at) || Number(left.id) - Number(right.id));
 }
 
-async function ensureAgendaPost(guild, governance, proposal) {
+async function ensureAgendaPost(guild: Guild, governance: GovernanceGuild, proposal: Proposal): Promise<Proposal> {
   if (proposal.forum_thread_id) return proposal;
-  const post = await createAgendaPost(guild, governance, proposal);
-  return updateProposal(proposal.id, {
+  const post: { threadId: string; messageId: string } = await createAgendaPost(guild, governance, proposal);
+  return requireProposal(updateProposal(proposal.id, {
     forum_thread_id: post.threadId,
     forum_message_id: post.messageId,
     retry_after: null,
     failure_count: 0,
     last_error: null
-  });
+  }));
 }
 
 // 人間が議会Forumへ立てたスレを議題として取り込む。スレ自体が提案であり、
 // 取り込みの時点ではAIは何も判断していない。
-async function adoptMemberThreads(guild, governance, constitution, rules, room) {
+async function adoptMemberThreads(guild: Guild, governance: GovernanceGuild, constitution: ActiveConstitution, rules: GovernanceRules, room: number): Promise<Proposal[]> {
   if (room <= 0) return [];
   const forum = await guild.channels.fetch(governance.parliament_forum_id).catch(() => null);
-  if (!forum?.threads) return [];
+  if (!forum || !('threads' in forum) || !forum.threads) return [];
   const active = await forum.threads.fetchActive().catch(() => null);
   const threads = [...(active?.threads?.values?.() ?? [])]
     .sort((left, right) => Number(left.createdTimestamp ?? 0) - Number(right.createdTimestamp ?? 0));
-  const adopted = [];
+  const adopted: Proposal[] = [];
   for (const thread of threads) {
     if (adopted.length >= room) break;
     if (thread.locked || thread.archived) continue;
@@ -80,6 +123,9 @@ async function adoptMemberThreads(guild, governance, constitution, rules, room) 
     const starter = await thread.fetchStarterMessage().catch(() => null);
     // botが立てた議題は作成時にproposal行を持つ。ここで拾うのは人間のスレだけ。
     if (!starter || starter.author?.bot) continue;
+    // 制裁で請願を止められた人 (block_petitions・拘留中) のスレは、その間は議題にしない。
+    // 議会Forumへの投稿を、事件申立てと同じ制裁の抜け道にしない。
+    if (!governanceActionAllowed(guild.id, starter.author.id, 'petition')) continue;
     const summary = String(starter.content ?? '').replace(/\s+/g, ' ').trim();
     if (!summary) continue;
     const created = createProposal({
@@ -93,17 +139,27 @@ async function adoptMemberThreads(guild, governance, constitution, rules, room) 
       constitutionId: constitution.id,
       voteScope: constitution.policy.voting.defaultScope
     });
-    adopted.push(updateProposal(created.id, {
+    adopted.push(requireProposal(updateProposal(created.id, {
       forum_thread_id: thread.id,
       forum_message_id: starter.id
-    }));
+    })));
     dispatchInstitutionEvent(guild.id, 'petition', { proposalId: created.id, summary }, created.id);
   }
   return adopted;
 }
 
+// AI の結論は llm.js が検査済みだが、ここでも議題に使う形だけを確かめる。形が違う項目は使わない。
+function weeklyIssues(found: unknown): WeeklyIssue[] {
+  // discoverWeeklyIssues は issues の配列を返す。旧来の { issues } の形も受け付ける。
+  const list = isArray(found) ? found : isRecord(found) && isArray(found.issues) ? found.issues : [];
+  return list.flatMap((issue) => (isRecord(issue) && typeof issue.title === 'string'
+    && typeof issue.summary === 'string' && isStringArray(issue.evidenceMessageIds)
+    ? [{ title: issue.title, summary: issue.summary, evidenceMessageIds: issue.evidenceMessageIds }]
+    : []));
+}
+
 // 公開ログから自分で議題を立てる。人間の提案と同格に扱う。
-async function discoverAgenda(guild, governance, constitution, rules, room) {
+async function discoverAgenda(guild: Guild, governance: GovernanceGuild, constitution: ActiveConstitution, rules: GovernanceRules, room: number): Promise<Proposal[]> {
   if (room <= 0) return [];
   if (!constitution.policy.legislation.logScan) return [];
   const now = Date.now();
@@ -125,20 +181,20 @@ async function discoverAgenda(guild, governance, constitution, rules, room) {
     .filter((row) => row.content);
   if (messages.length === 0) return [];
   const laws = listLaws(guild.id, { activeOnly: true, limit: 100 });
-  const { issues } = await discoverWeeklyIssues({
+  const issues = weeklyIssues(await discoverWeeklyIssues({
     guildId: guild.id,
     constitution,
     activeLaws: laws,
     messages,
     limit: room
-  });
+  }));
   const openProposals = listProposals(guild.id, { limit: 200 });
-  const created = [];
+  const created: Proposal[] = [];
   for (const issue of issues.slice(0, room)) {
     if (exactActiveProposalMatch(issue.title, openProposals)) continue;
     const evidence = issue.evidenceMessageIds
       .map((messageId) => messages.find((row) => row.id === String(messageId)))
-      .filter(Boolean)
+      .filter((row) => row !== undefined)
       .map((row) => `https://discord.com/channels/${guild.id}/${row.channelId}/${row.id}`);
     const proposal = createProposal({
       guildId: guild.id,
@@ -166,16 +222,25 @@ async function discoverAgenda(guild, governance, constitution, rules, room) {
   return created;
 }
 
-const OUTCOME_LABELS = {
+const OUTCOME_LABELS: Readonly<Record<string, string>> = {
   legislate: '成立',
   pending: '手続進行中',
   reject: '不採択',
   error: '次回へ持ち越し'
 };
 
+interface MinutesInput {
+  sessionId: number;
+  number: number;
+  manual: boolean;
+  now: number;
+  outcomes: AgendaOutcome[];
+  waiting: number;
+}
+
 // 「国会が開かれたこと」は議題スレを個別に見ないと分からなかった。開会ごとに
 // 手続の`国会記録`へ1件残し、そこから各議題のスレへ辿れるようにする。
-async function publishMinutes(guild, governance, constitution, session) {
+async function publishMinutes(guild: Guild, governance: GovernanceGuild, constitution: ActiveConstitution, session: MinutesInput): Promise<void> {
   const { sessionId, number, manual, now, outcomes, waiting } = session;
   const nextAt = now + sessionIntervalMilliseconds(constitution);
   const lines = [
@@ -205,15 +270,15 @@ async function publishMinutes(guild, governance, constitution, session) {
   if (waiting > 0) lines.push('', `今回入りきらなかった議題: ${waiting}件（次の国会で扱います）`);
   lines.push('', `次の開会: <t:${Math.floor(nextAt / 1000)}:R>（運営者は /governance から臨時に開けます）`);
   try {
-    const message = await postParliamentMinutes(guild, governance, lines.join('\n'));
+    const message: { id: string } = await postParliamentMinutes(guild, governance, lines.join('\n'));
     setParliamentSessionMinutes(sessionId, message.id);
   } catch (error) {
     // 議事録が出せなくても国会の結論そのものは既に確定している。
-    console.error('Parliament minutes failed:', error?.message ?? error);
+    console.error('Parliament minutes failed:', error instanceof Error ? error.message : error);
   }
 }
 
-async function processAgendaItem(guild, governance, constitution, input) {
+async function processAgendaItem(guild: Guild, governance: GovernanceGuild, _constitution: ActiveConstitution, input: Proposal): Promise<AgendaOutcome> {
   const proposal = await ensureAgendaPost(guild, governance, input);
   if (!constitutionForProposal(proposal).policy.autonomous) {
     const { advanceLegacyLegislation } = await import('./legacy-legislation.js');
@@ -222,17 +287,26 @@ async function processAgendaItem(guild, governance, constitution, input) {
   return advanceLegislation(guild, proposal);
 }
 
-function constitutionForProposal(proposal) { return getConstitution(proposal.constitution_id); }
+function constitutionForProposal(proposal: Proposal): Constitution {
+  const constitution = getConstitution(proposal.constitution_id);
+  if (!constitution) throw new Error('議題の憲法が見つかりません。');
+  return constitution;
+}
 
-const runningSessions = new Map();
-export function runParliamentSession(guild, governance, now = Date.now(), options = {}) {
-  if (runningSessions.has(guild.id)) return runningSessions.get(guild.id);
+export interface ParliamentSessionOptions {
+  manual?: boolean;
+}
+
+const runningSessions = new Map<string, Promise<ParliamentSessionResult | null>>();
+export function runParliamentSession(guild: Guild, governance: GovernanceGuild, now = Date.now(), options: ParliamentSessionOptions = {}): Promise<ParliamentSessionResult | null> {
+  const running = runningSessions.get(guild.id);
+  if (running) return running;
   const task = runSession(guild, governance, now, options).finally(() => runningSessions.delete(guild.id));
   runningSessions.set(guild.id, task);
   return task;
 }
 
-async function runSession(guild, governance, now, { manual = false } = {}) {
+async function runSession(guild: Guild, governance: GovernanceGuild, now: number, { manual = false }: ParliamentSessionOptions = {}): Promise<ParliamentSessionResult | null> {
   const constitution = getActiveConstitution(guild.id);
   if (!constitution) return null;
   if (!manual) {
@@ -252,7 +326,7 @@ async function runSession(guild, governance, now, { manual = false } = {}) {
   );
   const agenda = [...adopted, ...discovered, ...carried].sort((a, b) => Number(a.updated_at) - Number(b.updated_at)).slice(0, limit);
   const waiting = Math.max(0, agendaProposals(guild.id, rules).length - agenda.length);
-  const outcomes = [];
+  const outcomes: AgendaOutcome[] = [];
   for (const item of agenda) {
     try {
       outcomes.push(await processAgendaItem(guild, governance, constitution, item));
@@ -265,7 +339,7 @@ async function runSession(guild, governance, now, { manual = false } = {}) {
         proposalId: item.id,
         title: item.title,
         decision: 'error',
-        error: String(error?.message ?? error).slice(0, 300)
+        error: errorText(error).slice(0, 300)
       });
     }
   }
@@ -302,11 +376,11 @@ async function runSession(guild, governance, now, { manual = false } = {}) {
   return { agendaCount: agenda.length, waiting, outcomes };
 }
 
-export function recordParliamentFailure(guild, governance, error, now = Date.now()) {
+export function recordParliamentFailure(guild: Guild, governance: Pick<GovernanceGuild, 'session_failure_count'>, error: unknown, now = Date.now()): GovernanceGuild | null {
   const failures = Number(governance.session_failure_count ?? 0) + 1;
   return updateGovernanceGuild(guild.id, {
     session_failure_count: failures,
     session_retry_after: now + Math.min(3_600_000, 300_000 * (2 ** Math.min(failures - 1, 4))),
-    session_last_error: String(error?.message ?? error).slice(0, 500)
+    session_last_error: errorText(error).slice(0, 500)
   });
 }
