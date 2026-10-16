@@ -347,7 +347,8 @@ async function handleMessageCreate(message: Message): Promise<void> {
 
   // @bot と直接メンションされたら AI エージェントに渡す。
   if (isAgentRequest(message, client)) {
-    await handleAgentRequest(message, client);
+    // メッセージは接続後にしか届かないので、message.client は ready 済み (Client<true>) の同じ client
+    await handleAgentRequest(message, message.client);
     return;
   }
 

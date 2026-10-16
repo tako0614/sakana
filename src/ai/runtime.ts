@@ -96,7 +96,7 @@ const emptyUsage = (): RunUsage => ({ prompt_tokens: 0, completion_tokens: 0, pr
 const callFunction = (call: unknown): JsonRecord => (isRecord(call) && isRecord(call.function) ? call.function : {});
 const callName = (call: unknown): unknown => callFunction(call).name;
 
-interface UsedTool {
+export interface UsedTool {
   name: string;
   args: JsonRecord;
 }

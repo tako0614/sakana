@@ -4,7 +4,7 @@
 // (tools.js が semantic.js を読み込んでいるので、逆向きに import すると循環する)。
 
 import { db as archiveDb } from '../archive/db.js';
-import { archive } from './boundary.js';
+import { isChannelAllowed } from '../archive/search.js';
 import type { AgentContext } from './types.js';
 
 // channelScope は呼んだ人に見えるチャンネル。退出済みの人をアーカイブの表示名から引くときに、
@@ -58,7 +58,7 @@ export async function resolveMemberId(ctx: MemberContext, value: unknown): Promi
     `).all(ctx.guild.id, pattern);
 
     const row = rows.find((candidate) => (
-      candidate.author_id && archive.isChannelAllowed(candidate.channel_id, ctx.channelScope)
+      candidate.author_id && isChannelAllowed(candidate.channel_id, ctx.channelScope)
     ));
     if (row?.author_id) return row.author_id;
   } catch {

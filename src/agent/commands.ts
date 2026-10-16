@@ -15,7 +15,7 @@ import {
   type ChatInputCommandInteraction
 } from 'discord.js';
 
-import { archive } from './boundary.js';
+import { canManageIndex } from '../archive/permissions.js';
 import { agentConfig } from './config.js';
 import {
   TUNABLES,
@@ -102,7 +102,7 @@ async function requireAdmin(interaction: ChatInputCommandInteraction): Promise<b
   const member = interaction.inCachedGuild()
     ? interaction.member
     : (await interaction.guild?.members.fetch(interaction.user.id).catch(() => null)) ?? null;
-  if (archive.canManageIndex(member)) return true;
+  if (canManageIndex(member)) return true;
 
   await interaction.reply({
     content: '上限を変えられるのは「サーバー管理」権限を持つ人か、`ARCHIVE_ADMIN_USERS` に登録された人だけです。',

@@ -12,13 +12,15 @@
 // 見せると「0.79 も高いから似ている」と誤読するので、順位と併記し、
 // 相対値であることを明記する。
 
-import { hasChunkVectors } from '../archive/chunks.js';
+import { chunkCoverage, chunkMessages, hasChunkVectors } from '../archive/chunks.js';
+import { resolveModel } from '../archive/embed-job.js';
+import type { MessageRow } from '../archive/types.js';
+import { fetchChunks, scanChunksTopK, type ChunkFilters } from '../archive/vectors.js';
 import { embedConfig } from '../embed/config.js';
-import { isDisabled } from '../embed/worker.js';
-import { archive, isArchiveRow, type ArchiveRow, type ChunkFilters } from './boundary.js';
+import { embedTexts, isDisabled, type EmbedReply } from '../embed/worker.js';
 import { agentConfig } from './config.js';
 import { shortTime, truncate } from './format.js';
-import { errorMessage, isRecord, type AgentContext } from './types.js';
+import { errorMessage, type AgentContext } from './types.js';
 
 type SemanticContext = Pick<AgentContext, 'guild' | 'refs' | 'channelScope'>;
 
@@ -26,19 +28,12 @@ type SemanticContext = Pick<AgentContext, 'guild' | 'refs' | 'channelScope'>;
 const maxCandidates = Number(embedConfig.maxCandidates);
 const relativeCutoff = Number(embedConfig.relativeCutoff);
 
-/** 埋め込みの子プロセスが返したベクトル (base64)。形が違えば null。 */
-function firstVector(embedded: unknown): string | null {
-  const vectors = isRecord(embedded) ? embedded.vectors : undefined;
-  const first: unknown = Array.isArray(vectors) ? vectors[0] : undefined;
-  return typeof first === 'string' ? first : null;
-}
-
 /** ベクトルが1件も無い / サーキットブレーク中はモードを出さない。 */
 export async function semanticAvailable(guildId: string): Promise<boolean> {
   if (!embedConfig.enabled || isDisabled()) return false;
 
   try {
-    const { modelId } = await archive.resolveModel();
+    const { modelId } = await resolveModel();
     return hasChunkVectors(guildId, modelId);
   } catch {
     return false;
@@ -46,7 +41,7 @@ export async function semanticAvailable(guildId: string): Promise<boolean> {
 }
 
 /** 参加者を「たこ/さば/りん」の形にする。3人を超えたら数で出す。 */
-function participantLabel(rows: ArchiveRow[]): string {
+function participantLabel(rows: MessageRow[]): string {
   const names = [...new Set(rows.map((row) => row.author_name || 'unknown'))];
   return names.length <= 3 ? names.join('/') : `${names.slice(0, 3).join('/')}他${names.length - 3}人`;
 }
@@ -77,29 +72,29 @@ export async function runSemanticSearch(ctx: SemanticContext, {
   const text = String(queryText ?? '').trim();
   if (!text) return 'query を指定してください。';
 
-  const { modelId, dim } = await archive.resolveModel();
-  const stats = archive.chunkCoverage(ctx.guild.id, modelId);
+  const { modelId, dim } = await resolveModel();
+  const stats = chunkCoverage(ctx.guild.id, modelId);
 
   if (stats.done === 0) {
     return '意味検索用のベクトルがまだありません。管理者が `/index embed` を実行すると使えるようになります。';
   }
 
-  let embedded: unknown;
+  let embedded: EmbedReply;
   try {
-    embedded = await archive.embedTexts([text], { kind: 'query', encode: 'float32' });
+    embedded = await embedTexts([text], { kind: 'query', encode: 'float32' });
   } catch (error) {
     return `意味検索は今使えません (${truncate(errorMessage(error), 120)})。言い換えを何通りか試してください。`;
   }
 
-  // 子プロセスの出力。ベクトルが無い・次元が足りないときは埋め込み失敗と同じ扱いにする
-  const vector = firstVector(embedded);
+  // 子プロセスの出力 (worker.ts が形を確かめて返す)。ベクトルが無い・次元が足りないときは埋め込み失敗と同じ扱いにする
+  const vector = embedded.vectors[0] ?? null;
   const bytes = vector === null ? Buffer.alloc(0) : Buffer.from(vector, 'base64');
   if (bytes.byteLength < dim * Float32Array.BYTES_PER_ELEMENT) {
     return '意味検索は今使えません (埋め込みの結果を読めませんでした)。言い換えを何通りか試してください。';
   }
   const queryVec = new Float32Array(bytes.buffer, bytes.byteOffset, dim);
 
-  const result = archive.scanChunksTopK({
+  const result = scanChunksTopK({
     guildId: ctx.guild.id,
     modelId,
     queryVec,
@@ -120,15 +115,15 @@ export async function runSemanticSearch(ctx: SemanticContext, {
       ].join('');
   }
 
-  const hits = result.hits ?? [];
-  const chunks = archive.fetchChunks(hits.map((hit) => hit.cid));
+  const { hits } = result;
+  const chunks = fetchChunks(hits.map((hit) => hit.cid));
 
   // 起点にした発言そのものが入っているまとまりは外す。
   // 残すと必ず1位を占め、下の相対カットオフの基準を押し上げて、
   // 本当に近いまとまりまで切り落とす。
   const scoreById = new Map(hits.map((hit) => [hit.cid, hit.score]));
   const loaded = chunks
-    .map((chunk) => ({ chunk, rows: archive.chunkMessages(chunk).filter(isArchiveRow), score: scoreById.get(chunk.chunk_id) ?? 0 }))
+    .map((chunk) => ({ chunk, rows: chunkMessages(chunk), score: scoreById.get(chunk.chunk_id) ?? 0 }))
     .filter(({ rows }) => !(excludeId && rows.some((row) => row.message_id === excludeId)));
 
   if (loaded.length === 0) {

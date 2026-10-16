@@ -11,7 +11,10 @@
 
 import { getTopXP } from '../db.js';
 import { db as archiveDb, reactionUsers } from '../archive/db.js';
-import { archive, type SearchOptions } from './boundary.js';
+import { resolveModel } from '../archive/embed-job.js';
+import { chunkCoverage } from '../archive/chunks.js';
+import { aggregateSearch, buildSearch, isChannelAllowed, searchSummary } from '../archive/search.js';
+import type { SearchOptions, SqlParam } from '../archive/types.js';
 import { shortTime, truncate } from './format.js';
 import { resolveMemberId } from './members.js';
 import { numberField, stringField, type AgentContext, type ToolArgs, type ToolDefinition } from './types.js';
@@ -110,7 +113,7 @@ async function memberInfo(ctx: InfoContext, args: ToolArgs): Promise<string> {
 
   let summary = null;
   try {
-    summary = archive.searchSummary(options);
+    summary = searchSummary(options);
   } catch {
     // アーカイブが無い構成でも動く
   }
@@ -125,7 +128,7 @@ async function memberInfo(ctx: InfoContext, args: ToolArgs): Promise<string> {
     + ` ・ 平均 ${Math.round(summary.avg_length ?? 0)} 文字 ・ ${summary.channels} チャンネル`
   );
 
-  const channels = archive.aggregateSearch(options, 'channel', { limit: 3 });
+  const channels = aggregateSearch(options, 'channel', { limit: 3 });
   if (channels.length > 0) {
     const label = channels
       .map((row) => `#${channelLabel(ctx, String(row.bucket))}(${row.count})`)
@@ -138,7 +141,7 @@ async function memberInfo(ctx: InfoContext, args: ToolArgs): Promise<string> {
     lines.push(`よく返信する相手: ${partners.map((row) => `${row.name}(${row.count})`).join(' ')}`);
   }
 
-  const hours = archive.aggregateSearch(options, 'hour', { limit: 3 });
+  const hours = aggregateSearch(options, 'hour', { limit: 3 });
   if (hours.length > 0) {
     lines.push(`よく喋る時間: ${hours.map((row) => `${String(row.bucket).padStart(2, '0')}時`).join(' ')}`);
   }
@@ -171,8 +174,8 @@ function channelLabel(ctx: InfoContext, channelId: string): string {
  */
 function replyPartners(ctx: InfoContext, userId: string): { id: string; name: string | null; count: number }[] {
   try {
-    const visible = archive.buildSearch({ guildId: ctx.guild.id, channelScope: ctx.channelScope });
-    const rows = archiveDb.prepare<(string | number)[], { id: string; name: string | null; count: number }>(`
+    const visible = buildSearch({ guildId: ctx.guild.id, channelScope: ctx.channelScope });
+    const rows = archiveDb.prepare<SqlParam[], { id: string; name: string | null; count: number }>(`
       WITH visible AS (SELECT m.* FROM messages m WHERE ${visible.where})
       SELECT p.author_id AS id, p.author_name AS name, COUNT(*) AS count
       FROM visible m
@@ -200,10 +203,10 @@ function replyPartners(ctx: InfoContext, userId: string): { id: string; name: st
 function visibleArchiveStats(ctx: InfoContext): { total: number; firstAt: number | null; lastAt: number | null; channels: number; threads: number } {
   const channels = archiveDb.prepare<[string], { channel_id: string; is_thread: number | null }>(
     'SELECT channel_id, is_thread FROM channels WHERE guild_id = ?'
-  ).all(ctx.guild.id).filter((row) => archive.isChannelAllowed(row.channel_id, ctx.channelScope));
+  ).all(ctx.guild.id).filter((row) => isChannelAllowed(row.channel_id, ctx.channelScope));
 
-  const visible = archive.buildSearch({ guildId: ctx.guild.id, channelScope: ctx.channelScope });
-  const range = archiveDb.prepare<(string | number)[], { first_at: number | null; last_at: number | null; total: number }>(
+  const visible = buildSearch({ guildId: ctx.guild.id, channelScope: ctx.channelScope });
+  const range = archiveDb.prepare<SqlParam[], { first_at: number | null; last_at: number | null; total: number }>(
     `SELECT MIN(m.created_at) AS first_at, MAX(m.created_at) AS last_at, COUNT(*) AS total FROM messages m WHERE ${visible.where}`
   ).get(...visible.params);
 
@@ -239,8 +242,8 @@ async function guildInfo(ctx: InfoContext): Promise<string> {
   }
 
   try {
-    const { modelId } = await archive.resolveModel();
-    const coverage = archive.chunkCoverage(guild.id, modelId);
+    const { modelId } = await resolveModel();
+    const coverage = chunkCoverage(guild.id, modelId);
     if (coverage.done > 0) {
       lines.push(`意味検索: 会話の ${Math.round(coverage.ratio * 100)}% が埋め込み済み`);
     }
@@ -260,10 +263,10 @@ async function guildInfo(ctx: InfoContext): Promise<string> {
  * チャンネルで使われている絵文字まで出ていた。絞り方は search と同じ buildSearch。
  */
 function visibleReactionEmojis(ctx: InfoContext, { limit, since }: { limit: number; since: number | null }): { emoji: string; count: number }[] {
-  const visible = archive.buildSearch({ guildId: ctx.guild.id, channelScope: ctx.channelScope });
-  const params: (string | number)[] = [...visible.params, ...(since ? [since] : []), limit];
+  const visible = buildSearch({ guildId: ctx.guild.id, channelScope: ctx.channelScope });
+  const params: SqlParam[] = [...visible.params, ...(since ? [since] : []), limit];
 
-  return archiveDb.prepare<(string | number)[], { emoji: string; count: number }>(`
+  return archiveDb.prepare<SqlParam[], { emoji: string; count: number }>(`
     SELECT mr.emoji AS emoji, SUM(mr.count) AS count
     FROM message_reactions mr
     JOIN messages m ON m.message_id = mr.message_id
@@ -350,7 +353,7 @@ function reactionsInfo(ctx: InfoContext, args: ToolArgs): string {
   }
 
   const location = locate(ctx, entry.messageId);
-  if (!location || !archive.isChannelAllowed(location, ctx.channelScope)) {
+  if (!location || !isChannelAllowed(location, ctx.channelScope)) {
     return 'その発言はこのサーバーに無いか、閲覧権限がありません。';
   }
   let counts: { emoji: string; count: number }[] = [];

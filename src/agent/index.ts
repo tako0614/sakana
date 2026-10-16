@@ -16,15 +16,13 @@ import {
   type MessageMentionOptions,
   type MessageReplyOptions
 } from 'discord.js';
+import { canBotAttach, canBotSpeak, canManageIndex, getChannelScope } from '../archive/permissions.js';
+import { recallFor } from '../memory/recall.js';
+import { isSelfHosted } from '../mimic/client.js';
+import { engineFor } from '../mimic/prefs.js';
+import { handleMimicRequest } from '../mimic/respond.js';
 import { isBareAck } from './ack.js';
-import {
-  archive,
-  governance,
-  memory,
-  mimic,
-  type GovernanceAttempt,
-  type TokenUsage
-} from './boundary.js';
+import { governance, type GovernanceAttempt } from './boundary.js';
 import { closeBrowserSandbox } from './browser.js';
 import { agentConfig, agentEnabled } from './config.js';
 import {
@@ -47,7 +45,8 @@ import {
   reserveCall,
   usdToBudget,
   weighCost,
-  type Reservation
+  type Reservation,
+  type TokenUsage
 } from './ratelimit.js';
 import { ThinkingIndicator, isIndicatorMessage, toolLabel } from './thinking.js';
 import { buildToolset } from './tools.js';
@@ -338,7 +337,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
   // ドル換算の上限に混ぜると請求と乖離するから。
   const governanceTopic = Boolean(governance.getGovernanceGuild(guild.id))
     && isGovernanceAgentTopic(message.content);
-  const chosen = mimic.engineFor(message.author.id, guild.id);
+  const chosen = engineFor(message.author.id, guild.id);
   // 会話 agent のモデルはその人が /model で選んだもの (ling / glm / qwen)。
   // 自作モデルを選んでいる人が統治の話をしたときは既定のモデルで答える
   const model = agentModelFor(isAgentEngine(chosen) ? chosen : DEFAULT_AGENT_ENGINE);
@@ -347,7 +346,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
   // 名前を並べていたら evex-1 を足したときに書き足し忘れ、選んだ人が黙って
   // DeepSeek に回っていた (料金も掛かる)。自前で配信しているものは ENDPOINTS に
   // 全部載っているので、そちらを唯一の名簿にする
-  if (mimic.isSelfHosted(chosen) && !governanceTopic) {
+  if (isSelfHosted(chosen) && !governanceTopic) {
     const recent = await message.channel.messages
       .fetch({ limit: 20 })
       .then((found) => [...found.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp))
@@ -359,7 +358,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
 
     // 記録関数を渡す (import すると agent/index.js ⇄ mimic/respond.js の循環になる)。
     // これが無いと自作モデルの返答にリプしても起動条件に合わず無反応だった。
-    await mimic.handleMimicRequest(message, client, {
+    await handleMimicRequest(message, client, {
       recent, chain, engine: chosen, remember: rememberOwnReply, selfId: client.user.id
     });
     return;
@@ -371,7 +370,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
   // それでもトークンと同時実行の枠は消費していた (thinking.js は送信失敗を
   // 握り潰して続行し、replyOrSend の2段構えも両方落ちる)。枠を取る前に見る。
   const me = guild.members.me ?? await guild.members.fetchMe().catch(() => null);
-  if (!me || !archive.canBotSpeak(message.channel, me)) {
+  if (!me || !canBotSpeak(message.channel, me)) {
     console.warn(
       `Skipping an agent request in #${message.channel?.name ?? message.channelId}: the bot cannot speak there.`
     );
@@ -385,7 +384,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
     await replyOrSend(message, { content: attemptLimitMessage(attempt), allowedMentions: NO_MENTIONS });
     return;
   }
-  const admin = !attempt.governed && archive.canManageIndex(member);
+  const admin = !attempt.governed && canManageIndex(member);
 
   const reservation = reserveCall({
     guildId: guild.id,
@@ -429,13 +428,13 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
       me,
       refs,
       screenshots: [],
-      channelScope: archive.getChannelScope(guild, member),
+      channelScope: getChannelScope(guild, member),
       // ブラウザを操作できるかは人 (ID の許可リスト) だけで決まる。モデルの出力や
       // 会話の中身からは変えられない。
       browserFull: canUseFullBrowser(member),
       // 添付できないだけなら本文は出せるので実行は止めない。撮ったのに貼れない
       // ときだけ、その旨を回答に添える (黙って落とすと撮れたつもりで話が進む)。
-      canAttach: archive.canBotAttach(message.channel, me),
+      canAttach: canBotAttach(message.channel, me),
       // ツールの中から表示を差し替えられるようにする。キーワード検索から
       // 意味検索へ自動で回すときに数秒止まるので、そこを黙らせない。
       setStatus: (status) => indicator?.setStatus(status)
@@ -522,8 +521,11 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
     // 待っている間に会話が進んでいても一番下に出る。
     await thinking.stop();
 
-    const answer = result.text?.trim()
-      ? expandCitations(result.text.trim(), refs, { label: modelLabel(model), selfId: client.user.id })
+    // text は runtime が provider の content をそのまま返したもの (空でないことだけ確かめてある)。
+    // 文字列でなければ回答として使わない
+    const text = typeof result.text === 'string' ? result.text.trim() : '';
+    const answer = text
+      ? expandCitations(text, refs, { label: modelLabel(model), selfId: client.user.id })
       : 'うまく答えをまとめられませんでした。条件を絞ってもう一度聞いてください。';
 
     // 撮ったのに貼れないときは黙らない (画像が出ている前提で読まれる)
@@ -585,7 +587,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
  */
 function recallSafely(guildId: string, request: string, replyChain: AgentMessage[], recent: AgentMessage[]): string {
   try {
-    return memory.recallFor(guildId, {
+    return recallFor(guildId, {
       request: [request, ...replyChain.map((entry) => entry.content ?? '')].join('\n'),
       context: recent.slice(-10).map((entry) => entry.content ?? '').join('\n')
     });

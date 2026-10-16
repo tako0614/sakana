@@ -9,7 +9,7 @@
 
 import type { Client } from 'discord.js';
 import { db } from '../db.js';
-import { archive } from './boundary.js';
+import { isAllowedGuild } from '../guilds.js';
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS agent_indicators (
@@ -69,7 +69,7 @@ export async function sweepStaleIndicators(client: Client): Promise<void> {
 
     const channel = await client.channels.fetch(row.channel_id).catch(() => null);
     if (!channel?.isTextBased?.()) continue;
-    if (!('guildId' in channel) || !archive.isAllowedGuild(channel.guildId)) continue;
+    if (!('guildId' in channel) || !isAllowedGuild(channel.guildId)) continue;
 
     await channel.messages.delete(row.message_id).catch(() => {});
   }

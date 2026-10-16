@@ -19,9 +19,15 @@
 // 超過は「同時実行数 × 1回ぶん」で有界なので、それで足りるとみなす。
 
 import { db } from '../db.js';
-import type { TokenUsage, UsedTool } from './boundary.js';
+import type { RunUsage, UsedTool } from '../ai/runtime.js';
 import { agentConfig } from './config.js';
 import { stringField } from './types.js';
+
+/**
+ * 1回の実行の使用量。runtime が数え終えた RunUsage と、実行中に Object.assign で書き写している
+ * 途中の値 (欠けていてよい) の両方を受ける。cached_tokens は古い呼び出しの別名。
+ */
+export type TokenUsage = Partial<RunUsage> & { cached_tokens?: number; rounds?: number };
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS agent_calls (

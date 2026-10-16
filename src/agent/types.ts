@@ -4,18 +4,20 @@
 // ここの型を名乗る前に必ず確かめる。確かめる関数もここに置く。
 
 import type { Client, Guild, GuildMember, GuildTextBasedChannel } from 'discord.js';
+import type { ChannelScope } from '../archive/types.js';
+import type { MessageStructure } from '../conversation/message.js';
 import type { RefTable } from './format.js';
+
+// 持ち主のモジュールの型をそのまま使う (写しを作らない)。agent の他のファイルはここから読んでよい。
+//   ChannelScope     : 実行者が読めるチャンネルの範囲 (archive/types.ts。getChannelScope が返す)
+//   MessageStructure : 保存・受け渡しする発言の構造 (conversation/message.ts)
+//   ToolDefinition   : OpenAI 互換のツール定義 (ai/types.ts。provider と runtime が受け取る)
+export type { ChannelScope, MessageStructure };
+export type { ToolDefinition } from '../ai/types.js';
 
 /** 返信の鎖をどこで止めたか。プロンプトでは reference.availability に載る。 */
 export type ReferenceState =
   | 'not_applicable' | 'snapshot' | 'cycle' | 'unavailable' | 'deleted' | 'resolved' | 'depth_limit';
-
-/** conversation/message.js が作る構造。ここで触る部分だけ型にしてある。 */
-export interface MessageStructure {
-  reference?: ({ availability?: string } & Record<string, unknown>) | undefined;
-  replyChainState?: string;
-  [key: string]: unknown;
-}
 
 /** アーカイブ・discord.js・検索 API の生 JSON をそろえた共通形。 */
 export interface AgentMessage {
@@ -58,12 +60,6 @@ export interface ResolvedRef {
   ref?: number;
 }
 
-/** archive/permissions.js の getChannelScope が返す形。 */
-export interface ChannelScope {
-  mode: string;
-  ids: string[];
-}
-
 /** この実行専用の隔離タブ・コンテキスト。 */
 export interface BrowserState {
   contextId: string | null;
@@ -98,16 +94,6 @@ export interface AgentContext {
 
 /** モデルが渡してきたツールの引数。中身はどれも確かめるまで unknown。 */
 export type ToolArgs = Record<string, unknown>;
-
-/** OpenAI 互換のツール定義。 */
-export interface ToolDefinition {
-  type: 'function';
-  function: {
-    name: string;
-    description?: string;
-    parameters: Record<string, unknown>;
-  };
-}
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);

@@ -3,8 +3,8 @@
 
 import type { Message } from 'discord.js';
 import { TZ_OFFSET_HOURS } from '../archive/query.js';
-import { discordStructure, discordExtraText } from '../conversation/message.js';
-import { conversation, type ArchiveRow } from './boundary.js';
+import type { MessageRow } from '../archive/types.js';
+import { archiveStructure, discordStructure, discordExtraText, messageEnvelope } from '../conversation/message.js';
 import {
   isRecord,
   numberField,
@@ -210,7 +210,7 @@ export function shortTime(timestamp: unknown, now = Date.now()): string {
 }
 
 /** アーカイブ DB の行を共通形にそろえる。 */
-export function fromArchiveRow(row: ArchiveRow, channelName?: string | null): AgentMessage {
+export function fromArchiveRow(row: MessageRow, channelName?: string | null): AgentMessage {
   return {
     guildId: row.guild_id,
     channelId: row.channel_id,
@@ -227,7 +227,7 @@ export function fromArchiveRow(row: ArchiveRow, channelName?: string | null): Ag
     reactionCount: row.reaction_count ?? 0,
     replyTo: row.reply_to ?? null,
     attachmentCount: row.attachment_count ?? 0,
-    structure: conversation.archiveStructure(row)
+    structure: archiveStructure(row)
   };
 }
 
@@ -362,10 +362,11 @@ export function formatMessages(
   for (const message of messages) refs?.add(message);
   return messages.map((message) => {
     const ref = refs?.add(message);
-    const envelope = conversation.messageEnvelope(message, {
+    const envelope = messageEnvelope(message, {
       lookup: (id) => refs?.byMessageId.get(id), selfId: selfId ?? null, bodyChars
     });
-    if (!showChannel) delete envelope.location.channelName;
+    // location は messageEnvelope が必ず作るオブジェクト。型は JsonRecord の unknown なので確かめて触る
+    if (!showChannel && isRecord(envelope.location)) delete envelope.location.channelName;
     const note = tailOf?.(message);
     if (note) envelope.contextNote = note;
     return `${ref ? `${ref}) ` : ''}${JSON.stringify(envelope)}`;
