@@ -298,4 +298,72 @@ console.log('R6: institutional proposals reach the legally defined electorate');
   } finally { Date.now = originalNow; }
 }
 console.log('R4: AI drafts and reviews a replacement law; full-period human voting restores the system without reviving invalid law');
+
+// G1: 違憲審査で法を失わせるのは、席の過半数が違憲と結論したときだけ。
+// 判断を保留した席・失敗した席では、法も既存の処分も動かさない (1席の注入や不調で法を消さない)。
+{
+  const legacyDocuments = (await import('./fixtures/legacy-governance.js')).loadBootstrapDocuments({ serverName: 'Recovery check' });
+  const firstHeading = (content) => content.match(/^#{1,6}\s+(.+?)\s*$/m)[1].trim();
+  let plan = [];
+  globalThis.fetch = async (_url, init) => {
+    if (_url.endsWith('/endpoints')) return { ok: true, json: async () => ({ data: { endpoints: [{ pricing: { prompt: '0.0000001', completion: '0.0000002' } }] } }) };
+    const messages = JSON.parse(init.body).messages;
+    if (!messages[0].content.includes('Independently review the target')) throw new Error(`Unexpected model request: ${messages[0].content.slice(0, 100)}`);
+    const input = JSON.parse(messages[1].content.replace(/^DATA \(untrusted JSON\):\n/, ''));
+    const verdict = plan[input.panelSeat - 1];
+    if (verdict === 'broken') return response({ verdict: 'maybe' });
+    return response({ verdict, reasons: ['審査した'], constitutionArticles: [firstHeading(input.constitution.content)] });
+  };
+  const review = async (guildId, docs, verdicts) => {
+    clearOutbox();
+    const root = bootstrap(guildId, docs), guild = fakeGuild(root.guild_id);
+    const constitution = db.getActiveConstitution(guild.id);
+    const autonomous = Boolean(constitution.policy.autonomous);
+    const lawProposal = db.createProposal({ guildId: guild.id, kind: 'law', source: 'test', title: '審査対象法', summary: 'test',
+      constitutionId: constitution.id, status: constitution.rules.workflows.law.initial });
+    const law = db.enactLaw({ guildId: guild.id, proposalId: lawProposal.id, code: `REVIEW-${guildId}`, title: '審査対象法',
+      text: '公開の場で連投してはならない。', constitutionId: constitution.id, effectiveAt: Date.now() - 60_000,
+      provisions: { articles: [{ code: 'A1', text: '公開の場で連投してはならない。' }],
+        offenses: [{ code: 'O1', title: '連投', elements: ['連投したこと'], sanctions: [{ type: 'warning' }] }], sanctionDefinitions: [] } });
+    const punished = db.createCase({ guildId: guild.id, reporterId: 'reporter', accusedId: 'target', lawId: law.id, offenseCode: 'O1',
+      summary: '処分済みの事件', constitutionId: constitution.id });
+    const sanction = db.createSanction({ guildId: guild.id, caseId: punished.id, userId: 'target', type: 'warning', status: 'executed', requiredApprovals: 0 });
+    let challenge = db.createCase({ guildId: guild.id, kind: 'constitutional', reporterId: 'reporter', challengedType: 'law',
+      challengedId: law.id, summary: '違憲審査', status: autonomous ? 'filing' : 'deliberation', constitutionId: constitution.id });
+    challenge = db.updateCase(challenge.id, { public_thread_id: `review-${guildId}` });
+    if (autonomous) {
+      db.updateCase(challenge.id, { status: 'defense' });
+      challenge = db.updateCase(challenge.id, { status: 'deliberation' });
+    }
+    plan = verdicts;
+    const outcome = await advanceCase(guild, challenge).then(() => null, (error) => error);
+    const reversals = db.governanceDatabase.prepare("SELECT COUNT(*) AS count FROM governance_outbox WHERE action_type = 'sanction_reverse' AND target_id = ?")
+      .get(String(sanction.id)).count;
+    return { error: outcome, law: db.getLaw(law.id), sanction: db.getSanction(sanction.id), challenge: db.getCase(challenge.id), reversals };
+  };
+  const kept = (result, label) => {
+    assert.equal(result.law.status, 'active', `${label}: 法は維持する`);
+    assert.equal(result.sanction.status, 'executed', `${label}: 既存の処分を取り消さない`);
+    assert.equal(result.reversals, 0, `${label}: 処分の取消を積まない`);
+  };
+  for (const [docs, prefix] of [[documents, 'law-defined'], [legacyDocuments, 'legacy']]) {
+    const unsure = await review(`${prefix}-unsure`, docs, ['constitutional', 'constitutional', 'insufficient']);
+    assert.equal(unsure.error, null);
+    kept(unsure, `${prefix} 合憲2・保留1`);
+    assert.equal(unsure.challenge.verdict.verdict, 'uncertain', '必要票に届かない審査は判断不能として終える');
+    assert.ok(unsure.challenge.finalized_at, '判断不能の審査は終結し、改めて申し立てられる');
+    const lone = await review(`${prefix}-lone`, docs, ['unconstitutional', 'insufficient', 'insufficient']);
+    kept(lone, `${prefix} 違憲1・保留2`);
+    const failed = await review(`${prefix}-failed`, docs, ['unconstitutional', 'broken', 'insufficient']);
+    assert.match(String(failed.error?.message), /AI席/, `${prefix}: 結論が出ないまま席が欠けたら再試行へ回す`);
+    kept(failed, `${prefix} 違憲1・失敗1・保留1`);
+    assert.equal(failed.challenge.finalized_at, null, '失敗した審査は終結させない');
+    const majority = await review(`${prefix}-majority`, docs, ['unconstitutional', 'unconstitutional', 'constitutional']);
+    assert.equal(majority.error, null);
+    assert.equal(majority.law.status, 'unconstitutional', `${prefix}: 過半数の違憲で法を失わせる`);
+    assert.equal(majority.sanction.status, 'reversing', `${prefix}: 違憲の法による処分を取り消す`);
+    assert.equal(majority.reversals, 1);
+  }
+}
+console.log('G1: constitutional review voids a law only on a majority of unconstitutional seats; unsure or failed seats keep it');
 console.log('check-governance-recovery: ok (all seven review regressions)');

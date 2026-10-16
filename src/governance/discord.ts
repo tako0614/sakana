@@ -3,8 +3,24 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ChannelType,
+  Collection,
   OverwriteType,
-  PermissionFlagsBits
+  PermissionFlagsBits,
+  ThreadAutoArchiveDuration,
+  type AnyThreadChannel,
+  type APIInteractionGuildMember,
+  type AttachmentPayload,
+  type ForumChannel,
+  type GuildForumTagData,
+  type Guild,
+  type GuildBasedChannel,
+  type GuildMember,
+  type Message,
+  type NonThreadGuildBasedChannel,
+  type PermissionOverwriteOptions,
+  type Role,
+  type TextChannel,
+  type User
 } from 'discord.js';
 import { governanceCategoryName } from './config.js';
 import {
@@ -17,6 +33,38 @@ import {
   listProposals,
   updateGovernanceGuild
 } from './db.js';
+import {
+  errorCode,
+  errorMessage,
+  isCaseRow,
+  isCaseVerdict,
+  isConstitutionRow,
+  isDetentionRow,
+  isGovernanceGuildRow,
+  isLawRow,
+  isProposalRow,
+  isRecord,
+  isSanctionRow,
+  narrow,
+  narrowList,
+  rulesOf,
+  type ButtonRow,
+  type CaseRow,
+  type GovernanceGuildRow,
+  type GovernancePermissionReport,
+  type GovernanceSurfaces,
+  type PermissionName,
+  type PermissionState,
+  type ProposalRow,
+  type RecordPostOptions,
+  type RecordThreadView,
+  type RecordUpdateOptions,
+  type RequiredOverwrite,
+  type SanctionExecutionDetail,
+  type SanctionRow,
+  type SetupResources,
+  type ThreadCreator
+} from './types-service.js';
 
 const PARLIAMENT_TAGS = ['議題', '議論中', '投票中', '成立', '不成立'];
 const PARLIAMENT_TOPIC = '作りたい法律や直したい制度をここへ投稿します。定期的に開く国会がすべての投稿を議題として読みます。';
@@ -25,81 +73,124 @@ export const COURT_TOPIC = '警察の処分が争われた事件と、警察が�
 export const GOVERNANCE_PROCEDURE_NAME = '手続';
 export const GOVERNANCE_PROCEDURE_TOPIC = 'いま投票・執行承認できる案件だけを表示します。本文と議論は議会・裁判所にあります。';
 
-function proposalHandler(proposal) {
+function hasThreadCreator(channel: unknown): channel is ThreadCreator {
+  return isRecord(channel) && isRecord(channel['threads']) && typeof channel['threads']['create'] === 'function';
+}
+
+function isPermissionName(name: string): name is PermissionName {
+  return Object.hasOwn(PermissionFlagsBits, name);
+}
+
+function permissionEntries(state: PermissionState): [bigint, boolean][] {
+  return Object.entries(state).flatMap(([name, allowed]) => (
+    isPermissionName(name) && allowed !== undefined ? [[PermissionFlagsBits[name], allowed] satisfies [bigint, boolean]] : []
+  ));
+}
+
+/** bot 自身のメンバー情報。キャッシュに無ければ権限を確かめられないので止める。 */
+function botMember(guild: Guild): GuildMember {
+  const me = guild.members.me;
+  if (!me) throw new Error('botのメンバー情報を取得できません。');
+  return me;
+}
+
+/** 操作した人の GuildMember。キャッシュ外のサーバーでは API の素のメンバー (roles が ID の配列) が来るので取り直す。 */
+export async function actingMember(
+  interaction: { member: GuildMember | APIInteractionGuildMember | null; user: User },
+  guild: Guild
+): Promise<GuildMember> {
+  const member = interaction.member;
+  return isGuildMember(member) ? member : guild.members.fetch(interaction.user.id);
+}
+
+// GuildMember はロールを roles.cache (Collection) で持つ。API の素のメンバーは roles が配列。
+function isGuildMember(member: GuildMember | APIInteractionGuildMember | null): member is GuildMember {
+  return isRecord(member) && isRecord(member['roles']) && 'cache' in member['roles'];
+}
+
+const governanceGuild = (guildId: string) => narrow(getGovernanceGuild(guildId), isGovernanceGuildRow, 'governance guild');
+const caseSanction = (caseId: number) => narrow(getCaseSanction(caseId), isSanctionRow, 'sanction');
+
+function proposalHandler(proposal: ProposalRow): string | null {
   if (proposal.workflow_handler) return proposal.workflow_handler;
-  const constitution = getConstitution(proposal.constitution_id);
-  const workflow = constitution?.rules?.workflows?.[proposal.kind === 'amendment' ? 'constitutionalAmendment' : 'law'];
-  return workflow?.states?.[proposal.status]?.handler ?? null;
+  const constitution = narrow(getConstitution(proposal.constitution_id), isConstitutionRow, 'constitution');
+  const workflow = rulesOf(constitution?.rules)?.workflows[proposal.kind === 'amendment' ? 'constitutionalAmendment' : 'law'];
+  return workflow?.states[proposal.status]?.handler ?? null;
 }
 
-function proposalStateLabel(state, handler = null) {
+const PROPOSAL_STATE_LABELS: Record<string, string> = {
+  agenda: '議題',
+  voting: '投票中',
+  enacted: '成立',
+  rejected: '不成立'
+};
+const PROPOSAL_HANDLER_LABELS: Record<string, string> = {
+  parliament_agenda: '議題',
+  legislation_draft: '議論中',
+  ai_ratification: '議論中',
+  constitutional_panel: '議論中',
+  law_enactment: '議論中',
+  public_vote: '投票中',
+  terminal: '不成立'
+};
+
+function proposalStateLabel(state: string, handler: string | null = null): string {
   if (PARLIAMENT_TAGS.includes(state)) return state;
-  return ({
-    agenda: '議題',
-    voting: '投票中',
-    enacted: '成立',
-    rejected: '不成立'
-  })[state] ?? ({
-    parliament_agenda: '議題',
-    legislation_draft: '議論中',
-    ai_ratification: '議論中',
-    constitutional_panel: '議論中',
-    law_enactment: '議論中',
-    public_vote: '投票中',
-    terminal: '不成立'
-  })[handler] ?? '議題';
+  return PROPOSAL_STATE_LABELS[state] ?? (handler === null ? undefined : PROPOSAL_HANDLER_LABELS[handler]) ?? '議題';
 }
 
-function caseStateLabel(state) {
-  return ({
-    filing: '回答待ち',
-    police_review: '警察が確認中',
-    contest_window: '処分中・不服申立て可',
-    defense: '回答待ち',
-    deliberation: '判断中',
-    approval: '判断中',
-    appeal_window: '回答待ち',
-    appeal: '判断中',
-    execution: '判断中',
-    final: '処分確定',
-    overturned: '取消',
-    acquitted: '責任なし',
-    dismissed: '棄却',
-    constitutional_uncertain: '判断不能',
-    unenforceable: '判断不能'
-  })[state] ?? state;
+const CASE_STATE_LABELS: Record<string, string> = {
+  filing: '回答待ち',
+  police_review: '警察が確認中',
+  contest_window: '処分中・不服申立て可',
+  defense: '回答待ち',
+  deliberation: '判断中',
+  approval: '判断中',
+  appeal_window: '回答待ち',
+  appeal: '判断中',
+  execution: '判断中',
+  final: '処分確定',
+  overturned: '取消',
+  acquitted: '責任なし',
+  dismissed: '棄却',
+  constitutional_uncertain: '判断不能',
+  unenforceable: '判断不能'
+};
+
+function caseStateLabel(state: string): string {
+  return CASE_STATE_LABELS[state] ?? state;
 }
 
-function oneLine(value, maximum = 700) {
+function oneLine(value: unknown, maximum = 700): string {
   return String(value ?? '').replace(/[#*_`\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, maximum);
 }
 
-export function publicMemberLabel(userId, fallback = '表示対象のアカウント') {
+export function publicMemberLabel(userId: unknown, fallback = '表示対象のアカウント'): string {
   const value = String(userId ?? '');
   return /^\d{17,20}$/.test(value) ? `<@${value}>` : fallback;
 }
 
-function proposalDeadline(proposal) {
+function proposalDeadline(proposal: ProposalRow): string | null {
   if (proposal.workflow_status === 'queued') return null;
   if (!proposal.stage_ends_at || proposalHandler(proposal) === 'terminal') return null;
   return `<t:${Math.floor(proposal.stage_ends_at / 1000)}:F>`;
 }
 
-function courtDeadline(caseRecord) {
+function courtDeadline(caseRecord: CaseRow): number | null {
   if (caseRecord.status === 'defense' && caseRecord.defense_until) return caseRecord.defense_until;
-  if (caseRecord.status === 'appeal_window') return getCaseSanction(caseRecord.id)?.appeal_deadline ?? null;
+  if (caseRecord.status === 'appeal_window') return caseSanction(caseRecord.id)?.appeal_deadline ?? null;
   if (caseRecord.status === 'appeal') return caseRecord.retry_after ?? null;
   return null;
 }
 
-function courtAccessState(caseRecord) {
-  const live = getGovernanceGuild(caseRecord.guild_id)?.enforcement_mode === 'live';
-  const detention = getCaseDetention(caseRecord.id);
+function courtAccessState(caseRecord: CaseRow): string {
+  const live = governanceGuild(caseRecord.guild_id)?.enforcement_mode === 'live';
+  const detention = narrow(getCaseDetention(caseRecord.id), isDetentionRow, 'detention');
   if (detention?.status === 'active' && detention.ends_at > Date.now()) {
     return `拘留中（<t:${Math.floor(detention.ends_at / 1000)}:R>まで）。この事件記録では発言できます`;
   }
   if (caseRecord.procedure_version === 2 && caseRecord.status === 'appeal_window') {
-    const sanction = getCaseSanction(caseRecord.id);
+    const sanction = caseSanction(caseRecord.id);
     if (live && sanction?.type === 'timeout' && sanction.review_requested_at) {
       return '被申立人はこの事件だけ（上訴を選択中）';
     }
@@ -114,18 +205,18 @@ function courtAccessState(caseRecord) {
   return '通常（正式な主張として記録するのは当事者だけ）';
 }
 
-function caseLawDescription(caseRecord) {
+function caseLawDescription(caseRecord: CaseRow): string | null {
   if (!caseRecord.law_id) return null;
-  const law = getLaw(caseRecord.law_id);
+  const law = narrow(getLaw(caseRecord.law_id), isLawRow, 'law');
   if (!law) return '適用法: 裁判記録に記載';
-  const offense = law.provisions?.offenses?.find((entry) => entry.code === caseRecord.offense_code);
+  const offense = law.provisions.offenses?.find((entry) => entry.code === caseRecord.offense_code);
   return [
     `適用法: ${law.title}`,
     offense?.title ? `対象となる違反: ${offense.title}` : null
   ].filter(Boolean).join('\n');
 }
 
-const APPEAL_DENY = {
+const APPEAL_DENY: PermissionOverwriteOptions = {
   SendMessages: false,
   SendMessagesInThreads: false,
   AddReactions: false,
@@ -136,7 +227,7 @@ const APPEAL_DENY = {
   UseApplicationCommands: false
 };
 
-const APPEAL_COURT_ACCESS = {
+const APPEAL_COURT_ACCESS: PermissionOverwriteOptions = {
   ViewChannel: true,
   ReadMessageHistory: true,
   SendMessages: false,
@@ -149,9 +240,9 @@ const APPEAL_COURT_ACCESS = {
   UseApplicationCommands: false
 };
 
-function botOverwrite(guild) {
+function botOverwrite(guild: Guild): RequiredOverwrite {
   return {
-    id: guild.members.me.id,
+    id: botMember(guild).id,
     type: OverwriteType.Member,
     allow: [
       PermissionFlagsBits.ViewChannel,
@@ -168,7 +259,7 @@ function botOverwrite(guild) {
   };
 }
 
-export function readOnlyTextOverwrites(guild) {
+export function readOnlyTextOverwrites(guild: Guild): RequiredOverwrite[] {
   return [
     {
       id: guild.id,
@@ -187,11 +278,11 @@ export function readOnlyTextOverwrites(guild) {
   ];
 }
 
-export function governanceProcedureOverwrites(guild) {
+export function governanceProcedureOverwrites(guild: Guild): RequiredOverwrite[] {
   return readOnlyTextOverwrites(guild);
 }
 
-export async function createGovernanceProcedureChannel(guild, categoryId) {
+export async function createGovernanceProcedureChannel(guild: Guild, categoryId: string): Promise<TextChannel> {
   return guild.channels.create({
     name: GOVERNANCE_PROCEDURE_NAME,
     type: ChannelType.GuildText,
@@ -203,26 +294,36 @@ export async function createGovernanceProcedureChannel(guild, categoryId) {
 }
 
 // 警察の処分の公開先。裁判所は争われた事件だけを扱うので、ここが取締りの記録になる。
-export async function ensureGovernanceEnforcementThread(guild, governance, procedureMessage = null) {
-  let thread = governance.enforcement_thread_id
+export async function ensureGovernanceEnforcementThread(
+  guild: Guild,
+  governance: GovernanceGuildRow,
+  procedureMessage: Message | null = null
+): Promise<AnyThreadChannel> {
+  const existing = governance.enforcement_thread_id
     ? await guild.channels.fetch(governance.enforcement_thread_id).catch(() => null)
     : null;
-  if (thread?.isThread?.()) return thread;
+  if (existing?.isThread?.()) return existing;
   const channel = await guild.channels.fetch(governance.procedure_channel_id).catch(() => null);
   if (!channel?.isTextBased?.()) throw new Error('手続channelが見つかりません。');
   const starter = procedureMessage
     ?? await channel.messages.fetch(governance.procedure_message_id).catch(() => null);
   if (!starter) throw new Error('手続の案内messageが見つかりません。');
-  thread = await channel.threads.create({
+  if (!('threads' in channel)) throw new Error('手続channelが見つかりません。');
+  const thread = await channel.threads.create({
     name: '執行記録',
-    autoArchiveDuration: 10_080,
+    autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
     reason: `${guild.name} governance enforcement log`
   });
   updateGovernanceGuild(guild.id, { enforcement_thread_id: thread.id });
   return thread;
 }
 
-export async function postEnforcementRecord(guild, governance, text, { files = [], components = [] } = {}) {
+export async function postEnforcementRecord(
+  guild: Guild,
+  governance: GovernanceGuildRow,
+  text: string,
+  { files = [], components = [] }: RecordPostOptions = {}
+): Promise<Message> {
   const thread = await ensureGovernanceEnforcementThread(guild, governance);
   return thread.send({
     content: String(text).slice(0, 2000),
@@ -234,26 +335,36 @@ export async function postEnforcementRecord(guild, governance, text, { files = [
 
 // 国会が開かれたことは議題スレを見ないと分からない。開会ごとの議事録を
 // 手続の1本のスレへ時系列で残す（執行記録と対）。
-export async function ensureGovernanceParliamentThread(guild, governance, procedureMessage = null) {
-  let thread = governance.parliament_thread_id
+export async function ensureGovernanceParliamentThread(
+  guild: Guild,
+  governance: GovernanceGuildRow,
+  procedureMessage: Message | null = null
+): Promise<AnyThreadChannel> {
+  const existing = governance.parliament_thread_id
     ? await guild.channels.fetch(governance.parliament_thread_id).catch(() => null)
     : null;
-  if (thread?.isThread?.()) return thread;
+  if (existing?.isThread?.()) return existing;
   const channel = await guild.channels.fetch(governance.procedure_channel_id).catch(() => null);
   if (!channel?.isTextBased?.()) throw new Error('手続channelが見つかりません。');
   const starter = procedureMessage
     ?? await channel.messages.fetch(governance.procedure_message_id).catch(() => null);
   if (!starter) throw new Error('手続の案内messageが見つかりません。');
-  thread = await channel.threads.create({
+  if (!('threads' in channel)) throw new Error('手続channelが見つかりません。');
+  const thread = await channel.threads.create({
     name: '国会記録',
-    autoArchiveDuration: 10_080,
+    autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
     reason: `${guild.name} parliament minutes`
   });
   updateGovernanceGuild(guild.id, { parliament_thread_id: thread.id });
   return thread;
 }
 
-export async function postParliamentMinutes(guild, governance, text, { files = [] } = {}) {
+export async function postParliamentMinutes(
+  guild: Guild,
+  governance: GovernanceGuildRow,
+  text: string,
+  { files = [] }: { files?: AttachmentPayload[] } = {}
+): Promise<Message> {
   const thread = await ensureGovernanceParliamentThread(guild, governance);
   return thread.send({
     content: String(text).slice(0, 2000),
@@ -262,8 +373,12 @@ export async function postParliamentMinutes(guild, governance, text, { files = [
   });
 }
 
-export async function ensureGovernanceOperationsThread(guild, governance, procedureMessage = null) {
-  let thread = governance.operations_thread_id
+export async function ensureGovernanceOperationsThread(
+  guild: Guild,
+  governance: GovernanceGuildRow,
+  procedureMessage: Message | null = null
+): Promise<AnyThreadChannel> {
+  let thread: GuildBasedChannel | null = governance.operations_thread_id
     ? await guild.channels.fetch(governance.operations_thread_id).catch(() => null)
     : null;
   if (!thread?.isThread?.()) {
@@ -276,7 +391,7 @@ export async function ensureGovernanceOperationsThread(guild, governance, proced
     if (!thread?.isThread?.()) {
       thread = await starter.startThread({
         name: '運営変更',
-        autoArchiveDuration: 10_080,
+        autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
         reason: `${guild.name} governance authority history`
       });
     }
@@ -286,12 +401,12 @@ export async function ensureGovernanceOperationsThread(guild, governance, proced
   return thread;
 }
 
-export function authorityChangeContent(heading, body) {
+export function authorityChangeContent(heading: unknown, body: unknown): string {
   return [`**${oneLine(heading, 120)}**`, oneLine(body, 1_600)].filter(Boolean).join('\n');
 }
 
-export async function postAuthorityChange(guild, governance, heading, body) {
-  const current = getGovernanceGuild(guild.id) ?? governance;
+export async function postAuthorityChange(guild: Guild, governance: GovernanceGuildRow, heading: string, body: string): Promise<Message> {
+  const current = governanceGuild(guild.id) ?? governance;
   const thread = await ensureGovernanceOperationsThread(guild, current);
   if (thread.archived) await thread.setArchived(false, '運営変更を記録');
   return thread.send({
@@ -300,7 +415,7 @@ export async function postAuthorityChange(guild, governance, heading, body) {
   });
 }
 
-function everyoneForumOverwrite(guild, { discuss }) {
+function everyoneForumOverwrite(guild: Guild, { discuss }: { discuss: boolean }): RequiredOverwrite {
   return {
     id: guild.id,
     allow: [
@@ -317,7 +432,7 @@ function everyoneForumOverwrite(guild, { discuss }) {
   };
 }
 
-export function courtForumEveryonePermissionState() {
+export function courtForumEveryonePermissionState(): PermissionState {
   return {
     ViewChannel: true,
     ReadMessageHistory: true,
@@ -328,7 +443,7 @@ export function courtForumEveryonePermissionState() {
   };
 }
 
-function courtForumBotPermissionState() {
+function courtForumBotPermissionState(): PermissionState {
   return {
     ViewChannel: true,
     SendMessages: true,
@@ -343,34 +458,34 @@ function courtForumBotPermissionState() {
   };
 }
 
-function overwriteFromPermissionState(id, type, state) {
+function overwriteFromPermissionState(id: string, type: OverwriteType, state: PermissionState): RequiredOverwrite {
+  const entries = permissionEntries(state);
   return {
     id,
     type,
-    allow: Object.entries(state).filter(([, allowed]) => allowed).map(([name]) => PermissionFlagsBits[name]),
-    deny: Object.entries(state).filter(([, allowed]) => !allowed).map(([name]) => PermissionFlagsBits[name])
+    allow: entries.filter(([, allowed]) => allowed).map(([permission]) => permission),
+    deny: entries.filter(([, allowed]) => !allowed).map(([permission]) => permission)
   };
 }
 
-function courtForumOverwrites(guild) {
+function courtForumOverwrites(guild: Guild): RequiredOverwrite[] {
   return [
     overwriteFromPermissionState(guild.id, OverwriteType.Role, courtForumEveryonePermissionState()),
-    overwriteFromPermissionState(guild.members.me.id, OverwriteType.Member, courtForumBotPermissionState())
+    overwriteFromPermissionState(botMember(guild).id, OverwriteType.Member, courtForumBotPermissionState())
   ];
 }
 
-function permissionStateMatches(channel, id, state) {
+function permissionStateMatches(channel: ForumChannel, id: string, state: PermissionState): boolean {
   const overwrite = channel.permissionOverwrites.cache.get(id);
   if (!overwrite) return false;
-  return Object.entries(state).every(([name, allowed]) => {
-    const permission = PermissionFlagsBits[name];
-    return allowed
+  return permissionEntries(state).every(([permission, allowed]) => (
+    allowed
       ? overwrite.allow.has(permission) && !overwrite.deny.has(permission)
-      : overwrite.deny.has(permission) && !overwrite.allow.has(permission);
-  });
+      : overwrite.deny.has(permission) && !overwrite.allow.has(permission)
+  ));
 }
 
-async function reconcileCourtForumPermissions(forum, guild) {
+async function reconcileCourtForumPermissions(forum: ForumChannel, guild: Guild): Promise<void> {
   const everyoneState = courtForumEveryonePermissionState();
   if (!permissionStateMatches(forum, guild.id, everyoneState)) {
     await forum.permissionOverwrites.edit(guild.id, everyoneState, {
@@ -378,14 +493,15 @@ async function reconcileCourtForumPermissions(forum, guild) {
     });
   }
   const botState = courtForumBotPermissionState();
-  if (!permissionStateMatches(forum, guild.members.me.id, botState)) {
-    await forum.permissionOverwrites.edit(guild.members.me.id, botState, {
+  const botId = botMember(guild).id;
+  if (!permissionStateMatches(forum, botId, botState)) {
+    await forum.permissionOverwrites.edit(botId, botState, {
       reason: '裁判所のbot記録権限を同期'
     });
   }
 }
 
-async function createMentionRole(guild, name, { assignToBot = true } = {}) {
+async function createMentionRole(guild: Guild, name: string, { assignToBot = true }: { assignToBot?: boolean } = {}): Promise<Role> {
   const role = await guild.roles.create({
     name,
     permissions: [],
@@ -393,11 +509,11 @@ async function createMentionRole(guild, name, { assignToBot = true } = {}) {
     hoist: false,
     reason: `Governance conversational address: ${name}`
   });
-  if (assignToBot) await guild.members.me.roles.add(role, `Enable @${name} governance address`);
+  if (assignToBot) await botMember(guild).roles.add(role, `Enable @${name} governance address`);
   return role;
 }
 
-export async function ensureGovernanceMentionRoles(guild, governance) {
+export async function ensureGovernanceMentionRoles(guild: Guild, governance: GovernanceGuildRow): Promise<{ judiciaryRoleId: string }> {
   await guild.roles.fetch();
   // 立法の入口はForumへの投稿になったので、mention roleは裁判だけ維持する。
   let judiciary = governance.judiciary_role_id
@@ -405,15 +521,16 @@ export async function ensureGovernanceMentionRoles(guild, governance) {
     : null;
   if (!judiciary) judiciary = await createMentionRole(guild, '通報');
   if (!judiciary.mentionable) await judiciary.setMentionable(true, 'Governance address roles must be mentionable');
-  if (!guild.members.me.roles.cache.has(judiciary.id)) {
-    await guild.members.me.roles.add(judiciary, 'Restore governance conversational address');
+  const me = botMember(guild);
+  if (!me.roles.cache.has(judiciary.id)) {
+    await me.roles.add(judiciary, 'Restore governance conversational address');
   }
   return { judiciaryRoleId: judiciary.id };
 }
 
-export function governancePermissionReport(guild) {
+export function governancePermissionReport(guild: Guild): GovernancePermissionReport {
   const me = guild.members.me;
-  const required = [
+  const required: [string, bigint][] = [
     ['ManageChannels', PermissionFlagsBits.ManageChannels],
     ['ManageRoles', PermissionFlagsBits.ManageRoles],
     ['ManageThreads', PermissionFlagsBits.ManageThreads],
@@ -429,27 +546,34 @@ export function governancePermissionReport(guild) {
   return { ok: missing.length === 0, missing };
 }
 
-export async function createGovernanceSurfaces(guild, { resources = {}, onProgress = null } = {}) {
+const resourceId = (value: unknown): string => (typeof value === 'string' ? value : '');
+
+export async function createGovernanceSurfaces(
+  guild: Guild,
+  { resources = {}, onProgress = null }: { resources?: SetupResources; onProgress?: ((state: SetupResources) => unknown) | null } = {}
+): Promise<GovernanceSurfaces> {
   const core = governancePermissionReport(guild);
   const bootstrapRequired = ['ManageChannels', 'ManageRoles', 'ManageThreads', 'ManageMessages'];
   const blocking = core.missing.filter((name) => bootstrapRequired.includes(name));
   if (blocking.length > 0) throw new Error(`初期化に必要なbot権限がありません: ${blocking.join(', ')}`);
 
-  let state = {
+  let state: SetupResources = {
     ...resources,
-    procedureChannelId: resources.procedureChannelId ?? resources.adminChannelId ?? ''
+    procedureChannelId: resources['procedureChannelId'] ?? resources['adminChannelId'] ?? ''
   };
-  const remember = async (key, entity) => {
+  const remember = async <T extends { id: string }>(key: string, entity: T): Promise<T> => {
     state = { ...state, [key]: entity.id };
     await onProgress?.(state);
     return entity;
   };
-  const role = async (key, create) => {
-    const existing = state[key] ? await guild.roles.fetch(state[key]).catch(() => null) : null;
+  const role = async (key: string, create: () => Promise<Role>): Promise<Role> => {
+    const saved = resourceId(state[key]);
+    const existing = saved ? await guild.roles.fetch(saved).catch(() => null) : null;
     return existing ?? remember(key, await create());
   };
-  const channel = async (key, type, create) => {
-    const existing = state[key] ? await guild.channels.fetch(state[key]).catch(() => null) : null;
+  const channel = async (key: string, type: ChannelType, create: () => Promise<GuildBasedChannel>): Promise<GuildBasedChannel> => {
+    const saved = resourceId(state[key]);
+    const existing = saved ? await guild.channels.fetch(saved).catch(() => null) : null;
     return existing?.type === type ? existing : remember(key, await create());
   };
 
@@ -461,8 +585,9 @@ export async function createGovernanceSurfaces(guild, { resources = {}, onProgre
     reason: `${guild.name} governance appeal restriction`
   }));
   const judiciaryRole = await role('judiciaryRoleId', () => createMentionRole(guild, '通報', { assignToBot: false }));
-  if (!guild.members.me.roles.cache.has(judiciaryRole.id)) {
-    await guild.members.me.roles.add(judiciaryRole, 'Restore governance conversational address during setup');
+  const me = botMember(guild);
+  if (!me.roles.cache.has(judiciaryRole.id)) {
+    await me.roles.add(judiciaryRole, 'Restore governance conversational address during setup');
   }
   const category = await channel('categoryId', ChannelType.GuildCategory, () => guild.channels.create({
     name: governanceCategoryName(guild.name),
@@ -475,7 +600,7 @@ export async function createGovernanceSurfaces(guild, { resources = {}, onProgre
     parent: category.id,
     topic: PARLIAMENT_TOPIC,
     availableTags: PARLIAMENT_TAGS.map((name) => ({ name, moderated: true })),
-    defaultAutoArchiveDuration: 10_080,
+    defaultAutoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
     permissionOverwrites: [everyoneForumOverwrite(guild, { discuss: true }), botOverwrite(guild)],
     reason: `${guild.name} governance parliament`
   }));
@@ -485,13 +610,14 @@ export async function createGovernanceSurfaces(guild, { resources = {}, onProgre
     parent: category.id,
     topic: COURT_TOPIC,
     availableTags: COURT_TAGS.map((name) => ({ name, moderated: true })),
-    defaultAutoArchiveDuration: 10_080,
+    defaultAutoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
     permissionOverwrites: courtForumOverwrites(guild),
     reason: `${guild.name} governance court`
   }));
   const procedure = await channel('procedureChannelId', ChannelType.GuildText, () => createGovernanceProcedureChannel(guild, category.id));
-  if (state.courtChatChannelId && state.courtChatChannelId !== court.id) {
-    const legacy = await guild.channels.fetch(state.courtChatChannelId).catch(() => null);
+  const legacyCourtChat = resourceId(state['courtChatChannelId']);
+  if (legacyCourtChat && legacyCourtChat !== court.id) {
+    const legacy = await guild.channels.fetch(legacyCourtChat).catch(() => null);
     await retireLegacyCourtChat(legacy, guild.name);
   }
   state = { ...state, courtChatChannelId: court.id };
@@ -506,34 +632,35 @@ export async function createGovernanceSurfaces(guild, { resources = {}, onProgre
     // DB互換用の旧column。公開裁判所Forumと同じIDを保存し、別channelは作らない。
     courtChatChannelId: court.id,
     procedureChannelId: procedure.id,
-    legacyGuideChannelId: resources.guideChannelId ?? '',
-    legacyGazetteChannelId: resources.gazetteChannelId ?? '',
+    legacyGuideChannelId: resourceId(resources['guideChannelId']),
+    legacyGazetteChannelId: resourceId(resources['gazetteChannelId']),
     permissionReport: core
   };
 }
 
-export async function ensureGovernanceParliamentForum(guild, governance) {
-  const forum = await guild.channels.fetch(governance.parliament_forum_id).catch(() => null);
-  if (!forum || forum.type !== ChannelType.GuildForum) throw new Error('議会Forumが見つかりません。');
-  if (forum.topic !== PARLIAMENT_TOPIC) await forum.setTopic(PARLIAMENT_TOPIC, '議会の説明を同期');
-  const tags = PARLIAMENT_TAGS.map((name) => {
+function syncedTags(forum: ForumChannel, names: readonly string[]): GuildForumTagData[] {
+  return names.map((name) => {
     const existing = forum.availableTags.find((tag) => tag.name === name);
     return existing ? { id: existing.id, name, moderated: true, emoji: existing.emoji } : { name, moderated: true };
   });
+}
+
+export async function ensureGovernanceParliamentForum(guild: Guild, governance: GovernanceGuildRow): Promise<ForumChannel> {
+  const forum = await guild.channels.fetch(governance.parliament_forum_id).catch(() => null);
+  if (!forum || forum.type !== ChannelType.GuildForum) throw new Error('議会Forumが見つかりません。');
+  if (forum.topic !== PARLIAMENT_TOPIC) await forum.setTopic(PARLIAMENT_TOPIC, '議会の説明を同期');
+  const tags = syncedTags(forum, PARLIAMENT_TAGS);
   if (JSON.stringify(forum.availableTags.map((tag) => tag.name)) !== JSON.stringify(PARLIAMENT_TAGS)) {
     await forum.setAvailableTags(tags, '議会の公開状態を簡潔に同期');
   }
   return forum;
 }
 
-export async function ensureGovernanceCourtForum(guild, governance) {
+export async function ensureGovernanceCourtForum(guild: Guild, governance: GovernanceGuildRow): Promise<ForumChannel> {
   const forum = await guild.channels.fetch(governance.court_forum_id).catch(() => null);
   if (!forum || forum.type !== ChannelType.GuildForum) throw new Error('裁判所Forumが見つかりません。');
   if (forum.topic !== COURT_TOPIC) await forum.setTopic(COURT_TOPIC, '裁判所を公開審理へ同期');
-  const tags = COURT_TAGS.map((name) => {
-    const existing = forum.availableTags.find((tag) => tag.name === name);
-    return existing ? { id: existing.id, name, moderated: true, emoji: existing.emoji } : { name, moderated: true };
-  });
+  const tags = syncedTags(forum, COURT_TAGS);
   if (JSON.stringify(forum.availableTags.map((tag) => tag.name)) !== JSON.stringify(COURT_TAGS)) {
     await forum.setAvailableTags(tags, '裁判所の公開状態を簡潔に同期');
   }
@@ -542,7 +669,7 @@ export async function ensureGovernanceCourtForum(guild, governance) {
   return forum;
 }
 
-async function retireLegacyCourtChat(channel, guildName) {
+async function retireLegacyCourtChat(channel: GuildBasedChannel | null, guildName: string): Promise<{ removed: boolean; retained: boolean }> {
   if (!channel || channel.type !== ChannelType.GuildText) return { removed: false, retained: false };
   let hasCourtRecords = true;
   try {
@@ -553,7 +680,7 @@ async function retireLegacyCourtChat(channel, guildName) {
       // 旧実装や手動運用で本文をtext channelへ直接残した可能性もある。
       channel.messages.fetch({ limit: 2 })
     ]);
-    const belongsToChannel = (thread) => thread.parentId === channel.id;
+    const belongsToChannel = (thread: AnyThreadChannel) => thread.parentId === channel.id;
     hasCourtRecords = [...active.threads.values(), ...archived.threads.values()].some(belongsToChannel)
       || messages.size > 0;
   } catch {
@@ -573,8 +700,8 @@ async function retireLegacyCourtChat(channel, guildName) {
   return { removed: false, retained: true };
 }
 
-export async function retireGovernanceCourtChat(guild, governance) {
-  const candidates = new Map();
+export async function retireGovernanceCourtChat(guild: Guild, governance: GovernanceGuildRow): Promise<{ removed: boolean; retained: boolean }> {
+  const candidates = new Map<string, GuildBasedChannel>();
   if (governance.court_chat_channel_id && governance.court_chat_channel_id !== governance.court_forum_id) {
     const referenced = await guild.channels.fetch(governance.court_chat_channel_id).catch(() => null);
     if (referenced) candidates.set(referenced.id, referenced);
@@ -587,7 +714,7 @@ export async function retireGovernanceCourtChat(guild, governance) {
   const allChannels = fetched?.values ? fetched : guild.channels.cache;
   for (const channel of allChannels?.values?.() ?? []) {
     if (
-      channel.type === ChannelType.GuildText
+      channel?.type === ChannelType.GuildText
       && channel.parentId === governance.category_id
       && channel.id !== governance.court_forum_id
       && knownLegacyNames.has(channel.name)
@@ -605,18 +732,23 @@ export async function retireGovernanceCourtChat(guild, governance) {
 }
 
 
-export async function syncAppealRoleOverwrites(guild, roleId, courtForumId, { strict = false } = {}) {
+export async function syncAppealRoleOverwrites(
+  guild: Guild,
+  roleId: string,
+  courtForumId: string,
+  { strict = false }: { strict?: boolean } = {}
+): Promise<{ failures: { channelId: string; error: string }[] }> {
   await guild.channels.fetch();
-  const failures = [];
+  const failures: { channelId: string; error: string }[] = [];
   for (const channel of guild.channels.cache.values()) {
-    if (!channel.permissionOverwrites) continue;
+    if (!('permissionOverwrites' in channel) || !channel.permissionOverwrites) continue;
     const permissionState = channel.id === courtForumId ? APPEAL_COURT_ACCESS : APPEAL_DENY;
     try {
       await channel.permissionOverwrites.edit(roleId, permissionState, {
         reason: `${guild.name} governance: appeal restriction can speak only in court forum`
       });
     } catch (error) {
-      failures.push({ channelId: channel.id, error: String(error?.message ?? error) });
+      failures.push({ channelId: channel.id, error: errorMessage(error) });
     }
   }
   if (strict && failures.length > 0) {
@@ -625,7 +757,7 @@ export async function syncAppealRoleOverwrites(guild, roleId, courtForumId, { st
   return { failures };
 }
 
-export function appealRestrictedChannelAccessible(channel, member, courtForumId) {
+export function appealRestrictedChannelAccessible(channel: GuildBasedChannel, member: GuildMember, courtForumId: string): boolean {
   if (channel.id === courtForumId || channel.parentId === courtForumId) return false;
   const permissions = channel.permissionsFor?.(member);
   if (channel.isTextBased?.()) {
@@ -639,42 +771,53 @@ export function appealRestrictedChannelAccessible(channel, member, courtForumId)
   return false;
 }
 
-function tagId(channel, name) {
+function tagId(channel: GuildBasedChannel | ThreadCreator | null | undefined, name: string): string | null {
+  if (!channel || !('availableTags' in channel)) return null;
   return channel.availableTags?.find((tag) => tag.name === name)?.id ?? null;
 }
 
-export async function setForumState(thread, name) {
+export async function setForumState(thread: AnyThreadChannel, name: string): Promise<void> {
   const id = tagId(thread.parent, name);
   if (!id) return;
   await thread.setAppliedTags([id], `Community governance state: ${name}`);
 }
 
-export function voteButtons(proposalId, disabled = false) {
-  return [new ActionRowBuilder().addComponents(
+export function voteButtons(proposalId: number, disabled = false): ButtonRow[] {
+  return [new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`gov:vote:${proposalId}:yes`).setLabel('賛成').setStyle(ButtonStyle.Success).setDisabled(disabled),
     new ButtonBuilder().setCustomId(`gov:vote:${proposalId}:no`).setLabel('反対').setStyle(ButtonStyle.Danger).setDisabled(disabled),
     new ButtonBuilder().setCustomId(`gov:vote:${proposalId}:abstain`).setLabel('棄権').setStyle(ButtonStyle.Secondary).setDisabled(disabled)
   )];
 }
 
-export function approvalButtons(caseId, disabled = false) {
-  return [new ActionRowBuilder().addComponents(
+export function approvalButtons(caseId: number, disabled = false): ButtonRow[] {
+  return [new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`gov:approve:${caseId}:approve`).setLabel('執行承認').setStyle(ButtonStyle.Success).setDisabled(disabled),
     new ButtonBuilder().setCustomId(`gov:approve:${caseId}:reject`).setLabel('承認しない').setStyle(ButtonStyle.Danger).setDisabled(disabled)
   )];
 }
 
-function withoutDecisionRows(components = [], actions = ['vote', 'approve']) {
+// 受信したメッセージの行 (ActionRow) と送る前の builder の両方から custom_id を読む。
+function rowComponents(row: unknown): unknown[] {
+  return isRecord(row) && Array.isArray(row['components']) ? row['components'] : [];
+}
+
+export function componentCustomId(component: unknown): string {
+  if (!isRecord(component)) return '';
+  const data = component['data'];
+  return String(component['customId'] ?? (isRecord(data) ? data['custom_id'] : undefined) ?? '');
+}
+
+function withoutDecisionRows<T>(components: readonly T[] = [], actions: readonly string[] = ['vote', 'approve']): T[] {
   const blocked = new Set(actions);
-  return components.filter((row) => !(row.components ?? []).some((component) => {
-    const customId = component.customId ?? component.data?.custom_id;
-    const action = String(customId ?? '').match(/^gov:(vote|approve):/)?.[1];
+  return components.filter((row) => !rowComponents(row).some((component) => {
+    const action = componentCustomId(component).match(/^gov:(vote|approve):/)?.[1];
     return action && blocked.has(action);
   }));
 }
 
-export function contestButtons(guildId, sanctionId, disabled = false) {
-  return [new ActionRowBuilder().addComponents(
+export function contestButtons(guildId: string, sanctionId: number, disabled = false): ButtonRow[] {
+  return [new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`gov:contest:${guildId}:${sanctionId}`)
       .setLabel('裁判所の審理を求める')
@@ -683,25 +826,30 @@ export function contestButtons(guildId, sanctionId, disabled = false) {
   )];
 }
 
-function proposalNextAction(proposal) {
-  const byStatus = ({
-    agenda: 'この投稿で討論できます。次の国会が読みます。',
-    voting: '「手続」の案件カードから投票できます。',
-    enacted: '成立しました。現行本文は法令集にあります。',
-    rejected: '成立しませんでした。'
-  })[proposal.status];
+const PROPOSAL_NEXT_ACTIONS: Record<string, string> = {
+  agenda: 'この投稿で討論できます。次の国会が読みます。',
+  voting: '「手続」の案件カードから投票できます。',
+  enacted: '成立しました。現行本文は法令集にあります。',
+  rejected: '成立しませんでした。'
+};
+const PROPOSAL_HANDLER_NEXT_ACTIONS: Record<string, string> = {
+  parliament_agenda: 'この投稿で討論できます。次の国会が読みます。',
+  public_vote: '「手続」の案件カードから投票できます。',
+  terminal: '結論が確定しました。'
+};
+
+function proposalNextAction(proposal: ProposalRow): string {
+  const byStatus = PROPOSAL_NEXT_ACTIONS[proposal.status];
   if (byStatus) return byStatus;
-  return ({
-    parliament_agenda: 'この投稿で討論できます。次の国会が読みます。',
-    public_vote: '「手続」の案件カードから投票できます。',
-    terminal: '結論が確定しました。'
-  })[proposalHandler(proposal)] ?? 'この投稿で経過を確認できます。';
+  const handler = proposalHandler(proposal);
+  return (handler === null ? undefined : PROPOSAL_HANDLER_NEXT_ACTIONS[handler]) ?? 'この投稿で経過を確認できます。';
 }
 
-function proposalStarterContent(proposal, nextAction = proposalNextAction(proposal), displayState = proposal.status) {
-  const governance = getGovernanceGuild(proposal.guild_id);
+function proposalStarterContent(proposal: ProposalRow, nextAction = proposalNextAction(proposal), displayState = proposal.status): string {
+  const governance = governanceGuild(proposal.guild_id);
   const voting = proposalHandler(proposal) === 'public_vote';
   const deferrals = Number(proposal.deferrals ?? 0);
+  const deadline = proposalDeadline(proposal);
   return [
     `# ${proposal.title}`,
     '',
@@ -709,7 +857,7 @@ function proposalStarterContent(proposal, nextAction = proposalNextAction(propos
     '',
     `状態: **${proposalStateLabel(displayState, proposalHandler(proposal))}**`,
     deferrals > 0 ? `継続審議: ${deferrals}回` : null,
-    proposalDeadline(proposal) ? `期限: ${proposalDeadline(proposal)}` : null,
+    deadline ? `期限: ${deadline}` : null,
     `いま必要なこと: ${oneLine(nextAction)}`,
     voting && governance?.procedure_channel_id
       ? `[手続で投票](https://discord.com/channels/${proposal.guild_id}/${governance.procedure_channel_id})`
@@ -718,33 +866,35 @@ function proposalStarterContent(proposal, nextAction = proposalNextAction(propos
   ].filter(Boolean).join('\n').slice(0, 2_000);
 }
 
-function courtNextAction(caseRecord) {
-  return ({
-    filing: '裁判所の準備中です。',
-    police_review: '警察が成立法に照らして確認しています。',
-    contest_window: '被処分者は下のボタンから裁判所の審理を求められます。',
-    defense: '当事者は下のボタンから回答します。',
-    deliberation: '回答を締め切り、判断しています。',
-    approval: '特別有権者は「手続」の案件カードから承認します。',
-    appeal_window: '被申立人は下のボタンから上訴できます。',
-    appeal: '上訴審の回答または判定を待っています。',
-    execution: '確定した処分を処理しています。',
-    final: '判決は確定しました。',
-    overturned: '処分は取り消されました。',
-    acquitted: '責任なしで終了しました。',
-    dismissed: '申立ては棄却されました。',
-    constitutional_uncertain: '違憲判断は成立しませんでした。',
-    unenforceable: '処分を執行できないまま終了しました。'
-  })[caseRecord.status] ?? '経過はこの投稿で確認できます。';
+const COURT_NEXT_ACTIONS: Record<string, string> = {
+  filing: '裁判所の準備中です。',
+  police_review: '警察が成立法に照らして確認しています。',
+  contest_window: '被処分者は下のボタンから裁判所の審理を求められます。',
+  defense: '当事者は下のボタンから回答します。',
+  deliberation: '回答を締め切り、判断しています。',
+  approval: '特別有権者は「手続」の案件カードから承認します。',
+  appeal_window: '被申立人は下のボタンから上訴できます。',
+  appeal: '上訴審の回答または判定を待っています。',
+  execution: '確定した処分を処理しています。',
+  final: '判決は確定しました。',
+  overturned: '処分は取り消されました。',
+  acquitted: '責任なしで終了しました。',
+  dismissed: '申立ては棄却されました。',
+  constitutional_uncertain: '違憲判断は成立しませんでした。',
+  unenforceable: '処分を執行できないまま終了しました。'
+};
+
+function courtNextAction(caseRecord: CaseRow): string {
+  return COURT_NEXT_ACTIONS[caseRecord.status] ?? '経過はこの投稿で確認できます。';
 }
 
-function courtThreadName(caseRecord) {
+function courtThreadName(caseRecord: CaseRow): string {
   return `${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反'}: ${caseRecord.summary}`.slice(0, 100);
 }
 
-export function courtPublicState(caseRecord, displayState = caseRecord.status) {
+export function courtPublicState(caseRecord: Pick<CaseRow, 'kind' | 'status' | 'verdict'>, displayState = caseRecord.status): string {
   if (caseRecord.kind === 'constitutional') {
-    const verdict = caseRecord.verdict?.verdict;
+    const verdict = isCaseVerdict(caseRecord.verdict) ? caseRecord.verdict.verdict : undefined;
     if (verdict === 'constitutional') return '合憲';
     if (verdict === 'unconstitutional') return '違憲';
     if (verdict === 'uncertain' || displayState === 'constitutional_uncertain') return '判断不能';
@@ -752,8 +902,9 @@ export function courtPublicState(caseRecord, displayState = caseRecord.status) {
   return caseStateLabel(displayState);
 }
 
-function courtStarterContent(caseRecord, nextAction = courtNextAction(caseRecord), displayState = caseRecord.status) {
-  const governance = getGovernanceGuild(caseRecord.guild_id);
+function courtStarterContent(caseRecord: CaseRow, nextAction = courtNextAction(caseRecord), displayState = caseRecord.status): string {
+  const governance = governanceGuild(caseRecord.guild_id);
+  const deadline = courtDeadline(caseRecord);
   return [
     `# ${caseRecord.kind === 'constitutional' ? '違憲審査' : '法律違反の申立て'}`,
     caseRecord.accused_id ? `被申立人: ${publicMemberLabel(caseRecord.accused_id, '動作確認用アカウント')}` : null,
@@ -763,7 +914,7 @@ function courtStarterContent(caseRecord, nextAction = courtNextAction(caseRecord
     '',
     `状態: **${courtPublicState(caseRecord, displayState)}**`,
     `発言状態: ${courtAccessState(caseRecord)}`,
-    courtDeadline(caseRecord) ? `期限: <t:${Math.floor(courtDeadline(caseRecord) / 1000)}:F>` : null,
+    deadline ? `期限: <t:${Math.floor(deadline / 1000)}:F>` : null,
     `いま必要なこと: ${oneLine(nextAction)}`,
     caseRecord.status === 'approval' && governance?.procedure_channel_id
       ? `[手続で執行承認](https://discord.com/channels/${caseRecord.guild_id}/${governance.procedure_channel_id})`
@@ -773,14 +924,14 @@ function courtStarterContent(caseRecord, nextAction = courtNextAction(caseRecord
 }
 
 // 公開ログから国会が自分で立てた議題。人間が立てたスレと同じ扱いで討論に開く。
-export async function createAgendaPost(guild, governance, proposal) {
+export async function createAgendaPost(guild: Guild, governance: GovernanceGuildRow, proposal: ProposalRow): Promise<{ threadId: string; messageId: string }> {
   const forum = await guild.channels.fetch(governance.parliament_forum_id);
-  if (!forum?.threads) throw new Error('議会Forumが見つかりません。');
+  if (!hasThreadCreator(forum)) throw new Error('議会Forumが見つかりません。');
   const stageTag = tagId(forum, proposalStateLabel(proposal.status, 'parliament_agenda'));
   const thread = await forum.threads.create({
     name: proposal.title.slice(0, 100),
     appliedTags: stageTag ? [stageTag] : [],
-    autoArchiveDuration: 10_080,
+    autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
     message: {
       content: proposalStarterContent(proposal),
       allowedMentions: { parse: [] }
@@ -791,8 +942,21 @@ export async function createAgendaPost(guild, governance, proposal) {
   return { threadId: thread.id, messageId: starter?.id ?? thread.id };
 }
 
-export async function postProposalUpdate(guild, proposal, text, { state = null, components = [], files = [] } = {}) {
-  const thread = await guild.channels.fetch(proposal.forum_thread_id).catch(() => null);
+// 記録スレの ID が無くても元の呼び出しと同じく fetch を通す (Discord では全件取得になり thread にはならない)。
+async function fetchRecordChannel(guild: Guild, id: string | null | undefined): Promise<GuildBasedChannel | null> {
+  const fetched = id
+    ? await guild.channels.fetch(id).catch(() => null)
+    : await guild.channels.fetch().catch(() => null);
+  return fetched instanceof Collection ? null : fetched;
+}
+
+export async function postProposalUpdate(
+  guild: Guild,
+  proposal: ProposalRow,
+  text: string,
+  { state = null, components = [], files = [] }: RecordUpdateOptions = {}
+): Promise<Message> {
+  const thread = await fetchRecordChannel(guild, proposal.forum_thread_id);
   if (!thread?.isThread?.()) throw new Error('議会の案件投稿が見つかりません。公開記録なしでは手続を進められません。');
   const publicState = proposalForumState(proposal);
   if (state && publicState) await setForumState(thread, publicState).catch(() => {});
@@ -813,16 +977,21 @@ export async function postProposalUpdate(guild, proposal, text, { state = null, 
   return message;
 }
 
-export async function createCourtCaseThread(guild, governance, caseRecord, { onPartial = null } = {}) {
+export async function createCourtCaseThread(
+  guild: Guild,
+  governance: GovernanceGuildRow,
+  caseRecord: CaseRow,
+  { onPartial = null }: { onPartial?: ((patch: { public_thread_id: string }) => unknown) | null } = {}
+): Promise<{ publicThreadId: string }> {
   const forum = await guild.channels.fetch(governance.court_forum_id);
-  if (!forum?.threads) throw new Error('裁判所Forumが見つかりません。');
+  if (!hasThreadCreator(forum)) throw new Error('裁判所Forumが見つかりません。');
   const answerTag = tagId(forum, courtPublicState(caseRecord));
   const publicThread = caseRecord.public_thread_id
     ? await guild.channels.fetch(caseRecord.public_thread_id)
     : await forum.threads.create({
     name: courtThreadName(caseRecord),
     appliedTags: answerTag ? [answerTag] : [],
-    autoArchiveDuration: 10_080,
+    autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
     message: {
       content: courtStarterContent(caseRecord),
       components: courtActionButtons(caseRecord),
@@ -830,12 +999,18 @@ export async function createCourtCaseThread(guild, governance, caseRecord, { onP
     },
     reason: `${guild.name} governance case ${caseRecord.id}`
   });
+  if (!publicThread) throw new Error('裁判所の事件投稿が見つかりません。');
   await onPartial?.({ public_thread_id: publicThread.id });
   return { publicThreadId: publicThread.id };
 }
 
-export async function postCourtUpdate(guild, caseRecord, text, { state = null, components = [], files = [] } = {}) {
-  const thread = await guild.channels.fetch(caseRecord.public_thread_id).catch(() => null);
+export async function postCourtUpdate(
+  guild: Guild,
+  caseRecord: CaseRow,
+  text: string,
+  { state = null, components = [], files = [] }: RecordUpdateOptions = {}
+): Promise<Message | null> {
+  const thread = await fetchRecordChannel(guild, caseRecord.public_thread_id);
   if (!thread?.isThread?.()) return null;
   const publicState = courtPublicState(caseRecord);
   if (state && publicState) await setForumState(thread, publicState).catch(() => {});
@@ -857,32 +1032,32 @@ export async function postCourtUpdate(guild, caseRecord, text, { state = null, c
   return message;
 }
 
-function proposalForumState(proposal) {
+function proposalForumState(proposal: ProposalRow): string {
   if (proposal.workflow_status === 'queued') return '待機';
   return proposalStateLabel(proposal.status, proposalHandler(proposal));
 }
 
-function courtForumState(caseRecord) {
+function courtForumState(caseRecord: CaseRow): string {
   return courtPublicState(caseRecord);
 }
 
-function proposalClosed(proposal) {
+function proposalClosed(proposal: ProposalRow): boolean {
   return proposalHandler(proposal) === 'terminal'
     || ['enacted', 'rejected', 'remanded'].includes(proposal.status);
 }
 
-function caseClosed(caseRecord) {
+function caseClosed(caseRecord: CaseRow): boolean {
   return ['final', 'overturned', 'acquitted', 'dismissed', 'constitutional_uncertain', 'unenforceable']
     .includes(caseRecord.status);
 }
 
-async function closeRecordThread(thread) {
+async function closeRecordThread(thread: AnyThreadChannel): Promise<void> {
   if (!thread.locked) await thread.setLocked(true, '統治手続が完了したため記録を確定');
   if (!thread.archived) await thread.setArchived(true, '統治手続が完了したため記録を保管');
 }
 
-async function removeOldDecisionRows(thread, actions) {
-  let before;
+async function removeOldDecisionRows(thread: AnyThreadChannel, actions: readonly string[]): Promise<void> {
+  let before: string | undefined;
   for (let page = 0; page < 5; page += 1) {
     const batch = await thread.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
     if (batch.size === 0) break;
@@ -896,7 +1071,7 @@ async function removeOldDecisionRows(thread, actions) {
   }
 }
 
-async function syncRecordThread(thread, { name, content, components, state, removeActions = [], closed = false }) {
+async function syncRecordThread(thread: AnyThreadChannel, { name, content, components, state, removeActions = [], closed = false }: RecordThreadView): Promise<void> {
   const wasArchived = Boolean(thread.archived);
   if (wasArchived) await thread.setArchived(false, '公開表示を同期');
   if (thread.name !== name) await thread.setName(name, '内部番号を使わない表示へ同期');
@@ -912,9 +1087,9 @@ async function syncRecordThread(thread, { name, content, components, state, remo
   else if (wasArchived) await thread.setArchived(true, '公開表示の同期完了');
 }
 
-export function withoutLegacyPublicIds(content) {
+export function withoutLegacyPublicIds(content: unknown): string {
   return maskDiscordUrls(String(content ?? '')
-    .replace(/<@!?([^>]+)>/g, (mention, userId) => /^\d{17,20}$/.test(userId) ? mention : '表示対象のアカウント')
+    .replace(/<@!?([^>]+)>/g, (mention: string, userId: string) => /^\d{17,20}$/.test(userId) ? mention : '表示対象のアカウント')
     .replace(/\[E2E:[^\]]+\]/g, '【動作確認】')
     .replace(/制裁\s*#\d+/g, '制裁')
     .replace(/^\s*(?:参照番号|法律ID|ロールID):[^\n]*\n?/gim, '')
@@ -923,10 +1098,10 @@ export function withoutLegacyPublicIds(content) {
     .trim());
 }
 
-export async function syncGovernanceRecordUi(guild, governance) {
+export async function syncGovernanceRecordUi(guild: Guild, governance: GovernanceGuildRow): Promise<number> {
   let changed = 0;
-  const failures = [];
-  for (const proposal of listProposals(guild.id, { limit: 500 })) {
+  const failures: string[] = [];
+  for (const proposal of narrowList(listProposals(guild.id, { limit: 500 }), isProposalRow, 'proposal')) {
     if (!proposal.forum_thread_id || proposal.title.startsWith('[E2E:')) continue;
     const thread = await guild.channels.fetch(proposal.forum_thread_id).catch(() => null);
     if (!thread?.isThread?.() || thread.parentId !== governance.parliament_forum_id) continue;
@@ -941,10 +1116,10 @@ export async function syncGovernanceRecordUi(guild, governance) {
       });
       changed += 1;
     } catch (error) {
-      failures.push(`proposal ${proposal.id}: ${error?.message ?? error}`);
+      failures.push(`proposal ${proposal.id}: ${errorMessage(error)}`);
     }
   }
-  for (const caseRecord of listCases(guild.id, { limit: 500 })) {
+  for (const caseRecord of narrowList(listCases(guild.id, { limit: 500 }), isCaseRow, 'case')) {
     if (!caseRecord.public_thread_id || caseRecord.summary.startsWith('[E2E:')) continue;
     const thread = await guild.channels.fetch(caseRecord.public_thread_id).catch(() => null);
     if (!thread?.isThread?.() || thread.parentId !== governance.court_forum_id) continue;
@@ -959,31 +1134,31 @@ export async function syncGovernanceRecordUi(guild, governance) {
       });
       changed += 1;
     } catch (error) {
-      failures.push(`case ${caseRecord.id}: ${error?.message ?? error}`);
+      failures.push(`case ${caseRecord.id}: ${errorMessage(error)}`);
     }
   }
   if (failures.length > 0) throw new Error(`公開表示を${failures.length}件同期できません: ${failures.slice(0, 3).join(' / ')}`);
   return changed;
 }
 
-export function courtActionButtons(caseRecord) {
+export function courtActionButtons(caseRecord: CaseRow): ButtonRow[] {
   if (caseRecord.status === 'appeal_window') {
-    return [new ActionRowBuilder().addComponents(
+    return [new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`gov:court:${caseRecord.id}:appeal`).setLabel('上訴する').setStyle(ButtonStyle.Primary)
     )];
   }
   // 警察の処分に不服がある間は、事件記録からも直接争えるようにする。
   if (caseRecord.status === 'contest_window') {
-    const sanction = getCaseSanction(caseRecord.id);
+    const sanction = caseSanction(caseRecord.id);
     return sanction
-      ? [new ActionRowBuilder().addComponents(
+      ? [new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder().setCustomId(`gov:contest:${caseRecord.guild_id}:${sanction.id}`)
           .setLabel('裁判所の審理を求める').setStyle(ButtonStyle.Primary)
       )]
       : [];
   }
   if (!['defense', 'appeal'].includes(caseRecord.status)) return [];
-  return [new ActionRowBuilder().addComponents(
+  return [new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`gov:court:${caseRecord.id}:answer`).setLabel('回答を書く').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`gov:court:${caseRecord.id}:evidence`).setLabel('証拠を出す').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`gov:court:${caseRecord.id}:complete`).setLabel('回答完了').setStyle(ButtonStyle.Success),
@@ -991,41 +1166,51 @@ export function courtActionButtons(caseRecord) {
   )];
 }
 
-export async function postCourtRecord(guild, caseRecord, text, { files = [] } = {}) {
-  const thread = await guild.channels.fetch(caseRecord.public_thread_id).catch(() => null);
+export async function postCourtRecord(
+  guild: Guild,
+  caseRecord: CaseRow,
+  text: string,
+  { files = [] }: { files?: AttachmentPayload[] } = {}
+): Promise<Message> {
+  const thread = await fetchRecordChannel(guild, caseRecord.public_thread_id);
   if (!thread?.isThread?.()) throw new Error('裁判所の事件投稿が見つかりません。');
   return thread.send({ content: text.slice(0, 2000), files, allowedMentions: { parse: [] } });
 }
 
-export function maskDiscordUrls(value) {
+export function maskDiscordUrls(value: unknown): string {
   return String(value).replace(
     /(?<!\]\()https:\/\/discord\.com\/channels\/\d+\/\d+(?:\/\d+)?/g,
     (url) => `[Discordで開く](${url})`
   );
 }
 
-export async function applyAppealRestriction(guild, governance, userId) {
+// thread は自分の overwrite を持たないので、親 channel の overwrite で閉じる。
+function overwriteTarget(guild: Guild, channel: GuildBasedChannel): NonThreadGuildBasedChannel | null {
+  if ('permissionOverwrites' in channel) return channel;
+  const parent = channel.parentId ? guild.channels.cache.get(channel.parentId) : undefined;
+  return parent && 'permissionOverwrites' in parent ? parent : null;
+}
+
+export async function applyAppealRestriction(guild: Guild, governance: GovernanceGuildRow, userId: string): Promise<{ fallbackChannelIds: string[] }> {
   const member = await guild.members.fetch(userId);
   if (member.id === guild.ownerId || member.permissions.has(PermissionFlagsBits.Administrator)) {
     throw new Error('Discord owner / Administratorは裁判所限定を保証できません。');
   }
   const role = await guild.roles.fetch(governance.appeal_role_id);
-  if (!role || role.position >= guild.members.me.roles.highest.position) throw new Error('上訴中ロールをbotが管理できません。');
+  if (!role || role.position >= botMember(guild).roles.highest.position) throw new Error('上訴中ロールをbotが管理できません。');
   await syncAppealRoleOverwrites(guild, role.id, governance.court_forum_id, { strict: true });
   await member.roles.add(role, `${guild.name} governance appeal restriction`);
 
-  const fallbackChannelIds = [];
-  const canSpeakOutsideCourt = (channel) => appealRestrictedChannelAccessible(
+  const fallbackChannelIds: string[] = [];
+  const canSpeakOutsideCourt = (channel: GuildBasedChannel) => appealRestrictedChannelAccessible(
     channel,
     member,
     governance.court_forum_id
   );
   const stillAccessible = [...guild.channels.cache.values()].filter(canSpeakOutsideCourt);
-  const fallbackTargets = new Map();
+  const fallbackTargets = new Map<string, NonThreadGuildBasedChannel>();
   for (const channel of stillAccessible) {
-    const target = channel.permissionOverwrites
-      ? channel
-      : guild.channels.cache.get(channel.parentId);
+    const target = overwriteTarget(guild, channel);
     if (!target?.permissionOverwrites) {
       await member.roles.remove(role, `${guild.name} governance appeal restriction rollback`).catch(() => {});
       throw new Error(`上訴中の発言先 ${channel.id} を権限で閉じられません。`);
@@ -1050,7 +1235,9 @@ export async function applyAppealRestriction(guild, governance, userId) {
   } catch (error) {
     for (const channelId of fallbackChannelIds) {
       const channel = guild.channels.cache.get(channelId);
-      await channel?.permissionOverwrites?.delete(userId, `${guild.name} appeal restriction rollback`).catch(() => {});
+      if (channel && 'permissionOverwrites' in channel) {
+        await channel.permissionOverwrites?.delete(userId, `${guild.name} appeal restriction rollback`).catch(() => {});
+      }
     }
     await member.roles.remove(role, `${guild.name} governance appeal restriction rollback`).catch(() => {});
     throw error;
@@ -1058,8 +1245,13 @@ export async function applyAppealRestriction(guild, governance, userId) {
   return { fallbackChannelIds };
 }
 
-export async function releaseAppealRestriction(guild, governance, userId, fallbackChannelIds = []) {
-  const absent = (...codes) => (error) => { if (codes.includes(Number(error.code))) return null; throw error; };
+export async function releaseAppealRestriction(
+  guild: Guild,
+  governance: GovernanceGuildRow,
+  userId: string,
+  fallbackChannelIds: readonly string[] = []
+): Promise<void> {
+  const absent = (...codes: number[]) => (error: unknown): null => { if (codes.includes(errorCode(error))) return null; throw error; };
   const results = await Promise.allSettled([
     (async () => {
       const member = await guild.members.fetch(userId).catch(absent(10007));
@@ -1068,21 +1260,29 @@ export async function releaseAppealRestriction(guild, governance, userId, fallba
     })(),
     ...[...new Set(fallbackChannelIds)].map(async (channelId) => {
       const channel = await guild.channels.fetch(channelId).catch(absent(10003));
-      if (channel) await channel.permissionOverwrites.delete(userId,
-        `${guild.name} governance appeal fallback cleanup`).catch(absent(10003, 10009));
+      if (channel) {
+        if (!('permissionOverwrites' in channel)) throw new Error(`制限を解除できないchannelです: ${channel.id}`);
+        await channel.permissionOverwrites.delete(userId,
+          `${guild.name} governance appeal fallback cleanup`).catch(absent(10003, 10009));
+      }
     })
   ]);
-  const failures = results.filter((result) => result.status === 'rejected').map((result) => result.reason);
-  if (failures.length) throw new AggregateError(failures, `制限解除が未完了です: ${failures.map((error) => error.message).join('; ')}`);
+  const failures = results.flatMap((result) => (result.status === 'rejected' ? [result.reason] : []));
+  if (failures.length) throw new AggregateError(failures, `制限解除が未完了です: ${failures.map((error) => errorMessage(error)).join('; ')}`);
 }
 
-export async function executeDiscordSanction(guild, sanction, { beforeEffect = () => {} } = {}) {
+export async function executeDiscordSanction(
+  guild: Guild,
+  sanction: SanctionRow,
+  { beforeEffect = () => {} }: { beforeEffect?: () => void } = {}
+): Promise<SanctionExecutionDetail> {
   if (['ban', 'kick'].includes(sanction.type)) throw new Error('ban・kickは管理者がDiscordで手動執行します。');
-  const member = await guild.members.fetch(sanction.user_id).catch((error) => { if (Number(error.code) === 10007) return null; throw error; });
+  const member = await guild.members.fetch(sanction.user_id).catch((error: unknown) => { if (errorCode(error) === 10007) return null; throw error; });
   beforeEffect();
   if (sanction.type === 'warning' && !member) return { type: 'warning', delivered: false };
-  if (sanction.type !== 'ban' && !member) throw new Error('対象メンバーがサーバーにいません。');
-  if (member && (member.id === guild.ownerId || member.permissions.has(PermissionFlagsBits.Administrator))) {
+  // ban は上で手動執行へ回したので、ここで居ないメンバーはすべて執行できない。
+  if (!member) throw new Error('対象メンバーがサーバーにいません。');
+  if (member.id === guild.ownerId || member.permissions.has(PermissionFlagsBits.Administrator)) {
     throw new Error('Discord owner / Administratorには自動執行できません。');
   }
   const reason = `${guild.name} case C-${sanction.case_id} / sanction ${sanction.id}`;
