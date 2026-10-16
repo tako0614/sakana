@@ -224,7 +224,28 @@ export function budgetIdFor(guildId, now = Date.now()) {
 // どちらも「完了」に見えるので、空の区切りが静かに積み上がっていた。
 // builder は1時間ごとに起動し直すので、外した provider は記憶の DB に控える (プロセスの中だけだと毎回踏み直す)。
 const BAD_PROVIDERS = 'bad-providers';
-const BAD_PROVIDER_MS = 3 * 3_600_000;
+const BAD_PROVIDER_MS = 3_600_000;
+
+// provider ごとの直近1時間の成績 (この実行の中だけ)。1回の暴走・空返しでは外さない。
+// 2026-10-16、いちばん安くまともな StreamLake が出力の暴走3回 (25回中) で外れ、続いて Novita と
+// GMICloud も外れて、単価の上限に残った DeepInfra が 429 を連発し読み込みがほぼ止まった。
+// 出力の暴走はどの provider でも時々起きる。外すのは壊れている割合が高いものだけ
+const providerRecord = new Map();
+const RECORD_MS = 3_600_000;
+
+/** 結果を記録し、外すべきなら true。直近1時間に3回以上、かつ4回に1回以上壊れていたら外す。 */
+export function recordProvider(name, bad, now = Date.now()) {
+  if (!name) return false;
+  const list = (providerRecord.get(name) ?? []).filter((entry) => entry.at > now - RECORD_MS);
+  list.push({ at: now, bad });
+  providerRecord.set(name, list);
+  const bads = list.filter((entry) => entry.bad).length;
+  return bad && bads >= 3 && bads * 4 >= list.length;
+}
+
+export function forgetProviderRecord() {
+  providerRecord.clear();
+}
 
 export function avoidedProviders(now = Date.now()) {
   const saved = getState(BAD_PROVIDERS) ?? {};
@@ -244,8 +265,8 @@ export function forgetAvoidedProviders() {
 /**
  * 1回の呼び出し。待てば済む 429 は待って同じ入力を送り直し、日の上限・認証・
  * 残高は StopRun にする。出力が読めないものはそのまま投げる (呼び出し側が数える)。
- * check は読めた JSON の検査 (空の結果など)。落ちたら、または途中で切れたら、
- * その provider を外してすぐ送り直す (2回まで)。
+ * check は読めた JSON の検査 (空の結果など)。落ちたら、または途中で切れたら、すぐ送り直す (2回まで)。
+ * 壊れている割合が高い provider だけ1時間外す (recordProvider)。
  */
 export function openRouterCaller({ guildId, models = treeConfig.models, runId = randomUUID() } = {}) {
   const budgetId = budgetFor(guildId, models);
@@ -266,16 +287,17 @@ export function openRouterCaller({ guildId, models = treeConfig.models, runId = 
         const message = data.choices[0].message;
         const json = parseModelJson(message.content);
         check?.(json);
+        recordProvider(provider, false);
         return { json, model: data.model ?? models[0], provider, usage: data.usage };
       } catch (error) {
         const blame = provider ?? error.provider;
-        if ((error.code === 'BAD_OUTPUT' || /truncated/.test(error.message)) && blame && swapped < 2) {
+        const broken = error.code === 'BAD_OUTPUT' || /truncated/.test(error.message);
+        if (broken && recordProvider(blame, true)) {
           avoidProvider(blame);
-          swapped += 1;
-          console.warn(`memory: ${blame} を ${BAD_PROVIDER_MS / 3_600_000} 時間外す (${error.message})`);
-          continue;
+          console.warn(`memory: ${blame} を ${BAD_PROVIDER_MS / 3_600_000} 時間外す (直近1時間に壊れた出力が続いた: ${error.message})`);
         }
-        if (error.code === 'BAD_OUTPUT' || /truncated/.test(error.message)) throw error;
+        if (broken && swapped < 2) { swapped += 1; continue; }
+        if (broken) throw error;
         // 外しすぎて回す先が無くなった (404) ら、外したものを忘れて1回だけ送り直す
         if (error.status === 404 && ignored.length > treeConfig.ignoreProviders.length && !cleared) {
           forgetAvoidedProviders();
