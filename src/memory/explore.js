@@ -16,8 +16,12 @@ import {
 //   年表     そのページに関わる出来事を古い順に10件ずつ
 //   探す     入力欄からページと出来事を探す
 //
+//   共有     📢 で今の画面をチャンネルに出す。出したメッセージのボタンは誰が押しても全員の画面が変わる
+//            (一緒にたどる)。🔎 で押した人にだけ同じ画面を開く (ひとりで寄り道する)
+//
 // 画面の状態はボタン・メニューの ID に数字で持たせる (日本語のパスは ID の上限 100 字を超えうる)。
 //   n:<ページ>:<子の何件目から>   e:<出来事>:<開いたページ>   t:<ページ>:<何件目から>   root   s (探す)
+//   share:<画面>  mine:<画面>
 
 const PREFIX = 'memx';
 const TZ_MS = 9 * 3_600_000;
@@ -73,6 +77,11 @@ const select = (customId, placeholder, options) => new ActionRowBuilder().addCom
 const button = (customId, label, { disabled = false, style = ButtonStyle.Secondary } = {}) =>
   new ButtonBuilder().setCustomId(customId).setLabel(label).setStyle(style).setDisabled(disabled);
 
+/** 本人だけの画面には「みんなに見せる」、共有した画面には「自分で開く」。 */
+const shareButton = (target, shared) => shared
+  ? button(`${PREFIX}:mine:${target}`, '🔎 自分で開く')
+  : button(`${PREFIX}:share:${target}`, '📢 みんなに見せる', { style: ButtonStyle.Success });
+
 const episodeOption = (episode, fromId) => ({
   label: clip(`${kindEmoji(episode.kind)} ${episode.title}`, 100),
   description: clip(`${day(episode.at_ms)}${episode.kind ? ` · ${episode.kind}` : ''} · ${episode.summary ?? ''}`, 100),
@@ -84,7 +93,7 @@ function pageCount(guildId, path) {
   return memoryDb().prepare("SELECT COUNT(*) AS c FROM nodes WHERE guild_id = ? AND path LIKE ? ESCAPE '\\'").get(guildId, like).c;
 }
 
-export function pageView(guildId, node, { offset = 0 } = {}) {
+export function pageView(guildId, node, { offset = 0, shared = false } = {}) {
   const isRoot = !node.path;
   const lines = [];
   if (node.summary && !isRoot) lines.push(`*${node.summary}*`, '');
@@ -163,17 +172,19 @@ export function pageView(guildId, node, { offset = 0 } = {}) {
   components.push(new ActionRowBuilder().addComponents(nav));
   const tools = [button(`${PREFIX}:s`, '🔍 探す', { style: ButtonStyle.Primary })];
   if (episodes.length) tools.push(button(`${PREFIX}:t:${node.id}:0`, '🕒 年表'));
+  tools.push(shareButton(isRoot ? 'root' : `n:${node.id}:${offset}`, shared));
   components.push(new ActionRowBuilder().addComponents(tools));
   return { content: '', embeds: [embed], components };
 }
 
-export function episodeView(guildId, id, { fromId = 0 } = {}) {
+export function episodeView(guildId, id, { fromId = 0, shared = false } = {}) {
   const episode = getEpisode(guildId, id);
   const back = fromId ? nodeById(guildId, fromId) : null;
   const navRow = () => new ActionRowBuilder().addComponents([
     ...(back ? [button(`${PREFIX}:n:${back.id}`, clip(`← ${nameOf(back.path) || '根'}`, 80))] : []),
     button(`${PREFIX}:root`, '🏠 根'),
-    button(`${PREFIX}:s`, '🔍 探す', { style: ButtonStyle.Primary })
+    button(`${PREFIX}:s`, '🔍 探す', { style: ButtonStyle.Primary }),
+    ...(episode ? [shareButton(`e:${id}:${fromId}`, shared)] : [])
   ]);
   if (!episode) return { content: `出来事 e${id} はありません。`, embeds: [], components: [navRow()] };
 
@@ -222,7 +233,7 @@ export function episodeView(guildId, id, { fromId = 0 } = {}) {
   return { content: '', embeds: [embed], components };
 }
 
-export function timelineView(guildId, node, { offset = 0 } = {}) {
+export function timelineView(guildId, node, { offset = 0, shared = false } = {}) {
   const { total, rows } = episodeTimeline(guildId, node.path, { offset, limit: TIMELINE_PER_PAGE });
   const embed = new EmbedBuilder().setColor(COLOR)
     .setAuthor({ name: clip(breadcrumb(node.path), 250) })
@@ -237,7 +248,8 @@ export function timelineView(guildId, node, { offset = 0 } = {}) {
     button(`${PREFIX}:n:${node.id}`, clip(`← ${nameOf(node.path) || '根'}`, 80)),
     button(`${PREFIX}:t:${node.id}:${Math.max(0, offset - TIMELINE_PER_PAGE)}`, '◀ 前', { disabled: offset === 0 }),
     button(`${PREFIX}:t:${node.id}:${offset + TIMELINE_PER_PAGE}`, '次 ▶', { disabled: offset + TIMELINE_PER_PAGE >= total }),
-    button(`${PREFIX}:root`, '🏠 根')
+    button(`${PREFIX}:root`, '🏠 根'),
+    shareButton(`t:${node.id}:${offset}`, shared)
   ));
   return { content: '', embeds: [embed], components };
 }
@@ -267,21 +279,36 @@ export function searchView(guildId, query) {
   return { content: '', embeds: [embed], components };
 }
 
-export function rootView(guildId) {
+export function rootView(guildId, { shared = false } = {}) {
   const root = getNode(guildId, '');
-  return root ? pageView(guildId, root) : { content: '記憶の本はまだできていません。', embeds: [], components: [] };
+  return root ? pageView(guildId, root, { shared }) : { content: '記憶の本はまだできていません。', embeds: [], components: [] };
 }
 
-/** `root` / `n:12[:offset]` / `e:34[:from]` / `t:12[:offset]` を画面にする。 */
-export function viewFor(guildId, target) {
-  if (target === 'root') return rootView(guildId);
+/** `root` / `n:12[:offset]` / `e:34[:from]` / `t:12[:offset]` を画面にする。shared は共有したメッセージの中か。 */
+export function viewFor(guildId, target, { shared = false } = {}) {
+  if (target === 'root') return rootView(guildId, { shared });
   const [kind, id, extra] = String(target).split(':');
-  if (kind === 'e') return episodeView(guildId, Number(id), { fromId: Number(extra) || 0 });
+  if (kind === 'e') return episodeView(guildId, Number(id), { fromId: Number(extra) || 0, shared });
   const node = nodeById(guildId, id);
-  if (!node) return rootView(guildId);
-  if (kind === 't') return timelineView(guildId, node, { offset: Number(extra) || 0 });
-  return pageView(guildId, node, { offset: Number(extra) || 0 });
+  if (!node) return rootView(guildId, { shared });
+  if (kind === 't') return timelineView(guildId, node, { offset: Number(extra) || 0, shared });
+  return pageView(guildId, node, { offset: Number(extra) || 0, shared });
 }
+
+/**
+ * NSFW チャンネルの出来事 (原文の引用が載る) は NSFW のチャンネルにだけ共有する。
+ * ページの本文は出どころが混ざるので見分けない (本人だけの画面と同じく誰でも開ける)。
+ */
+function shareRefusal(interaction, target) {
+  const [kind, id] = String(target).split(':');
+  if (kind !== 'e') return null;
+  const episode = getEpisode(interaction.guildId, Number(id));
+  const source = episode && interaction.guild?.channels?.cache?.get(episode.channel_id);
+  if (source?.nsfw && !interaction.channel?.nsfw) return 'NSFW チャンネルの出来事は、NSFW のチャンネルでだけ共有できます。';
+  return null;
+}
+
+const sharedIn = (interaction) => Boolean(interaction.message) && !interaction.message.flags?.has?.(MessageFlags.Ephemeral);
 
 function searchModal() {
   return new ModalBuilder().setCustomId(`${PREFIX}:q`).setTitle('記憶の本を探す').addComponents(
@@ -293,18 +320,36 @@ function searchModal() {
 export async function handleMemoryComponent(interaction) {
   const customId = interaction.customId ?? '';
   if (!customId.startsWith(`${PREFIX}:`)) return false;
-  const [, action, a, b] = customId.split(':');
+  const [, action, ...rest] = customId.split(':');
+  const shared = sharedIn(interaction);
+  // 共有したメッセージは書き換えても「誰が共有したか」の一行を残す
+  const keep = (view) => (shared ? { ...view, content: interaction.message.content ?? '' } : view);
   try {
     if (action === 'noop') { await interaction.deferUpdate(); return true; }
     // 探す: ボタンで入力欄を出し、送られたら結果の画面に差し替える
     if (action === 's') { await interaction.showModal(searchModal()); return true; }
     if (action === 'q' && interaction.isModalSubmit?.()) {
-      await interaction.update(searchView(interaction.guildId, interaction.fields.getTextInputValue('query').trim()));
+      await interaction.update(keep(searchView(interaction.guildId, interaction.fields.getTextInputValue('query').trim())));
+      return true;
+    }
+    if (action === 'share') {
+      const target = rest.join(':') || 'root';
+      const refusal = shareRefusal(interaction, target);
+      if (refusal) { await interaction.reply({ content: refusal, flags: MessageFlags.Ephemeral }); return true; }
+      await interaction.reply({
+        ...viewFor(interaction.guildId, target, { shared: true }),
+        content: `-# 📖 ${interaction.user} が記憶の本を共有しました · ボタンは誰でも操作できます (全員の画面が変わります)`,
+        allowedMentions: { parse: [] }
+      });
+      return true;
+    }
+    if (action === 'mine') {
+      await interaction.reply({ ...viewFor(interaction.guildId, rest.join(':') || 'root'), flags: MessageFlags.Ephemeral });
       return true;
     }
     const target = interaction.isStringSelectMenu?.() ? interaction.values[0]
-      : action === 'root' ? 'root' : [action, a, b].filter((part) => part !== undefined).join(':');
-    await interaction.update(viewFor(interaction.guildId, target));
+      : action === 'root' ? 'root' : [action, ...rest].join(':');
+    await interaction.update(keep(viewFor(interaction.guildId, target, { shared })));
   } catch (error) {
     console.error('memory explore failed:', error);
     await interaction.reply({ content: `開けませんでした: ${clip(error.message, 150)}`, flags: MessageFlags.Ephemeral }).catch(() => {});

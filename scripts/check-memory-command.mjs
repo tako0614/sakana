@@ -6,7 +6,7 @@
 // ARCHIVE_DB_PATH / MEMORY_DB_PATH を一時ファイルに向けて呼ぶこと。
 
 import assert from 'node:assert/strict';
-import { PermissionFlagsBits } from 'discord.js';
+import { MessageFlags, PermissionFlagsBits } from 'discord.js';
 
 process.env.MEMORY_TREE_SYSTEMD_UNIT = '';
 const { db: archive } = await import('../src/archive/db.js');
@@ -155,9 +155,11 @@ assert.ok(peopleOption, 'the root menu lists top-level pages');
 const click = (fields) => {
   const updates = [];
   const modals = [];
-  return { updates, modals, guildId: GUILD, isButton: () => !fields.values && !fields.fields, isStringSelectMenu: () => Boolean(fields.values),
-    isModalSubmit: () => Boolean(fields.fields),
-    update: async (view) => { updates.push(view); }, reply: async () => { throw new Error('should update in place'); },
+  const replies = [];
+  return { updates, modals, replies, guildId: GUILD, isButton: () => !fields.values && !fields.fields, isStringSelectMenu: () => Boolean(fields.values),
+    isModalSubmit: () => Boolean(fields.fields), user: { id: 'u1', toString: () => '<@u1>' },
+    update: async (view) => { updates.push(view); },
+    reply: async (view) => { if (!fields.allowReply) throw new Error('should update in place'); replies.push(view); },
     showModal: async (modal) => { modals.push(modal); }, deferUpdate: async () => {}, ...fields };
 };
 // Discord の制限: 部品の ID は1つのメッセージで重複しない・選択肢の値は1つのメニューで重複しない・
@@ -234,6 +236,40 @@ await handleMemoryComponent(back);
 assert.match(json(back.updates[0]).embeds[0].title, /記憶の本/);
 assert.equal(await handleMemoryComponent(click({ customId: 'archive:reset:1' })), false, 'other components pass through');
 
+// 共有: 📢 で今の画面をチャンネルに出す (本人だけではないメッセージ)。出したものは誰でも操作でき、🔎 で自分だけに開ける
+const shareId = buttonsOf(takoJson).find((b) => b.custom_id.startsWith('memx:share:'))?.custom_id;
+assert.equal(shareId, `memx:share:n:${takoId}:0`, 'a private view offers to share itself');
+for (const view of [episodeJson, timelineJson]) assert.ok(buttonsOf(view).some((b) => b.custom_id.startsWith('memx:share:')), 'episodes and timelines can be shared');
+const share = click({ customId: shareId, allowReply: true, channel: { nsfw: false }, guild: { channels: { cache: new Map() } } });
+await handleMemoryComponent(share);
+assert.equal(share.replies.length, 1);
+assert.equal(share.replies[0].flags, undefined, 'the shared view is a normal message');
+assert.match(share.replies[0].content, /<@u1> が記憶の本を共有/);
+assert.deepEqual(share.replies[0].allowedMentions, { parse: [] }, 'sharing does not ping');
+const sharedJson = json(share.replies[0]);
+checkLimits(sharedJson, 'shared');
+assert.match(sharedJson.embeds[0].description, /sakana bot を作っている/);
+const mineId = buttonsOf(sharedJson).find((b) => b.custom_id.startsWith('memx:mine:'))?.custom_id;
+assert.ok(mineId && !buttonsOf(sharedJson).some((b) => b.custom_id.startsWith('memx:share:')), 'a shared view offers to open it privately instead');
+// 共有したメッセージでの操作はそのメッセージを書き換え、共有した人の一行を残す
+const sharedMessage = { content: share.replies[0].content, flags: { has: () => false } };
+const together = click({ customId: 'memx:root', message: sharedMessage });
+await handleMemoryComponent(together);
+assert.equal(together.updates[0].content, sharedMessage.content, 'navigating a shared view keeps who shared it');
+assert.ok(buttonsOf(json(together.updates[0])).some((b) => b.custom_id.startsWith('memx:mine:')), 'it stays a shared view');
+const mine = click({ customId: mineId, allowReply: true, message: sharedMessage });
+await handleMemoryComponent(mine);
+assert.equal(mine.replies[0].flags, MessageFlags.Ephemeral, 'opening privately is only for the clicker');
+assert.ok(buttonsOf(json(mine.replies[0])).some((b) => b.custom_id.startsWith('memx:share:')));
+// NSFW チャンネルの出来事は NSFW でないチャンネルに共有しない
+const episodeShare = buttonsOf(episodeJson).find((b) => b.custom_id.startsWith('memx:share:')).custom_id;
+const episodeChannel = store.getEpisode(GUILD, Number(episodeShare.split(':')[3])).channel_id;
+const nsfwShare = click({ customId: episodeShare, allowReply: true, channel: { nsfw: false },
+  guild: { channels: { cache: new Map([[episodeChannel, { nsfw: true }]]) } } });
+await handleMemoryComponent(nsfwShare);
+assert.equal(nsfwShare.replies[0].flags, MessageFlags.Ephemeral);
+assert.match(nsfwShare.replies[0].content, /NSFW/);
+
 store.resetTree(GUILD);
 archive.prepare('DELETE FROM messages WHERE guild_id = ?').run(GUILD);
-console.log('memory command ok (status は管理者・先に受付・割合と見込みと費用 / pause で止まる / include・exclude / category / explore でたどる・年表・探す / 誰でも開ける・根拠にリンク)');
+console.log('memory command ok (共有は普通のメッセージ・誰でも操作・自分で開く・NSFW の出来事は NSFW でだけ / status は管理者・先に受付・割合と見込みと費用 / pause で止まる / include・exclude / category / explore でたどる・年表・探す / 誰でも開ける・根拠にリンク)');
