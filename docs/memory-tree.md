@@ -131,6 +131,6 @@ node scripts/memory-tree.mjs settle   --guild ID   # 結果の返らなかった
 
 予算の予約: 呼び出す前に「最も高い provider で入力も出力も上限まで使った」額を予約し、返ってきた実額で置き換える。プロセスごと止めたり応答が途中で切れたりすると予約のまま残り、1件あたり実費の約10倍で上限を埋める (2026-10-15 は 107 件・$4.40 が残り、実費は $0.46 だった)。run は最初に OpenRouter に今月の請求額を聞き、台帳で確定した額との差を1時間より古い未確定の呼び出しに按分して精算する。予約のせいで止まっていた予算はそれで再開する。
 
-provider の当たり外れ: OpenRouter は同じモデルを複数の provider に回す。2026-10-15 には glm-5.3-flash の一部の provider が、3万トークン読ませても空の JSON だけを返したり、出力の上限まで暴走したりした。builder は長い区切り (`MEMORY_TREE_EMPTY_CHARS`、既定 4000 字) で出来事も知識も空なら読めていないとみなし、その provider と途中で切れた provider を3時間外して送り直す。最初から外したい provider は `MEMORY_TREE_IGNORE_PROVIDERS` に書く。
+provider の当たり外れ: OpenRouter は同じモデルを複数の provider に回す。2026-10-15 には glm-5.3-flash の一部の provider が、3万トークン読ませても空の JSON だけを返したり、出力の上限まで暴走したりした。builder は長い区切り (`MEMORY_TREE_EMPTY_CHARS`、既定 4000 字) で出来事も知識も空なら読めていないとみなし、その provider と途中で切れた provider を3時間外して送り直す。最初から外したい provider は `MEMORY_TREE_IGNORE_PROVIDERS` に書く。OpenRouter の「安い順」は主に入力の単価で並べるので、入力3万・出力4千トークンほどの区切りでは出力の高い provider (Reka は出力 $1.6/M、1回 $0.0094) が選ばれやすい。`MEMORY_TREE_MAX_PRICE=0.1,0.3` (入力,出力) で上限を付けると、StreamLake (1回 $0.0017) などに寄る。
 
 `--guild` を省くと `MEMORY_TREE_GUILD` を使う。builder は同時に1つだけ動く (ロック)。本番では `deploy/sakana-memory.service` を `deploy/sakana-memory.timer` で起動する。溜まっている分は読み切るまで続け、読み終えたら1時間おきに新着を読む。モデルを決める前に `try --model` で同じ区切りを候補ごとに読ませ、出来事の切り方・知識の書き方・捨てられた数を比べる。

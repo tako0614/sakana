@@ -35,6 +35,10 @@ const REASONING = {
 };
 
 const list = (value, fallback) => (value || fallback).split(',').map((item) => item.trim()).filter(Boolean);
+function priceOf(value) {
+  const [prompt, completion] = list(value, '').map(Number);
+  return Number.isFinite(prompt) && Number.isFinite(completion) && prompt > 0 && completion > 0 ? { prompt, completion } : null;
+}
 
 export const treeConfig = {
   models: list(process.env.MEMORY_TREE_MODELS, 'z-ai/glm-5.3-flash,inclusionai/ling-3.0-flash'),
@@ -63,6 +67,9 @@ export const treeConfig = {
   outputTokens: Number(process.env.MEMORY_TREE_OUTPUT_TOKENS || 16000),
   // 最初から外しておく provider (カンマ区切り)。壊れた出力を返したものは自動でも外す
   ignoreProviders: list(process.env.MEMORY_TREE_IGNORE_PROVIDERS, ''),
+  // provider の単価の上限 "入力,出力" (100万トークンあたり USD)。区切りは入力3万・出力4千トークンほどなので
+  // 出力の高い provider を避けたい (空なら予約の値段だけで縛る)
+  maxPrice: priceOf(process.env.MEMORY_TREE_MAX_PRICE),
   // これより長い区切りで出来事も知識も1つも無ければ、読めていないとみなす
   emptyChars: Number(process.env.MEMORY_TREE_EMPTY_CHARS || 4000),
   // これ以上待たされる 429 は日の上限とみなして止める
@@ -225,7 +232,7 @@ export function openRouterCaller({ guildId, models = treeConfig.models, runId = 
           maxOutputTokens: treeConfig.outputTokens, timeoutMs: treeConfig.timeoutMs,
           guildId, role: `memory-${kind}`, runId, budgetId, temperature: 0.2, reasoning: treeConfig.reasoning,
           // JSON 専用モード。glm-5.3-flash で約20回に1回 JSON が壊れていた
-          jsonOnly: true, ignoreProviders: ignored
+          jsonOnly: true, ignoreProviders: ignored, maxPrice: treeConfig.maxPrice
         });
         provider = data.provider ?? null;
         const message = data.choices[0].message;

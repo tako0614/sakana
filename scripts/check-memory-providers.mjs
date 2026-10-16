@@ -17,6 +17,7 @@ process.env.MEMORY_TREE_MODELS = 'check/memory-model';
 const { avoidProvider, avoidedProviders, checkSegmentOutput, openRouterCaller, treeConfig } = await import('../src/memory/build.js');
 
 const sent = [];
+const bodies = [];
 // provider ごとの返事: 空の JSON・暴走 (length で切れる)・まともな結果
 const replies = {
   Empty: { finish_reason: 'stop', content: '{"episodes":[],"facts":[]}' },
@@ -30,6 +31,7 @@ globalThis.fetch = async (url, init) => {
   }
   const body = JSON.parse(init.body);
   sent.push(body.provider?.ignore ?? []);
+  bodies.push(body);
   // OpenRouter は ignore に無い先のうち安い順に回す。ここでは order の先頭から
   const provider = order.find((name) => !(body.provider?.ignore ?? []).includes(name));
   const reply = replies[provider];
@@ -62,6 +64,18 @@ const { getState: savedState } = await import('../src/memory/store.js');
 assert.deepEqual(Object.keys(savedState('bad-providers')).sort(), ['Empty', 'Runaway'], 'avoided providers survive a restart');
 assert.deepEqual(avoidedProviders(Date.now() + 4 * 3_600_000), [], 'they come back after three hours');
 avoidProvider('Empty'); avoidProvider('Runaway');
+
+// --- 単価の上限: 予約の値段と、出力の高い provider を避ける上限の低い方を送る ---
+assert.deepEqual(bodies[0].provider.max_price, { prompt: 0.1, completion: 0.3, request: 0 }, 'only the reserved price caps by default');
+treeConfig.maxPrice = { prompt: 0.05, completion: 0.2 };
+bodies.length = 0;
+await call({ kind: 'segment', system: 's', user: 'u', check: (json) => checkSegmentOutput(longPack, json) });
+assert.deepEqual(bodies[0].provider.max_price, { prompt: 0.05, completion: 0.2, request: 0 }, 'the tighter cap wins: ' + JSON.stringify(bodies[0].provider));
+treeConfig.maxPrice = { prompt: 1, completion: 1 };
+bodies.length = 0;
+await call({ kind: 'segment', system: 's', user: 'u', check: (json) => checkSegmentOutput(longPack, json) });
+assert.deepEqual(bodies[0].provider.max_price, { prompt: 0.1, completion: 0.3, request: 0 }, 'a looser cap never raises the reserved price');
+treeConfig.maxPrice = null;
 
 // --- 次の呼び出しも最初から外したまま送る ---
 sent.length = 0;
@@ -110,4 +124,4 @@ assert.equal(memoryDb().prepare("SELECT status FROM segments WHERE guild_id = ? 
 assert.equal(getState(`retry:${G}:c1:200`), null, 'the retry counter starts over');
 assert.equal(reopenEmptySegments(G, { minChars: 4000 }).length, 0);
 
-console.log('memory providers ok (空のまま完了した区切りを読み直しに回す / 外した provider は DB に控えて3時間 / 回す先が無くなったら忘れる / 長い区切りの空は失敗 / 空・暴走の provider を外して取り直す / 外したまま次も送る / 取り直しは2回まで)');
+console.log('memory providers ok (単価の上限は予約と設定の低い方 / 空のまま完了した区切りを読み直しに回す / 外した provider は DB に控えて3時間 / 回す先が無くなったら忘れる / 長い区切りの空は失敗 / 空・暴走の provider を外して取り直す / 外したまま次も送る / 取り直しは2回まで)');

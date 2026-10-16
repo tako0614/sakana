@@ -170,6 +170,20 @@ function validateRoutes(model, fallbackModels) {
 }
 
 /** All requests share transport and accounting; the host runtime owns tools and effects. */
+// 予約した値段 (予算つき) と、呼び出し側の上限 ({ prompt, completion }、100万トークンあたり USD) の低い方。
+// OpenRouter の sort:'price' は主に入力の単価で並べるので、出力の多い使い方では出力の高い provider を
+// 先に選ぶ (glm-5.3-flash で Reka が出力 $1.6/M、1回 $0.0094 = StreamLake の5.5倍だった)。
+function priceCap(reservation, maxPrice) {
+  const pick = (reserved, limit) => [reserved, limit].filter(value => Number.isFinite(value)).reduce((a,b) => Math.min(a,b), Infinity);
+  const cap = {
+    prompt:pick(reservation.capped ? reservation.rates.input : NaN, maxPrice?.prompt),
+    completion:pick(reservation.capped ? reservation.rates.output : NaN, maxPrice?.completion)
+  };
+  if (reservation.capped) cap.request = reservation.rates.request ?? 0;
+  for (const key of ['prompt','completion']) if (cap[key] === Infinity) delete cap[key];
+  return cap;
+}
+
 /** OpenRouter が数えたこのキーの請求額 (USD)。累計・今日・今週・今月 (いずれも UTC)。 */
 export async function fetchKeyUsage({ timeoutMs = 15000 } = {}) {
   if (!providerConfig.apiKey) throw new Error('OPENROUTER_API_KEY is not configured');
@@ -184,7 +198,8 @@ export async function fetchKeyUsage({ timeoutMs = 15000 } = {}) {
 
 export async function requestModel({ model = providerConfig.model,fallbackModels = [],messages,tools,jsonOnly = false,
   maxOutputTokens = 8000,timeoutMs = 120000,deadlineAt = Infinity,reasoning,temperature,
-  guildId = null,role = 'chat',runId = null,retries = 0,budgetId = null,consumeRequest,beforeSend,ignoreProviders = [] }) {
+  guildId = null,role = 'chat',runId = null,retries = 0,budgetId = null,consumeRequest,beforeSend,ignoreProviders = [],
+  maxPrice = null }) {
   if (!providerConfig.apiKey) throw new Error('OPENROUTER_API_KEY is not configured');
   if (!Number.isInteger(retries) || retries < 0) throw new Error('retries must be a nonnegative integer');
   const routes = validateRoutes(model,fallbackModels);
@@ -225,8 +240,7 @@ export async function requestModel({ model = providerConfig.model,fallbackModels
             body:JSON.stringify({ model:route,messages,stream:false,max_tokens:maxOutputTokens,
               provider:{sort:'price',require_parameters:true,allow_fallbacks:true,
                 ...(ignoreProviders.length ? {ignore:ignoreProviders} : {}),
-                ...(reservation.capped ? {max_price:{prompt:reservation.rates.input,
-                  completion:reservation.rates.output,request:reservation.rates.request ?? 0}} : {})},
+                ...(reservation.capped || maxPrice ? {max_price:priceCap(reservation,maxPrice)} : {})},
               ...(tools?.length ? {tools,tool_choice:'auto'} : {}),
               ...(jsonOnly ? {response_format:{type:'json_object'}} : {}),
               ...(reasoning ? {reasoning} : {}),...(temperature !== undefined ? {temperature} : {}) })
