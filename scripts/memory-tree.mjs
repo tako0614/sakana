@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { db as archive } from '../src/archive/db.js';
 import { modelBudgetStatus, settleUnknownCalls } from '../src/ai/cost.js';
 import { fetchKeyUsage } from '../src/ai/provider.js';
-import { StopRun, openRouterCaller, runBuild, segmentPrompt, treeConfig } from '../src/memory/build.js';
+import { StopRun, budgetIdFor, openRouterCaller, runBuild, segmentPrompt, treeConfig } from '../src/memory/build.js';
 import {
   getCursor, getNode, getState, loadPublicChannels, memoryCounts, memoryDb, reopenEmptySegments, resetTree, segmentStats
 } from '../src/memory/store.js';
@@ -75,7 +75,7 @@ function status() {
     lock: lock ? { ...lock, at: day(lock.at) } : null
   };
   if (treeConfig.budgetUsd > 0) {
-    try { report.budget = modelBudgetStatus(`memory-tree:${guildId}:${treeConfig.budgetUsd}`); } catch { report.budget = null; }
+    try { report.budget = modelBudgetStatus(budgetIdFor(guildId)); } catch { report.budget = null; }
   }
   console.log(JSON.stringify(report, null, 2));
 }
@@ -186,7 +186,7 @@ switch (command) {
   case 'recall': console.log(recallFor(guildId, { request: String(args.text ?? '') }) || '(何も思い出さない)'); break;
   case 'root': console.log(memoryRootPrompt(guildId) || '(まだ木がありません)'); break;
   case 'export': exportTree(); break;
-  case 'settle': await settle(console.log); console.log(JSON.stringify(modelBudgetStatus(`memory-tree:${guildId}:${treeConfig.budgetUsd}`))); break;
+  case 'settle': await settle(console.log); console.log(JSON.stringify(modelBudgetStatus(budgetIdFor(guildId)))); break;
   case 'reopen-empty': {
     const rows = reopenEmptySegments(guildId, { minChars: Number(args['min-chars'] ?? treeConfig.emptyChars), apply: Boolean(args.yes) });
     const messages = rows.reduce((sum, row) => sum + row.messages, 0);

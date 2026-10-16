@@ -14,7 +14,11 @@ import assert from 'node:assert/strict';
 process.env.OPENROUTER_API_KEY ||= 'check';
 process.env.MEMORY_TREE_BUDGET_USD = '1';
 process.env.MEMORY_TREE_MODELS = 'check/memory-model';
-const { avoidProvider, avoidedProviders, checkSegmentOutput, openRouterCaller, treeConfig } = await import('../src/memory/build.js');
+const { avoidProvider, avoidedProviders, budgetIdFor, checkSegmentOutput, openRouterCaller, treeConfig } = await import('../src/memory/build.js');
+
+// --- 予算は月 (UTC) ごとの枠。読み終えた後も新着を読み続けるので、通算だといずれ止まる ---
+assert.equal(budgetIdFor('g', Date.UTC(2026, 9, 31, 23)), 'memory-tree:g:2026-10:1');
+assert.equal(budgetIdFor('g', Date.UTC(2026, 10, 1)), 'memory-tree:g:2026-11:1', 'a new month starts a new budget');
 
 const sent = [];
 const bodies = [];
@@ -124,4 +128,4 @@ assert.equal(memoryDb().prepare("SELECT status FROM segments WHERE guild_id = ? 
 assert.equal(getState(`retry:${G}:c1:200`), null, 'the retry counter starts over');
 assert.equal(reopenEmptySegments(G, { minChars: 4000 }).length, 0);
 
-console.log('memory providers ok (単価の上限は予約と設定の低い方 / 空のまま完了した区切りを読み直しに回す / 外した provider は DB に控えて3時間 / 回す先が無くなったら忘れる / 長い区切りの空は失敗 / 空・暴走の provider を外して取り直す / 外したまま次も送る / 取り直しは2回まで)');
+console.log('memory providers ok (予算は月ごと / 単価の上限は予約と設定の低い方 / 空のまま完了した区切りを読み直しに回す / 外した provider は DB に控えて3時間 / 回す先が無くなったら忘れる / 長い区切りの空は失敗 / 空・暴走の provider を外して取り直す / 外したまま次も送る / 取り直しは2回まで)');

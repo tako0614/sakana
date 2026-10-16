@@ -35,12 +35,15 @@ export function memoryStatus(guildId, { budgetUsd = 0, now = Date.now() } = {}) 
     if (!latest || (cursor && cursor.last_ms >= latest)) caughtUp += 1;
   }
 
-  let spent = { usd: 0, calls: 0 };
+  // 上限は月 (UTC) ごとなので、今月のぶんと累計を分けて出す
+  let spent = { usd: 0, calls: 0, month: 0 };
   try {
+    const date = new Date(now);
     spent = archive.prepare(`
-      SELECT COALESCE(SUM(COALESCE(reported_usd, estimated_usd, 0)), 0) AS usd, COUNT(*) AS calls
+      SELECT COALESCE(SUM(COALESCE(reported_usd, estimated_usd, 0)), 0) AS usd, COUNT(*) AS calls,
+        COALESCE(SUM(CASE WHEN started_at >= ? THEN COALESCE(reported_usd, estimated_usd, 0) ELSE 0 END), 0) AS month
       FROM ai_model_calls WHERE guild_id = ? AND role LIKE 'memory-%'
-    `).get(guildId);
+    `).get(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1), guildId);
   } catch {
     // 台帳がまだ無い (一度も呼んでいない)
   }
@@ -51,7 +54,7 @@ export function memoryStatus(guildId, { budgetUsd = 0, now = Date.now() } = {}) 
     totals, remaining, etaHours, lastHour,
     channels: { total: channels.length, caughtUp },
     memory: memoryCounts(guildId),
-    spentUsd: spent.usd, calls: spent.calls, budgetUsd,
+    spentUsd: spent.usd, monthUsd: spent.month, calls: spent.calls, budgetUsd,
     running: Boolean(lock && now - lock.at < LOCK_FRESH_MS),
     paused: getState(`pause:${guildId}`)
   };

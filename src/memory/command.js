@@ -35,12 +35,12 @@ function statusEmbed(status) {
   const progress = status.totals
     ? `${number(status.read)} / ${number(status.totals.messages)} 件 (${percent(status.read, status.totals.messages)})`
     : `${number(status.read)} 件 (総数は builder の初回で数える)`;
-  const eta = status.remaining === 0 ? '読み終えた (新着は1時間おき)'
+  const eta = status.remaining === 0 ? '読み終えた (新着は15分おきに見て、会話が1時間止まったら読む)'
     : status.etaHours === null ? '直近1時間に進んでいないので見込みなし'
       : `あと約 ${status.etaHours < 1 ? `${Math.ceil(status.etaHours * 60)} 分` : `${status.etaHours.toFixed(1)} 時間`} (直近1時間 ${number(status.lastHour.messages)} 件)`;
   const state = status.paused ? `⏸ 一時停止中 (${status.paused.by})`
-    : status.running ? '▶ 読み込み中' : '待機中 (timer が1時間おきに起動)';
-  const budget = status.budgetUsd > 0 ? ` / 上限 $${status.budgetUsd}` : '';
+    : status.running ? '▶ 読み込み中' : '待機中 (timer が15分おきに起動)';
+  const budget = status.budgetUsd > 0 ? ` / 月の上限 $${status.budgetUsd}` : '';
   return new EmbedBuilder()
     .setColor('#2b2d31')
     .setTitle('🧠 記憶の本')
@@ -53,7 +53,7 @@ function statusEmbed(status) {
       { name: '区切り', value: `${number(status.done)} 回${status.failed ? ` / 失敗 ${status.failed}` : ''}`, inline: true },
       { name: '記憶', value: `ページ ${number(status.memory.pages)} / 出来事 ${number(status.memory.episodes)} / つながり ${number(status.memory.links)}`
         + (status.memory.pendingPages ? ` / 統合待ち ${status.memory.pendingPages} ページ` : '') },
-      { name: '費用', value: `$${status.spentUsd.toFixed(3)}${budget} (${number(status.calls)} 回)`, inline: true },
+      { name: '費用', value: `今月 $${(status.monthUsd ?? status.spentUsd).toFixed(3)}${budget} (累計 $${status.spentUsd.toFixed(3)} · ${number(status.calls)} 回)`, inline: true },
       { name: 'モデル', value: treeConfig.models.join(' → ').slice(0, 1000), inline: true },
       { name: '追加したチャンネル (@everyone 以外)', value: status.included.length
         ? status.included.map((id) => `<#${id}>`).join(' ').slice(0, 1000) : 'なし (公開チャンネルだけ)' }

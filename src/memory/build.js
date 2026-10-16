@@ -45,13 +45,15 @@ function priceOf(value) {
 
 export const treeConfig = {
   models: list(process.env.MEMORY_TREE_MODELS, 'z-ai/glm-5.3-flash,inclusionai/ling-3.0-flash'),
-  // 有料の route を使うには累計の上限 (USD) が要る。0 なら :free しか使わない。
+  // 有料の route を使うには月の上限 (USD、UTC の暦月ごと) が要る。0 なら :free しか使わない。
+  // 読み終えた後も新着を読み続けるので、通算の上限だといずれ止まる
   budgetUsd: Number(process.env.MEMORY_TREE_BUDGET_USD || 0),
   reasoning: REASONING[process.env.MEMORY_TREE_REASONING || 'low'] ?? REASONING.low,
   segmentChars: Number(process.env.MEMORY_TREE_SEGMENT_CHARS || 40000),
-  // 新着の尻尾がこれ未満で、まだ会話が続いていそうなら次の起動まで貯める
+  // 新着の尻尾がこれ未満で、まだ会話が続いていそうなら次の起動まで貯める。
+  // 1時間止まったら読む (timer は15分おき)。日々の会話をその日のうちに入れる
   minChars: Number(process.env.MEMORY_TREE_MIN_CHARS || 6000),
-  idleMs: Number(process.env.MEMORY_TREE_IDLE_MS || 12 * 3_600_000),
+  idleMs: Number(process.env.MEMORY_TREE_IDLE_MS || 3_600_000),
   // ページの統合待ちがこれだけ溜まったら書き直す。読み終えたら残りも書き直す
   // (3000 だと人のページの 149 件中 1 件しか本文にならず、ほとんど「まとめ中」のままだった)
   integrateChars: Number(process.env.MEMORY_TREE_INTEGRATE_CHARS || 1200),
@@ -203,12 +205,17 @@ function budgetFor(guildId, models) {
   if (!(treeConfig.budgetUsd > 0)) {
     // stealth (stealth/xxx-alpha) は :free が付かないが 0 円。期間が終わると有料の別名になったり
     // 消えたりするので、値段が変わったときの上限としてここで止める
-    throw new StopRun(`:free でないモデル (${paid.join(', ')}) を使うには MEMORY_TREE_BUDGET_USD に上限を置いてください`
+    throw new StopRun(`:free でないモデル (${paid.join(', ')}) を使うには MEMORY_TREE_BUDGET_USD に月の上限を置いてください`
       + ' (stealth など 0 円のモデルでも、値段が変わったときの安全装置として 1 などを置く)', 'config');
   }
-  const id = `memory-tree:${guildId}:${treeConfig.budgetUsd}`;
+  const id = budgetIdFor(guildId);
   ensureModelBudget({ id, guildId, limitUsd: treeConfig.budgetUsd });
   return id;
+}
+
+/** 予算の台帳の id。月 (UTC) ごとに新しい枠になる。 */
+export function budgetIdFor(guildId, now = Date.now()) {
+  return `memory-tree:${guildId}:${new Date(now).toISOString().slice(0, 7)}:${treeConfig.budgetUsd}`;
 }
 
 // 壊れた出力を返す provider をしばらく外す。

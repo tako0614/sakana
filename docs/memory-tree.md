@@ -84,7 +84,7 @@ Evex の人間の発言は約129万件 (2,267万字) で、そのうち公開チ
 
 :free の枠は1分20回・1日50回で、OpenRouter でクレジットを累計10ドル以上買っていれば1日1000回。待てば済む 429 は待ち、10分より先まで待たされる 429 は日の上限とみなして止まる。次の timer 起動で続きから読む。
 
-有料モデルを混ぜるときは `MEMORY_TREE_BUDGET_USD` に累計の上限を置く。0 のままだと `:free` 以外の route を拒否する。
+有料モデルを混ぜるときは `MEMORY_TREE_BUDGET_USD` に月の上限を置く (UTC の暦月ごとに新しい枠。読み終えた後も新着を読み続けるので、通算の上限ではいずれ止まる)。0 のままだと `:free` 以外の route を拒否する。
 
 OpenRouter の stealth モデル (`stealth/space-bunny-alpha` のような匿名のテスト中モデル) は `:free` が付かないが 0 円で、無料枠の回数制限とは別に使える。期間が終わると消えるか有料の別名になるので、`MEMORY_TREE_MODELS=stealth/<名前>,google/gemma-4-31b-it:free,...` のように先頭に置き、`MEMORY_TREE_BUDGET_USD=1` を安全装置として置く。消えた route は価格が取れずに次のモデルへ落ちる。stealth は入力を記録・学習に使う前提のものが多い。費用は既存の `ai_model_calls` 台帳に `memory-segment` / `memory-integrate` / `memory-root` として残る。
 
@@ -133,4 +133,4 @@ node scripts/memory-tree.mjs settle   --guild ID   # 結果の返らなかった
 
 provider の当たり外れ: OpenRouter は同じモデルを複数の provider に回す。2026-10-15 には glm-5.3-flash の一部の provider が、3万トークン読ませても空の JSON だけを返したり、出力の上限まで暴走したりした。builder は長い区切り (`MEMORY_TREE_EMPTY_CHARS`、既定 4000 字) で出来事も知識も空なら読めていないとみなし、その provider と途中で切れた provider を3時間外して送り直す。最初から外したい provider は `MEMORY_TREE_IGNORE_PROVIDERS` に書く。OpenRouter の「安い順」は主に入力の単価で並べるので、入力3万・出力4千トークンほどの区切りでは出力の高い provider (Reka は出力 $1.6/M、1回 $0.0094) が選ばれやすい。`MEMORY_TREE_MAX_PRICE=0.1,0.3` (入力,出力) で上限を付けると、StreamLake (1回 $0.0017) などに寄る。
 
-`--guild` を省くと `MEMORY_TREE_GUILD` を使う。builder は同時に1つだけ動く (ロック)。本番では `deploy/sakana-memory.service` を `deploy/sakana-memory.timer` で起動する。溜まっている分は読み切るまで続け、読み終えたら1時間おきに新着を読む。モデルを決める前に `try --model` で同じ区切りを候補ごとに読ませ、出来事の切り方・知識の書き方・捨てられた数を比べる。
+`--guild` を省くと `MEMORY_TREE_GUILD` を使う。builder は同時に1つだけ動く (ロック)。本番では `deploy/sakana-memory.service` を `deploy/sakana-memory.timer` で起動する。溜まっている分は読み切るまで続け、読み終えたら15分おきに起動して新着を読む。会話が1時間止まるか、新着が 6,000 字溜まったチャンネルから読むので、日々の会話はその日のうちに入る。モデルを決める前に `try --model` で同じ区切りを候補ごとに読ませ、出来事の切り方・知識の書き方・捨てられた数を比べる。

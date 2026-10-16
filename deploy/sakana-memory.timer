@@ -1,9 +1,9 @@
 [Unit]
-Description=Grow the Sakana memory tree every hour
+Description=Grow the Sakana memory tree every 15 minutes (new chat goes in once a channel has been quiet for an hour)
 
 [Timer]
 OnBootSec=10min
-OnUnitInactiveSec=1h
+OnUnitInactiveSec=15min
 Persistent=true
 
 [Install]
