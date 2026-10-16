@@ -5,6 +5,7 @@ import { db as archive } from '../archive/db.js';
 import { ensureModelBudget } from '../ai/cost.js';
 import {
   MAX_DEPTH, addAliases, placeTopLevel, topLevels, addPending, depthOf, ensureNode, ensureSeeds, flushPendingRaw, getNode, getState,
+  parentOf,
   insertEpisode, linkEpisodeNodes, linkEpisodes, linkPageMentions, listChildren, loadPublicChannels, memoryDb, nameOf,
   normalizePath, pendingNodes, recordSegment, resolveExisting, setCursor, setState, treeIndex, writePage
 } from './store.js';
@@ -56,8 +57,10 @@ export const treeConfig = {
   integrateChars: Number(process.env.MEMORY_TREE_INTEGRATE_CHARS || 1200),
   // 1回の統合は小さめに (8ページ・3万字だと出力が長く、1回2〜3分かかった)
   integrateBatchChars: 15000,
-  // 1回に書き直すページ数の上限。大きいページは文字数の上限で先に切れる (小さい新ページは10件まとめる)
-  integratePages: 10,
+  // 1回に書き直すページ数の上限。本文の無い新しいページは小さいので10件まとめる
+  // (本文のあるページを10件束ねると、一部を書かずに返した)
+  integratePages: 4,
+  newPages: 10,
   // 統合待ちがこれだけ溜まったページは、書き直す前に子ページへ仕分ける。
   // 1万字を超える知識を本文3000字へ書き直させると、モデルは千字ほどに縮めて「削りすぎ」で却下され続けた
   sortChars: Number(process.env.MEMORY_TREE_SORT_CHARS || 6000),
@@ -143,7 +146,8 @@ const INTEGRATE_SYSTEM = `あなたは Discord サーバーの「記憶の本」
 
 export const SORT_SYSTEM = `あなたは Discord サーバーの「記憶の本」の編集者です。知識が溜まりすぎた1つのページの「新しい知識」を、子ページに仕分けます。書き直しはしません (番号で振り分けるだけ)。
 
-- 子ページはそのページの中のまとまり。人物なら「技術・言語観」「Linux・環境」「作ったもの」「人間関係」「名言・ネタ」「経歴・近況」のように、中身に合わせて 3〜8 個。今ある子ページに合うものはその名前を使う。
+- 子ページはそのページの中のまとまり。中身に合わせて 3〜8 個 (人物のページなら、例えば技術の好み・作ったもの・人間関係・名言・経歴のように)。今ある子ページに合うものはその名前を使う。
+- そのページ自体が大きなページの一部 (「親のページ」が書いてある) なら、その部分の中をさらに細かい話題で分ける。親や兄弟のページと同じ名前は使わない。
 - 子の名前は短い日本語 (20字以内)。/ や [ ] は使わない。ページ自身の名前は付けない (「あかりの技術」ではなく「技術・言語観」)。
 - そのページが何者か・何なのかを示す核になる知識 (概要に要るもの) だけ main に残す。main は全体の2割まで。
 - すべての番号をどこか1つに入れる。
@@ -489,18 +493,26 @@ export function applySortResult(guildId, job, result, { now = Date.now() } = {})
   const lines = sortLines(job.consumed);
   const owner = new Map();
   const groups = [];
+  // 兄弟や祖先と同じ名前の子は作らない (people/あかり/Linux・環境 を「技術・言語観」1つへ丸ごと移した)
+  // (兄弟を見るのは深いページだけ。people/あかり の兄弟は人の名前なので見ても意味がない)
+  const siblings = depthOf(job.path) >= 3 ? listChildren(guildId, parentOf(job.path), 200).map((row) => nameOf(row.path)) : [];
+  const taken = new Set([...job.path.split('/'), ...siblings].map(nameKeyOf));
+  const own = new Set(listChildren(guildId, job.path, 200).map((row) => nameKeyOf(nameOf(row.path))));
   for (const child of children.slice(0, 10)) {
     const name = childName(child?.name).slice(0, 24);
-    if (!name || name === nameOf(job.path)) continue;
+    if (!name || (taken.has(nameKeyOf(name)) && !own.has(nameKeyOf(name)))) continue;
     const picked = [...new Set((Array.isArray(child?.lines) ? child.lines : []).map(Number))]
       .filter((n) => Number.isInteger(n) && n >= 1 && n <= lines.length && !owner.has(n));
     if (picked.length === 0) continue;
     for (const n of picked) owner.set(n, groups.length);
     groups.push({ name, summary: String(child?.summary ?? '').trim().slice(0, 80), lines: picked });
   }
-  // 子へ4割も回さないなら仕分けになっていない (本文に戻すだけで終わる)
+  // 子へ4割も回さないなら仕分けになっていない (本文に戻すだけで終わる)。1つの子へ9割以上なら、名前を変えただけ
   if (groups.length === 0 || owner.size < lines.length * 0.4) {
     throw badOutput(`sort moved too little (${owner.size}/${lines.length})`);
+  }
+  if (groups.length < 2 || Math.max(...groups.map((group) => group.lines.length)) > owner.size * 0.9) {
+    throw badOutput(`sort did not split (${groups.map((group) => `${group.name}:${group.lines.length}`).join(', ')})`);
   }
   const main = lines.filter((_, i) => !owner.has(i + 1));
   const known = memoryDb().prepare('SELECT 1 FROM episodes WHERE guild_id = ? AND id = ?');
@@ -561,10 +573,11 @@ function integratePrompt(guildId, batch) {
       ...(node.aliases.length ? [`別名: ${node.aliases.join(', ')}`] : []),
       depthOf(item.path) >= MAX_DEPTH ? '(深さの上限なので子ページは作れない)' : `子ページ: ${children.join(' / ') || '(なし)'}`,
       // 何字残せばよいかを数字で渡す (渡さないと、1万字を千字に縮めて却下されていた)
+      // 何字かを数字で渡す。「何字以上残せ」と下限を渡すと本文を長くしすぎた (6000字を超えて却下)
       depthOf(item.path) >= MAX_DEPTH
         ? `(本文と新しい知識で約${node.body.length + item.consumed.length}字。本文は${treeConfig.bodyChars}字以内に要約する)`
-        : `(本文と新しい知識で約${node.body.length + item.consumed.length}字。本文は${treeConfig.bodyChars}字以内、`
-          + `本文と子ページで合わせて${Math.ceil((node.body.length + item.consumed.length) * 0.4)}字以上残す)`,
+        : `(本文と新しい知識で約${node.body.length + item.consumed.length}字。本文は${treeConfig.bodyChars}字以内。`
+          + '収まらない分はまとまりごとに子ページへ移す (今ある子ページの名前を使ってよい)。捨てるのは重複だけ)',
       '現在の本文:',
       node.body || '(まだ無い)',
       '新しい知識:',
@@ -575,13 +588,19 @@ function integratePrompt(guildId, batch) {
 }
 
 const sortLines = (consumed) => consumed.split('\n').filter((line) => line.trim());
+const nameKeyOf = (name) => String(name ?? '').normalize('NFKC').toLowerCase().replace(/[\s・･_\-]/g, '');
 
 export function sortPrompt(guildId, job) {
   const node = getNode(guildId, job.path);
   const children = listChildren(guildId, job.path, 30).map((child) => `${nameOf(child.path)} — ${child.summary || ''}`);
   const lines = sortLines(job.consumed);
+  const parent = parentOf(job.path);
+  const siblings = depthOf(job.path) >= 3
+    ? listChildren(guildId, parent, 30).map((row) => nameOf(row.path)).filter((name) => name !== nameOf(job.path)) : [];
   return [
     `ページ: ${job.path}`,
+    ...(depthOf(job.path) >= 3 ? [`親のページ: ${parent} (このページはその中の「${nameOf(job.path)}」の部分)`,
+      `兄弟のページ (この名前は使わない): ${siblings.join(' / ') || '(なし)'}`] : []),
     `説明: ${node.summary || '(なし)'}`,
     `本文の冒頭: ${node.body.slice(0, 600) || '(まだ無い)'}`,
     `今ある子ページ: ${children.join(' / ') || '(なし)'}`,
@@ -687,7 +706,7 @@ function integrationBatch(guildId, { minChars, skip, newOnly = false }) {
     }
     batch.push({ path: row.path, consumed });
     used += node.body.length + consumed.length + 400;
-    if (batch.length >= treeConfig.integratePages || used >= treeConfig.integrateBatchChars) break;
+    if (batch.length >= (newOnly ? treeConfig.newPages : treeConfig.integratePages) || used >= treeConfig.integrateBatchChars) break;
   }
   return batch.length ? batch : null;
 }

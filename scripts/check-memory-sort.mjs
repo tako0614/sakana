@@ -103,7 +103,8 @@ const topicCalls = calls.filter((c) => c.kind === 'integrate' && c.user.includes
 assert.ok(topicCalls.length <= 2, `12 new pages need at most 2 calls, got ${topicCalls.length}`);
 for (let i = 0; i < 12; i += 1) assert.ok(st.getNode(G, `topics/話題${i}`).body.includes(`話題${i}の知識`), `new page ${i} gets a body`);
 // 統合の目安の字数を渡す
-assert.match(calls.find((c) => c.kind === 'integrate').user, /字以上残す\)|字以内に要約する\)/, 'the integrator is told how much to keep');
+assert.match(calls.find((c) => c.kind === 'integrate').user, /捨てるのは重複だけ\)|字以内に要約する\)/, 'the integrator is told the size and where the rest goes');
+assert.doesNotMatch(calls.find((c) => c.kind === 'integrate').user, /字以上残す/, 'no lower bound (it made bodies too long)');
 
 // --- 人のページの子は想起の照合に入れない ---
 forgetNames(G);
@@ -114,8 +115,24 @@ assert.ok(matchPages(G, 'あかりの話').some((m) => m.path === 'people/あか
 assert.throws(() => applySortResult(G, { path: 'people/あかり', consumed: '- a\n- b\n- c\n' }, { children: [{ name: 'x', lines: [1] }] }),
   /moved too little/);
 st.addPending(G, 'people/あかり', ['新しい行1', '新しい行2'], { firstAt: now, lastAt: now });
-assert.throws(() => applySortResult(G, { path: 'people/あかり', consumed: '- 別の行\n' }, { children: [{ name: 'x', lines: [1] }] }),
-  /pending changed/);
+assert.throws(() => applySortResult(G, { path: 'people/あかり', consumed: '- 別の行\n- 別の行2\n' },
+  { children: [{ name: 'x', lines: [1] }, { name: 'y', lines: [2] }] }), /pending changed/);
+
+// --- 名前を変えただけの仕分け (1つの子へ9割以上) と、兄弟の名前の子は受け取らない ---
+// 本番で people/あかり/Linux・環境 を兄弟と同じ「技術・言語観」1つへ丸ごと移した
+const many = Array.from({ length: 10 }, (_, i) => `- 環境の話 ${i + 1} [e${episodes[0]}]`).join('\n') + '\n';
+st.ensureNode(G, 'people/あかり/環境');
+st.addPending(G, 'people/あかり/環境', many.trim().split('\n'), { firstAt: now, lastAt: now });
+const job = { path: 'people/あかり/環境', consumed: st.getNode(G, 'people/あかり/環境').pending };
+assert.throws(() => applySortResult(G, job, { children: [{ name: 'ぜんぶ', lines: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] }] }), /did not split/);
+assert.throws(() => applySortResult(G, job, { children: [{ name: '技術・言語観', lines: [1, 2, 3, 4, 5, 6] }, { name: '機材', lines: [7, 8, 9, 10] }] }),
+  /moved too little|did not split/, 'a child named like a sibling is dropped, and what is left is not a sort');
+const ok = applySortResult(G, job, { children: [{ name: 'ディストロ', lines: [1, 2, 3, 4, 5] }, { name: '機材', lines: [6, 7, 8, 9] }] });
+assert.deepEqual(ok.children.sort(), ['ディストロ', '機材'].sort());
+assert.equal(ok.kept, 1);
+const sortPromptText = (await import('../src/memory/build.js')).sortPrompt(G, { path: 'people/あかり/環境', consumed: '- x\n' });
+assert.match(sortPromptText, /親のページ: people\/あかり/);
+assert.match(sortPromptText, /兄弟のページ \(この名前は使わない\): .*技術・言語観/, 'a deep page sees its siblings');
 
 // --- 仕分けに3回失敗したら普通の統合へ戻す ---
 st.ensureNode(G, 'people/たこ');
