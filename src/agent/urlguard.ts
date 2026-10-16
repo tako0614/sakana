@@ -11,21 +11,36 @@
 import dns from 'node:dns';
 import net from 'node:net';
 
+/** 検査の結果。ok なら正規化した url、だめならモデルにそのまま返せる理由。 */
+export type UrlVerdict = { ok: true; url: string } | { ok: false; reason: string };
+
+/** 内部宛てで断るときの文。どの IP だったかは書かない (下の inspectUrl の注記)。 */
+export const INTERNAL_REASON = '内部ネットワーク宛なので開けません。';
+
+/**
+ * 名前を引いて断るときの文。「引けなかった」と「内部を指していた」を同じ文にする。
+ * 分けると、名前を渡すだけで社内 DNS にその名前があるかを調べられてしまう。
+ */
+export const UNRESOLVED_REASON = 'ホスト名を解決できないか、内部ネットワーク宛なので開けません。';
+
 // about:blank だけは例外的に通す (タブの初期化に使う)。
 // file: / data: / chrome: / devtools: / view-source: は AGENT_BROWSER_ALLOW_LOCAL でも開けない。
 // ローカルファイルを読ませる用途はブラウザ経由でやるべきものではない。
 const ALLOWED_SCHEMES = new Set(['http:', 'https:']);
 
 // 同じホストへの lookup を繰り返さない (ページ1枚でサブリソースごとに呼ばれる)。
-const lookupCache = new Map();
+const lookupCache = new Map<string, { at: number; addresses: string[] }>();
 const LOOKUP_TTL_MS = 60_000;
 const LOOKUP_CACHE_MAX = 500;
+const LOOKUP_TIMEOUT_MS = 5000;
 
-function ipv4Blocked(ip) {
+function ipv4Blocked(ip: string): boolean {
   const parts = ip.split('.').map(Number);
   if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
 
-  const [a, b] = parts;
+  // 4つあることは上で確かめた
+  const a = parts[0] ?? -1;
+  const b = parts[1] ?? -1;
 
   if (a === 0) return true; // 0.0.0.0/8 (0 は「このホスト」に化ける)
   if (a === 127) return true; // ループバック
@@ -46,16 +61,17 @@ function ipv4Blocked(ip) {
  * ::ffff:127.0.0.1 のような点表記も、::ffff:7f00:1 のような16進表記も
  * 同じ形に落として v4 として判定できるようにするために要る。
  */
-function expandIpv6(input) {
+function expandIpv6(input: unknown): number[] | null {
   let text = String(input).toLowerCase().replace(/^\[|\]$/g, '');
 
   // 末尾が IPv4 表記なら 16bit 2つに畳む
   const tail = /:((?:\d{1,3}\.){3}\d{1,3})$/.exec(text);
-  if (tail) {
+  if (tail?.[1] !== undefined) {
     const octets = tail[1].split('.').map(Number);
     if (octets.some((n) => !Number.isInteger(n) || n > 255)) return null;
-    const hi = (((octets[0] << 8) | octets[1]) >>> 0).toString(16);
-    const lo = (((octets[2] << 8) | octets[3]) >>> 0).toString(16);
+    const [o0 = 0, o1 = 0, o2 = 0, o3 = 0] = octets;
+    const hi = (((o0 << 8) | o1) >>> 0).toString(16);
+    const lo = (((o2 << 8) | o3) >>> 0).toString(16);
     text = `${text.slice(0, tail.index)}:${hi}:${lo}`;
   }
 
@@ -67,13 +83,13 @@ function expandIpv6(input) {
     ? (halves[1] ? halves[1].split(':').filter(Boolean) : [])
     : null;
 
-  let groups;
+  let groups: string[];
   if (right === null) {
     groups = left;
   } else {
     const fill = 8 - left.length - right.length;
     if (fill < 0) return null;
-    groups = [...left, ...Array(fill).fill('0'), ...right];
+    groups = [...left, ...Array<string>(fill).fill('0'), ...right];
   }
 
   if (groups.length !== 8) return null;
@@ -82,50 +98,61 @@ function expandIpv6(input) {
   return out.some((n) => !Number.isInteger(n) || n < 0 || n > 0xffff) ? null : out;
 }
 
-function ipv6Blocked(ip) {
+function ipv6Blocked(ip: string): boolean {
   const groups = expandIpv6(ip);
   if (!groups) return true; // 解釈できないものは通さない
 
+  // expandIpv6 は必ず 8 個返す
+  const [first = 0, second = 0, , , , sixth = 0, g6 = 0, g7 = 0] = groups;
+
   // IPv4-mapped (::ffff:x) と IPv4-compatible (::x) は v4 として判定する
-  if (groups.slice(0, 5).every((n) => n === 0) && (groups[5] === 0xffff || groups[5] === 0)) {
-    if (groups[5] === 0 && groups[6] === 0 && groups[7] <= 1) return true; // :: と ::1
-    const v4 = [groups[6] >> 8, groups[6] & 0xff, groups[7] >> 8, groups[7] & 0xff].join('.');
+  if (groups.slice(0, 5).every((n) => n === 0) && (sixth === 0xffff || sixth === 0)) {
+    if (sixth === 0 && g6 === 0 && g7 <= 1) return true; // :: と ::1
+    const v4 = [g6 >> 8, g6 & 0xff, g7 >> 8, g7 & 0xff].join('.');
     return ipv4Blocked(v4);
   }
 
-  const first = groups[0];
   if ((first & 0xfe00) === 0xfc00) return true; // fc00::/7 ULA
   if ((first & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
   if ((first & 0xff00) === 0xff00) return true; // ff00::/8 multicast
-  if (first === 0x64 && groups[1] === 0xff9b) return true; // 64:ff9b::/96 NAT64 (内部 v4 に化ける)
-  if (first === 0x2001 && groups[1] === 0x0db8) return true; // ドキュメント用
+  if (first === 0x64 && second === 0xff9b) return true; // 64:ff9b::/96 NAT64 (内部 v4 に化ける)
+  if (first === 0x2001 && second === 0x0db8) return true; // ドキュメント用
 
   return false;
 }
 
 /** この IP に出て行かせてよいか。判定できないものは全部止める。 */
-export function isBlockedAddress(ip) {
+export function isBlockedAddress(ip: unknown): boolean {
   const version = net.isIP(String(ip).replace(/^\[|\]$/g, ''));
   if (version === 4) return ipv4Blocked(String(ip));
   if (version === 6) return ipv6Blocked(String(ip));
   return true;
 }
 
-async function resolveHost(hostname) {
+async function resolveHost(hostname: string): Promise<string[]> {
   const cached = lookupCache.get(hostname);
   if (cached && Date.now() - cached.at < LOOKUP_TTL_MS) return cached.addresses;
 
-  let addresses = [];
+  let addresses: string[] = [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const found = await dns.promises.lookup(hostname, { all: true, verbatim: true });
+    // 返事を引き延ばす DNS で検査が止まり続けないように上限を付ける (引けなかった扱い)
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('dns lookup timed out')), LOOKUP_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    const found = await Promise.race([dns.promises.lookup(hostname, { all: true, verbatim: true }), timeout]);
     addresses = found.map((entry) => entry.address);
   } catch {
     addresses = [];
+  } finally {
+    clearTimeout(timer);
   }
 
   // 上限を超えたら古いものから捨てる (Map は挿入順)
-  if (lookupCache.size >= LOOKUP_CACHE_MAX) {
-    lookupCache.delete(lookupCache.keys().next().value);
+  const oldest = lookupCache.keys().next();
+  if (lookupCache.size >= LOOKUP_CACHE_MAX && !oldest.done) {
+    lookupCache.delete(oldest.value);
   }
   lookupCache.set(hostname, { at: Date.now(), addresses });
 
@@ -137,11 +164,11 @@ async function resolveHost(hostname) {
  * 例外は投げない — 呼び出し側がモデルへの文字列としてそのまま返せるように
  * { ok, url, reason } で返す (throw はツール失敗扱いになり、モデルが再試行を繰り返す)。
  */
-export async function inspectUrl(input, { allowLocal = false } = {}) {
+export async function inspectUrl(input: unknown, { allowLocal = false }: { allowLocal?: boolean } = {}): Promise<UrlVerdict> {
   const trimmed = String(input ?? '').trim();
   if (!trimmed) return { ok: false, reason: 'url を指定してください。' };
 
-  let parsed;
+  let parsed: URL;
   try {
     const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(trimmed);
     parsed = new URL(hasScheme ? trimmed : `https://${trimmed}`);
@@ -175,17 +202,19 @@ export async function inspectUrl(input, { allowLocal = false } = {}) {
 
   const addresses = await resolveHost(hostname);
   if (addresses.length === 0) {
-    return { ok: false, reason: `ホスト名を解決できませんでした: ${hostname}` };
+    return { ok: false, reason: UNRESOLVED_REASON };
   }
 
   // 1つでも内部を指していたら止める。DNS が複数返すときに
   // 公開 IP だけ見て通すと、そのあと内部側に繋がれる可能性が残る。
+  //
+  // 理由の文に解決先の IP は書かない。書くと、名前を渡すだけで内部の DNS を引ける
+  // 道具 (resolver oracle) になる。どこに解決されたかはサーバーのログにだけ残す。
+  // 「引けなかった」とも同じ文にする (上の UNRESOLVED_REASON)。
   const blocked = addresses.find((address) => isBlockedAddress(address));
   if (blocked) {
-    return {
-      ok: false,
-      reason: `${hostname} は内部アドレス (${blocked}) に解決されるので開けません。`
-    };
+    console.warn(`Browser URL refused: ${hostname} resolves to an internal address (${blocked}).`);
+    return { ok: false, reason: UNRESOLVED_REASON };
   }
 
   return { ok: true, url: parsed.href };

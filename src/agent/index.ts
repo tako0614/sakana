@@ -7,15 +7,24 @@
 // 呼ばれた時点で直近の会話を渡してしまうので、多くの場合ツールを1回も呼ばずに答える。
 
 import { DEFAULT_AGENT_ENGINE, agentModelFor, isAgentEngine } from './engines.js';
-import { recallFor } from '../memory/recall.js';
-import { AttachmentBuilder } from 'discord.js';
 import {
-  canBotAttach,
-  canBotSpeak,
-  canManageIndex,
-  getChannelScope
-} from '../archive/permissions.js';
+  AttachmentBuilder,
+  MessageReferenceType,
+  type Client,
+  type GuildMember,
+  type Message,
+  type MessageMentionOptions,
+  type MessageReplyOptions
+} from 'discord.js';
 import { isBareAck } from './ack.js';
+import {
+  archive,
+  governance,
+  memory,
+  mimic,
+  type GovernanceAttempt,
+  type TokenUsage
+} from './boundary.js';
 import { closeBrowserSandbox } from './browser.js';
 import { agentConfig, agentEnabled } from './config.js';
 import {
@@ -37,24 +46,30 @@ import {
   rememberAgentReply,
   reserveCall,
   usdToBudget,
-  weighCost
+  weighCost,
+  type Reservation
 } from './ratelimit.js';
-import { isSelfHosted } from '../mimic/client.js';
-import { engineFor } from '../mimic/prefs.js';
-import { handleMimicRequest } from '../mimic/respond.js';
 import { ThinkingIndicator, isIndicatorMessage, toolLabel } from './thinking.js';
 import { buildToolset } from './tools.js';
-import { reserveGovernanceAgentAttempt } from '../governance/service.js';
-import { getGovernanceGuild } from '../governance/db.js';
+import {
+  errorCode,
+  errorMessage,
+  type AgentContext,
+  type AgentMessage,
+  type ReferenceState,
+  type ReplyChain
+} from './types.js';
 
-const NO_MENTIONS = { parse: [], repliedUser: false };
+// 本文中のメンション (@everyone / @here / ロール / ユーザー) は一切通知にしない。
+// ユーザーやモデルの文章がそのまま届く場所なので、parse を空にして明示する。
+const NO_MENTIONS: MessageMentionOptions = { parse: [], repliedUser: false };
 
 // 回答の1通目だけ、聞いた人に通知を出す。
 //
 // 全部 NO_MENTIONS にしていたので、30〜60秒待たされた挙句リプライの ping が
 // 飛ばず、答えが返ったことに気付けなかった。本文中のメンションは引き続き無効
 // (`parse: []`)。誤爆を防ぐのはそちらの役目で、返信先への通知とは別の話。
-const PING_ASKER = { parse: [], repliedUser: true };
+const PING_ASKER: MessageMentionOptions = { parse: [], repliedUser: true };
 
 // bot が出す定型文の先頭。回答ではないので、次の実行の背景に混ぜない。
 // 金額と時刻が可変なので前方一致で見る。
@@ -65,7 +80,15 @@ const NOTICE_ERROR = 'エージェントの実行に失敗しました';
 
 const NOTICE_HEADS = [NOTICE_BUSY, NOTICE_USER_LIMIT, NOTICE_GLOBAL_LIMIT, NOTICE_ERROR];
 
-export function chatRunId({ guildId, channelId, memberId, messageId }) {
+/** 1つの Discord 入力を指す4つの ID。 */
+export interface ChatRunIdentity {
+  guildId: string | null | undefined;
+  channelId: string | null | undefined;
+  memberId: string | null | undefined;
+  messageId: string | null | undefined;
+}
+
+export function chatRunId({ guildId, channelId, memberId, messageId }: ChatRunIdentity): string {
   const identity = [guildId, channelId, memberId, messageId].map((value) => String(value ?? '').trim());
   if (identity.some((value) => !value)) throw new Error('Chat run identity requires guild, channel, member and message IDs');
   return `discord-chat:${JSON.stringify(identity)}`;
@@ -77,7 +100,10 @@ export function chatRunId({ guildId, channelId, memberId, messageId }) {
  * 経過表示と同じ理由。混ぜると「上限に達しました」が `←自分の発言` として
  * 次の実行の材料になり、モデルが自分の断り文を会話の一部として読む。
  */
-export function isAgentNotice(message, selfId) {
+export function isAgentNotice(
+  message: { authorId?: string; content?: string } | null | undefined,
+  selfId: string | null | undefined
+): boolean {
   if (!selfId || message?.authorId !== selfId) return false;
 
   const content = String(message.content ?? '');
@@ -89,18 +115,19 @@ export function isAgentNotice(message, selfId) {
 // 自分が送ったものを覚えておいて突き合わせる。メモリは速い経路で、実体は DB
 // (再起動を挟んでも続けられるように)。
 const OWN_REPLY_LIMIT = 500;
-const ownReplies = new Set();
+const ownReplies = new Set<string>();
 
-function rememberOwnReply(messageId, callId) {
+function rememberOwnReply(messageId: string | null | undefined, callId?: number): void {
   if (!messageId) return;
 
   ownReplies.add(messageId);
   // 古いものから落とす (Set は挿入順を保つ)
-  while (ownReplies.size > OWN_REPLY_LIMIT) {
-    ownReplies.delete(ownReplies.values().next().value);
+  for (const oldest of ownReplies) {
+    if (ownReplies.size <= OWN_REPLY_LIMIT) break;
+    ownReplies.delete(oldest);
   }
 
-  rememberAgentReply(messageId, callId);
+  rememberAgentReply(messageId, callId ?? null);
 }
 
 /**
@@ -114,9 +141,10 @@ function rememberOwnReply(messageId, callId) {
  *
  * @everyone / ロールメンション / リプライの自動メンションでは起動しない。
  */
-export function isAgentRequest(message, client) {
+export function isAgentRequest(message: Message, client: Client): boolean {
   if (!agentEnabled) return false;
-  if (!message.guildId || message.author?.bot) return false;
+  // bot / webhook の発言では起動しない。自分の回答への返信で自分が起動する輪を作らないため。
+  if (!message.guildId || message.author?.bot || message.webhookId) return false;
   if (!client.user) return false;
 
   const mentioned = message.mentions.has(client.user, {
@@ -146,9 +174,11 @@ export function isAgentRequest(message, client) {
  * コードが1行に潰れたままモデルへ渡っていた (人が読んでいる形と違うものを
  * 読ませることになる)。畳むのは行の中の連続空白だけ。
  */
-export function stripMention(content, clientId) {
+export function stripMention(content: unknown, clientId: string): string {
+  // clientId はスノーフレークだが、正規表現に埋めるので念のため記号を逃がしておく
+  const escaped = String(clientId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return String(content ?? '')
-    .replace(new RegExp(`<@!?${clientId}>`, 'g'), ' ')
+    .replace(new RegExp(`<@!?${escaped}>`, 'g'), ' ')
     .replace(/[^\S\n]+/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
@@ -160,7 +190,7 @@ const GOVERNANCE_TOPIC_PATTERN = /(憲法|法令集|官報|法律|現行法|法�
  * 統治に関する自然文は、選択中の雑談用mimic modelでは処理しない。
  * mimic modelにはsystem promptもtoolも無く、正本DBを読めないため。
  */
-export function isGovernanceAgentTopic(content) {
+export function isGovernanceAgentTopic(content: unknown): boolean {
   return GOVERNANCE_TOPIC_PATTERN.test(String(content ?? ''));
 }
 
@@ -172,7 +202,7 @@ export function isGovernanceAgentTopic(content) {
  * (Cookie の吸い出しも root でのファイル書き込みも射程に入る)。
  * 名指しの許可リストだけにして、既定では誰も持たない。
  */
-function canUseFullBrowser(member) {
+function canUseFullBrowser(member: Pick<GuildMember, 'id'>): boolean {
   if (agentConfig.browserFullForAll) return true;
   return agentConfig.browserTrustedUsers.includes(member.id);
 }
@@ -182,11 +212,11 @@ function canUseFullBrowser(member) {
  * 以前はハイフンを空白にしていたが、自作モデル側が `evex-ft-1-preview` の形なので
  * そちらと揃える。`/model` の表示・フッター・env の値が全部同じ綴りになる。
  */
-function modelLabel(model = agentConfig.model) {
+function modelLabel(model: string = agentConfig.model): string {
   return model;
 }
 
-function limitMessage(reservation) {
+function limitMessage(reservation: Extract<Reservation, { ok: false }>): string {
   if (reservation.scope === 'busy') {
     // 「他の人の質問」とは言わない。自分の2本目でもここに来る。
     return `${NOTICE_BUSY}。少し待ってからもう一度呼んでください。`;
@@ -202,7 +232,7 @@ function limitMessage(reservation) {
     : `${NOTICE_GLOBAL_LIMIT} (${window} ${amount})。${at} に空きます。`;
 }
 
-function attemptLimitMessage(reservation) {
+function attemptLimitMessage(reservation: GovernanceAttempt): string {
   const at = reservation.retryAt ? ` <t:${Math.floor(reservation.retryAt / 1000)}:R>に空きます。` : '';
   if (reservation.scope === 'sanction') {
     return `${NOTICE_USER_LIMIT}。現在の判決でエージェント利用が制限されています。${at}`;
@@ -219,16 +249,19 @@ function attemptLimitMessage(reservation) {
  * (エラー文の返信も同じ理由で失敗するので、ユーザーには何も出ないままトークンだけ払う)。
  * 返信先が消えていても答えは残す。
  */
-async function replyOrSend(message, payload) {
+async function replyOrSend(message: Message<true>, payload: MessageReplyOptions): Promise<Message<true> | null> {
   try {
     return await message.reply(payload);
   } catch (error) {
-    console.error('reply failed, sending to the channel instead:', error?.message ?? error);
+    console.error('reply failed, sending to the channel instead:', errorMessage(error));
     return await message.channel.send(payload).catch(() => null);
   }
 }
 
-async function fetchRecent(channel, { exclude, selfId, limit }) {
+async function fetchRecent(
+  channel: Message<true>['channel'],
+  { exclude, selfId, limit }: { exclude: Set<string>; selfId: string | undefined; limit: number }
+): Promise<AgentMessage[]> {
   if (limit <= 0 || typeof channel.messages?.fetch !== 'function') return [];
 
   try {
@@ -256,44 +289,43 @@ async function fetchRecent(channel, { exclude, selfId, limit }) {
 // 鎖をたどれば「いまの話題」だけを取り出せる。
 const REPLY_CHAIN_LIMIT = 6;
 
-export async function fetchReplyChain(message, channelName) {
-  const chain = [];
-  const seen = new Set([message.id]);
-  let node = message;
-  chain.referenceState = 'not_applicable';
+export async function fetchReplyChain(message: Message<true>, channelName?: string | null): Promise<ReplyChain> {
+  const chain: AgentMessage[] = [];
+  const seen = new Set<string>([message.id]);
+  let state: ReferenceState = 'not_applicable';
+  let node: Message<true> = message;
   while (node.reference?.messageId && chain.length < REPLY_CHAIN_LIMIT) {
     // A forwarded snapshot is quoted material attached to the sender's message.
     // It is not an interlocutor, nor a hop in this conversation's reply chain.
-    if (node.reference.type === 1 || node.messageSnapshots?.size) {
-      chain.referenceState = chain.length ? chain.referenceState : 'snapshot';
+    if (node.reference.type === MessageReferenceType.Forward || node.messageSnapshots?.size) {
+      state = chain.length ? state : 'snapshot';
       break;
     }
     const parentId = node.reference.messageId;
-    if (seen.has(parentId)) { chain.referenceState = 'cycle'; break; }
+    if (seen.has(parentId)) { state = 'cycle'; break; }
     seen.add(parentId);
     const targetChannelId = node.reference.channelId ?? node.channelId;
-    const targetChannel = targetChannelId === message.channelId ? message.channel
-      : message.guild?.channels?.cache?.get(targetChannelId);
     // Never follow a reference into a broader/different audience during preload.
     // The read tool can resolve explicit requests under its permission checks.
-    if (!targetChannel || targetChannelId !== message.channelId) {
-      chain.referenceState = 'unavailable'; break;
+    const targetChannel = targetChannelId === message.channelId ? message.channel : undefined;
+    if (!targetChannel) {
+      state = 'unavailable'; break;
     }
-    let parent = targetChannel.messages?.cache?.get(parentId);
+    let parent: Message<true> | undefined = targetChannel.messages?.cache?.get(parentId);
     if (!parent) {
       try { parent = await targetChannel.messages.fetch(parentId); }
-      catch (error) { chain.referenceState = Number(error.code) === 10008 ? 'deleted' : 'unavailable'; break; }
+      catch (error) { state = Number(errorCode(error)) === 10008 ? 'deleted' : 'unavailable'; break; }
     }
-    if (!parent) { chain.referenceState = 'unavailable'; break; }
+    if (!parent) { state = 'unavailable'; break; }
     chain.push(fromDiscordMessage(parent, parent.channel?.name ?? channelName));
-    chain.referenceState = 'resolved';
+    state = 'resolved';
     node = parent;
   }
-  if (chain.length === REPLY_CHAIN_LIMIT && node.reference?.messageId) chain.referenceState = 'depth_limit';
-  return chain.reverse();
+  if (chain.length === REPLY_CHAIN_LIMIT && node.reference?.messageId) state = 'depth_limit';
+  return Object.assign(chain.reverse(), { referenceState: state });
 }
 
-export async function handleAgentRequest(message, client) {
+export async function handleAgentRequest(message: Message<true>, client: Client<true>): Promise<void> {
   const guild = message.guild;
   const member = message.member ?? await guild.members.fetch(message.author.id).catch(() => null);
 
@@ -304,9 +336,9 @@ export async function handleAgentRequest(message, client) {
   // 起動条件 (メンション / 回答へのリプライ) は共通にしておきたいので、判定の後・
   // 予約の前で分ける。予約より前なのは、あちらは API を叩かないので費用がゼロで、
   // ドル換算の上限に混ぜると請求と乖離するから。
-  const governanceTopic = Boolean(getGovernanceGuild(guild.id))
+  const governanceTopic = Boolean(governance.getGovernanceGuild(guild.id))
     && isGovernanceAgentTopic(message.content);
-  const chosen = engineFor(message.author.id, guild.id);
+  const chosen = mimic.engineFor(message.author.id, guild.id);
   // 会話 agent のモデルはその人が /model で選んだもの (ling / glm / qwen)。
   // 自作モデルを選んでいる人が統治の話をしたときは既定のモデルで答える
   const model = agentModelFor(isAgentEngine(chosen) ? chosen : DEFAULT_AGENT_ENGINE);
@@ -315,7 +347,7 @@ export async function handleAgentRequest(message, client) {
   // 名前を並べていたら evex-1 を足したときに書き足し忘れ、選んだ人が黙って
   // DeepSeek に回っていた (料金も掛かる)。自前で配信しているものは ENDPOINTS に
   // 全部載っているので、そちらを唯一の名簿にする
-  if (isSelfHosted(chosen) && !governanceTopic) {
+  if (mimic.isSelfHosted(chosen) && !governanceTopic) {
     const recent = await message.channel.messages
       .fetch({ limit: 20 })
       .then((found) => [...found.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp))
@@ -327,7 +359,7 @@ export async function handleAgentRequest(message, client) {
 
     // 記録関数を渡す (import すると agent/index.js ⇄ mimic/respond.js の循環になる)。
     // これが無いと自作モデルの返答にリプしても起動条件に合わず無反応だった。
-    await handleMimicRequest(message, client, {
+    await mimic.handleMimicRequest(message, client, {
       recent, chain, engine: chosen, remember: rememberOwnReply, selfId: client.user.id
     });
     return;
@@ -339,7 +371,7 @@ export async function handleAgentRequest(message, client) {
   // それでもトークンと同時実行の枠は消費していた (thinking.js は送信失敗を
   // 握り潰して続行し、replyOrSend の2段構えも両方落ちる)。枠を取る前に見る。
   const me = guild.members.me ?? await guild.members.fetchMe().catch(() => null);
-  if (!me || !canBotSpeak(message.channel, me)) {
+  if (!me || !archive.canBotSpeak(message.channel, me)) {
     console.warn(
       `Skipping an agent request in #${message.channel?.name ?? message.channelId}: the bot cannot speak there.`
     );
@@ -348,12 +380,12 @@ export async function handleAgentRequest(message, client) {
 
   // 統治サーバーではManageGuildを自動的な信頼根拠にしない。指定されたtrusted roleは
   // 回数枠だけを増やし、ブラウザ操作権や司法・立法権限とは結び付けない。
-  const attempt = reserveGovernanceAgentAttempt(member, message.id);
+  const attempt = governance.reserveGovernanceAgentAttempt(member, message.id);
   if (!attempt.ok) {
     await replyOrSend(message, { content: attemptLimitMessage(attempt), allowedMentions: NO_MENTIONS });
     return;
   }
-  const admin = !attempt.governed && canManageIndex(member);
+  const admin = !attempt.governed && archive.canManageIndex(member);
 
   const reservation = reserveCall({
     guildId: guild.id,
@@ -370,22 +402,24 @@ export async function handleAgentRequest(message, client) {
 
   // ここから先は必ず try の中で組み立てる。
   // 確保した枠を返さずに抜けると、同時実行の空きが永久に戻らない。
+  // 枠を確保した reserveCall から try に入るまでの間に await も例外もない
+  // (枠の返却は finalizeCall か releaseCall のどちらか1回だけ。下の finished で守る)。
   //
   // リクエスト全体のタイムアウトは持たない。止めるのはトークンの予算だけで、
   // 時間で畳むと「払ったのに謝り文だけ返す」ことになる (実際にそうなっていた)。
   // 応答が来ないソケットは llm.js が1回ごとに畳む。
   let finished = false;
-  let indicator = null;
-  let ctx = null;
+  let indicator: ThinkingIndicator | null = null;
+  let ctx: AgentContext | null = null;
 
   // 例外や中断でも、この呼び出しで新たに使ったぶんは残す。
   // 再開前の累計をこの新しい予約に付け替えないため、runAgent が
   // この object に書くのは呼び出し単位の差分だけ。
-  const usage = { prompt_tokens: 0, completion_tokens: 0, prompt_cache_hit_tokens: 0 };
+  const usage: TokenUsage = { prompt_tokens: 0, completion_tokens: 0, prompt_cache_hit_tokens: 0 };
 
   try {
     const refs = new RefTable();
-    ctx = {
+    const runContext: AgentContext = {
       client,
       guild,
       channel: message.channel,
@@ -395,28 +429,32 @@ export async function handleAgentRequest(message, client) {
       me,
       refs,
       screenshots: [],
-      channelScope: getChannelScope(guild, member),
+      channelScope: archive.getChannelScope(guild, member),
+      // ブラウザを操作できるかは人 (ID の許可リスト) だけで決まる。モデルの出力や
+      // 会話の中身からは変えられない。
       browserFull: canUseFullBrowser(member),
       // 添付できないだけなら本文は出せるので実行は止めない。撮ったのに貼れない
       // ときだけ、その旨を回答に添える (黙って落とすと撮れたつもりで話が進む)。
-      canAttach: canBotAttach(message.channel, me),
+      canAttach: archive.canBotAttach(message.channel, me),
       // ツールの中から表示を差し替えられるようにする。キーワード検索から
       // 意味検索へ自動で回すときに数秒止まるので、そこを黙らせない。
       setStatus: (status) => indicator?.setStatus(status)
     };
+    ctx = runContext;
 
     // 経過表示を出しておく。この先の準備 (ブラウザの生存確認や
     // 直近メッセージの取得) にも時間がかかるので、一番先に出す。
-    indicator = new ThinkingIndicator(message.channel);
-    await indicator.start();
+    const thinking = new ThinkingIndicator(message.channel);
+    indicator = thinking;
+    await thinking.start();
 
-    const toolset = await buildToolset(ctx);
+    const toolset = await buildToolset(runContext);
 
     // 直近を先に取る (鎖のたどり先がキャッシュに載るので API を叩かずに済む)
     const preloaded = await fetchRecent(message.channel, {
       // 依頼そのものと、いま出している経過表示は渡さない
-      exclude: new Set([message.id, indicator.messageId].filter(Boolean)),
-      selfId: client.user?.id,
+      exclude: new Set([message.id, thinking.messageId].filter((id): id is string => Boolean(id))),
+      selfId: client.user.id,
       limit: agentConfig.preloadMessages
     });
     const replyChain = await fetchReplyChain(message, message.channel.name);
@@ -426,13 +464,13 @@ export async function handleAgentRequest(message, client) {
     const recent = preloaded.filter((entry) => !inChain.has(entry.messageId));
 
     // query を省略した意味検索で「いまの会話」を使う
-    ctx.recent = recent;
-    ctx.thread = replyChain;
+    runContext.recent = recent;
+    runContext.thread = replyChain;
 
-    const system = buildSystemPrompt(ctx, toolset);
+    const system = buildSystemPrompt(runContext, toolset);
     const request = stripMention(message.content, client.user.id);
     const userContent = buildUserContent({
-      ctx,
+      ctx: runContext,
       prompt: request,
       // 依頼に貼られた画像・埋め込み・スタンプ。中身は読めないが、存在を
       // 伝えないと「これ何？」に対して直近の会話の話をしてしまう。
@@ -468,7 +506,7 @@ export async function handleAgentRequest(message, client) {
       // 超えてもツールが外れるだけなので、答えはその場の材料で必ず書かれる。
       deadlineAt: Date.now() + agentConfig.deadlineMs,
       weigh: weighCost,
-      onToolCall: (name, args) => indicator.setStatus(toolLabel(name, args))
+      onToolCall: (name, args) => thinking.setStatus(toolLabel(name, args))
     });
 
     finalizeCall(reservation.id, {
@@ -476,35 +514,37 @@ export async function handleAgentRequest(message, client) {
       rounds: result.invocation.rounds,
       usage: result.invocation.usage
     });
-    recordToolCalls(reservation.id, result.used);
+    // 枠は finalizeCall が返した。以降に何が起きても releaseCall で二重に返さない。
     finished = true;
+    recordToolCalls(reservation.id, result.used);
 
     // 回答ができたので経過表示は消す。回答は新しいメッセージとして送るので、
     // 待っている間に会話が進んでいても一番下に出る。
-    await indicator.stop();
+    await thinking.stop();
 
     const answer = result.text?.trim()
-      ? expandCitations(result.text.trim(), refs, { label: modelLabel(model), selfId: client.user?.id })
+      ? expandCitations(result.text.trim(), refs, { label: modelLabel(model), selfId: client.user.id })
       : 'うまく答えをまとめられませんでした。条件を絞ってもう一度聞いてください。';
 
     // 撮ったのに貼れないときは黙らない (画像が出ている前提で読まれる)
-    const blocked = ctx.screenshots.length > 0 && !ctx.canAttach;
+    const blocked = runContext.screenshots.length > 0 && !runContext.canAttach;
     const chunks = chunkForDiscord(
       blocked
         ? `${answer}\n\n-# (スクリーンショットは撮ったけど、このチャンネルにファイルを添付する権限が無くて貼れなかった)`
         : answer
     );
 
-    const files = ctx.canAttach
-      ? ctx.screenshots.map(
+    const files = runContext.canAttach
+      ? runContext.screenshots.map(
         (buffer, index) => new AttachmentBuilder(buffer, { name: `screenshot-${index + 1}.png` })
       )
       : [];
 
     for (const [index, chunk] of chunks.entries()) {
-      const payload = {
+      const payload: MessageReplyOptions = {
         content: chunk,
         // 1通目だけ聞いた人に通知する。2通目以降で鳴らすと同じ答えで2回鳴る。
+        // モデルの文章に @everyone / ロールが入っていても、どちらも parse が空なので通知にならない。
         allowedMentions: index === 0 ? PING_ASKER : NO_MENTIONS,
         // 添付は最後のメッセージにまとめてつける
         ...(index === chunks.length - 1 && files.length > 0 ? { files } : {})
@@ -543,9 +583,9 @@ export async function handleAgentRequest(message, client) {
  * 依頼と返信先を強い手がかり、直近の会話を弱い手がかりにして思い出す。
  * 記憶が読めなくても会話は止めない。
  */
-function recallSafely(guildId, request, replyChain, recent) {
+function recallSafely(guildId: string, request: string, replyChain: AgentMessage[], recent: AgentMessage[]): string {
   try {
-    return recallFor(guildId, {
+    return memory.recallFor(guildId, {
       request: [request, ...replyChain.map((entry) => entry.content ?? '')].join('\n'),
       context: recent.slice(-10).map((entry) => entry.content ?? '').join('\n')
     });

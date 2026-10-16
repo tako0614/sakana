@@ -7,9 +7,13 @@ const directory = mkdtempSync(join(tmpdir(), 'sakana-guild-isolation-'));
 process.env.DATABASE_PATH = join(directory, 'main.sqlite');
 process.env.ARCHIVE_DB_PATH = join(directory, 'archive.sqlite');
 process.env.AGENT_RUNTIME_PATH = join(directory, 'runs.sqlite');
+// 記憶の本の DB と本物のブラウザには触れない (tools.js を読み込むだけで開かれる)
+process.env.MEMORY_DB_PATH ??= join(directory, 'memory.sqlite');
+process.env.AGENT_BROWSER = '0';
 const { db, saveMessage, upsertChannel } = await import('../src/archive/db.js');
 const { toRecord } = await import('../src/archive/indexer.js');
-const { runRead } = await import('../src/agent/tools.js');
+const { buildToolset, runRead, runSearch } = await import('../src/agent/tools.js');
+const { ChannelType, PermissionFlagsBits } = await import('discord.js');
 const { runInfo } = await import('../src/agent/info.js');
 const { RefTable } = await import('../src/agent/format.js');
 const { exampleTurns } = await import('../src/mimic/speakers.js');
@@ -96,6 +100,98 @@ try {
       assert.deepEqual(publicChannels('guild-b'), [], 'an uncached guild has no public channels');
     } finally { setVisibilityClient(null); }
   });
+
+  // ---- ツール経由の読み取りが、呼んだ人に見えるチャンネルの中に留まること ----
+  // 見えるかどうかは archive/permissions.js の canRead が決める。ここは偽物のチャンネルを
+  // 渡して、tools.js がその判定を取りこぼさず通ることだけを見る。
+  // readable でも ManageThreads は持たない人。非公開スレッドは参加者でなければ見えない。
+  const fakeChannel = (id, readable, type = ChannelType.GuildText, extra = {}) => ({
+    id, name: id, guildId: 'guild-a', type, rawPosition: 0,
+    permissionsFor: () => ({ has: (flag) => readable && flag !== PermissionFlagsBits.ManageThreads }),
+    ...extra
+  });
+  const publicChannel = fakeChannel('public-a', true);
+  const privateChannel = fakeChannel('private-a', false);
+  const toolCtx = (channels, extra = {}) => ({
+    guild: { id: 'guild-a', channels: { cache: new Map(channels.map((channel) => [channel.id, channel])), fetch: async () => null },
+      members: { cache: new Map() } },
+    member: { id: 'viewer' }, channel: publicChannel, channelScope: { mode: 'all', ids: [] }, refs: new RefTable(),
+    client: { user: { id: 'bot' } }, ...extra
+  });
+
+  await check('tool names are looked up as data, never as object properties', async () => {
+    const toolset = await buildToolset(toolCtx([publicChannel]));
+    assert.deepEqual(toolset.definitions.map((definition) => definition.function.name), ['search', 'read', 'channels', 'info']);
+    for (const name of ['constructor', 'toString', '__proto__', 'hasOwnProperty', 'valueOf', 'isPrototypeOf']) {
+      assert.match(await toolset.call(name, {}), /そのツールはありません/, name);
+    }
+    assert.match(await toolset.call('channels', {}), /#public-a/, 'a real tool still resolves');
+    assert.match(await toolset.call('channels', 'not-an-object'), /#public-a/, 'non-object arguments are treated as empty');
+  });
+
+  await check('discord search says nothing about hits in channels the caller cannot read', async () => {
+    const hit = (id, channelId, content) => [{ id, channel_id: channelId, hit: true, content,
+      timestamp: '2024-01-01T00:00:00.000Z', author: { id: 'author-1', username: 'someone' } }];
+    const visible = hit('200000000000000001', 'public-a', 'VISIBLE_HIT');
+    const hidden = hit('200000000000000002', 'private-a', 'HIDDEN_HIT');
+    const run = (groups, limit) => runSearch(
+      toolCtx([publicChannel, privateChannel], { client: { user: { id: 'bot' }, rest: { get: async () => ({ messages: groups }) } } }),
+      { query: 'sentinel', limit }, { archiveAvailable: false, semanticAvailable: false });
+    const mixed = await run([visible, hidden], 2);
+    assert.match(mixed, /VISIBLE_HIT/);
+    assert.doesNotMatch(mixed, /HIDDEN_HIT|読めない|除外|除いた/);
+    // 1件は隠れているので「limit ぶん埋まった」とも言わない。隠れた側の有無で出力が変わらないこと
+    assert.equal(mixed, await run([visible], 2), 'a hidden hit must not change the output at all');
+    assert.equal(await run([hidden], 2), await run([], 2), 'only hidden hits looks exactly like no hits');
+    assert.match(await run([], 2), /該当するメッセージはありませんでした/);
+  });
+
+  await check('active forum posts the caller cannot read are not listed', async () => {
+    const thread = (id, type, members) => fakeChannel(id, true, type, {
+      name: id, ownerId: 'owner', messageCount: 3, createdTimestamp: 1, members: { cache: new Map(members) } });
+    const open = thread('OPEN_POST', ChannelType.PublicThread, []);
+    const secret = thread('SECRET_POST', ChannelType.PrivateThread, []);
+    const joined = thread('JOINED_POST', ChannelType.PrivateThread, [['viewer', {}]]);
+    const forum = fakeChannel('forum-a', true, ChannelType.GuildForum, {
+      threads: { fetchActive: async () => ({ threads: new Map([open, secret, joined].map((entry) => [entry.id, entry])) }) } });
+    const output = await runRead(toolCtx([forum]), { channel: 'forum-a' });
+    assert.match(output, /OPEN_POST/);
+    assert.match(output, /JOINED_POST/, 'a private thread the caller is in stays visible');
+    assert.doesNotMatch(output, /SECRET_POST/);
+  });
+
+  await check('a start point that is not a message ID is refused before any fetch', async () => {
+    let fetches = 0;
+    const text = fakeChannel('text-a', true, ChannelType.GuildText, {
+      messages: { fetch: async () => { fetches += 1; return new Map(); } } });
+    const ctx2 = toolCtx([text]);
+    ctx2.refs.add({ messageId: 'not-a-snowflake', channelId: 'somewhere-else' });
+    const output = await runRead(ctx2, { channel: 'text-a', at: '1' });
+    assert.match(output, /メッセージ ID の形ではない/);
+    assert.doesNotMatch(output, /BigInt|SyntaxError/);
+    assert.equal(fetches, 0);
+    for (const direction of ['before', 'after']) {
+      assert.match(await runRead(ctx2, { channel: 'text-a', at: '1', direction }), /メッセージ ID の形ではない/);
+    }
+    assert.equal(fetches, 0);
+  });
+
+  await check('model-supplied lists and strings are cut down before they are used', async () => {
+    const seen = [];
+    const text = fakeChannel('text-a', true, ChannelType.GuildText, { messages: { fetch: async () => new Map() } });
+    const ctx3 = toolCtx([text], { client: { user: { id: 'bot' }, rest: { get: async (_path, options) => {
+      seen.push(options.query); return { messages: [] };
+    } } } });
+    await runSearch(ctx3, { query: 'a'.repeat(50_000), offset: 1e12 }, { archiveAvailable: false, semanticAvailable: false });
+    assert.ok(seen[0].get('content').length <= 500, 'query is capped');
+    assert.ok(Number(seen[0].get('offset')) <= 10_000, 'offset is capped');
+    // 1000 個のチャンネル指定でも、読むのは5つまで。超えたことは言う
+    const many = await runRead(ctx3, { channel: Array(1000).fill('text-a').join(',') });
+    assert.match(many, /一度に読めるのは 5 チャンネルまで/);
+    assert.equal((many.match(/--- #text-a/g) ?? []).length, 5);
+    await assert.rejects(runRead(ctx3, { channel: 'x'.repeat(50_000) }), /見つかりませんでした/);
+  });
+
   assert.deepEqual(failures, [], 'server information isolation regressions');
   console.log('check-guild-isolation: ok');
 } finally { db.close(); rmSync(directory, { recursive: true, force: true }); }

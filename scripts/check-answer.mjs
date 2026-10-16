@@ -561,6 +561,9 @@ const { stripMention } = await import('../src/agent/index.js');
   if (stripMention('a\n\n\n\n\nb', BOT) !== 'a\n\nb') fail('空行を詰める');
   // メンションは消える (ニックネーム形式 <@!id> も)
   if (stripMention(`<@!${BOT}> やあ`, BOT) !== 'やあ') fail('メンションが残っている');
+  // clientId は正規表現として読ませない (`.` が別の文字に一致して他人のメンションを消さない)
+  if (stripMention('<@1x2> やあ', '1.2') !== '<@1x2> やあ') fail('clientId の記号を正規表現として扱っている');
+  if (stripMention('<@1.2> やあ', '1.2') !== 'やあ') fail('escape した clientId でメンションが消えない');
 }
 
 {
@@ -678,6 +681,9 @@ try {
   if (isAgentRequest(ask({ replyTo: 'someone-else' }), client)) fail('他人へのリプライでは起動しない');
   if (isAgentRequest(ask({}), client)) fail('ただの発言では起動しない');
   if (isAgentRequest(ask({ mention: true, fromBot: true }), client)) fail('bot の発言では起動しない');
+  // webhook の発言も同じ。自分の回答への返信で自分が起動する輪を作らない
+  if (isAgentRequest({ ...ask({ mention: true }), webhookId: 'wh-1' }, client)) fail('webhook の発言では起動しない');
+  if (isAgentRequest({ ...ask({ replyTo: ANSWER_ID }), webhookId: 'wh-1' }, client)) fail('webhook の返信では起動しない');
 
   // --- 相槌では起動しない ---
   //
@@ -711,3 +717,7 @@ try {
 } finally {
   clearReplies();
 }
+
+// ブラウザの通信の関門 (DNS リバインディング対策と、断る理由に IP を書かないこと)。
+// package.json の check から呼ばれるのはこのファイルなので、ここから読み込む。
+await import('./check-browser-guard.mjs');
