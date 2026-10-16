@@ -6,48 +6,55 @@
 // archive の channels 表と親チャンネルの権限で判定する)。
 // Discord の client が無いとき (起動直後・検査) は空を返す。呼び出し側は
 // hasVisibilityClient() で「判定できない」と「公開チャンネルが無い」を区別する。
-import { ChannelType } from 'discord.js';
+import { ChannelType, type Client, type Guild, type GuildBasedChannel } from 'discord.js';
 import { db } from './db.js';
 import { canRead } from './permissions.js';
 
 export { canRead };
 
-let discordClient = null;
+let discordClient: Client | null = null;
 
 /** discord.js の Client を覚える。ready で1回呼ぶ。 */
-export function setVisibilityClient(client) {
+export function setVisibilityClient(client: Client | null | undefined): void {
   discordClient = client ?? null;
 }
 
-export function hasVisibilityClient() {
+export function hasVisibilityClient(): boolean {
   return Boolean(discordClient);
 }
 
-const isPrivateThread = (channel) => channel.type === ChannelType.PrivateThread;
+const isPrivateThread = (channel: GuildBasedChannel): boolean => channel.type === ChannelType.PrivateThread;
+
+interface ThreadRow {
+  channel_id: string;
+  parent_id: string | null;
+}
 
 /**
  * @everyone と bot の両方が読めるチャンネル ID の一覧。
  * suppliedGuild を渡せばそれを使い、無ければ覚えた client のキャッシュから引く。
  */
-export function publicChannels(guildId, suppliedGuild) {
+export function publicChannels(guildId: string, suppliedGuild?: Guild | null): string[] {
   const guild = suppliedGuild ?? discordClient?.guilds?.cache?.get(String(guildId));
-  if (!guild?.channels?.cache || !guild.roles?.everyone || !guild.members?.me) return [];
+  const everyone = guild?.roles?.everyone;
+  const me = guild?.members?.me;
+  if (!guild?.channels?.cache || !everyone || !me) return [];
   const parents = new Set(
     [...guild.channels.cache.values()]
       .filter((channel) => !isPrivateThread(channel)
-        && canRead(channel, guild.roles.everyone)
-        && canRead(channel, guild.members.me))
+        && canRead(channel, everyone)
+        && canRead(channel, me))
       .map((channel) => channel.id)
   );
   const visible = [...guild.channels.cache.values()]
     .filter((channel) => !isPrivateThread(channel) && channel.isTextBased?.() && parents.has(channel.id))
     .map((channel) => channel.id);
   const threads = db
-    .prepare('SELECT channel_id, parent_id FROM channels WHERE guild_id = ? AND is_thread = 1 AND is_private = 0')
+    .prepare<[string], ThreadRow>('SELECT channel_id, parent_id FROM channels WHERE guild_id = ? AND is_thread = 1 AND is_private = 0')
     .all(String(guildId));
   for (const row of threads) {
     const cached = guild.channels.cache.get(row.channel_id);
-    if (cached ? !isPrivateThread(cached) && parents.has(cached.id) : parents.has(row.parent_id)) {
+    if (cached ? !isPrivateThread(cached) && parents.has(cached.id) : row.parent_id !== null && parents.has(row.parent_id)) {
       visible.push(row.channel_id);
     }
   }

@@ -11,7 +11,8 @@
 //   2. 並べるのは頻度ではなく「偏り」。生の頻度では「する」「です」しか出ない。
 //      ギルド全体の出現率を事前分布にした log-odds で並べる。
 
-import { guildTimeRange, sampleMessages } from './search.js';
+import { guildTimeRange, sampleMessages, type SampleRow, type TimeRange } from './search.js';
+import type { SearchOptions } from './types.js';
 
 const SCAN_CAP = Number(process.env.ARCHIVE_TERM_SCAN_CAP ?? 4000);
 const BASELINE_SAMPLE = Number(process.env.ARCHIVE_TERM_BASELINE_SAMPLE ?? 20_000);
@@ -55,7 +56,7 @@ const TERM_STOPLIST = new Set([
  * 消費/費税/税増/増税 に割ると、費税のような偽語が本物と完全に共起し、
  * ベースラインでも同じくらい稀なのでスコアで分離できなくなる。
  */
-export function extractTerms(raw) {
+export function extractTerms(raw: string | null | undefined): string[] {
   if (!raw) return [];
 
   const text = String(raw)
@@ -65,7 +66,7 @@ export function extractTerms(raw) {
     .replace(URL_PATTERN, ' ')
     .replace(DISCORD_TOKEN, ' ');
 
-  const terms = new Set();
+  const terms = new Set<string>();
 
   for (const match of text.matchAll(HAN_RUN)) terms.add(match[0]);
 
@@ -93,8 +94,13 @@ export function extractTerms(raw) {
  * 「その語を含む発言が何件あったか」を数える。
  * 1発言で同じ語が何回出ても1回 (連投で順位が壊れるのを防ぐ)。
  */
-function countDocumentFrequencies(rows, { skipBots = true } = {}) {
-  const df = new Map();
+interface DocumentFrequencies {
+  df: Map<string, number>;
+  messages: number;
+}
+
+function countDocumentFrequencies(rows: readonly SampleRow[], { skipBots = true }: { skipBots?: boolean } = {}): DocumentFrequencies {
+  const df = new Map<string, number>();
   let messages = 0;
 
   for (const row of rows) {
@@ -110,7 +116,11 @@ function countDocumentFrequencies(rows, { skipBots = true } = {}) {
   return { df, messages };
 }
 
-const baselineCache = new Map(); // guildId -> { df, messages, builtAt }
+interface Baseline extends DocumentFrequencies {
+  builtAt: number;
+}
+
+const baselineCache = new Map<string, Baseline>(); // guildId -> { df, messages, builtAt }
 
 /**
  * 比較用のギルド全体の出現率。派生データなのでテーブルにせずメモリに置く。
@@ -118,7 +128,7 @@ const baselineCache = new Map(); // guildId -> { df, messages, builtAt }
  * channelScope は掛けない。ここは分母にしか使わず、出力するのは検索条件側
  * (権限で絞った側) に出た語だけ。topReactionEmojis / topDomains と同じ扱い。
  */
-function guildBaseline(guildId) {
+function guildBaseline(guildId: string): Baseline {
   const cached = baselineCache.get(guildId);
   if (cached && Date.now() - cached.builtAt < BASELINE_TTL_MS) return cached;
 
@@ -142,18 +152,18 @@ function guildBaseline(guildId) {
     counted.df = new Map(kept);
   }
 
-  const entry = { df: counted.df, messages: counted.messages, builtAt: Date.now() };
+  const entry: Baseline = { df: counted.df, messages: counted.messages, builtAt: Date.now() };
   baselineCache.set(guildId, entry);
 
   if (baselineCache.size > BASELINE_CACHE_GUILDS) {
     const oldest = [...baselineCache.entries()].sort((a, b) => a[1].builtAt - b[1].builtAt)[0];
-    baselineCache.delete(oldest[0]);
+    if (oldest) baselineCache.delete(oldest[0]);
   }
 
   return entry;
 }
 
-export function resetTermBaseline(guildId) {
+export function resetTermBaseline(guildId?: string | null): void {
   if (guildId) baselineCache.delete(guildId);
   else baselineCache.clear();
 }
@@ -165,7 +175,7 @@ export function resetTermBaseline(guildId) {
  * (身内ネタ・その人固有の話題) は分散だけが膨らんで沈んでしまうので、
  * 下限を入れて拾えるようにする。
  */
-function distinctiveness(dfTarget, nTarget, dfBase, nBase) {
+function distinctiveness(dfTarget: number, nTarget: number, dfBase: number, nBase: number): number {
   const baseRate = (dfBase + 0.5) / (nBase + 1);
   const prior = Math.max(0.5, PRIOR_STRENGTH * baseRate);
 
@@ -186,8 +196,15 @@ function distinctiveness(dfTarget, nTarget, dfBase, nBase) {
  * 同じ話題の部分文字列は上位だけ残す。
  * 「消費税増税」と「消費税」、漢字が隣接してできた偽語などを畳む。
  */
-function dedupeSubstrings(ranked, limit) {
-  const kept = [];
+export interface RankedTerm {
+  term: string;
+  count: number;
+  ratio: number;
+  score: number;
+}
+
+function dedupeSubstrings(ranked: readonly RankedTerm[], limit: number): RankedTerm[] {
+  const kept: RankedTerm[] = [];
 
   for (const entry of ranked) {
     const covered = kept.some((other) => (
@@ -203,14 +220,29 @@ function dedupeSubstrings(ranked, limit) {
   return kept;
 }
 
-export function topTerms(options, { limit = 20, cap = SCAN_CAP, range = null } = {}) {
+export interface TopTermsOptions {
+  limit?: number;
+  cap?: number;
+  range?: TimeRange | null;
+}
+
+export interface TopTerms {
+  rows: RankedTerm[];
+  scanned: number;
+  messages: number;
+  mode: 'head' | 'all' | 'stratified';
+  weakBaseline: boolean;
+  baseline: { messages: number; terms: number; builtAt: number };
+}
+
+export function topTerms(options: SearchOptions, { limit = 20, cap = SCAN_CAP, range = null }: TopTermsOptions = {}): TopTerms {
   const sample = sampleMessages(options, { cap, range });
   const target = countDocumentFrequencies(sample.rows);
   const baseline = guildBaseline(options.guildId);
   const weakBaseline = baseline.messages < BASELINE_MIN_MESSAGES;
 
   const minDf = Math.max(MIN_DF, Math.ceil(target.messages * MIN_RATE));
-  const ranked = [];
+  const ranked: RankedTerm[] = [];
 
   for (const [term, count] of target.df) {
     if (count < minDf) continue;

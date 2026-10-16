@@ -10,6 +10,7 @@
 // cursor_rowid はバッチごとに永続化するので、落ちても1バッチ分しか戻らない
 // (まとまりに移ったあとは chunk_id を入れている。AUTOINCREMENT なので単調)。
 
+import type { Client, Guild } from 'discord.js';
 import { embedConfig } from '../embed/config.js';
 import { embedTexts, prewarm } from '../embed/worker.js';
 import {
@@ -21,28 +22,64 @@ import {
   maxChunkIdFor,
   nextChunkBatch,
   refreshStale,
-  saveChunkVectors
+  saveChunkVectors,
+  type ChunkCoverage
 } from './chunks.js';
 import { db, getEmbedState, listEmbedGuilds, setEmbedState } from './db.js';
+import { errorMessage, field } from './guards.js';
 import { claimJob, getRunningJob, releaseJob } from './indexer.js';
+import type { EmbedJob } from './types.js';
 import { ensureModelId } from './vectors.js';
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-let cachedModel = null;
+export interface ResolvedModel {
+  modelId: number;
+  dim: number;
+  name: string;
+}
+
+let cachedModel: ResolvedModel | null = null;
+
+/** 埋め込みワーカーの返事。ベクトルは base64 の int8 列、scales はその倍率。 */
+export interface EmbedResult {
+  dim: number;
+  vectors: string[];
+  scales: number[];
+}
+
+/** ワーカー (Python) の返事を確かめる。形が違えば失敗にする (壊れたベクトルを保存しない)。 */
+export function parseEmbedResult(raw: unknown, expected: number): EmbedResult {
+  const dim = field(raw, 'dim');
+  const vectors = field(raw, 'vectors');
+  const scales = field(raw, 'scales');
+
+  if (typeof dim !== 'number' || !Number.isInteger(dim) || dim <= 0) throw new Error('Invalid embed output: no dimension');
+  if (!Array.isArray(vectors) || !vectors.every((vector) => typeof vector === 'string')) {
+    throw new Error('Invalid embed output: vectors must be base64 strings');
+  }
+  if (!Array.isArray(scales) || !scales.every((scale) => typeof scale === 'number' && Number.isFinite(scale))) {
+    throw new Error('Invalid embed output: scales must be numbers');
+  }
+  if (vectors.length !== expected || scales.length !== expected) {
+    throw new Error(`Invalid embed output: expected ${expected} vectors, got ${vectors.length}/${scales.length}`);
+  }
+
+  return { dim, vectors, scales };
+}
 
 /**
  * ワーカーに繋いでモデルの実際の次元を確かめ、embed_models に登録する。
  * 次元をここで確定させるのが要点 — 設定だけ信じると、モデルを差し替えたときに
  * 別の次元のベクトルが同じ model_id に混ざる。
  */
-export async function resolveModel() {
+export async function resolveModel(): Promise<ResolvedModel> {
   if (cachedModel) return cachedModel;
 
   // 登録済みならそれを使う。以前は毎回まず1件埋め込んで次元を確かめていたので、
   // 再起動後の最初のメンションで Python (torch と E5) の起動を待ち、HDD の本番では
   // 返事まで2分かかっていた (2026-10-15)。
-  const known = db.prepare(`
+  const known = db.prepare<[string], { model_id: number; dim: number }>(`
     SELECT model_id, dim FROM embed_models
     WHERE name = ? AND quant = 'int8' AND prefix_query = 'query: ' AND prefix_passage = 'passage: '
     ORDER BY model_id DESC LIMIT 1
@@ -53,8 +90,9 @@ export async function resolveModel() {
   }
 
   // 1件だけ埋め込んで ready の情報を取る
-  const probe = await embedTexts(['モデルの次元を確かめるための文'], { kind: 'passage' });
-  const dim = probe.dim;
+  const probe: unknown = await embedTexts(['モデルの次元を確かめるための文'], { kind: 'passage' });
+  const dim = field(probe, 'dim');
+  if (typeof dim !== 'number' || !Number.isInteger(dim) || dim <= 0) throw new Error('Invalid embed output: no dimension');
 
   const modelId = ensureModelId({
     name: embedConfig.modelName,
@@ -69,15 +107,23 @@ export async function resolveModel() {
   return cachedModel;
 }
 
-export function resetModelCache() {
+export function resetModelCache(): void {
   cachedModel = null;
+}
+
+export interface EmbedPreflight extends ChunkCoverage {
+  remaining: number;
+  modelId: number;
+  dim: number;
+  estimatedBytes: number;
+  estimatedMs: number;
 }
 
 /**
  * 開始前の見積り。実際の件数を SQL で数えて出す (0.5 のような推定値を信じさせない)。
  * まとまりはまだ作っていないことがあるので、その場合は発言数から概算する。
  */
-export async function embedPreflight(guildId) {
+export async function embedPreflight(guildId: string): Promise<EmbedPreflight> {
   const { modelId, dim } = await resolveModel();
   const stats = chunkCoverage(guildId, modelId);
   const remaining = Math.max(0, stats.total - stats.done);
@@ -98,33 +144,47 @@ export async function embedPreflight(guildId) {
   };
 }
 
+interface PreparedChunk {
+  chunkId: number;
+  text: string;
+}
+
 /**
  * バッチが失敗したときに1件ずつ埋め直す。
  * 埋め込めない1件は印を残して飛ばす。印を残さないと次回も同じ行で止まり、
  * バックフィルが永久に先へ進まない。
  */
-async function embedOneByOne(prepared, modelId, job) {
+async function embedOneByOne(prepared: readonly PreparedChunk[], modelId: number, job: EmbedJob): Promise<void> {
   for (const row of prepared) {
     try {
-      const single = await embedTexts([row.text], { kind: 'passage', encode: 'int8' });
+      const single = parseEmbedResult(await embedTexts([row.text], { kind: 'passage', encode: 'int8' }), 1);
+      const [vector] = single.vectors;
+      const [scale] = single.scales;
+      if (vector === undefined || scale === undefined) throw new Error('Invalid embed output: empty result');
       saveChunkVectors([{
         chunkId: row.chunkId,
         modelId,
-        scale: single.scales[0],
-        vec: Buffer.from(single.vectors[0], 'base64')
+        scale,
+        vec: Buffer.from(vector, 'base64')
       }]);
       job.embedded += 1;
     } catch (error) {
       saveChunkVectors([{ chunkId: row.chunkId, modelId, scale: 0, vec: Buffer.alloc(0) }]);
       job.skipped += 1;
       job.failed += 1;
-      console.error(`Skipping chunk ${row.chunkId}: ${String(error.message ?? error).slice(0, 160)}`);
+      console.error(`Skipping chunk ${row.chunkId}: ${errorMessage(error).slice(0, 160)}`);
     }
   }
 }
 
-export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, onProgress = () => {} } = {}) {
-  const job = {
+export interface EmbedJobOptions {
+  mode?: 'forward' | 'sweep';
+  rebuild?: boolean;
+  onProgress?: (job: EmbedJob) => void;
+}
+
+export async function runEmbedJob(guild: Guild, { mode = 'forward', rebuild = false, onProgress = () => {} }: EmbedJobOptions = {}): Promise<EmbedJob> {
+  const job: EmbedJob = {
     guildId: guild.id,
     mode: `embed:${mode}`,
     cancelled: false,
@@ -185,8 +245,8 @@ export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, on
     }
 
     // --- ② まとまりを埋め込む ---
-    const state = getEmbedState(guild.id) ?? {};
-    let cursor = mode === 'sweep' ? 0 : (state.cursor_rowid ?? 0);
+    const state = getEmbedState(guild.id);
+    let cursor = mode === 'sweep' ? 0 : (state?.cursor_rowid ?? 0);
 
     // カーソルの意味が messages.rowid から chunk_id に変わったので、
     // 発言単位だった頃の値が残っていると chunk_id > 93万 で永久に0件になり、
@@ -213,7 +273,8 @@ export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, on
         limit: embedConfig.batchSize
       });
 
-      if (chunks.length === 0) break;
+      const lastChunk = chunks.at(-1);
+      if (!lastChunk) break;
 
       const prepared = chunks
         .map((chunk) => ({ chunkId: chunk.chunk_id, text: chunkText(chunkMessages(chunk)) }))
@@ -221,13 +282,13 @@ export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, on
 
       if (prepared.length > 0) {
         const started = Date.now();
-        let result = null;
+        let result: EmbedResult | null = null;
 
         try {
-          result = await embedTexts(prepared.map((row) => row.text), { kind: 'passage', encode: 'int8' });
+          result = parseEmbedResult(await embedTexts(prepared.map((row) => row.text), { kind: 'passage', encode: 'int8' }), prepared.length);
         } catch (error) {
           // バッチ内の1件が悪いだけで全体を止めない。1件ずつ試して犯人を隔離する。
-          console.error('Embed batch failed, retrying one by one:', String(error.message ?? error).slice(0, 200));
+          console.error('Embed batch failed, retrying one by one:', errorMessage(error).slice(0, 200));
           job.batchFailures += 1;
           await embedOneByOne(prepared, modelId, job);
         }
@@ -235,12 +296,14 @@ export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, on
         if (result) {
           const elapsed = Math.max(1, Date.now() - started);
           job.rate = Math.round(prepared.length / (elapsed / 1000));
+          const { scales, vectors } = result;
 
           saveChunkVectors(prepared.map((row, index) => ({
             chunkId: row.chunkId,
             modelId,
-            scale: result.scales[index],
-            vec: Buffer.from(result.vectors[index], 'base64')
+            // 件数は parseEmbedResult で prepared と同じだと確かめてある
+            scale: scales[index] ?? 0,
+            vec: Buffer.from(vectors[index] ?? '', 'base64')
           })));
 
           job.embedded += prepared.length;
@@ -250,7 +313,7 @@ export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, on
       job.messagesIndexed = job.embedded + job.skipped;
       job.channelsDone = job.messagesIndexed;
 
-      cursor = chunks[chunks.length - 1].chunk_id;
+      cursor = lastChunk.chunk_id;
       if (mode !== 'sweep') {
         setEmbedState(guild.id, { cursor_rowid: cursor, embedded: job.embedded, skipped: job.skipped });
       }
@@ -274,7 +337,7 @@ export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, on
     setEmbedState(guild.id, {
       status: 'error',
       finished_at: Date.now(),
-      last_error: String(error.message ?? error).slice(0, 300)
+      last_error: errorMessage(error).slice(0, 300)
     });
     throw error;
   } finally {
@@ -283,7 +346,7 @@ export async function runEmbedJob(guild, { mode = 'forward', rebuild = false, on
 }
 
 /** 夜間スイープ。有効にしたギルドだけ、新規分と編集で崩れた分を拾う。 */
-export async function sweepEnabledGuilds(client) {
+export async function sweepEnabledGuilds(client: Client): Promise<void> {
   if (!embedConfig.enabled) return;
 
   for (const row of listEmbedGuilds()) {

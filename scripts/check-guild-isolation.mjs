@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -98,4 +100,8 @@ try {
   });
   assert.deepEqual(failures, [], 'server information isolation regressions');
   console.log('check-guild-isolation: ok');
+  // archive の検索と返事 (正規表現の時間切れ・メンション・公開の返事に出す範囲) は別の DB で検査する
+  const security = spawnSync(process.execPath, [...process.execArgv, fileURLToPath(new URL('./check-archive-security.mjs', import.meta.url))],
+    { stdio: 'inherit', env: process.env });
+  assert.equal(security.status, 0, 'archive security regressions (scripts/check-archive-security.mjs)');
 } finally { db.close(); rmSync(directory, { recursive: true, force: true }); }

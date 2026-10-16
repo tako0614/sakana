@@ -20,6 +20,7 @@
 import { embedConfig } from '../embed/config.js';
 import { db } from './db.js';
 import { normalizeForEmbedding } from './vectors.js';
+import type { ChunkRange, ChunkRow, CountRow, MessageRow, MessageRowWithRid } from './types.js';
 
 const ELIGIBLE_SQL = `
   m.deleted = 0
@@ -27,35 +28,39 @@ const ELIGIBLE_SQL = `
   AND (@include_bots = 1 OR m.is_bot = 0)
 `;
 
-function eligibleParams() {
+interface EligibleParams {
+  include_bots: number;
+}
+
+function eligibleParams(): EligibleParams {
   return { include_bots: embedConfig.includeBots ? 1 : 0 };
 }
 
 // channels 表から取る。messages の DISTINCT は 224ms かかる (実測) うえ、
 // 取り込み済みチャンネルの一覧はこちらが正しい持ち主。
-const selectChannels = db.prepare('SELECT channel_id FROM channels WHERE guild_id = ?');
-const selectChannelsFromMessages = db.prepare('SELECT DISTINCT channel_id FROM messages WHERE guild_id = ?');
+const selectChannels = db.prepare<[string], { channel_id: string }>('SELECT channel_id FROM channels WHERE guild_id = ?');
+const selectChannelsFromMessages = db.prepare<[string], { channel_id: string }>('SELECT DISTINCT channel_id FROM messages WHERE guild_id = ?');
 
-const selectLastChunk = db.prepare(`
+const selectLastChunk = db.prepare<[string], Pick<ChunkRow, 'chunk_id' | 'from_ms'>>(`
   SELECT chunk_id, from_ms FROM message_chunks
   WHERE channel_id = ? ORDER BY from_ms DESC LIMIT 1
 `);
 
-const deleteChunk = db.prepare('DELETE FROM message_chunks WHERE chunk_id = ?');
+const deleteChunk = db.prepare<[number]>('DELETE FROM message_chunks WHERE chunk_id = ?');
 
-const insertChunk = db.prepare(`
+const insertChunk = db.prepare<[Omit<ChunkRow, 'chunk_id'>]>(`
   INSERT INTO message_chunks
     (guild_id, channel_id, from_ms, to_ms, from_id, to_id, msg_count, text_len, built_at)
   VALUES (@guild_id, @channel_id, @from_ms, @to_ms, @from_id, @to_id, @msg_count, @text_len, @built_at)
 `);
 
-const insertChunkAuthor = db.prepare(
+const insertChunkAuthor = db.prepare<[number, string]>(
   'INSERT OR IGNORE INTO chunk_authors (chunk_id, author_id) VALUES (?, ?)'
 );
 
 /** そのまとまりに入る発言。描画にも埋め込みにも同じ範囲を使う。 */
-export function chunkMessages(chunk) {
-  return db.prepare(`
+export function chunkMessages(chunk: ChunkRange): MessageRow[] {
+  return db.prepare<[EligibleParams & ChunkRange], MessageRow>(`
     SELECT m.* FROM messages m
     WHERE m.channel_id = @channel_id AND m.created_at BETWEEN @from_ms AND @to_ms AND ${ELIGIBLE_SQL}
     ORDER BY m.created_at
@@ -67,8 +72,8 @@ export function chunkMessages(chunk) {
  * 「誰がどちら側か」が入っていないと、対立している2つの主張が1つの
  * ベクトルに混ざったときに区別が付かなくなる。
  */
-export function chunkText(rows) {
-  const lines = [];
+export function chunkText(rows: readonly Pick<MessageRow, 'author_name' | 'content'>[]): string {
+  const lines: string[] = [];
 
   for (const row of rows) {
     const body = normalizeForEmbedding(row.content);
@@ -81,27 +86,40 @@ export function chunkText(rows) {
   return chars.length <= embedConfig.maxChars ? text : chars.slice(0, embedConfig.maxChars).join('');
 }
 
+/** 切り分けに要るのは時刻と長さだけ (検査では最小の形で渡す)。 */
+export interface ChunkableRow {
+  created_at: number;
+  char_count?: number | null;
+  content?: string | null;
+}
+
+export interface SplitOptions {
+  gapMs?: number;
+  maxMessages?: number;
+  maxChars?: number;
+}
+
 /**
  * 発言列を境界で切る。純粋な関数にしてあるのでテストできる。
  * 切る条件は3つ: 無言が続いた / 発言数の上限 / 文字数の上限。
  */
-export function splitIntoChunks(rows, {
+export function splitIntoChunks<Row extends ChunkableRow>(rows: readonly Row[], {
   gapMs = embedConfig.chunkGapMs,
   maxMessages = embedConfig.chunkMaxMessages,
   maxChars = embedConfig.chunkMaxChars
-} = {}) {
-  const chunks = [];
-  let current = [];
+}: SplitOptions = {}): Row[][] {
+  const chunks: Row[][] = [];
+  let current: Row[] = [];
   let chars = 0;
 
-  const flush = () => {
+  const flush = (): void => {
     if (current.length > 0) chunks.push(current);
     current = [];
     chars = 0;
   };
 
   for (const row of rows) {
-    const previous = current[current.length - 1];
+    const previous = current.at(-1);
     const gap = previous ? row.created_at - previous.created_at : 0;
 
     if (previous && (gap > gapMs || current.length >= maxMessages || chars >= maxChars)) {
@@ -116,11 +134,12 @@ export function splitIntoChunks(rows, {
   return chunks;
 }
 
-const saveChunk = db.transaction((guildId, rows) => {
-  const text = chunkText(rows);
+const saveChunk = db.transaction((guildId: string, rows: readonly MessageRow[]): number => {
   const first = rows[0];
-  const last = rows[rows.length - 1];
+  const last = rows.at(-1);
+  if (!first || !last) return 0; // 空の組は作らない (splitIntoChunks は空の組を返さない)
 
+  const text = chunkText(rows);
   const { lastInsertRowid } = insertChunk.run({
     guild_id: guildId,
     channel_id: first.channel_id,
@@ -142,7 +161,7 @@ const saveChunk = db.transaction((guildId, rows) => {
   return chunkId;
 });
 
-const countAfter = db.prepare(`
+const countAfter = db.prepare<[EligibleParams & { channel_id: string; since: number | null }], CountRow>(`
   SELECT COUNT(*) AS count FROM messages m
   WHERE m.channel_id = @channel_id AND m.created_at > @since AND ${ELIGIBLE_SQL}
 `);
@@ -150,7 +169,7 @@ const countAfter = db.prepare(`
 
 // (created_at, rowid) の行値で進める。created_at だけだと同一ミリ秒の発言で
 // 取りこぼしか重複が出るし、rowid だけだと backfill の挿入順が時系列と逆なので使えない。
-const selectPage = db.prepare(`
+const selectPage = db.prepare<[EligibleParams & { channel_id: string; since_ms: number; since_rid: number; limit: number }], MessageRowWithRid>(`
   SELECT m.*, m.rowid AS rid FROM messages m
   WHERE m.channel_id = @channel_id
     AND (m.created_at, m.rowid) > (@since_ms, @since_rid)
@@ -162,7 +181,7 @@ const selectPage = db.prepare(`
 // イベントループに順番を返す。better-sqlite3 は同期なので、これを挟まないと
 // Discord への送信が全部タイムアウトする (実際に28秒ブロックして、その間
 // deferReply も thinking もリアクション処理も AbortError になった)。
-const yieldToLoop = () => new Promise((resolve) => setImmediate(resolve));
+const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 // 譲る間隔は件数ではなく経過時間で決める。ページ単位 (5000件) で譲る作りにしたら
 // 粗すぎて28秒止まった。1チャンクの重さはチャンネルの喋り方でまるで違うので、
@@ -173,12 +192,16 @@ const SLICE_MS = 40;
  * 「同期で走り続けてよい時間」を測るタイマー。
  * done() が true を返したら譲る。
  */
-function slicer(ms = SLICE_MS) {
+function slicer(ms = SLICE_MS): { expired: () => boolean; reset: () => void } {
   let until = Date.now() + ms;
   return {
     expired: () => Date.now() >= until,
     reset: () => { until = Date.now() + ms; }
   };
+}
+
+export interface BuildChunkOptions {
+  isCancelled?: () => boolean;
 }
 
 /**
@@ -189,11 +212,15 @@ function slicer(ms = SLICE_MS) {
  * ただし新しい発言が1件も無いなら触らない — 作り直すとベクトルも捨てることに
  * なり、静かなチャンネルでも毎晩1件ずつ埋め直す羽目になる。
  */
-export async function buildChannelChunks(guildId, channelId, { isCancelled = () => false } = {}) {
+export async function buildChannelChunks(guildId: string, channelId: string, { isCancelled = () => false }: BuildChunkOptions = {}): Promise<number> {
   const last = selectLastChunk.get(channelId);
 
   if (last) {
-    const fresh = countAfter.get({ ...eligibleParams(), channel_id: channelId, since: last.to_ms }).count;
+    // 注意: 以前の実装は last.to_ms を渡していたが、selectLastChunk は to_ms を選んでいない。
+    // undefined は NULL として束縛され、`created_at > NULL` は常に偽なので fresh は必ず 0 になる
+    // (= まとまりが1つでもあるチャンネルには新しいまとまりを足さない)。型付けで表に出たが、
+    // 挙動を変えないためそのまま NULL を渡している。直すなら selectLastChunk に to_ms を足す。
+    const fresh = countAfter.get({ ...eligibleParams(), channel_id: channelId, since: null })?.count ?? 0;
     if (fresh === 0) return 0;
   }
 
@@ -201,7 +228,7 @@ export async function buildChannelChunks(guildId, channelId, { isCancelled = () 
   let sinceMs = last ? last.from_ms - 1 : -1;
   let sinceRid = 0;
   // ページの境目でまとまりが切れないよう、最後の組は次のページに持ち越す
-  let carry = [];
+  let carry: MessageRowWithRid[] = [];
   let built = 0;
 
   if (last) deleteChunk.run(last.chunk_id);
@@ -217,7 +244,8 @@ export async function buildChannelChunks(guildId, channelId, { isCancelled = () 
       limit: embedConfig.chunkPage
     });
 
-    if (rows.length === 0) break;
+    const tail = rows.at(-1);
+    if (!tail) break;
 
     const groups = splitIntoChunks([...carry, ...rows]);
     const done = rows.length < embedConfig.chunkPage;
@@ -236,7 +264,6 @@ export async function buildChannelChunks(guildId, channelId, { isCancelled = () 
       }
     }
 
-    const tail = rows[rows.length - 1];
     sinceMs = tail.created_at;
     sinceRid = tail.rid;
 
@@ -252,8 +279,21 @@ export async function buildChannelChunks(guildId, channelId, { isCancelled = () 
   return built;
 }
 
+export interface GuildChunkProgress {
+  channelsDone: number;
+  channelsTotal: number;
+  built: number;
+}
+
+export interface BuildGuildChunkOptions extends BuildChunkOptions {
+  onProgress?: (progress: GuildChunkProgress) => void;
+}
+
 /** ギルド全体。取り込み済みチャンネルを順に回す。 */
-export async function buildGuildChunks(guildId, { onProgress = () => {}, isCancelled = () => false } = {}) {
+export async function buildGuildChunks(
+  guildId: string,
+  { onProgress = () => {}, isCancelled = () => false }: BuildGuildChunkOptions = {}
+): Promise<{ built: number; channels: number }> {
   const known = selectChannels.all(guildId).map((row) => row.channel_id);
   // channels 表が無い構成でも動くようにする (取り込み前など)
   const channels = known.length > 0
@@ -278,8 +318,8 @@ export async function buildGuildChunks(guildId, { onProgress = () => {}, isCance
  * 編集はトリガでは拾えない (範囲の判定ができない)。まとまりを作った時刻より
  * 後に編集された発言を含むものだけ選んで作り直す。
  */
-export function staleChunks(guildId, limit = 500) {
-  return db.prepare(`
+export function staleChunks(guildId: string, limit = 500): Pick<ChunkRow, 'chunk_id' | 'channel_id'>[] {
+  return db.prepare<[string, number], Pick<ChunkRow, 'chunk_id' | 'channel_id'>>(`
     SELECT c.chunk_id, c.channel_id FROM message_chunks c
     WHERE c.guild_id = ? AND EXISTS (
       SELECT 1 FROM messages m
@@ -291,11 +331,11 @@ export function staleChunks(guildId, limit = 500) {
   `).all(guildId, limit);
 }
 
-const refreshChunk = db.prepare(`
+const refreshChunk = db.prepare<[Pick<ChunkRow, 'chunk_id' | 'msg_count' | 'text_len' | 'built_at'>]>(`
   UPDATE message_chunks SET msg_count = @msg_count, text_len = @text_len, built_at = @built_at
   WHERE chunk_id = @chunk_id
 `);
-const dropChunkVector = db.prepare('DELETE FROM chunk_vectors WHERE chunk_id = ?');
+const dropChunkVector = db.prepare<[number]>('DELETE FROM chunk_vectors WHERE chunk_id = ?');
 
 /**
  * 本文が変わったまとまりを埋め直す。
@@ -305,12 +345,12 @@ const dropChunkVector = db.prepare('DELETE FROM chunk_vectors WHERE chunk_id = ?
  * 1件が編集されただけで、そのチャンネルの後ろ全部のベクトルを捨てることになる
  * (実際にそれで4つあったまとまりが3つに減るバグを踏んだ)。
  */
-export const refreshStale = db.transaction((guildId, limit = 500) => {
+export const refreshStale = db.transaction((guildId: string, limit = 500): { stale: number } => {
   const rows = staleChunks(guildId, limit);
   const now = Date.now();
 
   for (const row of rows) {
-    const chunk = db.prepare('SELECT * FROM message_chunks WHERE chunk_id = ?').get(row.chunk_id);
+    const chunk = db.prepare<[number], ChunkRow>('SELECT * FROM message_chunks WHERE chunk_id = ?').get(row.chunk_id);
     if (!chunk) continue;
 
     const messages = chunkMessages(chunk);
@@ -340,14 +380,23 @@ export const refreshStale = db.transaction((guildId, limit = 500) => {
  * このギルドの最後のまとまりの ID。
  * カーソルが実在しない値まで進んでいないかを確かめるのに使う。
  */
-export function maxChunkIdFor(guildId) {
-  return db.prepare('SELECT COALESCE(MAX(chunk_id), 0) AS id FROM message_chunks WHERE guild_id = ?')
-    .get(guildId).id;
+export function maxChunkIdFor(guildId: string): number {
+  return db.prepare<[string], { id: number }>('SELECT COALESCE(MAX(chunk_id), 0) AS id FROM message_chunks WHERE guild_id = ?')
+    .get(guildId)?.id ?? 0;
 }
 
+export interface ChunkBatchOptions {
+  guildId: string;
+  modelId: number;
+  cursor?: number;
+  limit?: number;
+}
+
+export type ChunkBatchRow = Pick<ChunkRow, 'chunk_id' | 'channel_id' | 'from_ms' | 'to_ms'>;
+
 /** 次に埋め込むまとまり。cursor は chunk_id (AUTOINCREMENT なので単調)。 */
-export function nextChunkBatch({ guildId, modelId, cursor = 0, limit = 32 }) {
-  return db.prepare(`
+export function nextChunkBatch({ guildId, modelId, cursor = 0, limit = 32 }: ChunkBatchOptions): ChunkBatchRow[] {
+  return db.prepare<[{ guild_id: string; model_id: number; cursor: number; limit: number }], ChunkBatchRow>(`
     SELECT c.chunk_id, c.channel_id, c.from_ms, c.to_ms
     FROM message_chunks c
     WHERE c.guild_id = @guild_id AND c.chunk_id > @cursor AND c.text_len > 0
@@ -358,12 +407,19 @@ export function nextChunkBatch({ guildId, modelId, cursor = 0, limit = 32 }) {
   `).all({ guild_id: guildId, model_id: modelId, cursor, limit });
 }
 
-const insertChunkVector = db.prepare(`
+const insertChunkVector = db.prepare<[number, number, number, Uint8Array, number]>(`
   INSERT OR REPLACE INTO chunk_vectors (chunk_id, model_id, scale, vec, created_at)
   VALUES (?, ?, ?, ?, ?)
 `);
 
-export const saveChunkVectors = db.transaction((rows) => {
+export interface ChunkVector {
+  chunkId: number;
+  modelId: number;
+  scale: number;
+  vec: Uint8Array;
+}
+
+export const saveChunkVectors = db.transaction((rows: readonly ChunkVector[]): number => {
   const now = Date.now();
   for (const row of rows) {
     insertChunkVector.run(row.chunkId, row.modelId, row.scale, row.vec, now);
@@ -397,19 +453,27 @@ export const COVERAGE_SQL = {
     )
     LIMIT 1
   `
-};
+} as const;
 
-export function chunkCoverage(guildId, modelId) {
-  const { total, messages } = db.prepare(COVERAGE_SQL.total).get(guildId);
-  const { done } = db.prepare(COVERAGE_SQL.done).get(guildId, modelId);
+export interface ChunkCoverage {
+  total: number;
+  done: number;
+  messages: number;
+  ratio: number;
+}
+
+export function chunkCoverage(guildId: string, modelId: number): ChunkCoverage {
+  const { total, messages } = db.prepare<[string], { total: number; messages: number }>(COVERAGE_SQL.total).get(guildId)
+    ?? { total: 0, messages: 0 };
+  const { done } = db.prepare<[string, number], { done: number }>(COVERAGE_SQL.done).get(guildId, modelId) ?? { done: 0 };
   return { total, done, messages, ratio: total > 0 ? done / total : 0 };
 }
 
 /** 意味検索のモードを出すか。chunkCoverage(...).done > 0 は全件を数えてから比べていた。 */
-export function hasChunkVectors(guildId, modelId) {
-  return Boolean(db.prepare(COVERAGE_SQL.any).get(guildId, modelId));
+export function hasChunkVectors(guildId: string, modelId: number): boolean {
+  return Boolean(db.prepare<[string, number]>(COVERAGE_SQL.any).get(guildId, modelId));
 }
 
-export function clearGuildChunks(guildId) {
-  db.prepare('DELETE FROM message_chunks WHERE guild_id = ?').run(guildId);
+export function clearGuildChunks(guildId: string): void {
+  db.prepare<[string]>('DELETE FROM message_chunks WHERE guild_id = ?').run(guildId);
 }

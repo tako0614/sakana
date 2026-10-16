@@ -10,11 +10,15 @@
 // Discord 標準検索と違い OR / NOT / 括弧 / 正規表現 / リアクション数 / 文字数 /
 // 時間帯 / 曜日 / ドメインを組み合わせられる。
 
+import type { QueryNode } from './types.js';
+
+export type { QueryNode };
+
 export const TZ_OFFSET_HOURS = Number(process.env.ARCHIVE_TZ_OFFSET_HOURS ?? 9);
 
 const TZ_OFFSET_MS = TZ_OFFSET_HOURS * 3_600_000;
 
-const FILTER_KEYS = new Set([
+const FILTER_KEYS: ReadonlySet<string> = new Set([
   'from', 'author',
   'in', 'channel',
   'mentions', 'mention',
@@ -32,9 +36,9 @@ const FILTER_KEYS = new Set([
   'regex', 're'
 ]);
 
-const DIRECTIVE_KEYS = new Set(['sort']);
+const DIRECTIVE_KEYS: ReadonlySet<string> = new Set(['sort']);
 
-const WEEKDAYS = {
+const WEEKDAYS: Readonly<Record<string, number>> = {
   sun: 0, sunday: 0, 日: 0,
   mon: 1, monday: 1, 月: 1,
   tue: 2, tuesday: 2, 火: 2,
@@ -45,6 +49,39 @@ const WEEKDAYS = {
 };
 
 export class QueryError extends Error {}
+
+interface OpenToken {
+  type: '(';
+  text: string;
+}
+
+interface CloseToken {
+  type: ')';
+  text: string;
+}
+
+interface WordToken {
+  type: 'word';
+  text: string;
+  quoted: boolean;
+  dashes: number;
+  /** 既知のフィルタ / 指示子のときだけ付く */
+  key?: string;
+  value?: string;
+}
+
+type Token = OpenToken | CloseToken | WordToken;
+
+type Classified =
+  | { type: 'or' }
+  | { type: 'and' }
+  | { type: 'not' }
+  | { type: 'leaf'; negated: boolean; node: QueryNode };
+
+export interface ParsedQuery {
+  ast: QueryNode | null;
+  directives: Record<string, string>;
+}
 
 // 先頭の - は tokenize で数える。classify で数えると -"foo bar" の - が
 // 引用符処理に食われて否定が落ちる。
@@ -60,14 +97,14 @@ const FILTER_HEAD = /^([A-Za-z_]+):/;
  *   ・括弧は対応が取れている限り値の一部。(from:@a OR from:@b) の閉じ括弧は値にしない
  *   ・\ の次の1文字はそのまま (regex の \( \) を括弧として数えないため)
  */
-function readFilterValue(input, start) {
+function readFilterValue(input: string, start: number): { text: string; quoted: boolean; index: number } {
   let index = start;
   let text = '';
   let quoted = false;
   let depth = 0;
 
   while (index < input.length) {
-    const char = input[index];
+    const char = input.charAt(index);
 
     if (/\s/.test(char)) break;
 
@@ -75,7 +112,7 @@ function readFilterValue(input, start) {
       quoted = true;
       index += 1;
       while (index < input.length && input[index] !== '"') {
-        text += input[index];
+        text += input.charAt(index);
         index += 1;
       }
       index += 1; // 閉じ引用符 (無ければ末尾)
@@ -83,7 +120,7 @@ function readFilterValue(input, start) {
     }
 
     if (char === '\\' && index + 1 < input.length) {
-      text += char + input[index + 1];
+      text += char + input.charAt(index + 1);
       index += 2;
       continue;
     }
@@ -101,12 +138,12 @@ function readFilterValue(input, start) {
   return { text, quoted, index };
 }
 
-function tokenize(input) {
-  const tokens = [];
+function tokenize(input: string): Token[] {
+  const tokens: Token[] = [];
   let index = 0;
 
   while (index < input.length) {
-    const char = input[index];
+    const char = input.charAt(index);
 
     if (/\s/.test(char)) {
       index += 1;
@@ -121,7 +158,7 @@ function tokenize(input) {
 
     let dashes = 0;
     const dash = LEADING_DASHES.exec(input.slice(index));
-    if (dash) {
+    if (dash?.[1]) {
       dashes = dash[1].length;
       index += dash[1].length;
     }
@@ -130,15 +167,16 @@ function tokenize(input) {
     // regex:/(べき|絶対)/ の括弧やスラッシュを壊さないため。
     // 知らないキー (http: や 12: など) は従来の語スキャンに落として挙動を変えない。
     const head = FILTER_HEAD.exec(input.slice(index));
-    const key = head ? head[1].toLowerCase() : null;
+    const name = head?.[1];
+    const key = name ? name.toLowerCase() : null;
 
-    if (key && (FILTER_KEYS.has(key) || DIRECTIVE_KEYS.has(key))) {
+    if (head && name && key && (FILTER_KEYS.has(key) || DIRECTIVE_KEYS.has(key))) {
       const value = readFilterValue(input, index + head[0].length);
       index = value.index;
       tokens.push({
         type: 'word',
         // フィルタ扱いしないときに使う素の語。従来と同じ見え方にするため元の大小を保つ
-        text: `${head[1]}:${value.text}`,
+        text: `${name}:${value.text}`,
         quoted: value.quoted,
         dashes,
         key,
@@ -151,7 +189,7 @@ function tokenize(input) {
     let quoted = false;
 
     while (index < input.length) {
-      const current = input[index];
+      const current = input.charAt(index);
 
       if (/\s/.test(current) || current === '(' || current === ')') {
         break;
@@ -161,7 +199,7 @@ function tokenize(input) {
         quoted = true;
         index += 1;
         while (index < input.length && input[index] !== '"') {
-          text += input[index];
+          text += input.charAt(index);
           index += 1;
         }
         index += 1; // 閉じ引用符 (無ければ末尾)
@@ -180,7 +218,7 @@ function tokenize(input) {
   return tokens;
 }
 
-function classify(token) {
+function classify(token: WordToken): Classified {
   // 演算子と見なすのは素の語だけ。-OR は昔から「OR を含まない」の意味なので
   // dashes が付いていたら演算子にしない。
   if (!token.quoted && token.dashes === 0) {
@@ -193,21 +231,26 @@ function classify(token) {
   const negated = token.dashes % 2 === 1;
 
   if (token.key && FILTER_KEYS.has(token.key)) {
-    return { type: 'leaf', negated, node: { type: 'filter', key: token.key, value: token.value } };
+    return { type: 'leaf', negated, node: { type: 'filter', key: token.key, value: token.value ?? '' } };
   }
 
   // sort: のようにフィルタでないキーは従来どおり素の語として扱う
   return { type: 'leaf', negated, node: { type: 'term', value: token.text } };
 }
 
-export function parseQuery(input) {
-  const directives = {};
-  const tokens = [];
+/** 次の語が演算子か (括弧はどれでもない)。 */
+function kindOf(token: Token): Classified['type'] {
+  return token.type === 'word' ? classify(token).type : 'leaf';
+}
+
+export function parseQuery(input: string | null | undefined): ParsedQuery {
+  const directives: Record<string, string> = {};
+  const tokens: Token[] = [];
 
   for (const token of tokenize(input ?? '')) {
     // sort: は AST に載せない。-sort:new / sort:"new" は従来どおり検索語扱い。
-    if (token.key && token.dashes === 0 && !token.quoted && DIRECTIVE_KEYS.has(token.key)) {
-      directives[token.key] = token.value.toLowerCase();
+    if (token.type === 'word' && token.key && token.dashes === 0 && !token.quoted && DIRECTIVE_KEYS.has(token.key)) {
+      directives[token.key] = (token.value ?? '').toLowerCase();
       continue;
     }
     tokens.push(token);
@@ -215,34 +258,35 @@ export function parseQuery(input) {
 
   let position = 0;
 
-  const peek = () => tokens[position];
+  const peek = (): Token | undefined => tokens[position];
 
-  function parseOr() {
+  function parseOr(): QueryNode {
     const nodes = [parseAnd()];
 
-    while (peek() && peek().type === 'word' && classify(peek()).type === 'or') {
+    for (let next = peek(); next && next.type === 'word' && classify(next).type === 'or'; next = peek()) {
       position += 1;
       nodes.push(parseAnd());
     }
 
-    return nodes.length === 1 ? nodes[0] : { type: 'or', nodes };
+    return nodes.length === 1 && nodes[0] ? nodes[0] : { type: 'or', nodes };
   }
 
-  function parseAnd() {
+  function parseAnd(): QueryNode {
     const nodes = [parseUnary()];
 
-    while (peek() && peek().type !== ')') {
-      const kind = peek().type === 'word' ? classify(peek()).type : 'leaf';
+    for (let next = peek(); next && next.type !== ')'; next = peek()) {
+      const kind = kindOf(next);
       if (kind === 'or') break;
       if (kind === 'and') position += 1;
-      if (!peek() || peek().type === ')') break;
+      const after = peek();
+      if (!after || after.type === ')') break;
       nodes.push(parseUnary());
     }
 
-    return nodes.length === 1 ? nodes[0] : { type: 'and', nodes };
+    return nodes.length === 1 && nodes[0] ? nodes[0] : { type: 'and', nodes };
   }
 
-  function parseUnary() {
+  function parseUnary(): QueryNode {
     const token = peek();
     if (!token) throw new QueryError('クエリが途中で終わっています。');
 
@@ -285,26 +329,26 @@ export function parseQuery(input) {
 }
 
 // AST から検索語だけを集める (結果のハイライト用)。
-export function collectTerms(ast, out = []) {
+export function collectTerms(ast: QueryNode | null | undefined, out: string[] = []): string[] {
   if (!ast) return out;
 
   if (ast.type === 'term') {
     out.push(ast.value);
   } else if (ast.type === 'not') {
     // 否定語はハイライトしない
-  } else if (ast.nodes) {
+  } else if (ast.type === 'and' || ast.type === 'or') {
     for (const node of ast.nodes) collectTerms(node, out);
   }
 
   return out;
 }
 
-export function parseSnowflake(value) {
+export function parseSnowflake(value: string | null | undefined): string | null {
   const match = /(\d{16,21})/.exec(value ?? '');
-  return match ? match[1] : null;
+  return match?.[1] ?? null;
 }
 
-function localParts(timestamp) {
+function localParts(timestamp: number): { year: number; month: number; day: number } {
   const shifted = new Date(timestamp + TZ_OFFSET_MS);
   return {
     year: shifted.getUTCFullYear(),
@@ -313,11 +357,11 @@ function localParts(timestamp) {
   };
 }
 
-function localTimestamp(year, month, day) {
+function localTimestamp(year: number, month: number, day: number): number {
   return Date.UTC(year, month, day) - TZ_OFFSET_MS;
 }
 
-const RELATIVE_UNITS = {
+const RELATIVE_UNITS: Readonly<Record<string, number>> = {
   h: 3_600_000,
   d: 86_400_000,
   w: 604_800_000,
@@ -325,9 +369,15 @@ const RELATIVE_UNITS = {
   y: 31_536_000_000
 };
 
+export interface DateRange {
+  start: number;
+  end: number;
+  relative: boolean;
+}
+
 // 日付表現を { start, end } (end は含まない) に変換する。
 // relative: true のときは「今から N 前」という相対指定なので before:/after: の解釈を変える。
-export function parseDateRange(raw) {
+export function parseDateRange(raw: string | null | undefined): DateRange {
   const value = (raw ?? '').trim().toLowerCase();
   if (!value) throw new QueryError('日付が空です。');
 
@@ -344,8 +394,9 @@ export function parseDateRange(raw) {
   }
 
   const relative = /^(\d+)(h|d|w|mo|y)$/.exec(value);
-  if (relative) {
-    return { start: now - Number(relative[1]) * RELATIVE_UNITS[relative[2]], end: now, relative: true };
+  const unit = relative?.[2] ? RELATIVE_UNITS[relative[2]] : undefined;
+  if (relative && unit !== undefined) {
+    return { start: now - Number(relative[1]) * unit, end: now, relative: true };
   }
 
   const ymd = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/.exec(value);
@@ -365,7 +416,7 @@ export function parseDateRange(raw) {
     return { start: localTimestamp(Number(y[1]), 0, 1), end: localTimestamp(Number(y[1]) + 1, 0, 1), relative: false };
   }
 
-  const parsed = Date.parse(raw);
+  const parsed = Date.parse(raw ?? '');
   if (!Number.isNaN(parsed)) {
     return { start: parsed, end: parsed + 1, relative: false };
   }
@@ -373,14 +424,20 @@ export function parseDateRange(raw) {
   throw new QueryError(`日付を解釈できません: \`${raw}\` (例: 2024-05-01 / 2024-05 / 7d / today)`);
 }
 
-export function parseComparison(raw) {
+export type ComparisonOperator = '=' | '>' | '<' | '>=' | '<=';
+
+export function parseComparison(raw: string | null | undefined): { operator: ComparisonOperator; value: number } {
   const match = /^(>=|<=|>|<|=)?\s*(\d+)$/.exec((raw ?? '').trim());
   if (!match) throw new QueryError(`数値条件を解釈できません: \`${raw}\` (例: >5, <=100, 3)`);
 
-  return { operator: match[1] === '=' || !match[1] ? '=' : match[1], value: Number(match[2]) };
+  const operator = match[1];
+  return {
+    operator: operator === '>' || operator === '<' || operator === '>=' || operator === '<=' ? operator : '=',
+    value: Number(match[2])
+  };
 }
 
-export function parseHourRange(raw) {
+export function parseHourRange(raw: string | null | undefined): { from: number; to: number } {
   const match = /^(\d{1,2})\s*-\s*(\d{1,2})$/.exec((raw ?? '').trim());
   if (match) {
     return { from: Number(match[1]) % 24, to: Number(match[2]) % 24 };
@@ -395,12 +452,14 @@ export function parseHourRange(raw) {
   throw new QueryError(`時間帯を解釈できません: \`${raw}\` (例: 22-4, 9-18, 3)`);
 }
 
-export function parseWeekdays(raw) {
+export function parseWeekdays(raw: string | null | undefined): number[] {
   const parts = (raw ?? '').split(/[,、\s]+/).filter(Boolean);
-  const days = [];
+  const days: number[] = [];
 
   for (const part of parts) {
-    const day = WEEKDAYS[part.toLowerCase()];
+    // 自前のキーだけを見る (constructor や __proto__ を曜日として拾わない)
+    const key = part.toLowerCase();
+    const day = Object.hasOwn(WEEKDAYS, key) ? WEEKDAYS[key] : undefined;
     if (day === undefined) throw new QueryError(`曜日を解釈できません: \`${part}\` (例: sat,sun / 土,日)`);
     days.push(day);
   }
