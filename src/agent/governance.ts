@@ -84,6 +84,12 @@ function labelFrom(table: Record<string, string>, value: string | null | undefin
   return value !== null && value !== undefined && Object.hasOwn(table, value) ? table[value] : undefined;
 }
 
+/** 判決の記録 ({ verdict: 'constitutional' ... }) から判決の名前だけを取り出す。形が違えば undefined。 */
+function verdictName(record: unknown): string | undefined {
+  if (typeof record !== 'object' || record === null || !('verdict' in record)) return undefined;
+  return typeof record.verdict === 'string' ? record.verdict : undefined;
+}
+
 function governanceStateLabel(value: string): string {
   return labelFrom({ active: '稼働中', paused: '一時停止中' }, value) ?? value;
 }
@@ -184,9 +190,12 @@ export function runGovernanceInfo(ctx: GovernanceContext, args: ToolArgs): strin
     const constitution = records.getActiveConstitution(guildId);
     if (!constitution) throw new Error('現行憲法がありません。');
     const kind = action === 'institutions' ? 'institution' : 'procedure';
-    const entries = constitution.rules?.[action === 'institutions' ? 'institutions' : 'procedures'] ?? {};
+    // 機関・手続・出典を持つのは v2 の法体系だけ (v1 の憲法本文に埋め込んだ規則には無い)
+    const rules = constitution.rules;
+    const system = rules?.$schema === 'sakana.legal-system/v2' ? rules : null;
+    const entries = (action === 'institutions' ? system?.institutions : system?.procedures) ?? {};
     return Object.entries(entries).map(([key, value]) => ({ id: key, ...value,
-      legalBasis: constitution.rules?.sources?.[`${kind}:${key}`] })).map((entry) => JSON.stringify(entry)).join('\n') || '旧憲法の実行規則を参照してください。';
+      legalBasis: system?.sources[`${kind}:${key}`] })).map((entry) => JSON.stringify(entry)).join('\n') || '旧憲法の実行規則を参照してください。';
   }
   if (action === 'laws') {
     const laws = records.listLaws(guildId);
@@ -226,7 +235,7 @@ export function runGovernanceInfo(ctx: GovernanceContext, args: ToolArgs): strin
       `申立概要: ${entry.summary}`,
       entry.law_id ? `適用法: ${lawDescription(entry)}` : null,
       entry.challenged_type ? '違憲審査対象: 申立概要と公開裁判記録に記載' : null,
-      entry.verdict ? `判決: ${labelFrom(VERDICT_LABELS, entry.verdict.verdict) ?? '確定済み'}` : '判決: 未確定'
+      entry.verdict ? `判決: ${labelFrom(VERDICT_LABELS, verdictName(entry.verdict)) ?? '確定済み'}` : '判決: 未確定'
     ].filter(Boolean).join('\n');
   }
   if (action === 'administration') {

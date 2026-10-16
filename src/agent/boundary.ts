@@ -28,78 +28,9 @@ import { reserveGovernanceAgentAttempt } from '../governance/service.js';
 
 // ---------------------------------------------------------------- governance
 
-export interface GovernanceGuild {
-  guild_id: string;
-  status: string;
-  enforcement_mode: string;
-  procedure_channel_id: string;
-  parliament_forum_id: string;
-  court_forum_id: string;
-  trusted_role_id: string | null;
-}
-
-export interface Constitution {
-  version: number;
-  content: string;
-  rules?: {
-    institutions?: Record<string, Record<string, unknown>>;
-    procedures?: Record<string, Record<string, unknown>>;
-    sources?: Record<string, unknown>;
-  } | null;
-}
-
-export interface Law {
-  id: number;
-  guild_id: string;
-  title: string;
-  text: string;
-  effective_at: number;
-  provisions?: {
-    offenses?: { code: string; title: string }[];
-    governance?: unknown[];
-  } | null;
-}
-
-export interface Proposal {
-  id: number;
-  guild_id: string;
-  kind: string;
-  status: string;
-  workflow_handler: string | null;
-  title: string;
-  summary: string;
-  body?: { content?: string; text?: string } | null;
-}
-
-export interface CaseRecord {
-  id: number;
-  guild_id: string;
-  kind: string;
-  status: string;
-  summary: string;
-  law_id: number | null;
-  offense_code: string | null;
-  finalized_at: number | null;
-  workflow_handler: string | null;
-  challenged_type: string | null;
-  verdict?: { verdict?: string } | null;
-}
-
-export interface AdministrativeAct {
-  id: number;
-  guild_id: string;
-  kind: string;
-  status: string;
-  summary: string;
-}
-
-export interface VoteSummary {
-  yes: number;
-  no: number;
-  abstain: number;
-  trustedNo: number;
-  trustedTotal: number;
-}
+// db.ts は TypeScript なので、記録の型も関数も持ち主から直接使う。
+// まだ JavaScript の service.js の関数だけ、ここで呼び方を宣言する。
+export type { AdministrativeAct, CaseRecord, Constitution, Law, Proposal } from '../governance/types.js';
 
 export interface GovernanceAttempt {
   ok: boolean;
@@ -110,19 +41,13 @@ export interface GovernanceAttempt {
   retryAt?: number | null;
 }
 
-interface GovernanceApi {
-  getGovernanceGuild(guildId: string): GovernanceGuild | null | undefined;
-  getActiveConstitution(guildId: string): Constitution | null | undefined;
-  getLaw(id: number): Law | null | undefined;
-  listLaws(guildId: string): Law[];
-  listProposals(guildId: string, options: { limit: number }): Proposal[];
-  proposalVoteSummary(proposalId: number): VoteSummary;
-  listCases(guildId: string, options: { limit: number }): CaseRecord[];
-  listAdministrativeActs(guildId: string, limit: number): AdministrativeAct[];
+interface AttemptApi {
   reserveGovernanceAgentAttempt(member: GuildMember, eventId: string): GovernanceAttempt;
 }
 
-export const governance: GovernanceApi = {
+const attempts: AttemptApi = { reserveGovernanceAgentAttempt };
+
+export const governance = {
   getGovernanceGuild,
   getActiveConstitution,
   getLaw,
@@ -131,5 +56,5 @@ export const governance: GovernanceApi = {
   proposalVoteSummary,
   listCases,
   listAdministrativeActs,
-  reserveGovernanceAgentAttempt
+  ...attempts
 };
