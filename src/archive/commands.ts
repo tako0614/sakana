@@ -5,7 +5,12 @@ import {
   EmbedBuilder,
   InteractionContextType,
   MessageFlags,
-  SlashCommandBuilder
+  SlashCommandBuilder,
+  type ButtonInteraction,
+  type ChatInputCommandInteraction,
+  type GuildMember,
+  type Interaction,
+  type MessageMentionOptions
 } from 'discord.js';
 
 import {
@@ -18,14 +23,15 @@ import {
   purgeGuild,
   rebuildFts
 } from './db.js';
-import { cancelJob, coverageReport, getRunningJob, runCoverageJob, runIndexJob } from './indexer.js';
-import { embedPreflight, runEmbedJob } from './embed-job.js';
+import { cancelJob, coverageReport, getRunningJob, runCoverageJob, runIndexJob, type CoverageReport } from './indexer.js';
+import { embedPreflight, runEmbedJob, type EmbedPreflight } from './embed-job.js';
 import { chunkCoverage } from './chunks.js';
+import { errorMessage } from './guards.js';
 import { canManageIndex, canSeeDeleted, getChannelScope } from './permissions.js';
 import { QueryError } from './query.js';
 import {
   aggregateSearch,
-  countSearch,
+  countSearchVisibility,
   getContext,
   search,
   searchSummary,
@@ -43,32 +49,79 @@ import {
   shortDate,
   sparkline
 } from './render.js';
+import type {
+  AggregateRow,
+  ArchiveJob,
+  CoverageJob,
+  EmbedJob,
+  FilterCondition,
+  GuildIndexStateRow,
+  IndexJob,
+  MessageRow,
+  SearchOptions
+} from './types.js';
+import { publicChannels } from './visibility.js';
 
 const PAGE_SIZE = 5;
 const SESSION_TTL_MS = 15 * 60_000;
-const NO_MENTIONS = { parse: [] };
+// 1人が検索を連打してもメモリが増え続けないよう、保持するページ送りの数に上限を置く
+const MAX_SESSIONS = 500;
+// 返事の中のユーザー名・ロール・@everyone で誰も呼ばない。検索語や結果の本文は
+// 利用者の入力なので、<@&ロール> や @everyone が混ざっていても通知を飛ばさない。
+const NO_MENTIONS: MessageMentionOptions = { parse: [] };
 const WEEKDAY_LABELS = ['日', '月', '火', '水', '木', '金', '土'];
 
-const sessions = new Map();
+// 公開の返事に出せない結果 (このチャンネルの全員が見られるとは限らない発言) が混ざったときの断り
+const PRIVATE_NOTICE = '🔒 結果に、このチャンネルの全員が見られるとは限らないメッセージ (非公開の場所・削除済み) が含まれるため、実行した人にだけ表示しました。';
+const PRIVATE_NOTE = '🔒 このチャンネルの全員が見られるとは限らない結果が含まれるため、あなたにだけ表示しています。';
 
-function saveSession(token, payload) {
+type GuildCommand = ChatInputCommandInteraction<'cached'>;
+type GuildButton = ButtonInteraction<'cached'>;
+
+interface CommandSearchOptions extends SearchOptions {
+  query: string;
+  extra: FilterCondition[];
+}
+
+interface SearchSession {
+  options: CommandSearchOptions;
+  total: number;
+  label: string;
+  userId: string;
+  guildId: string;
+  expiresAt: number;
+}
+
+const sessions = new Map<string, SearchSession>();
+
+function saveSession(token: string, payload: Omit<SearchSession, 'expiresAt'>): void {
   const now = Date.now();
   for (const [key, value] of sessions) {
     if (value.expiresAt <= now) sessions.delete(key);
   }
+  // Map は入れた順に並ぶので、先頭がいちばん古い
+  while (sessions.size >= MAX_SESSIONS) {
+    const oldest = sessions.keys().next();
+    if (oldest.done) break;
+    sessions.delete(oldest.value);
+  }
   sessions.set(token, { ...payload, expiresAt: now + SESSION_TTL_MS });
 }
 
-function requireGuild(interaction) {
-  if (!interaction.guildId) {
-    interaction.reply({ content: 'このコマンドはサーバー内でのみ使用できます。', flags: MessageFlags.Ephemeral });
-    return false;
-  }
-  return true;
+/** サーバー内 (キャッシュ済み) のコマンドか。DM や未キャッシュのサーバーでは使わせない。 */
+function requireGuild(interaction: ChatInputCommandInteraction): interaction is GuildCommand {
+  if (interaction.guildId && interaction.guild) return true;
+  interaction.reply({ content: 'このコマンドはサーバー内でのみ使用できます。', flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS })
+    .catch(() => {});
+  return false;
 }
 
-function collectFilters(interaction) {
-  const extra = [];
+function isGuildButton(interaction: ButtonInteraction): interaction is GuildButton {
+  return Boolean(interaction.guildId) && interaction.guild !== null;
+}
+
+function collectFilters(interaction: GuildCommand): FilterCondition[] {
+  const extra: FilterCondition[] = [];
 
   const user = interaction.options.getUser('from');
   if (user) extra.push({ key: 'from', value: user.id });
@@ -88,8 +141,8 @@ function collectFilters(interaction) {
   return extra;
 }
 
-function describeQuery(query, extra) {
-  const parts = [];
+function describeQuery(query: string, extra: readonly FilterCondition[]): string {
+  const parts: string[] = [];
   if (query) parts.push(query);
   for (const condition of extra) {
     const value = /^\d{16,21}$/.test(condition.value) && condition.key === 'from'
@@ -102,8 +155,12 @@ function describeQuery(query, extra) {
   return parts.join(' ') || '(条件なし)';
 }
 
-async function buildSearchOptions(interaction, { sort } = {}) {
-  const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
+async function commandMember(interaction: GuildCommand): Promise<GuildMember> {
+  return interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
+}
+
+async function buildSearchOptions(interaction: GuildCommand, { sort }: { sort?: string } = {}): Promise<CommandSearchOptions> {
+  const member = await commandMember(interaction);
 
   return {
     guildId: interaction.guildId,
@@ -115,14 +172,52 @@ async function buildSearchOptions(interaction, { sort } = {}) {
   };
 }
 
-function emptyArchiveEmbed() {
+/**
+ * このチャンネルにいる全員が見られるチャンネル。公開の返事に載せてよい範囲。
+ * 実行者の権限で見えるもの (getChannelScope) ではなく、@everyone と bot が読める場所と
+ * このチャンネル自身だけ。それ以外の発言が混ざる結果は本人にだけ見せる。
+ */
+function sharedChannels(interaction: GuildCommand | GuildButton): Set<string> {
+  const ids = new Set(publicChannels(interaction.guildId, interaction.guild));
+  if (interaction.channelId) ids.add(interaction.channelId);
+  return ids;
+}
+
+/** 公開の返事に載せてよい発言か。削除済みは誰に対しても本人だけに見せる。 */
+function isShareable(row: Pick<MessageRow, 'channel_id' | 'deleted'>, shared: ReadonlySet<string>): boolean {
+  return !row.deleted && shared.has(row.channel_id);
+}
+
+interface ResultPayload {
+  embeds: EmbedBuilder[];
+  components?: ActionRowBuilder<ButtonBuilder>[];
+}
+
+/**
+ * 公開で defer した返事を、断り書きに差し替えてから本人だけに結果を送る。
+ * defer した返事は後から ephemeral にできないので、続きの followUp で送る
+ * (editReply を先に済ませておかないと、最初の followUp が defer の返事を置き換えて公開になる)。
+ */
+async function replyPrivately(interaction: GuildCommand, payload: ResultPayload): Promise<void> {
+  await interaction.editReply({ content: PRIVATE_NOTICE, embeds: [], components: [], allowedMentions: NO_MENTIONS });
+  await interaction.followUp({ ...payload, content: PRIVATE_NOTE, flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
+}
+
+function emptyArchiveEmbed(): EmbedBuilder {
   return new EmbedBuilder()
     .setColor('#2b2d31')
     .setTitle('インデックスがまだありません')
     .setDescription('管理者が `/index build` を実行するとサーバーの過去ログを取り込めます。');
 }
 
-function renderSearchPage({ options, page, total, label }) {
+interface SearchPageInput {
+  options: SearchOptions;
+  page: number;
+  total: number;
+  label: string;
+}
+
+function renderSearchPage({ options, page, total, label }: SearchPageInput): { embed: EmbedBuilder; rows: MessageRow[]; pages: number } {
   const offset = page * PAGE_SIZE;
   const { rows, built } = search(options, { limit: PAGE_SIZE, offset });
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
@@ -137,11 +232,11 @@ function renderSearchPage({ options, page, total, label }) {
     )
     .setFooter({ text: `${page + 1} / ${pages} ページ ・ 並び順: ${built.sortKey} ・ ${label}`.slice(0, 2000) });
 
-  return { embed, rows, built, pages };
+  return { embed, rows, pages };
 }
 
-function paginationRow(token, page, pages) {
-  return new ActionRowBuilder().addComponents(
+function paginationRow(token: string, page: number, pages: number): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`archive:page:${token}:${page - 1}`)
       .setLabel('前へ')
@@ -159,12 +254,18 @@ function paginationRow(token, page, pages) {
   );
 }
 
+/** 公開の進捗に出すチャンネル。名前ではなく <#ID> にして、見えない人には名前を伏せる。 */
+function currentChannelLabel(job: ArchiveJob): string {
+  if (!job.currentChannelId) return job.currentChannel ?? '-';
+  return `<#${job.currentChannelId}>${job.currentChannel?.endsWith('(再試行)') ? ' (再試行)' : ''}`;
+}
+
 /**
  * 何のジョブが動いているのかを出す。
  * 「既に別のジョブが実行中」だけだと、起動時のキャッチアップが握っている場合に
  * 何を待てばいいのか分からない (実際にそれで詰まった)。
  */
-function runningJobMessage(guildId) {
+function runningJobMessage(guildId: string): string {
   const job = getRunningJob(guildId);
   if (!job) return '既に別のジョブが実行中です。`/index status` で確認できます。';
 
@@ -182,7 +283,7 @@ function runningJobMessage(guildId) {
   ].join('');
 }
 
-function queryErrorText(error) {
+function queryErrorText(error: QueryError): string {
   return `⚠️ ${error.message}`;
 }
 
@@ -225,14 +326,15 @@ const indexCommand = {
       .setName('reset')
       .setDescription('このサーバーのインデックスを全削除します')),
 
-  async execute(interaction) {
+  async execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!requireGuild(interaction)) return;
 
-    const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
+    const member = await commandMember(interaction);
     if (!canManageIndex(member)) {
       await interaction.reply({
         content: 'このコマンドは「サーバー管理」権限を持つ人か、`ARCHIVE_ADMIN_USERS` に登録された人だけが使えます。',
-        flags: MessageFlags.Ephemeral
+        flags: MessageFlags.Ephemeral,
+        allowedMentions: NO_MENTIONS
       });
       return;
     }
@@ -250,12 +352,12 @@ const indexCommand = {
   }
 };
 
-async function showStatus(interaction) {
+async function showStatus(interaction: GuildCommand): Promise<void> {
   const guildId = interaction.guildId;
   const state = getGuildState(guildId);
 
   if (!state) {
-    await interaction.reply({ embeds: [emptyArchiveEmbed()], flags: MessageFlags.Ephemeral });
+    await interaction.reply({ embeds: [emptyArchiveEmbed()], flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
     return;
   }
 
@@ -267,12 +369,12 @@ async function showStatus(interaction) {
     await interaction.editReply({ embeds: [buildStatusEmbed(interaction, state)], allowedMentions: NO_MENTIONS });
   } catch (error) {
     console.error('index status failed:', error);
-    await interaction.editReply({ content: `状態を取得できませんでした: ${String(error?.message ?? error).slice(0, 200)}` })
+    await interaction.editReply({ content: `状態を取得できませんでした: ${errorMessage(error).slice(0, 200)}`, allowedMentions: NO_MENTIONS })
       .catch(() => {});
   }
 }
 
-function buildStatusEmbed(interaction, state) {
+function buildStatusEmbed(interaction: GuildCommand, state: GuildIndexStateRow): EmbedBuilder {
   const guildId = interaction.guildId;
   const job = getRunningJob(guildId);
   const channels = listChannelStates(guildId);
@@ -296,7 +398,7 @@ function buildStatusEmbed(interaction, state) {
       value: [
         `チャンネル: ${job.channelsDone} / ${job.channelsTotal}`,
         `取り込み: ${formatNumber(job.messagesIndexed)} 件`,
-        `現在: ${job.currentChannel ?? '-'}`
+        `現在: ${currentChannelLabel(job)}`
       ].join('\n')
     });
   } else if (state.finished_at) {
@@ -378,8 +480,9 @@ function buildStatusEmbed(interaction, state) {
   }
 
   const top = channels.slice(0, 10);
-  if (top.length > 0) {
-    const max = top[0].message_count;
+  const first = top[0];
+  if (first) {
+    const max = first.message_count;
     embed.addFields({
       name: 'メッセージが多いチャンネル',
       value: top.map((channel) => `<#${channel.channel_id}> ${bar(channel.message_count, max, 10)} \`${formatNumber(channel.message_count)}\``).join('\n')
@@ -389,7 +492,7 @@ function buildStatusEmbed(interaction, state) {
   return embed;
 }
 
-function formatDuration(ms) {
+function formatDuration(ms: number): string {
   const minutes = Math.round(ms / 60_000);
   if (minutes < 60) return `${minutes}分`;
   const hours = Math.floor(minutes / 60);
@@ -403,40 +506,50 @@ function formatDuration(ms) {
  * 索引が本体とずれると「件数は合っているのに古い行だけ引けない」状態になり、
  * 症状が出ないまま検索結果が痩せる。直す手段がリポジトリに無かったので用意する。
  */
-async function repairFts(interaction) {
+async function repairFts(interaction: GuildCommand): Promise<void> {
   await interaction.deferReply();
 
   const first = checkFtsIntegrity();
   if (first.ok) {
-    await interaction.editReply('全文検索の索引は本体と一致しています (作り直しは不要)。');
+    await interaction.editReply({ content: '全文検索の索引は本体と一致しています (作り直しは不要)。', allowedMentions: NO_MENTIONS });
     return;
   }
 
-  await interaction.editReply(`⚠️ 索引が本体とずれています (${first.error})。作り直します…`);
+  await interaction.editReply({ content: `⚠️ 索引が本体とずれています (${first.error})。作り直します…`, allowedMentions: NO_MENTIONS });
 
   try {
     rebuildFts();
   } catch (error) {
-    await interaction.editReply(`索引の作り直しに失敗しました: ${String(error.message ?? error).slice(0, 300)}`);
+    await interaction.editReply({ content: `索引の作り直しに失敗しました: ${errorMessage(error).slice(0, 300)}`, allowedMentions: NO_MENTIONS });
     return;
   }
 
   const second = checkFtsIntegrity();
-  await interaction.editReply(
-    second.ok
+  await interaction.editReply({
+    content: second.ok
       ? '索引を作り直しました。検索が痩せていた分は元に戻ります。'
-      : `作り直しましたが、まだ食い違っています: ${second.error}`
-  );
+      : `作り直しましたが、まだ食い違っています: ${second.error}`,
+    allowedMentions: NO_MENTIONS
+  });
 }
 
-async function startVerify(interaction) {
+/** 進捗の投稿 (interaction のトークンは15分で切れるので、通常のメッセージに出す)。 */
+async function postProgress(interaction: GuildCommand, embed: EmbedBuilder) {
+  return interaction.channel?.send({ embeds: [embed], allowedMentions: NO_MENTIONS }).catch(() => null) ?? null;
+}
+
+function failureEmbed(title: string, error: unknown): EmbedBuilder {
+  return new EmbedBuilder().setColor('#ed4245').setTitle(title).setDescription(errorMessage(error).slice(0, 2000));
+}
+
+async function startVerify(interaction: GuildCommand): Promise<void> {
   if (!getGuildState(interaction.guildId)) {
-    await interaction.reply({ embeds: [emptyArchiveEmbed()], flags: MessageFlags.Ephemeral });
+    await interaction.reply({ embeds: [emptyArchiveEmbed()], flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
     return;
   }
 
   if (getRunningJob(interaction.guildId)) {
-    await interaction.reply({ content: runningJobMessage(interaction.guildId), flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: runningJobMessage(interaction.guildId), flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
     return;
   }
 
@@ -445,35 +558,32 @@ async function startVerify(interaction) {
   await interaction.reply({
     content: before.gapCount === 0
       ? '🔍 記録済みの穴はありませんが、末尾の取りこぼしがないか確認します。'
-      : `🔍 穴 ${before.gapCount} 件 (合計 ${formatDuration(before.gapMs)}) を埋めます。`
+      : `🔍 穴 ${before.gapCount} 件 (合計 ${formatDuration(before.gapMs)}) を埋めます。`,
+    allowedMentions: NO_MENTIONS
   });
 
   // 進捗は interaction ではなく通常メッセージに出す (トークンは15分で切れる)
-  const statusMessage = await interaction.channel
-    ?.send({ embeds: [verifyEmbed(null)] })
-    .catch(() => null);
+  const statusMessage = await postProgress(interaction, verifyEmbed(null));
 
   let lastEdit = 0;
-  const onProgress = (job) => {
+  const onProgress = (job: CoverageJob): void => {
     const now = Date.now();
     if (now - lastEdit < 5000) return;
     lastEdit = now;
-    statusMessage?.edit({ embeds: [verifyEmbed(job)] }).catch(() => {});
+    statusMessage?.edit({ embeds: [verifyEmbed(job)], allowedMentions: NO_MENTIONS }).catch(() => {});
   };
 
   try {
     const job = await runCoverageJob(interaction.guild, { mode: 'verify', onProgress });
     const after = coverageReport(interaction.guildId);
-    await statusMessage?.edit({ embeds: [verifyEmbed(job, after, true)] }).catch(() => {});
+    await statusMessage?.edit({ embeds: [verifyEmbed(job, after, true)], allowedMentions: NO_MENTIONS }).catch(() => {});
   } catch (error) {
     console.error('Verify job failed:', error);
-    await statusMessage?.edit({
-      embeds: [new EmbedBuilder().setColor('#ed4245').setTitle('確認に失敗しました').setDescription(String(error.message ?? error).slice(0, 2000))]
-    }).catch(() => {});
+    await statusMessage?.edit({ embeds: [failureEmbed('確認に失敗しました', error)], allowedMentions: NO_MENTIONS }).catch(() => {});
   }
 }
 
-function verifyEmbed(job, after = null, done = false) {
+function verifyEmbed(job: CoverageJob | null, after: CoverageReport | null = null, done = false): EmbedBuilder {
   const embed = new EmbedBuilder()
     .setColor(done ? '#3ba55d' : '#2b2d31')
     .setTitle(done ? '✅ 取りこぼしの確認が終わりました' : '🔍 取りこぼしを確認中…');
@@ -491,7 +601,7 @@ function verifyEmbed(job, after = null, done = false) {
     `チャンネル: **${job.channelsDone} / ${job.channelsTotal}**`,
     `取り込み: **${formatNumber(job.messagesIndexed)}** 件`,
     `埋めた穴: **${job.gapsClosed}**`,
-    job.cancelled ? '⏹️ 中止しました' : `現在: ${job.currentChannel ?? '-'}`
+    job.cancelled ? '⏹️ 中止しました' : `現在: ${currentChannelLabel(job)}`
   ].join('\n'));
 
   if (done && after) {
@@ -506,20 +616,20 @@ function verifyEmbed(job, after = null, done = false) {
   return embed;
 }
 
-function formatBytes(bytes) {
+function formatBytes(bytes: number): string {
   if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)}GB`;
   if (bytes >= 1024 ** 2) return `${Math.round(bytes / 1024 ** 2)}MB`;
   return `${Math.round(bytes / 1024)}KB`;
 }
 
-async function startEmbed(interaction) {
+async function startEmbed(interaction: GuildCommand): Promise<void> {
   if (!getGuildState(interaction.guildId)) {
-    await interaction.reply({ embeds: [emptyArchiveEmbed()], flags: MessageFlags.Ephemeral });
+    await interaction.reply({ embeds: [emptyArchiveEmbed()], flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
     return;
   }
 
   if (getRunningJob(interaction.guildId)) {
-    await interaction.reply({ content: runningJobMessage(interaction.guildId), flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: runningJobMessage(interaction.guildId), flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
     return;
   }
 
@@ -527,16 +637,17 @@ async function startEmbed(interaction) {
 
   await interaction.deferReply();
 
-  let preflight;
+  let preflight: EmbedPreflight;
   try {
     preflight = await embedPreflight(interaction.guildId);
   } catch (error) {
     await interaction.editReply({
       content: [
         '意味検索の準備に失敗しました。Python 側の依存が揃っていない可能性があります。',
-        `\`\`\`${String(error.message ?? error).slice(0, 500)}\`\`\``,
+        `\`\`\`${errorMessage(error).slice(0, 500)}\`\`\``,
         '`pip install -r requirements.txt` を確認してください。'
-      ].join('\n')
+      ].join('\n'),
+      allowedMentions: NO_MENTIONS
     });
     return;
   }
@@ -549,33 +660,30 @@ async function startEmbed(interaction) {
       `推定 **${Math.max(1, Math.round(preflight.estimatedMs / 60_000))} 分** / 追加ディスク **${formatBytes(target * (preflight.dim + 76))}**`,
       `モデル: \`${preflight.dim}次元\` ・ 既に完了: ${formatNumber(preflight.done)} 件`,
       rebuild ? '⚠️ rebuild:true なので既存のベクトルを捨てて作り直します。' : ''
-    ].filter(Boolean).join('\n')
+    ].filter(Boolean).join('\n'),
+    allowedMentions: NO_MENTIONS
   });
 
-  const statusMessage = await interaction.channel
-    ?.send({ embeds: [embedJobEmbed(null)] })
-    .catch(() => null);
+  const statusMessage = await postProgress(interaction, embedJobEmbed(null));
 
   let lastEdit = 0;
-  const onProgress = (job) => {
+  const onProgress = (job: EmbedJob): void => {
     const now = Date.now();
     if (now - lastEdit < 5000) return;
     lastEdit = now;
-    statusMessage?.edit({ embeds: [embedJobEmbed(job)] }).catch(() => {});
+    statusMessage?.edit({ embeds: [embedJobEmbed(job)], allowedMentions: NO_MENTIONS }).catch(() => {});
   };
 
   try {
     const job = await runEmbedJob(interaction.guild, { mode: 'forward', rebuild, onProgress });
-    await statusMessage?.edit({ embeds: [embedJobEmbed(job, true)] }).catch(() => {});
+    await statusMessage?.edit({ embeds: [embedJobEmbed(job, true)], allowedMentions: NO_MENTIONS }).catch(() => {});
   } catch (error) {
     console.error('Embed job failed:', error);
-    await statusMessage?.edit({
-      embeds: [new EmbedBuilder().setColor('#ed4245').setTitle('埋め込みに失敗しました').setDescription(String(error.message ?? error).slice(0, 2000))]
-    }).catch(() => {});
+    await statusMessage?.edit({ embeds: [failureEmbed('埋め込みに失敗しました', error)], allowedMentions: NO_MENTIONS }).catch(() => {});
   }
 }
 
-function embedJobEmbed(job, done = false) {
+function embedJobEmbed(job: EmbedJob | null, done = false): EmbedBuilder {
   const embed = new EmbedBuilder()
     .setColor(done ? '#3ba55d' : '#2b2d31')
     .setTitle(done ? '✅ 埋め込みが完了しました' : '🧠 埋め込み中…');
@@ -601,18 +709,19 @@ function embedJobEmbed(job, done = false) {
   return embed;
 }
 
-async function cancelIndex(interaction) {
+async function cancelIndex(interaction: GuildCommand): Promise<void> {
   const cancelled = cancelJob(interaction.guildId);
   await interaction.reply({
     content: cancelled ? '中止をリクエストしました。現在のチャンネルの処理が終わり次第停止します。' : '実行中のインデックス作成はありません。',
-    flags: MessageFlags.Ephemeral
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: NO_MENTIONS
   });
 }
 
-async function confirmReset(interaction) {
+async function confirmReset(interaction: GuildCommand): Promise<void> {
   const count = countMessages(interaction.guildId);
 
-  const row = new ActionRowBuilder().addComponents(
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`archive:reset:${interaction.user.id}`)
       .setLabel('削除する')
@@ -626,49 +735,63 @@ async function confirmReset(interaction) {
   await interaction.reply({
     content: `⚠️ このサーバーのインデックス **${formatNumber(count)} 件** を削除します。取り込み直すには再度 \`/index build\` が必要です。`,
     components: [row],
-    flags: MessageFlags.Ephemeral
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: NO_MENTIONS
   });
 }
 
-async function startIndex(interaction, mode) {
+async function startIndex(interaction: GuildCommand, mode: 'full' | 'update'): Promise<void> {
   if (getRunningJob(interaction.guildId)) {
-    await interaction.reply({ content: '既にインデックス作成が実行中です。`/index status` で進捗を確認できます。', flags: MessageFlags.Ephemeral });
+    await interaction.reply({
+      content: '既にインデックス作成が実行中です。`/index status` で進捗を確認できます。',
+      flags: MessageFlags.Ephemeral,
+      allowedMentions: NO_MENTIONS
+    });
     return;
   }
 
   await interaction.reply({
     content: mode === 'full'
       ? '📚 全チャンネルの過去ログ取り込みを開始します。進捗はこのチャンネルに投稿します。'
-      : '🔄 差分の取り込みを開始します。'
+      : '🔄 差分の取り込みを開始します。',
+    allowedMentions: NO_MENTIONS
   });
 
   // 進捗表示は interaction ではなく通常メッセージに出す。
   // interaction のトークンは15分で切れるが、全件取り込みはそれより長くかかるため。
-  const statusMessage = await interaction.channel
-    ?.send({ embeds: [jobEmbed(null, mode)] })
-    .catch(() => null);
+  const statusMessage = await postProgress(interaction, jobEmbed(null, mode));
 
   let lastEdit = 0;
 
-  const onProgress = (job) => {
+  const onProgress = (job: IndexJob): void => {
     const now = Date.now();
     if (now - lastEdit < 5000) return;
     lastEdit = now;
-    statusMessage?.edit({ embeds: [jobEmbed(job, mode)] }).catch(() => {});
+    statusMessage?.edit({ embeds: [jobEmbed(job, mode)], allowedMentions: NO_MENTIONS }).catch(() => {});
   };
 
   try {
     const job = await runIndexJob(interaction.guild, { mode, onProgress });
-    await statusMessage?.edit({ embeds: [jobEmbed(job, mode, true)] }).catch(() => {});
+    await statusMessage?.edit({ embeds: [jobEmbed(job, mode, true)], allowedMentions: NO_MENTIONS }).catch(() => {});
   } catch (error) {
     console.error('Index job failed:', error);
-    await statusMessage?.edit({
-      embeds: [new EmbedBuilder().setColor('#ed4245').setTitle('インデックス作成に失敗しました').setDescription(String(error.message ?? error).slice(0, 2000))]
-    }).catch(() => {});
+    await statusMessage?.edit({ embeds: [failureEmbed('インデックス作成に失敗しました', error)], allowedMentions: NO_MENTIONS }).catch(() => {});
   }
 }
 
-function jobEmbed(job, mode, done = false) {
+/**
+ * bot が読めなかったチャンネル。進捗はチャンネルに公開で出るので、名前ではなく <#ID> で並べる
+ * (読めない人には名前が伏せられる。非公開チャンネルの名前を進捗で晒さない)。
+ */
+function skippedChannelsText(job: IndexJob): string {
+  const ids = new Set(job.skippedIds ?? []);
+  for (const entry of job.skipped ?? []) {
+    if (typeof entry !== 'string' && entry.channelId) ids.add(entry.channelId);
+  }
+  return [...ids].slice(0, 15).map((id) => `<#${id}>`).join(', ').slice(0, 1000) || '-';
+}
+
+function jobEmbed(job: IndexJob | null, mode: 'full' | 'update', done = false): EmbedBuilder {
   const embed = new EmbedBuilder()
     .setColor(done ? (job?.cancelled ? '#faa61a' : '#3ba55d') : '#2b2d31')
     .setTitle(done
@@ -687,14 +810,15 @@ function jobEmbed(job, mode, done = false) {
     '',
     `チャンネル: **${job.channelsDone} / ${job.channelsTotal}**`,
     `取り込み: **${formatNumber(job.messagesIndexed)}** 件`,
-    job.cancelled ? '⏹️ 中止しました' : `現在: ${job.currentChannel ?? '-'}`,
+    job.cancelled ? '⏹️ 中止しました' : `現在: ${currentChannelLabel(job)}`,
     `モード: ${mode === 'full' ? '全件' : '差分'}`
   ].join('\n'));
 
-  if (done && job.skipped?.length > 0) {
+  const skipped = job.skipped ?? [];
+  if (done && skipped.length > 0) {
     embed.addFields({
-      name: `Bot が読めなかったチャンネル (${job.skipped.length})`,
-      value: job.skipped.slice(0, 15).join(', ').slice(0, 1000)
+      name: `Bot が読めなかったチャンネル (${skipped.length})`,
+      value: skippedChannelsText(job)
     });
   }
 
@@ -753,40 +877,42 @@ const searchCommand = {
         { name: 'ランダム', value: 'random' }
       )),
 
-  async execute(interaction) {
+  async execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!requireGuild(interaction)) return;
 
     if (!getGuildState(interaction.guildId)) {
-      await interaction.reply({ embeds: [emptyArchiveEmbed()], flags: MessageFlags.Ephemeral });
+      await interaction.reply({ embeds: [emptyArchiveEmbed()], flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
       return;
     }
 
     await interaction.deferReply();
 
-    let options;
     try {
-      options = await buildSearchOptions(interaction);
+      const options = await buildSearchOptions(interaction);
 
       if (!options.query && options.extra.length === 0) {
-        await interaction.editReply({ content: '検索条件を1つ以上指定してください。使い方は `/searchhelp` で確認できます。' });
+        await interaction.editReply({ content: '検索条件を1つ以上指定してください。使い方は `/searchhelp` で確認できます。', allowedMentions: NO_MENTIONS });
         return;
       }
 
-      const total = countSearch(options);
+      // 件数と「公開の場に出せない結果」の件数を1回で数える
+      const { total, restricted } = countSearchVisibility(options, [...sharedChannels(interaction)]);
       const label = describeQuery(options.query, options.extra);
       const { embed, pages } = renderSearchPage({ options, page: 0, total, label });
 
       const token = interaction.id;
-      saveSession(token, { options, total, label, userId: interaction.user.id });
+      saveSession(token, { options, total, label, userId: interaction.user.id, guildId: interaction.guildId });
 
-      await interaction.editReply({
-        embeds: [embed],
-        components: total > PAGE_SIZE ? [paginationRow(token, 0, pages)] : [],
-        allowedMentions: NO_MENTIONS
-      });
+      const components = total > PAGE_SIZE ? [paginationRow(token, 0, pages)] : [];
+      if (restricted > 0) {
+        await replyPrivately(interaction, { embeds: [embed], components });
+        return;
+      }
+
+      await interaction.editReply({ embeds: [embed], components, allowedMentions: NO_MENTIONS });
     } catch (error) {
       if (error instanceof QueryError) {
-        await interaction.editReply({ content: queryErrorText(error) });
+        await interaction.editReply({ content: queryErrorText(error), allowedMentions: NO_MENTIONS });
         return;
       }
       throw error;
@@ -796,15 +922,28 @@ const searchCommand = {
 
 // ---------------------------------------------------------------- /searchstats
 
-const AGGREGATIONS = {
+interface Aggregation {
+  limit: number;
+  orderByKey: false | 'asc' | 'desc';
+  label: (row: AggregateRow) => string;
+  title: string;
+}
+
+const AGGREGATIONS: Readonly<Record<string, Aggregation>> = {
   author: { limit: 10, orderByKey: false, label: (row) => `<@${row.bucket}>`, title: '投稿者' },
   channel: { limit: 10, orderByKey: false, label: (row) => `<#${row.bucket}>`, title: 'チャンネル' },
   year: { limit: 20, orderByKey: 'asc', label: (row) => `\`${row.bucket}\``, title: '年別' },
   month: { limit: 24, orderByKey: 'desc', label: (row) => `\`${row.bucket}\``, title: '月別 (直近24ヶ月)' },
   day: { limit: 30, orderByKey: 'desc', label: (row) => `\`${row.bucket}\``, title: '日別 (直近30日)' },
   hour: { limit: 24, orderByKey: 'asc', label: (row) => `\`${String(row.bucket).padStart(2, '0')}時\``, title: '時間帯' },
-  weekday: { limit: 7, orderByKey: 'asc', label: (row) => `\`${WEEKDAY_LABELS[row.bucket]}曜\``, title: '曜日' }
+  weekday: { limit: 7, orderByKey: 'asc', label: (row) => `\`${WEEKDAY_LABELS[Number(row.bucket)]}曜\``, title: '曜日' }
 };
+
+const DEFAULT_AGGREGATION: Aggregation = { limit: 10, orderByKey: false, label: (row) => `<@${row.bucket}>`, title: '投稿者' };
+
+function aggregationFor(by: string): Aggregation {
+  return (Object.hasOwn(AGGREGATIONS, by) ? AGGREGATIONS[by] : undefined) ?? AGGREGATIONS.author ?? DEFAULT_AGGREGATION;
+}
 
 const searchStatsCommand = {
   data: new SlashCommandBuilder()
@@ -833,11 +972,11 @@ const searchStatsCommand = {
     .addStringOption((option) => option.setName('after').setDescription('この日以降').setRequired(false))
     .addStringOption((option) => option.setName('before').setDescription('この日より前').setRequired(false)),
 
-  async execute(interaction) {
+  async execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!requireGuild(interaction)) return;
 
     if (!getGuildState(interaction.guildId)) {
-      await interaction.reply({ embeds: [emptyArchiveEmbed()], flags: MessageFlags.Ephemeral });
+      await interaction.reply({ embeds: [emptyArchiveEmbed()], flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
       return;
     }
 
@@ -846,12 +985,12 @@ const searchStatsCommand = {
     try {
       const options = await buildSearchOptions(interaction);
       const by = interaction.options.getString('by') ?? 'author';
-      const config = AGGREGATIONS[by] ?? AGGREGATIONS.author;
+      const config = aggregationFor(by);
 
       const summary = searchSummary(options);
 
       if (!summary.count) {
-        await interaction.editReply({ content: '該当するメッセージがありませんでした。' });
+        await interaction.editReply({ content: '該当するメッセージがありませんでした。', allowedMentions: NO_MENTIONS });
         return;
       }
 
@@ -868,7 +1007,7 @@ const searchStatsCommand = {
           { name: 'チャンネル数', value: formatNumber(summary.channels), inline: true },
           { name: '平均文字数', value: formatNumber(Math.round(summary.avg_length ?? 0)), inline: true },
           { name: 'リアクション合計', value: formatNumber(summary.reactions), inline: true },
-          { name: '期間', value: `${shortDate(summary.first_at)} 〜 ${shortDate(summary.last_at)}`, inline: true },
+          { name: '期間', value: `${shortDate(summary.first_at ?? 0)} 〜 ${shortDate(summary.last_at ?? 0)}`, inline: true },
           { name: config.title, value: formatRanking(rows, config.label).slice(0, 1024) || '該当なし' }
         );
 
@@ -879,10 +1018,18 @@ const searchStatsCommand = {
         });
       }
 
+      // 集計にも非公開の場所や削除済みの発言が入っていれば、人数・チャンネル・件数から
+      // 中身が推し量れるので本人にだけ見せる
+      const { restricted } = countSearchVisibility(options, [...sharedChannels(interaction)]);
+      if (restricted > 0) {
+        await replyPrivately(interaction, { embeds: [embed] });
+        return;
+      }
+
       await interaction.editReply({ embeds: [embed], allowedMentions: NO_MENTIONS });
     } catch (error) {
       if (error instanceof QueryError) {
-        await interaction.editReply({ content: queryErrorText(error) });
+        await interaction.editReply({ content: queryErrorText(error), allowedMentions: NO_MENTIONS });
         return;
       }
       throw error;
@@ -891,6 +1038,8 @@ const searchStatsCommand = {
 };
 
 // ---------------------------------------------------------------- /context
+
+const CONTEXT_MAX_RANGE = 10;
 
 const contextCommand = {
   data: new SlashCommandBuilder()
@@ -905,25 +1054,26 @@ const contextCommand = {
       .setName('range')
       .setDescription('前後に表示する件数 (既定 4, 最大 10)')
       .setMinValue(1)
-      .setMaxValue(10)
+      .setMaxValue(CONTEXT_MAX_RANGE)
       .setRequired(false)),
 
-  async execute(interaction) {
+  async execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!requireGuild(interaction)) return;
 
-    const raw = interaction.options.getString('message');
+    const raw = interaction.options.getString('message') ?? '';
     const ids = [...raw.matchAll(/\d{16,21}/g)].map((match) => match[0]);
-    const messageId = ids[ids.length - 1];
+    const messageId = ids.at(-1);
 
     if (!messageId) {
-      await interaction.reply({ content: 'メッセージのリンクか ID を指定してください。', flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: 'メッセージのリンクか ID を指定してください。', flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
       return;
     }
 
     await interaction.deferReply();
 
-    const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
-    const range = interaction.options.getInteger('range') ?? 4;
+    const member = await commandMember(interaction);
+    // Discord 側でも 1〜10 に絞っているが、サーバー側でも確かめる
+    const range = Math.min(CONTEXT_MAX_RANGE, Math.max(1, interaction.options.getInteger('range') ?? 4));
     const result = getContext(messageId, {
       guildId: interaction.guildId,
       before: range,
@@ -932,11 +1082,11 @@ const contextCommand = {
     });
 
     if (!result || result.target.guild_id !== interaction.guildId) {
-      await interaction.editReply({ content: 'そのメッセージはインデックスに無いか、閲覧権限がありません。' });
+      await interaction.editReply({ content: 'そのメッセージはインデックスに無いか、閲覧権限がありません。', allowedMentions: NO_MENTIONS });
       return;
     }
 
-    const line = (row, highlight) => {
+    const line = (row: MessageRow, highlight: boolean): string => {
       const body = excerpt(row.content || row.extra, [], 220);
       return highlight
         ? `**➤ <@${row.author_id}>** ${relativeTime(row.created_at)}\n> **${body}**`
@@ -953,6 +1103,13 @@ const contextCommand = {
       ].join('\n\n').slice(0, 4000))
       .setFooter({ text: '➤ が指定したメッセージ' })
       .addFields({ name: 'チャンネル', value: `<#${result.target.channel_id}> ・ [跳ぶ](${messageLink(result.target)})` });
+
+    // 前後の発言は全部同じチャンネル (getContext は削除済みを返さない)。
+    // そのチャンネルをここにいる全員が見られるときだけ公開で返す
+    if (!isShareable(result.target, sharedChannels(interaction))) {
+      await replyPrivately(interaction, { embeds: [embed] });
+      return;
+    }
 
     await interaction.editReply({ embeds: [embed], allowedMentions: NO_MENTIONS });
   }
@@ -975,11 +1132,11 @@ const archiveStatsCommand = {
         { name: '直近7日', value: '7d' }
       )),
 
-  async execute(interaction) {
+  async execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!requireGuild(interaction)) return;
 
     if (!getGuildState(interaction.guildId)) {
-      await interaction.reply({ embeds: [emptyArchiveEmbed()], flags: MessageFlags.Ephemeral });
+      await interaction.reply({ embeds: [emptyArchiveEmbed()], flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
       return;
     }
 
@@ -992,13 +1149,16 @@ const archiveStatsCommand = {
         ? Date.now() - 30 * 86_400_000
         : null;
 
-    const emojis = topReactionEmojis(interaction.guildId, { limit: 10, since });
-    const domains = topDomains(interaction.guildId, { limit: 10, since });
+    // 公開の返事なので、このチャンネルの全員が見られる場所の発言だけを数える
+    // (以前は非公開チャンネルも含めて数え、そこで貼られたドメインまで公開で出していた)
+    const shared = [...sharedChannels(interaction)];
+    const emojis = topReactionEmojis(interaction.guildId, { limit: 10, since, channelIds: shared });
+    const domains = topDomains(interaction.guildId, { limit: 10, since, channelIds: shared });
 
     const embed = new EmbedBuilder()
       .setColor('#2b2d31')
       .setTitle('📈 アーカイブの傾向')
-      .setFooter({ text: period === 'all' ? '全期間' : `直近${period}` })
+      .setFooter({ text: `${period === 'all' ? '全期間' : `直近${period}`} ・ このチャンネルの全員が見られる場所のみ` })
       .addFields(
         {
           name: 'よく付くリアクション',
@@ -1021,7 +1181,7 @@ const searchHelpCommand = {
     .setName('searchhelp')
     .setDescription('検索クエリの書き方を表示します'),
 
-  async execute(interaction) {
+  async execute(interaction: ChatInputCommandInteraction): Promise<void> {
     const embed = new EmbedBuilder()
       .setColor('#2b2d31')
       .setTitle('🔎 検索クエリの書き方')
@@ -1056,7 +1216,8 @@ const searchHelpCommand = {
             '`weekday:sat,sun` … 土日の発言だけ',
             '`domain:github.com` … 特定サイトのURLが貼られたもの',
             '`regex:/^\\d+$/` … 正規表現 (本文のみ。添付名や埋め込み文言は見ません)',
-            '`regex:"/a b/i"` … 空白や `)` 単体を含むパターンは引用符で囲む'
+            '`regex:"/a b/i"` … 空白や `)` 単体を含むパターンは引用符で囲む',
+            '`(a+)+` のような量指定子の入れ子は使えません。重い正規表現は数秒で打ち切ります'
           ].join('\n')
         },
         {
@@ -1081,82 +1242,120 @@ const searchHelpCommand = {
         }
       );
 
-    await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+    await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
   }
 };
 
 // ---------------------------------------------------------------- ボタン
 
-export async function handleArchiveComponent(interaction) {
+export async function handleArchiveComponent(interaction: Interaction): Promise<boolean> {
   if (!interaction.isButton() || !interaction.customId.startsWith('archive:')) return false;
+
+  if (!isGuildButton(interaction)) {
+    await interaction.reply({ content: 'この操作はサーバー内でのみ使用できます。', flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
+    return true;
+  }
 
   const [, action, ...rest] = interaction.customId.split(':');
 
   if (action === 'reset' || action === 'cancelreset') {
     if (rest[0] !== interaction.user.id) {
-      await interaction.reply({ content: 'この操作は実行した本人だけができます。', flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: 'この操作は実行した本人だけができます。', flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
       return true;
     }
 
     if (action === 'cancelreset') {
-      await interaction.update({ content: 'キャンセルしました。', components: [] });
+      await interaction.update({ content: 'キャンセルしました。', components: [], allowedMentions: NO_MENTIONS });
+      return true;
+    }
+
+    // ボタンの ID に入っているのは押してよい人の ID だけで、権限は入っていない。
+    // 確認を出した後で権限を外された人が押しても消せないよう、押した時点で確かめ直す
+    if (!canManageIndex(interaction.member)) {
+      await interaction.reply({
+        content: 'このサーバーのインデックスを削除する権限がありません (「サーバー管理」か `ARCHIVE_ADMIN_USERS`)。',
+        flags: MessageFlags.Ephemeral,
+        allowedMentions: NO_MENTIONS
+      });
       return true;
     }
 
     purgeGuild(interaction.guildId);
-    await interaction.update({ content: '🗑️ このサーバーのインデックスを削除しました。', components: [] });
+    await interaction.update({ content: '🗑️ このサーバーのインデックスを削除しました。', components: [], allowedMentions: NO_MENTIONS });
     return true;
   }
 
-  const token = rest[0];
+  const token = rest[0] ?? '';
   const session = sessions.get(token);
 
   if (!session || session.expiresAt <= Date.now()) {
-    await interaction.reply({ content: 'この検索結果は古くなりました。もう一度 `/search` を実行してください。', flags: MessageFlags.Ephemeral });
+    await interaction.reply({
+      content: 'この検索結果は古くなりました。もう一度 `/search` を実行してください。',
+      flags: MessageFlags.Ephemeral,
+      allowedMentions: NO_MENTIONS
+    });
     return true;
   }
 
-  if (session.userId !== interaction.user.id) {
-    await interaction.reply({ content: 'この検索を実行した本人だけがページを移動できます。', flags: MessageFlags.Ephemeral });
+  if (session.userId !== interaction.user.id || session.guildId !== interaction.guildId) {
+    await interaction.reply({ content: 'この検索を実行した本人だけがページを移動できます。', flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
     return true;
   }
+
+  // 読める範囲は押した時点の権限で作り直す (検索の後で権限を外された人に、外される前の範囲で見せない)
+  const options: SearchOptions = {
+    ...session.options,
+    channelScope: getChannelScope(interaction.guild, interaction.member),
+    allowDeleted: canSeeDeleted(interaction.member)
+  };
 
   try {
     if (action === 'shuffle') {
-      const { rows, built } = search({ ...session.options, sort: 'random' }, { limit: 1, offset: 0 });
-      if (rows.length === 0) {
-        await interaction.reply({ content: '該当がありませんでした。', flags: MessageFlags.Ephemeral });
+      const { rows, built } = search({ ...options, sort: 'random' }, { limit: 1, offset: 0 });
+      const row = rows[0];
+      if (!row) {
+        await interaction.reply({ content: '該当がありませんでした。', flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
         return true;
       }
 
       const embed = new EmbedBuilder()
         .setColor('#2b2d31')
         .setTitle('🎲 ランダムに1件')
-        .setDescription(formatResult(rows[0], 1, built.terms));
+        .setDescription(formatResult(row, 1, built.terms));
 
-      await interaction.reply({ embeds: [embed], allowedMentions: NO_MENTIONS });
+      // 引いた1件をこのチャンネルの全員が見られるときだけ公開で返す
+      if (isShareable(row, sharedChannels(interaction))) {
+        await interaction.reply({ embeds: [embed], allowedMentions: NO_MENTIONS });
+      } else {
+        await interaction.reply({ content: PRIVATE_NOTE, embeds: [embed], flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
+      }
       return true;
     }
 
     if (action === 'page') {
-      const page = Math.max(0, Number(rest[1]) || 0);
-      const { embed, pages } = renderSearchPage({
-        options: session.options,
+      const lastPage = Math.max(0, Math.ceil(session.total / PAGE_SIZE) - 1);
+      const page = Math.min(lastPage, Math.max(0, Number(rest[1]) || 0));
+      const { embed, rows, pages } = renderSearchPage({
+        options,
         page,
         total: session.total,
         label: session.label
       });
+      const components = [paginationRow(token, page, pages)];
 
-      await interaction.update({
-        embeds: [embed],
-        components: [paginationRow(token, page, pages)],
-        allowedMentions: NO_MENTIONS
-      });
+      // 本人にだけ見えている結果ならそのまま差し替える。公開の結果を差し替えるときは、
+      // そのページに公開できない発言が無いか確かめ直す (検索の後に増えた発言もある)
+      const shared = sharedChannels(interaction);
+      if (interaction.message.flags.has(MessageFlags.Ephemeral) || rows.every((row) => isShareable(row, shared))) {
+        await interaction.update({ embeds: [embed], components, allowedMentions: NO_MENTIONS });
+      } else {
+        await interaction.reply({ content: PRIVATE_NOTE, embeds: [embed], components, flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
+      }
       return true;
     }
   } catch (error) {
     if (error instanceof QueryError) {
-      await interaction.reply({ content: queryErrorText(error), flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: queryErrorText(error), flags: MessageFlags.Ephemeral, allowedMentions: NO_MENTIONS });
       return true;
     }
     throw error;

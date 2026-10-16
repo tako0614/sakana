@@ -1,5 +1,22 @@
 import Database from 'better-sqlite3';
 import { envMiB, scheduleOptimize, tuneSqlite } from '../sqlite.js';
+import { errorCode, errorMessage, field } from './guards.js';
+import type {
+  ChannelGap,
+  ChannelInput,
+  ChannelRow,
+  ChannelStatePatch,
+  ChannelTailGap,
+  CountRow,
+  EmbedStatePatch,
+  EmbedStateRow,
+  GuildIndexStateRow,
+  GuildStatePatch,
+  MessageRecord,
+  MessageRow,
+  ReactionRecord,
+  SpanRow
+} from './types.js';
 
 // メッセージアーカイブは XP 用の database.sqlite とは別ファイルに置く。
 // 巨大になりやすく、作り直し (再インデックス) も独立してできるようにするため。
@@ -9,7 +26,7 @@ const dbPath = process.env.ARCHIVE_DB_PATH ?? 'archive.sqlite';
 // 別プロセス (記憶の builder の費用台帳など) が重なったときに SQLITE_BUSY で
 // チャンネルごと取り込みが失敗していた (2026-10 の /index build で nsfw が落ちた)。
 export const BUSY_TIMEOUT_MS = 30_000;
-export const db = new Database(dbPath, { timeout: BUSY_TIMEOUT_MS });
+export const db: Database.Database = new Database(dbPath, { timeout: BUSY_TIMEOUT_MS });
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous = NORMAL');
 // 2.7GB の本体を毎回ディスクから読み直さない (src/sqlite.js)
@@ -17,15 +34,26 @@ tuneSqlite(db, { cacheMiB: envMiB('ARCHIVE_SQLITE_CACHE_MIB', 128), mmapMiB: env
 scheduleOptimize(db, { label: 'archive' });
 
 /** ロックの取り合いで失敗したか (待てば通る失敗)。 */
-export function isBusy(error) {
-  return /^SQLITE_(BUSY|LOCKED)/.test(error?.code ?? '') || /database (table )?is locked/i.test(error?.message ?? '');
+export function isBusy(error: unknown): boolean {
+  const message = field(error, 'message');
+  return /^SQLITE_(BUSY|LOCKED)/.test(String(errorCode(error, 'code') ?? ''))
+    || /database (table )?is locked/i.test(typeof message === 'string' ? message : '');
+}
+
+export interface RetryBusyOptions {
+  attempts?: number;
+  delayMs?: number;
+  label?: string;
 }
 
 /**
  * 30秒待っても書けなかったときに、間を空けてやり直す。待てば通る失敗で
  * 取り込みジョブやチャンネルを死なせない。それ以外の失敗はそのまま投げる。
  */
-export async function retryBusy(fn, { attempts = 5, delayMs = 2000, label = 'archive write' } = {}) {
+export async function retryBusy<T>(
+  fn: () => T | Promise<T>,
+  { attempts = 5, delayMs = 2000, label = 'archive write' }: RetryBusyOptions = {}
+): Promise<T> {
   for (let attempt = 1; ; attempt += 1) {
     try {
       return await fn();
@@ -33,7 +61,7 @@ export async function retryBusy(fn, { attempts = 5, delayMs = 2000, label = 'arc
       if (!isBusy(error) || attempt >= attempts) throw error;
       const wait = Math.min(60_000, delayMs * 2 ** (attempt - 1));
       console.warn(`${label}: database is locked, retrying in ${wait}ms (${attempt}/${attempts - 1})`);
-      await new Promise((resolve) => setTimeout(resolve, wait));
+      await new Promise<void>((resolve) => setTimeout(resolve, wait));
     }
   }
 }
@@ -139,6 +167,15 @@ db.exec(`
   );
 `);
 
+interface ColumnInfo {
+  name: string;
+}
+
+/** 表にその列があるか。table はこのファイルの固定の名前だけ (利用者の入力は入らない)。 */
+function hasColumn(table: string, column: string): boolean {
+  return db.prepare<[], ColumnInfo>(`PRAGMA table_info(${table})`).all().some((row) => row.name === column);
+}
+
 // CREATE TABLE IF NOT EXISTS では既存の DB に列が増えないので、無いときだけ足す。
 //
 // applied_tags はフォーラムのタグ。ID ではなく名前を ` タグ1 タグ2 ` の形で持つ
@@ -146,12 +183,12 @@ db.exec(`
 // 名前で持つのは、ID から名前に直すには親フォーラムの availableTags が要り、
 // 検索のたびに Discord のキャッシュを引く羽目になるため。タグ名が変わったら
 // 次の取り込みで追随する。
-if (!db.pragma('table_info(channels)').some((row) => row.name === 'applied_tags')) {
+if (!hasColumn('channels', 'applied_tags')) {
   db.exec("ALTER TABLE channels ADD COLUMN applied_tags TEXT NOT NULL DEFAULT ''");
 }
 
 // チャンネルの説明文。「#dev って何のチャンネル？」に答えるのに要る。
-if (!db.pragma('table_info(channels)').some((row) => row.name === 'topic')) {
+if (!hasColumn('channels', 'topic')) {
   db.exec("ALTER TABLE channels ADD COLUMN topic TEXT NOT NULL DEFAULT ''");
 }
 
@@ -321,23 +358,44 @@ db.exec(`
   );
 `);
 
-export function getEmbedState(guildId) {
-  return db.prepare('SELECT * FROM embed_state WHERE guild_id = ?').get(guildId);
+// 状態の更新は「列名 = @列名」を組み立てるので、列名はここに挙げたものだけ通す。
+// 値は名前付き引数で渡るが、列名は SQL にそのまま埋め込まれるため。
+const EMBED_STATE_COLUMNS: ReadonlySet<string> = new Set([
+  'model_id', 'status', 'cursor_rowid', 'embedded', 'skipped', 'started_at', 'finished_at', 'swept_at', 'last_error', 'enabled'
+]);
+const GUILD_STATE_COLUMNS: ReadonlySet<string> = new Set([
+  'status', 'mode', 'started_at', 'finished_at', 'channels_total', 'channels_done', 'messages_indexed', 'current_channel', 'last_error'
+]);
+const CHANNEL_STATE_COLUMNS: ReadonlySet<string> = new Set([
+  'guild_id', 'parent_id', 'name', 'type', 'is_thread', 'is_private', 'oldest_id', 'newest_id', 'complete',
+  'message_count', 'last_error', 'applied_tags', 'topic'
+]);
+
+function patchKeys(patch: object, allowed: ReadonlySet<string>, table: string): string[] {
+  const keys = Object.keys(patch);
+  for (const key of keys) {
+    if (!allowed.has(key)) throw new Error(`${table}: unknown column ${JSON.stringify(key)}`);
+  }
+  return keys;
 }
 
-export function setEmbedState(guildId, patch) {
-  db.prepare('INSERT OR IGNORE INTO embed_state (guild_id) VALUES (?)').run(guildId);
+export function getEmbedState(guildId: string): EmbedStateRow | undefined {
+  return db.prepare<[string], EmbedStateRow>('SELECT * FROM embed_state WHERE guild_id = ?').get(guildId);
+}
 
-  const keys = Object.keys(patch);
+export function setEmbedState(guildId: string, patch: EmbedStatePatch): void {
+  db.prepare<[string]>('INSERT OR IGNORE INTO embed_state (guild_id) VALUES (?)').run(guildId);
+
+  const keys = patchKeys(patch, EMBED_STATE_COLUMNS, 'embed_state');
   if (keys.length === 0) return;
 
   const assignments = keys.map((key) => `${key} = @${key}`).join(', ');
-  db.prepare(`UPDATE embed_state SET ${assignments} WHERE guild_id = @guild_id`)
+  db.prepare<[EmbedStatePatch & { guild_id: string }]>(`UPDATE embed_state SET ${assignments} WHERE guild_id = @guild_id`)
     .run({ ...patch, guild_id: guildId });
 }
 
-export function listEmbedGuilds() {
-  return db.prepare('SELECT * FROM embed_state WHERE enabled = 1').all();
+export function listEmbedGuilds(): EmbedStateRow[] {
+  return db.prepare<[], EmbedStateRow>('SELECT * FROM embed_state WHERE enabled = 1').all();
 }
 
 const DISCORD_EPOCH_MS = 1420070400000n;
@@ -349,7 +407,7 @@ const DISCORD_EPOCH_MS = 1420070400000n;
  * 桁数が違うと文字列比較の大小が実際の時系列と逆になる。
  * 数値化しても 2^53 を超えるので BigInt で shift してから ms に落とす。
  */
-export function snowflakeToMs(id) {
+export function snowflakeToMs(id: string | number | bigint | null | undefined): number | null {
   try {
     return Number((BigInt(String(id)) >> 22n) + DISCORD_EPOCH_MS);
   } catch {
@@ -367,28 +425,28 @@ export function snowflakeToMs(id) {
  *
  * integrity-check はデータを書き換えない (食い違っていれば例外を投げるだけ)。
  */
-export function checkFtsIntegrity() {
+export function checkFtsIntegrity(): { ok: true } | { ok: false; error: string } {
   try {
     db.prepare("INSERT INTO messages_fts(messages_fts) VALUES('integrity-check')").run();
     return { ok: true };
   } catch (error) {
-    return { ok: false, error: String(error.message ?? error).slice(0, 300) };
+    return { ok: false, error: errorMessage(error).slice(0, 300) };
   }
 }
 
 /** 索引を本体から作り直す。件数が多いと数分かかる。 */
-export function rebuildFts() {
+export function rebuildFts(): void {
   db.prepare("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')").run();
 }
 
-const selectMessageRowid = db.prepare('SELECT rowid AS rid FROM messages WHERE message_id = ?');
+const selectMessageRowid = db.prepare<[string], { rid: number }>('SELECT rowid AS rid FROM messages WHERE message_id = ?');
 
 /** スノーフレークから rowid を引く。ベクトル表は rowid で紐づいている。 */
-export function messageRowid(messageId) {
+export function messageRowid(messageId: string | number): number | null {
   return selectMessageRowid.get(String(messageId))?.rid ?? null;
 }
 
-const selectChannelRange = db.prepare(`
+const selectChannelRange = db.prepare<[{ id: string }], { oldest_id: string | null; newest_id: string | null }>(`
   SELECT
     (SELECT message_id FROM messages WHERE channel_id = @id ORDER BY created_at ASC LIMIT 1) AS oldest_id,
     (SELECT message_id FROM messages WHERE channel_id = @id ORDER BY created_at DESC LIMIT 1) AS newest_id
@@ -398,7 +456,7 @@ const selectChannelRange = db.prepare(`
  * 取り込み済みメッセージの端。
  * created_at で並べる (message_id の文字列比較は桁数を跨ぐと逆転する)。
  */
-export function channelMessageRange(channelId) {
+export function channelMessageRange(channelId: string): { oldestId: string | null; newestId: string | null } {
   const row = selectChannelRange.get({ id: channelId });
   return { oldestId: row?.oldest_id ?? null, newestId: row?.newest_id ?? null };
 }
@@ -411,7 +469,7 @@ export function channelMessageRange(channelId) {
  * 下位 22bit は 0 なので、その ms のいちばん先頭を指す ID になる。
  * Discord 以前 (2015年より前) は表せないので 0 に丸める。
  */
-export function msToSnowflake(ms) {
+export function msToSnowflake(ms: number | string | bigint | null | undefined): string | null {
   const value = Number(ms);
   if (!Number.isFinite(value)) return null;
 
@@ -419,13 +477,13 @@ export function msToSnowflake(ms) {
   return shifted <= 0n ? '0' : String(shifted << 22n);
 }
 
-const selectOverlappingSpans = db.prepare(`
+const selectOverlappingSpans = db.prepare<[string, number, number], SpanRow>(`
   SELECT from_ms, to_ms, from_id, to_id FROM channel_spans
   WHERE channel_id = ? AND to_ms >= ? AND from_ms <= ?
   ORDER BY from_ms
 `);
-const deleteSpanStmt = db.prepare('DELETE FROM channel_spans WHERE channel_id = ? AND from_ms = ?');
-const insertSpanStmt = db.prepare(`
+const deleteSpanStmt = db.prepare<[string, number]>('DELETE FROM channel_spans WHERE channel_id = ? AND from_ms = ?');
+const insertSpanStmt = db.prepare<[string, number, number, string, string]>(`
   INSERT OR REPLACE INTO channel_spans (channel_id, from_ms, to_ms, from_id, to_id)
   VALUES (?, ?, ?, ?, ?)
 `);
@@ -434,7 +492,7 @@ const insertSpanStmt = db.prepare(`
  * 「fromId から toId までは取り切った」を記録する。
  * 既存区間と重なっていれば1本にまとめる (連続取得なら必ず端で重なる)。
  */
-export const recordSpan = db.transaction((channelId, fromId, toId) => {
+export const recordSpan = db.transaction((channelId: string, fromId: string, toId: string): void => {
   let fromMs = snowflakeToMs(fromId);
   let toMs = snowflakeToMs(toId);
   if (fromMs === null || toMs === null) return;
@@ -461,14 +519,19 @@ export const recordSpan = db.transaction((channelId, fromId, toId) => {
  * ロックを取る回数が減り、途中で失敗しても「保存したのに位置が進んでいない」が起きない
  * (やり直しは同じページを取り直して上書きするだけ)。
  */
-export const savePage = db.transaction((channelId, records, span, state) => {
+export const savePage = db.transaction((
+  channelId: string,
+  records: readonly MessageRecord[],
+  span: readonly [string, string] | null,
+  state: ChannelStatePatch | null
+): void => {
   saveMessages(records);
   if (span) recordSpan(channelId, span[0], span[1]);
   if (state) updateChannelState(channelId, state);
 });
 
-export function listSpans(channelId) {
-  return db.prepare(`
+export function listSpans(channelId: string): SpanRow[] {
+  return db.prepare<[string], SpanRow>(`
     SELECT from_ms, to_ms, from_id, to_id FROM channel_spans
     WHERE channel_id = ? ORDER BY from_ms
   `).all(channelId);
@@ -478,16 +541,19 @@ export function listSpans(channelId) {
  * 区間の隙間 = 取りこぼしている期間。
  * 末尾 (最後の区間より後) は起動時のキャッチアップが担当するのでここには含めない。
  */
-export function channelGaps(channelId) {
+export function channelGaps(channelId: string): ChannelGap[] {
   const spans = listSpans(channelId);
-  const gaps = [];
+  const gaps: ChannelGap[] = [];
 
   for (let i = 1; i < spans.length; i += 1) {
+    const previous = spans[i - 1];
+    const current = spans[i];
+    if (!previous || !current) continue; // 添字は範囲内なので来ない
     gaps.push({
-      afterId: spans[i - 1].to_id,
-      beforeId: spans[i].from_id,
-      fromMs: spans[i - 1].to_ms,
-      toMs: spans[i].from_ms
+      afterId: previous.to_id,
+      beforeId: current.from_id,
+      fromMs: previous.to_ms,
+      toMs: current.from_ms
     });
   }
 
@@ -501,13 +567,13 @@ export function channelGaps(channelId) {
  * 区間の隙間 (channelGaps) は前後を区間で挟まれた穴しか拾えないので、
  * 末尾はこちらで別に見る必要がある。追いつきが済めば区間が伸びて消える。
  */
-export function channelTailGap(channelId) {
+export function channelTailGap(channelId: string): ChannelTailGap | null {
   const spans = listSpans(channelId);
-  if (spans.length === 0) return null;
+  const last = spans.at(-1);
+  if (!last) return null;
 
-  const last = spans[spans.length - 1];
   const row = db
-    .prepare('SELECT MAX(created_at) AS at FROM messages WHERE channel_id = ? AND deleted = 0')
+    .prepare<[string], { at: number | null }>('SELECT MAX(created_at) AS at FROM messages WHERE channel_id = ? AND deleted = 0')
     .get(channelId);
 
   if (!row?.at || row.at <= last.to_ms) return null;
@@ -515,36 +581,35 @@ export function channelTailGap(channelId) {
   return { afterId: last.to_id, fromMs: last.to_ms, toMs: row.at };
 }
 
-export function clearSpans(channelId) {
-  db.prepare('DELETE FROM channel_spans WHERE channel_id = ?').run(channelId);
+export function clearSpans(channelId: string): void {
+  db.prepare<[string]>('DELETE FROM channel_spans WHERE channel_id = ?').run(channelId);
 }
 
-// 正規表現検索用。SQLite 側から呼べるようにしておく。
-// 暴走を防ぐため、1クエリあたりの評価回数に上限を設ける。
+// 正規表現検索用の regexp()。
+//
+// 以前はここ (メインスレッド) で1行ごとに評価していた。(a+)+$ のようなパターンが
+// 長い発言1件で何十秒も返らず、その間 bot 全体が止まっていた (件数の上限では防げない)。
+// いまは search.ts の withRegexGuard が使い捨てのワーカー (regex.ts) で評価し、
+// 時間切れならワーカーごと止める。メインの接続の regexp() は名前だけ残して評価を断る
+// (うっかり regex: 入りの SQL をメインで流しても、止まる代わりにエラーになる)。
+//
+// 走査件数の上限はワーカー側が持つ。setRegexBudget は互換のために残してある
+// (メインの接続では評価しないので、ここで覚えた値は照合に使われない)。
 let regexBudget = Infinity;
 
-export function setRegexBudget(limit) {
+export function setRegexBudget(limit: number): void {
   regexBudget = limit;
 }
 
-export class RegexBudgetExceeded extends Error {}
+export { RegexBudgetExceeded } from './regex.js';
 
-db.function('regexp', { deterministic: true }, (pattern, value) => {
-  if (value == null) return 0;
-  if (regexBudget-- <= 0) {
-    throw new RegexBudgetExceeded('regex scan budget exceeded');
-  }
-
-  try {
-    const [, body, flags] = /^\/(.*)\/([a-z]*)$/s.exec(pattern) ?? [null, pattern, 'i'];
-    return new RegExp(body, flags).test(String(value)) ? 1 : 0;
-  } catch {
-    return 0;
-  }
+// 引数の数は以前と同じ2つ (SQLite は関数の引数の数で呼び分ける)
+db.function('regexp', { deterministic: true }, (_pattern: unknown, _value: unknown) => {
+  throw new Error('regexp() is evaluated only in the archive regex worker (see withRegexGuard in archive/search)');
 });
 
 // Discord の関係 (返信・転送・スレッド・埋め込み) は structure_json に構造のまま持つ。
-if (!db.prepare('PRAGMA table_info(messages)').all().some((column) => column.name === 'structure_json')) {
+if (!hasColumn('messages', 'structure_json')) {
   db.exec("ALTER TABLE messages ADD COLUMN structure_json TEXT NOT NULL DEFAULT '{}'");
 }
 // 編集・削除の監査。発言が書き換わる直前の版を残す (変わらない再取り込みでは残さない)。
@@ -566,10 +631,10 @@ db.exec(`
 // Older audit rows cannot recover discarded embed fields; retain them from this
 // migration onward. Install atomically so concurrent ingestion sees no gap.
 db.transaction(() => {
-  if (!db.prepare('PRAGMA table_info(message_versions)').all().some(c => c.name === 'extra')) {
+  if (!hasColumn('message_versions', 'extra')) {
     db.exec("ALTER TABLE message_versions ADD COLUMN extra TEXT NOT NULL DEFAULT ''");
   }
-  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE name='messages_history_au'").get()?.sql ?? '';
+  const sql = db.prepare<[], { sql: string | null }>("SELECT sql FROM sqlite_master WHERE name='messages_history_au'").get()?.sql ?? '';
   if (!sql.includes('old.extra')) db.exec(`
     DROP TRIGGER IF EXISTS messages_history_au;
     CREATE TRIGGER messages_history_au BEFORE UPDATE ON messages
@@ -608,16 +673,22 @@ const RETIRED_MEMORY_TABLES = [
   'dream_reviews', 'dream_review_legacy_audit', 'dream_review_passes',
   'dream_review_targets', 'dream_semantic_reviews', 'dream_scheduler_migrations'
 ];
+interface RetiredObjects {
+  projectionState: boolean;
+  triggers: string[];
+  indexes: string[];
+  tables: string[];
+}
 {
-  const present = (type, names) => names.filter((name) =>
-    db.prepare('SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?').get(type, name));
-  const retired = () => ({
+  const present = (type: string, names: readonly string[]): string[] => names.filter((name) =>
+    db.prepare<[string, string]>('SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?').get(type, name) !== undefined);
+  const retired = (): RetiredObjects => ({
     projectionState: present('table', ['memory_projection_state']).length > 0,
     triggers: present('trigger', RETIRED_MEMORY_TRIGGERS),
     indexes: present('index', RETIRED_MEMORY_INDEXES),
     tables: present('table', RETIRED_MEMORY_TABLES)
   });
-  const pending = (found) => found.projectionState
+  const pending = (found: RetiredObjects): boolean => found.projectionState
     || found.triggers.length > 0 || found.indexes.length > 0 || found.tables.length > 0;
   // 移行済みなら書き込みロックを取らずに抜ける。中では取り直してから判定する
   // (同じファイルを開く別プロセスが先に済ませていることがある)。
@@ -639,7 +710,9 @@ const RETIRED_MEMORY_TABLES = [
   }
 }
 
-const upsertMessageStmt = db.prepare(`
+type UpsertMessageParams = Omit<MessageRecord, 'mentions' | 'reactions' | 'links'>;
+
+const upsertMessageStmt = db.prepare<[UpsertMessageParams]>(`
   INSERT INTO messages (
     message_id, guild_id, channel_id, parent_id, author_id, author_name, is_bot,
     content, extra, created_at, edited_at, reply_to,
@@ -670,16 +743,16 @@ const upsertMessageStmt = db.prepare(`
     structure_json = excluded.structure_json
 `);
 
-const deleteMentionsStmt = db.prepare('DELETE FROM message_mentions WHERE message_id = ?');
-const insertMentionStmt = db.prepare('INSERT OR IGNORE INTO message_mentions (message_id, user_id) VALUES (?, ?)');
-const deleteReactionsStmt = db.prepare('DELETE FROM message_reactions WHERE message_id = ?');
-const insertReactionStmt = db.prepare('INSERT OR REPLACE INTO message_reactions (message_id, emoji, count) VALUES (?, ?, ?)');
-const deleteReactionUsersStmt = db.prepare('DELETE FROM message_reaction_users WHERE message_id = ? AND emoji = ?');
-const insertReactionUserStmt = db.prepare('INSERT OR IGNORE INTO message_reaction_users (message_id, emoji, user_id) VALUES (?, ?, ?)');
-const deleteLinksStmt = db.prepare('DELETE FROM message_links WHERE message_id = ?');
-const insertLinkStmt = db.prepare('INSERT OR IGNORE INTO message_links (message_id, url, domain) VALUES (?, ?, ?)');
+const deleteMentionsStmt = db.prepare<[string]>('DELETE FROM message_mentions WHERE message_id = ?');
+const insertMentionStmt = db.prepare<[string, string]>('INSERT OR IGNORE INTO message_mentions (message_id, user_id) VALUES (?, ?)');
+const deleteReactionsStmt = db.prepare<[string]>('DELETE FROM message_reactions WHERE message_id = ?');
+const insertReactionStmt = db.prepare<[string, string, number]>('INSERT OR REPLACE INTO message_reactions (message_id, emoji, count) VALUES (?, ?, ?)');
+const deleteReactionUsersStmt = db.prepare<[string, string]>('DELETE FROM message_reaction_users WHERE message_id = ? AND emoji = ?');
+const insertReactionUserStmt = db.prepare<[string, string, string]>('INSERT OR IGNORE INTO message_reaction_users (message_id, emoji, user_id) VALUES (?, ?, ?)');
+const deleteLinksStmt = db.prepare<[string]>('DELETE FROM message_links WHERE message_id = ?');
+const insertLinkStmt = db.prepare<[string, string, string]>('INSERT OR IGNORE INTO message_links (message_id, url, domain) VALUES (?, ?, ?)');
 
-function saveOne(record) {
+function saveOne(record: MessageRecord): void {
   // 子テーブル向けの配列は名前付きパラメータに渡せないので分離する
   const { mentions = [], reactions = [], links = [], ...row } = record;
 
@@ -701,26 +774,26 @@ function saveOne(record) {
   }
 }
 
-export const saveMessages = db.transaction((records) => {
+export const saveMessages = db.transaction((records: readonly MessageRecord[]): number => {
   for (const record of records) {
     saveOne(record);
   }
   return records.length;
 });
 
-export function saveMessage(record) {
+export function saveMessage(record: MessageRecord): void {
   saveMessages([record]);
 }
 
-export function markMessageDeleted(messageId) {
-  db.prepare('UPDATE messages SET deleted = 1 WHERE message_id = ?').run(messageId);
+export function markMessageDeleted(messageId: string): void {
+  db.prepare<[string]>('UPDATE messages SET deleted = 1 WHERE message_id = ?').run(messageId);
 }
 
-export function replaceReactions(messageId, reactions) {
+export function replaceReactions(messageId: string, reactions: readonly ReactionRecord[]): void {
   const total = reactions.reduce((sum, reaction) => sum + reaction.count, 0);
   // users を渡してきた絵文字だけ入れ替える。渡していない絵文字の記録は残す
   // (取れなかった/上限を超えたぶんを消すと、記録が「無い」に化ける)。
-  const withUsers = reactions.filter((reaction) => Array.isArray(reaction.users));
+  const withUsers = reactions.flatMap((reaction) => (Array.isArray(reaction.users) ? [{ emoji: reaction.emoji, users: reaction.users }] : []));
 
   db.transaction(() => {
     deleteReactionsStmt.run(messageId);
@@ -735,19 +808,19 @@ export function replaceReactions(messageId, reactions) {
       }
     }
 
-    db.prepare('UPDATE messages SET reaction_count = ? WHERE message_id = ?').run(total, messageId);
+    db.prepare<[number, string]>('UPDATE messages SET reaction_count = ? WHERE message_id = ?').run(total, messageId);
   })();
 }
 
 /** そのメッセージに誰が何を押したか。記録が無ければ空。 */
-export function reactionUsers(messageId) {
+export function reactionUsers(messageId: string | number): { emoji: string; user_id: string }[] {
   return db
-    .prepare('SELECT emoji, user_id FROM message_reaction_users WHERE message_id = ?')
+    .prepare<[string], { emoji: string; user_id: string }>('SELECT emoji, user_id FROM message_reaction_users WHERE message_id = ?')
     .all(String(messageId));
 }
 
-export function upsertChannel(channel) {
-  db.prepare(`
+export function upsertChannel(channel: ChannelInput): void {
+  db.prepare<[Required<ChannelInput>]>(`
     INSERT INTO channels (channel_id, guild_id, parent_id, name, type, is_thread, is_private, applied_tags, topic, updated_at)
     VALUES (@channel_id, @guild_id, @parent_id, @name, @type, @is_thread, @is_private, @applied_tags, @topic, @updated_at)
     ON CONFLICT(channel_id) DO UPDATE SET
@@ -763,44 +836,50 @@ export function upsertChannel(channel) {
   `).run({ updated_at: Date.now(), applied_tags: '', topic: '', ...channel });
 }
 
-export function getChannelState(channelId) {
-  return db.prepare('SELECT * FROM channels WHERE channel_id = ?').get(channelId);
+export function getChannelState(channelId: string): ChannelRow | undefined {
+  return db.prepare<[string], ChannelRow>('SELECT * FROM channels WHERE channel_id = ?').get(channelId);
 }
 
-export function updateChannelState(channelId, patch) {
-  const keys = Object.keys(patch);
+export function updateChannelState(channelId: string, patch: ChannelStatePatch): void {
+  const keys = patchKeys(patch, CHANNEL_STATE_COLUMNS, 'channels');
   if (keys.length === 0) return;
 
   const assignments = keys.map((key) => `${key} = @${key}`).join(', ');
-  db.prepare(`UPDATE channels SET ${assignments}, updated_at = @updated_at WHERE channel_id = @channel_id`)
-    .run({ ...patch, channel_id: channelId, updated_at: Date.now() });
+  db.prepare<[ChannelStatePatch & { channel_id: string; updated_at: number }]>(
+    `UPDATE channels SET ${assignments}, updated_at = @updated_at WHERE channel_id = @channel_id`
+  ).run({ ...patch, channel_id: channelId, updated_at: Date.now() });
 }
 
-export function listChannelStates(guildId) {
-  return db.prepare('SELECT * FROM channels WHERE guild_id = ? ORDER BY message_count DESC').all(guildId);
+export function listChannelStates(guildId: string): ChannelRow[] {
+  return db.prepare<[string], ChannelRow>('SELECT * FROM channels WHERE guild_id = ? ORDER BY message_count DESC').all(guildId);
 }
 
-export function getGuildState(guildId) {
-  return db.prepare('SELECT * FROM guild_index_state WHERE guild_id = ?').get(guildId);
+export function getGuildState(guildId: string): GuildIndexStateRow | undefined {
+  return db.prepare<[string], GuildIndexStateRow>('SELECT * FROM guild_index_state WHERE guild_id = ?').get(guildId);
 }
 
-export function setGuildState(guildId, patch) {
-  db.prepare('INSERT OR IGNORE INTO guild_index_state (guild_id) VALUES (?)').run(guildId);
+export function setGuildState(guildId: string, patch: GuildStatePatch): void {
+  db.prepare<[string]>('INSERT OR IGNORE INTO guild_index_state (guild_id) VALUES (?)').run(guildId);
 
-  const keys = Object.keys(patch);
+  const keys = patchKeys(patch, GUILD_STATE_COLUMNS, 'guild_index_state');
   if (keys.length === 0) return;
 
   const assignments = keys.map((key) => `${key} = @${key}`).join(', ');
-  db.prepare(`UPDATE guild_index_state SET ${assignments} WHERE guild_id = @guild_id`)
+  db.prepare<[GuildStatePatch & { guild_id: string }]>(`UPDATE guild_index_state SET ${assignments} WHERE guild_id = @guild_id`)
     .run({ ...patch, guild_id: guildId });
 }
 
-export function isGuildIndexed(guildId) {
+export function isGuildIndexed(guildId: string): boolean {
   return Boolean(getGuildState(guildId));
 }
 
-export function countMessages(guildId) {
-  return db.prepare('SELECT COUNT(*) AS count FROM messages WHERE guild_id = ?').get(guildId).count;
+/** COUNT(*) / SUM は必ず1行返るが、型の上では無い場合もあるので 0 に倒す。 */
+function countOf(row: CountRow | undefined): number {
+  return row?.count ?? 0;
+}
+
+export function countMessages(guildId: string): number {
+  return countOf(db.prepare<[string], CountRow>('SELECT COUNT(*) AS count FROM messages WHERE guild_id = ?').get(guildId));
 }
 
 /**
@@ -808,37 +887,37 @@ export function countMessages(guildId) {
  * 取り込みジョブが終わった時点の値 (ジョブの間に来た live 発言は次の更新まで入らない)。
  * countMessages は messages の全行を数えるので、100万件では状態表示に使えない。
  */
-export function approximateMessageCount(guildId) {
-  return db.prepare('SELECT COALESCE(SUM(message_count), 0) AS count FROM channels WHERE guild_id = ?')
-    .get(guildId).count;
+export function approximateMessageCount(guildId: string): number {
+  return countOf(db.prepare<[string], CountRow>('SELECT COALESCE(SUM(message_count), 0) AS count FROM channels WHERE guild_id = ?')
+    .get(guildId));
 }
 
-export function countChannelMessages(channelId) {
-  return db.prepare('SELECT COUNT(*) AS count FROM messages WHERE channel_id = ?').get(channelId).count;
+export function countChannelMessages(channelId: string): number {
+  return countOf(db.prepare<[string], CountRow>('SELECT COUNT(*) AS count FROM messages WHERE channel_id = ?').get(channelId));
 }
 
-export function getMessageById(messageId) {
-  return db.prepare('SELECT * FROM messages WHERE message_id = ?').get(messageId);
+export function getMessageById(messageId: string): MessageRow | undefined {
+  return db.prepare<[string], MessageRow>('SELECT * FROM messages WHERE message_id = ?').get(messageId);
 }
 
-export function purgeGuild(guildId) {
+export function purgeGuild(guildId: string): void {
   db.transaction(() => {
-    db.prepare(`
+    db.prepare<[string]>(`
       DELETE FROM message_mentions WHERE message_id IN (SELECT message_id FROM messages WHERE guild_id = ?)
     `).run(guildId);
-    db.prepare(`
+    db.prepare<[string]>(`
       DELETE FROM message_reactions WHERE message_id IN (SELECT message_id FROM messages WHERE guild_id = ?)
     `).run(guildId);
-    db.prepare(`
+    db.prepare<[string]>(`
       DELETE FROM message_links WHERE message_id IN (SELECT message_id FROM messages WHERE guild_id = ?)
     `).run(guildId);
-    db.prepare(`
+    db.prepare<[string]>(`
       DELETE FROM channel_spans WHERE channel_id IN (SELECT channel_id FROM channels WHERE guild_id = ?)
     `).run(guildId);
     // ベクトルは messages_vec_ad トリガで連鎖して消える
-    db.prepare('DELETE FROM messages WHERE guild_id = ?').run(guildId);
-    db.prepare('DELETE FROM channels WHERE guild_id = ?').run(guildId);
-    db.prepare('DELETE FROM guild_index_state WHERE guild_id = ?').run(guildId);
-    db.prepare('DELETE FROM embed_state WHERE guild_id = ?').run(guildId);
+    db.prepare<[string]>('DELETE FROM messages WHERE guild_id = ?').run(guildId);
+    db.prepare<[string]>('DELETE FROM channels WHERE guild_id = ?').run(guildId);
+    db.prepare<[string]>('DELETE FROM guild_index_state WHERE guild_id = ?').run(guildId);
+    db.prepare<[string]>('DELETE FROM embed_state WHERE guild_id = ?').run(guildId);
   })();
 }
