@@ -446,10 +446,10 @@ export function flushPendingRaw(guildId, path, now = Date.now()) {
   `).run(now, guildId, path);
 }
 
-export function pendingNodes(guildId, { minChars = 0, limit = 200 } = {}) {
+export function pendingNodes(guildId, { minChars = 0, limit = 200, newOnly = false } = {}) {
   return memoryDb().prepare(`
     SELECT path, length(body) AS body_chars, length(pending) AS pending_chars, pending_count FROM nodes
-    WHERE guild_id = ? AND pending_count > 0 AND length(pending) >= ?
+    WHERE guild_id = ? AND pending_count > 0 AND length(pending) >= ? ${newOnly ? "AND body = ''" : ''}
     ORDER BY length(pending) DESC LIMIT ?
   `).all(guildId, minChars, limit);
 }
@@ -476,8 +476,10 @@ export function treeIndex(guildId, maxChars = 6000) {
 
 /** 想起と照合に使う名前の一覧 (ページ名と別名)。2文字未満と最上位の名前は除く。 */
 export function nodeNames(guildId) {
+  // 人のページの子 (people/あかり/Linux・環境) は話題の切り口で、名前で呼ばれる人やものではない。
+  // 照合に入れると「Linux」と言うだけで あかり の Linux 観を思い出してしまう
   const rows = memoryDb().prepare(`
-    SELECT path, aliases, weight FROM nodes WHERE guild_id = ? AND instr(path, '/') > 0
+    SELECT path, aliases, weight FROM nodes WHERE guild_id = ? AND instr(path, '/') > 0 AND path NOT LIKE 'people/%/%'
   `).all(guildId);
   const names = [];
   for (const row of rows) {

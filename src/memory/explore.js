@@ -123,8 +123,11 @@ export function pageView(guildId, node, { offset = 0 } = {}) {
       .map((episode) => `${kindEmoji(episode.kind)} ${day(episode.at_ms)} ${episode.title}`);
     embed.addFields({ name: `最近の出来事 (${episodeTimeline(guildId, node.path, { limit: 0 }).total})`, value: clip(recent.join('\n'), 1024) });
   }
+  // 本文はあるが、まだ本文に入っていない知識がある (本文は長いので末尾に書くと切れる。足元に出す)
+  const waiting = node.body && node.pending ? node.pending.split('\n').filter(Boolean).length : 0;
   const footer = [node.first_at ? `期間 ${month(node.first_at)}〜${month(node.last_at ?? node.first_at)}` : null,
-    node.updated_at ? `更新 ${day(node.updated_at)}` : null].filter(Boolean).join(' · ');
+    node.updated_at ? `更新 ${day(node.updated_at)}` : null,
+    waiting ? `📝 本文に入る前の知識 ${waiting} 件` : null].filter(Boolean).join(' · ');
   if (footer) embed.setFooter({ text: footer });
   fitDescription(embed, lines.join('\n'));
 

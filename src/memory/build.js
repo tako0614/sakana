@@ -18,6 +18,8 @@ import { cursorBefore, packOf, planPack, renderSegment } from './transcript.js';
 //              そこから分かった知識 (どのページに足すか)
 //   integrate: 知識が溜まったページを数件まとめて書き直す。ログの写しではなく説明に統合し、
 //              主張ごとに [e12] で出来事を引き、[[path]] で他のページへリンクする
+//   sort:      知識が溜まりすぎたページ (たこ・あかりの人のページは数万字になった) の統合待ちを、
+//              番号で子ページへ仕分ける。書き直さないので1行も落ちない。仕分けた先で普通に統合する
 //   root:      根 (サーバーの概要) の書き直し
 //
 // 書く前に「この区切りに出てくる既知のページ」(説明・本文の冒頭・最近の出来事) を渡す。
@@ -54,7 +56,12 @@ export const treeConfig = {
   integrateChars: Number(process.env.MEMORY_TREE_INTEGRATE_CHARS || 1200),
   // 1回の統合は小さめに (8ページ・3万字だと出力が長く、1回2〜3分かかった)
   integrateBatchChars: 15000,
-  integratePages: 4,
+  // 1回に書き直すページ数の上限。大きいページは文字数の上限で先に切れる (小さい新ページは10件まとめる)
+  integratePages: 10,
+  // 統合待ちがこれだけ溜まったページは、書き直す前に子ページへ仕分ける。
+  // 1万字を超える知識を本文3000字へ書き直させると、モデルは千字ほどに縮めて「削りすぎ」で却下され続けた
+  sortChars: Number(process.env.MEMORY_TREE_SORT_CHARS || 6000),
+  sortBatchChars: 12000,
   // ページ本文の上限。超えたら子ページへ分けさせる
   nodeChars: Number(process.env.MEMORY_TREE_NODE_CHARS || 6000),
   bodyChars: 3000,
@@ -133,6 +140,16 @@ const INTEGRATE_SYSTEM = `あなたは Discord サーバーの「記憶の本」
 
 出力は JSON だけ (渡したページすべてについて書く):
 {"pages":[{"path":"…","summary":"…","aliases":["…"],"body":"…","children":[{"name":"…","summary":"…","body":"…"}]}]}`;
+
+export const SORT_SYSTEM = `あなたは Discord サーバーの「記憶の本」の編集者です。知識が溜まりすぎた1つのページの「新しい知識」を、子ページに仕分けます。書き直しはしません (番号で振り分けるだけ)。
+
+- 子ページはそのページの中のまとまり。人物なら「技術・言語観」「Linux・環境」「作ったもの」「人間関係」「名言・ネタ」「経歴・近況」のように、中身に合わせて 3〜8 個。今ある子ページに合うものはその名前を使う。
+- 子の名前は短い日本語 (20字以内)。/ や [ ] は使わない。ページ自身の名前は付けない (「あかりの技術」ではなく「技術・言語観」)。
+- そのページが何者か・何なのかを示す核になる知識 (概要に要るもの) だけ main に残す。main は全体の2割まで。
+- すべての番号をどこか1つに入れる。
+
+出力は JSON だけ:
+{"children":[{"name":"…","summary":"… (40字以内)","lines":[1,2,5]}],"main":[3,4]}`;
 
 const ROOT_SYSTEM = `あなたは Discord サーバーの「記憶の本」の編集者です。根のページ (サーバー全体の概要) を書きます。bot が毎回の会話で最初に読む、唯一の常駐する記憶です。
 
@@ -460,6 +477,56 @@ export function applyIntegrateResult(guildId, batch, result, { now = Date.now() 
   return { done, failed };
 }
 
+/**
+ * 仕分けの結果を入れる。子ページへ回した知識は子の統合待ちへ (行はそのまま、[e12] も残る)。
+ * 子ページからも出来事をたどれるように、行が引いている出来事を子にも結ぶ。
+ * main と、どこにも入らなかった行は親の統合待ちの末尾へ戻す (次の仕分けで同じ行を先頭から読み直さない)。
+ */
+export function applySortResult(guildId, job, result, { now = Date.now() } = {}) {
+  const children = Array.isArray(result?.children) ? result.children : null;
+  if (!children) throw badOutput('sort output has no children');
+  if (depthOf(job.path) >= MAX_DEPTH) throw badOutput('cannot sort at max depth');
+  const lines = sortLines(job.consumed);
+  const owner = new Map();
+  const groups = [];
+  for (const child of children.slice(0, 10)) {
+    const name = childName(child?.name).slice(0, 24);
+    if (!name || name === nameOf(job.path)) continue;
+    const picked = [...new Set((Array.isArray(child?.lines) ? child.lines : []).map(Number))]
+      .filter((n) => Number.isInteger(n) && n >= 1 && n <= lines.length && !owner.has(n));
+    if (picked.length === 0) continue;
+    for (const n of picked) owner.set(n, groups.length);
+    groups.push({ name, summary: String(child?.summary ?? '').trim().slice(0, 80), lines: picked });
+  }
+  // 子へ4割も回さないなら仕分けになっていない (本文に戻すだけで終わる)
+  if (groups.length === 0 || owner.size < lines.length * 0.4) {
+    throw badOutput(`sort moved too little (${owner.size}/${lines.length})`);
+  }
+  const main = lines.filter((_, i) => !owner.has(i + 1));
+  const known = memoryDb().prepare('SELECT 1 FROM episodes WHERE guild_id = ? AND id = ?');
+  const moved = [];
+  memoryDb().transaction(() => {
+    const node = getNode(guildId, job.path);
+    // 仕分けている間に足された知識は末尾にある。渡した部分が先頭に無ければ、誰かが書き換えている
+    if (!node.pending.startsWith(job.consumed)) throw badOutput('pending changed during the sort');
+    for (const group of groups) {
+      const target = resolveExisting(guildId, `${job.path}/${group.name}`);
+      ensureNode(guildId, target, { summary: group.summary, now });
+      const text = group.lines.map((n) => lines[n - 1]);
+      addPending(guildId, target, text, { firstAt: node.first_at ?? now, lastAt: node.last_at ?? now, now });
+      const refs = new Set(text.flatMap((line) => [...line.matchAll(/\[e(\d+)\]/g)].map((m) => Number(m[1]))));
+      for (const id of refs) if (known.get(guildId, id)) linkEpisodeNodes(guildId, id, [target], now);
+      moved.push(nameOf(target));
+    }
+    const rest = node.pending.slice(job.consumed.length);
+    const pending = `${rest}${main.length ? `${main.join('\n')}\n` : ''}`;
+    memoryDb().prepare('UPDATE nodes SET pending = ?, pending_count = ?, updated_at = ? WHERE guild_id = ? AND path = ?')
+      .run(pending, pending.split('\n').filter(Boolean).length, now, guildId, job.path);
+  })();
+  forgetNames(guildId);
+  return { moved: owner.size, kept: main.length, children: moved };
+}
+
 // ---- プロンプト ---------------------------------------------------------------
 
 export function segmentPrompt(guildId, pack) {
@@ -493,6 +560,11 @@ function integratePrompt(guildId, batch) {
       `説明: ${node.summary || '(なし)'}`,
       ...(node.aliases.length ? [`別名: ${node.aliases.join(', ')}`] : []),
       depthOf(item.path) >= MAX_DEPTH ? '(深さの上限なので子ページは作れない)' : `子ページ: ${children.join(' / ') || '(なし)'}`,
+      // 何字残せばよいかを数字で渡す (渡さないと、1万字を千字に縮めて却下されていた)
+      depthOf(item.path) >= MAX_DEPTH
+        ? `(本文と新しい知識で約${node.body.length + item.consumed.length}字。本文は${treeConfig.bodyChars}字以内に要約する)`
+        : `(本文と新しい知識で約${node.body.length + item.consumed.length}字。本文は${treeConfig.bodyChars}字以内、`
+          + `本文と子ページで合わせて${Math.ceil((node.body.length + item.consumed.length) * 0.4)}字以上残す)`,
       '現在の本文:',
       node.body || '(まだ無い)',
       '新しい知識:',
@@ -500,6 +572,25 @@ function integratePrompt(guildId, batch) {
     ].join('\n');
   });
   return [`木の索引 (リンクに使えるパス):\n${index.text}`, ...blocks, '各ページを書き直して JSON だけで出力してください。'].join('\n\n');
+}
+
+const sortLines = (consumed) => consumed.split('\n').filter((line) => line.trim());
+
+export function sortPrompt(guildId, job) {
+  const node = getNode(guildId, job.path);
+  const children = listChildren(guildId, job.path, 30).map((child) => `${nameOf(child.path)} — ${child.summary || ''}`);
+  const lines = sortLines(job.consumed);
+  return [
+    `ページ: ${job.path}`,
+    `説明: ${node.summary || '(なし)'}`,
+    `本文の冒頭: ${node.body.slice(0, 600) || '(まだ無い)'}`,
+    `今ある子ページ: ${children.join(' / ') || '(なし)'}`,
+    '',
+    `新しい知識 (${lines.length} 件。行頭が番号):`,
+    lines.map((line, i) => `${i + 1}| ${line.replace(/^-\s*/, '')}`).join('\n'),
+    '',
+    '番号を子ページに仕分けて JSON だけで出力してください。'
+  ].join('\n');
 }
 
 function rootPrompt(guildId) {
@@ -574,11 +665,11 @@ export function refreshTotals(guildId, channelIds, now = Date.now()) {
  * 統合する組。統合待ちの多いページから、合計の文字数上限まで。
  * 1ページの統合待ちが大きすぎるときは先頭から渡せるぶんだけ渡す (残りは次)。
  */
-function integrationBatch(guildId, { minChars, skip }) {
+function integrationBatch(guildId, { minChars, skip, newOnly = false }) {
   const batch = [];
   let used = 0;
-  for (const row of pendingNodes(guildId, { minChars, limit: 60 })) {
-    if (skip.has(row.path)) continue;
+  for (const row of pendingNodes(guildId, { minChars, limit: 60, newOnly })) {
+    if (skip.has(row.path) || needsSort(guildId, row.path, row.pending_chars)) continue;
     const failures = getState(`integrate-fail:${guildId}:${row.path}`)?.count ?? 0;
     if (failures >= treeConfig.failuresBeforeSkip) {
       // 統合できないページでも知識は落とさない (本文の末尾へそのまま移す)
@@ -601,6 +692,23 @@ function integrationBatch(guildId, { minChars, skip }) {
   return batch.length ? batch : null;
 }
 
+/** 書き直す前に子ページへ仕分けるページか。仕分けに3回失敗したら普通の統合へ戻す。 */
+function needsSort(guildId, path, pendingChars) {
+  return pendingChars >= treeConfig.sortChars && depthOf(path) < MAX_DEPTH
+    && (getState(`sort-fail:${guildId}:${path}`)?.count ?? 0) < treeConfig.failuresBeforeSkip;
+}
+
+/** 仕分けるページを1つ。統合待ちの多い順に、先頭から渡せるぶんだけ (残りは次の仕分けで)。 */
+function sortJob(guildId, { skip }) {
+  for (const row of pendingNodes(guildId, { minChars: treeConfig.sortChars, limit: 30 })) {
+    if (skip.has(row.path) || !needsSort(guildId, row.path, row.pending_chars)) continue;
+    const { pending } = getNode(guildId, row.path);
+    const cut = pending.lastIndexOf('\n', treeConfig.sortBatchChars);
+    return { path: row.path, consumed: pending.length <= treeConfig.sortBatchChars ? pending : pending.slice(0, cut + 1) };
+  }
+  return null;
+}
+
 /**
  * 記憶を育てる。上限 (回数・時間) に達するか、読むものが無くなるか、無料枠が尽きたら止まる。
  * 何度止めても cursor と統合待ちの続きから再開できる。
@@ -613,7 +721,7 @@ export async function runBuild({
   const release = acquireLock(guildId, started);
   ensureSeeds(guildId, started);
   const stats = {
-    calls: 0, segments: 0, messages: 0, episodes: 0, facts: 0, related: 0, integrated: 0,
+    calls: 0, segments: 0, messages: 0, episodes: 0, facts: 0, related: 0, integrated: 0, sorted: 0,
     dropped: { noSource: 0, copied: 0, unsourced: 0 }, failed: 0, root: false, stopped: 'done'
   };
   const spent = () => stats.calls >= maxCalls || now() - started >= maxMs;
@@ -649,6 +757,25 @@ export async function runBuild({
         stats.failed += pack.segments.length;
       }
       return false;
+    }
+  };
+
+  const sortPage = async (job) => {
+    stats.calls += 1;
+    const key = `sort-fail:${guildId}:${job.path}`;
+    try {
+      const result = await call({ kind: 'sort', system: SORT_SYSTEM, user: sortPrompt(guildId, job) });
+      const applied = applySortResult(guildId, job, result.json, { now: now() });
+      setState(key, null);
+      // 仕分けで小さくなったので、書き直しの失敗 (削りすぎ) も数え直す
+      setState(`integrate-fail:${guildId}:${job.path}`, null);
+      stats.sorted += 1;
+      log(`sort ${job.path} → ${applied.children.join(', ')} (${applied.moved} 件を子へ / ${applied.kept} 件は本文へ)`);
+    } catch (error) {
+      if (error instanceof StopRun) throw error;
+      skip.add(job.path);
+      setState(key, { count: (getState(key)?.count ?? 0) + 1, problem: String(error.message).slice(0, 120) });
+      log(`sort failed ${job.path}: ${error.message}`);
     }
   };
 
@@ -715,21 +842,46 @@ export async function runBuild({
       })();
       inFlight.add(task);
     };
-    const integrateLater = (batch) => {
+    const integrateLater = (batch, done = () => {}) => {
       for (const item of batch) busyPages.add(item.path);
       integrations += 1;
       launch(() => integrate(batch), () => {
         integrations -= 1;
+        done();
         // この実行で失敗したページ (skip) は外したままにする
         for (const item of batch) if (!skip.has(item.path)) busyPages.delete(item.path);
       });
     };
+    const sortLater = (job) => {
+      busyPages.add(job.path);
+      integrations += 1;
+      launch(() => sortPage(job), () => {
+        integrations -= 1;
+        if (!skip.has(job.path)) busyPages.delete(job.path);
+      });
+    };
+    let newPageBatches = 0;
     const fill = () => {
+      const slots = Math.max(1, Math.floor(width / 2));
+      // 溜まりすぎたページは書き直す前に子ページへ仕分ける (1ページ1本)
+      while (room() && integrations < slots) {
+        const job = sortJob(guildId, { skip: busyPages });
+        if (!job) break;
+        sortLater(job);
+      }
       // 知識が溜まったページを先に書き直す (既知のページとして次の区切りに渡すため)。幅の半分まで
-      while (room() && integrations < Math.max(1, Math.floor(width / 2))) {
+      while (room() && integrations < slots) {
         const batch = integrationBatch(guildId, { minChars: treeConfig.integrateChars, skip: busyPages });
         if (!batch) break;
         integrateLater(batch);
+      }
+      // 統合の枠が空いていれば、本文のまだ無い新しいページに最初の本文を書く (幅の4分の1まで)。
+      // 読み終えるまで「まとめ中」のまま待たせない。本文のあるページは溜まるまで待つ (書き直しを繰り返さない)
+      while (room() && integrations < slots && newPageBatches < Math.max(1, Math.floor(width / 4))) {
+        const batch = integrationBatch(guildId, { minChars: 1, skip: busyPages, newOnly: true });
+        if (!batch) break;
+        newPageBatches += 1;
+        integrateLater(batch, () => { newPageBatches -= 1; });
       }
       let planned = 0;
       while (room()) {
@@ -747,6 +899,11 @@ export async function runBuild({
       }
       // 読むものが残っていなければ、少ない統合待ちも書き直す
       if (planned === 0 && busyChannels.size === 0) {
+        while (room()) {
+          const job = sortJob(guildId, { skip: busyPages });
+          if (!job) break;
+          sortLater(job);
+        }
         while (room()) {
           const batch = integrationBatch(guildId, { minChars: 1, skip: busyPages });
           if (!batch) break;
