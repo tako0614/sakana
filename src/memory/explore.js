@@ -332,10 +332,10 @@ export async function handleMemoryComponent(interaction) {
   // 先に受け付けだけを返し、画面はそのあと書き換える。Discord は3秒以内に返事が無い操作を
   // 「失敗しました」にする (受け付けの後の書き換えは15分まで効く)
   const update = async (view) => { await interaction.deferUpdate(); await interaction.editReply(view); };
-  const reply = async (view, { ephemeral = false } = {}) => {
-    await interaction.deferReply(ephemeral ? { flags: MessageFlags.Ephemeral } : {});
-    await interaction.editReply(view);
-  };
+  // 新しいメッセージ (共有・自分で開く) はすぐ送る。画面は 25ms でできるので3秒に余裕がある。
+  // 「考え中」を出してから書き換える形 (deferReply → editReply) は、ページを共有したときに
+  // Discord が書き換えを毎回 500 で拒否した (2026-10-16)
+  const reply = (view, { ephemeral = false } = {}) => interaction.reply(ephemeral ? { ...view, flags: MessageFlags.Ephemeral } : view);
   try {
     if (action === 'noop') { await interaction.deferUpdate(); return true; }
     // 探す: ボタンで入力欄を出し、送られたら結果の画面に差し替える (入力欄は最初の返事でしか出せない)
@@ -372,7 +372,7 @@ export async function handleMemoryComponent(interaction) {
     if (error?.code === 10062 && ageMs < 2500) {
       console.error('memory explore: Discord did not know this interaction within 2.5s; another process may be answering with the same bot token');
     }
-    const notice = { content: `開けませんでした: ${clip(error.message, 150)}`, flags: MessageFlags.Ephemeral };
+    const notice = { content: `開けませんでした: ${clip(error.message, 150)} (もう一度押すか、/memory explore で開き直してください)`, flags: MessageFlags.Ephemeral };
     await (interaction.deferred || interaction.replied ? interaction.followUp(notice) : interaction.reply(notice)).catch(() => {});
   }
   return true;

@@ -152,8 +152,8 @@ const menu = rootJson.components.find((row) => row.components[0].type === 3).com
 const peopleOption = menu.options.find((option) => /people/.test(option.label));
 assert.ok(peopleOption, 'the root menu lists top-level pages');
 
-// 返事は「先に受け付け (deferUpdate / deferReply) → 書き換え (editReply)」の順で来ること
-// (3秒の制限があるので、画面を作る前に受け付けを返す)
+// 画面の切り替えは「先に受け付け (deferUpdate) → 書き換え (editReply)」の順で来ること (3秒の制限)。
+// 新しいメッセージ (共有・自分で開く) はすぐ送る (deferReply → editReply は Discord が 500 で拒否した)
 const click = (fields) => {
   const updates = [];
   const modals = [];
@@ -164,10 +164,7 @@ const click = (fields) => {
     isModalSubmit: () => Boolean(fields.fields), createdTimestamp: Date.now(),
     update: async () => { throw new Error('acknowledge first (deferUpdate), then editReply'); },
     deferUpdate: async () => { pending = { kind: 'update' }; },
-    deferReply: async (options = {}) => {
-      if (!fields.allowReply) throw new Error('should update in place');
-      pending = { kind: 'reply', flags: options.flags };
-    },
+    deferReply: async () => { throw new Error('send new messages at once (deferReply then editReply got 500 from Discord)'); },
     editReply: async (view) => {
       if (!pending) throw new Error('editReply before acknowledging');
       if (pending.kind === 'update') updates.push(view); else replies.push({ ...view, flags: pending.flags });
