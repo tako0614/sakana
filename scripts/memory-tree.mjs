@@ -2,7 +2,8 @@ import 'dotenv/config';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { db as archive } from '../src/archive/db.js';
-import { modelBudgetStatus } from '../src/ai/cost.js';
+import { modelBudgetStatus, settleUnknownCalls } from '../src/ai/cost.js';
+import { fetchKeyUsage } from '../src/ai/provider.js';
 import { StopRun, openRouterCaller, runBuild, segmentPrompt, treeConfig } from '../src/memory/build.js';
 import {
   getCursor, getNode, getState, loadPublicChannels, memoryCounts, memoryDb, reopenEmptySegments, resetTree, segmentStats
@@ -25,6 +26,7 @@ import { planPack } from '../src/memory/transcript.js';
 //   node scripts/memory-tree.mjs export  --guild ID --out DIR     Markdown に書き出す
 //   node scripts/memory-tree.mjs reset   --guild ID --yes         記憶を消す (原文には触らない)
 //   node scripts/memory-tree.mjs reopen-empty --guild ID [--yes]  出来事が1つも無い長い区切りを読み直しに回す
+//   node scripts/memory-tree.mjs settle  --guild ID               返らなかった呼び出しの予約を OpenRouter の実額で精算 (run も最初にやる)
 
 const [command, ...rest] = process.argv.slice(2);
 const args = {};
@@ -35,7 +37,7 @@ for (let i = 0; i < rest.length; i += 1) {
 }
 const guildId = String(args.guild ?? process.env.MEMORY_TREE_GUILD ?? '');
 if (!command || !guildId) {
-  console.error('usage: node scripts/memory-tree.mjs <status|run|try|show|episode|search|recall|root|estimate|export|reset|reopen-empty> --guild ID');
+  console.error('usage: node scripts/memory-tree.mjs <status|run|try|show|episode|search|recall|root|estimate|export|reset|reopen-empty|settle> --guild ID');
   process.exit(2);
 }
 
@@ -100,7 +102,25 @@ function estimate() {
   }, null, 2));
 }
 
+/**
+ * 結果の返らなかった呼び出しの予約を OpenRouter の実額で精算する (止めて入れ直すと予約が残り、
+ * 実費の10倍で上限を埋める)。OpenRouter に聞けなければ精算せずに進む (予約は安全側)。
+ */
+async function settle(log) {
+  try {
+    const usage = await fetchKeyUsage();
+    if (usage.monthly === null) return;
+    const result = settleUnknownCalls({ monthUsageUsd: usage.monthly });
+    if (result.settled) {
+      log(`settled ${result.settled} unfinished calls: held $${result.heldUsd.toFixed(3)} → OpenRouter's gap $${result.gapUsd.toFixed(3)} (released $${result.releasedUsd.toFixed(3)})`);
+    }
+  } catch (error) {
+    log(`settle skipped: ${error.message}`);
+  }
+}
+
 async function run() {
+  await settle((line) => console.log(`[${new Date().toISOString()}] ${line}`));
   const call = openRouterCaller({ guildId });
   const stats = await runBuild({
     guildId, call,
@@ -166,6 +186,7 @@ switch (command) {
   case 'recall': console.log(recallFor(guildId, { request: String(args.text ?? '') }) || '(何も思い出さない)'); break;
   case 'root': console.log(memoryRootPrompt(guildId) || '(まだ木がありません)'); break;
   case 'export': exportTree(); break;
+  case 'settle': await settle(console.log); console.log(JSON.stringify(modelBudgetStatus(`memory-tree:${guildId}:${treeConfig.budgetUsd}`))); break;
   case 'reopen-empty': {
     const rows = reopenEmptySegments(guildId, { minChars: Number(args['min-chars'] ?? treeConfig.emptyChars), apply: Boolean(args.yes) });
     const messages = rows.reduce((sum, row) => sum + row.messages, 0);

@@ -126,7 +126,10 @@ node scripts/memory-tree.mjs estimate --guild ID   # 未読の量と呼び出し
 node scripts/memory-tree.mjs export   --guild ID --out DIR   # ページを Markdown に、出来事を episodes.md に
 node scripts/memory-tree.mjs reset    --guild ID --yes
 node scripts/memory-tree.mjs reopen-empty --guild ID [--yes]   # 出来事が1つも無いまま「完了」になった長い区切りを読み直しに回す
+node scripts/memory-tree.mjs settle   --guild ID   # 結果の返らなかった呼び出しの予約を OpenRouter の実額で精算 (run も最初にやる)
 ```
+
+予算の予約: 呼び出す前に「最も高い provider で入力も出力も上限まで使った」額を予約し、返ってきた実額で置き換える。プロセスごと止めたり応答が途中で切れたりすると予約のまま残り、1件あたり実費の約10倍で上限を埋める (2026-10-15 は 107 件・$4.40 が残り、実費は $0.46 だった)。run は最初に OpenRouter に今月の請求額を聞き、台帳で確定した額との差を1時間より古い未確定の呼び出しに按分して精算する。予約のせいで止まっていた予算はそれで再開する。
 
 provider の当たり外れ: OpenRouter は同じモデルを複数の provider に回す。2026-10-15 には glm-5.3-flash の一部の provider が、3万トークン読ませても空の JSON だけを返したり、出力の上限まで暴走したりした。builder は長い区切り (`MEMORY_TREE_EMPTY_CHARS`、既定 4000 字) で出来事も知識も空なら読めていないとみなし、その provider と途中で切れた provider を3時間外して送り直す。最初から外したい provider は `MEMORY_TREE_IGNORE_PROVIDERS` に書く。
 

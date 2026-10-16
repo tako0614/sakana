@@ -170,6 +170,18 @@ function validateRoutes(model, fallbackModels) {
 }
 
 /** All requests share transport and accounting; the host runtime owns tools and effects. */
+/** OpenRouter が数えたこのキーの請求額 (USD)。累計・今日・今週・今月 (いずれも UTC)。 */
+export async function fetchKeyUsage({ timeoutMs = 15000 } = {}) {
+  if (!providerConfig.apiKey) throw new Error('OPENROUTER_API_KEY is not configured');
+  const response = await fetch(`${providerConfig.baseUrl}/key`, {
+    signal:AbortSignal.timeout(timeoutMs),headers:{authorization:`Bearer ${providerConfig.apiKey}`}
+  });
+  if (!response.ok) throw new ProviderError(`OpenRouter HTTP ${response.status}`,response.status);
+  const data = (await response.json())?.data ?? {};
+  const usd = (value) => (Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : null);
+  return { total:usd(data.usage),daily:usd(data.usage_daily),weekly:usd(data.usage_weekly),monthly:usd(data.usage_monthly) };
+}
+
 export async function requestModel({ model = providerConfig.model,fallbackModels = [],messages,tools,jsonOnly = false,
   maxOutputTokens = 8000,timeoutMs = 120000,deadlineAt = Infinity,reasoning,temperature,
   guildId = null,role = 'chat',runId = null,retries = 0,budgetId = null,consumeRequest,beforeSend,ignoreProviders = [] }) {

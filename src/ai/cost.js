@@ -131,6 +131,63 @@ export function modelBudgetStatus(id) {
     remainingUsd:Math.max(0,row.limit_usd-committedUsd),calls:totals.calls,unknownCalls:totals.unknown_calls };
 }
 
+/**
+ * 結果の返らなかった呼び出し (プロセスごと止めた・応答が途中で切れた) の予約を、OpenRouter の実額で精算する。
+ *
+ * 予約は「最も高い provider で入力も出力も上限まで使った」額なので、1件あたり実費の約10倍になる。
+ * 2026-10-15、builder を何度も入れ直したせいで 107 件が予約のまま残り、実費 $0.46 に対して
+ * $4.40 を押さえ続けて $10 の上限で止まった。
+ *
+ * monthUsageUsd は OpenRouter が数えたこのキーの今月 (UTC) の請求額。今月の台帳で確定している額との差が、
+ * 確定していない今月の呼び出し全部の実費の上限になる。その差を予約の大きさで按分し、見積もり (estimated)
+ * に置き換える。予約より大きくはしない。差の方が予約より大きければ何もしない。
+ * 前提: 今月の呼び出しは全部このキーで行った (途中でキーを替えると差が小さく出る)。
+ */
+export function settleUnknownCalls({ monthUsageUsd, olderThanMs = 3_600_000, now = Date.now() }) {
+  ledger();
+  if (!Number.isFinite(monthUsageUsd) || monthUsageUsd < 0) throw codedError('MODEL_BUDGET_INVALID', 'Monthly usage must be a nonnegative USD amount');
+  const date = new Date(now);
+  const monthStart = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1);
+  return db.transaction(() => {
+    const known = db.prepare(`SELECT coalesce(sum(reported_usd),0)+coalesce(sum(estimated_usd),0) AS usd
+      FROM ai_model_calls WHERE started_at>=?`).get(monthStart).usd;
+    const open = db.prepare(`SELECT id,budget_id,reserved_usd,started_at FROM ai_model_calls
+      WHERE started_at>=? AND status IN ('pending','unknown') AND reported_usd IS NULL AND estimated_usd IS NULL`).all(monthStart);
+    const gap = Math.max(0, monthUsageUsd - known);
+    // 新しい呼び出しはまだ走っているかもしれないので精算は古いものだけ。差は全部古いものに負わせる
+    // (新しいものがまだ請求されていなくても、古いものの実費が差を超えることはない)
+    const settle = open.filter((call) => call.started_at < now - olderThanMs);
+    const held = settle.reduce((sum, call) => sum + call.reserved_usd, 0);
+    if (settle.length === 0 || gap >= held) return { settled:0, heldUsd:held, gapUsd:gap, releasedUsd:0 };
+    const ratio = held > 0 ? gap / held : 0;
+    const mark = db.prepare(`UPDATE ai_model_calls SET status='estimated',estimated_usd=? WHERE id=? AND status IN ('pending','unknown')`);
+    const budgets = new Map();
+    let released = 0;
+    for (const call of settle) {
+      const estimate = call.reserved_usd * ratio;
+      if (!mark.run(estimate, call.id).changes) continue;
+      released += call.reserved_usd - estimate;
+      if (call.budget_id) {
+        const entry = budgets.get(call.budget_id) ?? { reserved:0, estimated:0, calls:0 };
+        entry.reserved += call.reserved_usd; entry.estimated += estimate; entry.calls += 1;
+        budgets.set(call.budget_id, entry);
+      }
+    }
+    for (const [id, entry] of budgets) {
+      db.prepare(`UPDATE ai_model_budgets SET reserved_usd=max(0,reserved_usd-?),estimated_usd=estimated_usd+?,
+        unknown_calls=max(0,unknown_calls-?),updated_at=? WHERE id=?`).run(entry.reserved, entry.estimated, entry.calls, now, id);
+      // 予約のせいで止まっていたなら、空きができたので再開する (手で止めたものはそのまま)
+      const row = budgetRow(id);
+      const totals = budgetTotals(row);
+      if (row.paused && row.pause_reason === 'exhausted'
+        && totals.reported_usd + totals.estimated_usd + totals.reserved_usd < row.limit_usd) {
+        db.prepare('UPDATE ai_model_budgets SET paused=0,pause_reason=NULL,updated_at=? WHERE id=?').run(now, id);
+      }
+    }
+    return { settled:settle.length, heldUsd:held, gapUsd:gap, releasedUsd:released };
+  }).immediate();
+}
+
 export function setModelBudgetPaused(id, paused) {
   ledger();
   if (typeof id !== 'string' || !id.trim()) throw codedError('MODEL_BUDGET_INVALID', 'Model budget requires a nonempty id');
