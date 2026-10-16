@@ -41,7 +41,7 @@
 
 ## 書き方
 
-`scripts/memory-tree.mjs run` が次の3種類の呼び出しだけで育てる。どれも1回で完結し、tool の往復はしない (無料枠は回数で数える)。
+`scripts/memory-tree.ts run` が次の3種類の呼び出しだけで育てる。どれも1回で完結し、tool の往復はしない (無料枠は回数で数える)。
 
 1. **区切り** — 公開チャンネルの続きを、行番号つきの短い台本 (`12|14:02 たこ: 本文`) にして約4万字ずつ渡す。返ってくるのは出来事 (根拠の行番号・関わったページ・前の出来事) と知識 (どのページの説明に足すか、どの出来事が根拠か)。小さいチャンネルは1回に詰め合わせる。
 2. **統合** — 知識が 1,200 字溜まったページを数件まとめて書き直す。本文のまだ無い新しいページは、空いた統合の枠で10件ずつ最初の本文を書く (読み終えるまで「まとめ中」のまま待たせない)。統合待ちが 6,000 字を超えたページ (人のページは数万字になる) は、書き直す前に統合待ちを番号で子ページへ仕分ける (`people/あかり/Linux・環境` など。書き直さないので1行も落ちず、仕分けた先で普通に統合する)。人のページの子は話題の切り口なので、想起の名前の照合には入れない。読み終えたら残りも書き直す。本文が 3,000 字を超えるときは、まとまりごとに子ページへ分け、本文には概要と子へのリンクを残す。
@@ -92,11 +92,19 @@ OpenRouter の stealth モデル (`stealth/space-bunny-alpha` のような匿名
 
 ## 読む範囲
 
-記憶に入るのは、bot が控えた「@everyone と bot の両方が読めるチャンネル」と、その下の非公開でないスレッド、それに管理者が `/memory include` で入れたチャンネル (ロールが要るチャンネルなど) とその下の非公開でないスレッド。2026-10 の Evex では @everyone から見えないチャンネルに人間の発言の半分 (#generax 47万件・#taxt 12万件・#nsfw 5万件など) があり、#generax・#taxt・#nsfw を入れた。運営用 (#internal・#moderator-room) は入れていない。追加したチャンネルの内容は、そのチャンネルを見られない人にも思い出される。`/memory exclude` で外すと以後は読まないが、読んだ分の記憶は残る。builder は Discord につながらないので、bot が起動時と30分ごとに `public_channels` へ控えを書き、builder はそこに無いチャンネルを読まない。控えが無ければ builder は何もしない。
+記憶に入るのは、bot が控えた「@everyone と bot の両方が読めるチャンネル」と、その下の非公開でないスレッド、それに管理者が `/memory include` で入れたチャンネル (ロールが要るチャンネルなど) とその下の非公開でないスレッド。2026-10 の Evex では @everyone から見えないチャンネルに人間の発言の半分 (#generax 47万件・#taxt 12万件・#nsfw 5万件など) があり、#generax・#taxt・#nsfw を入れた。運営用 (#internal・#moderator-room) は入れていない。追加したチャンネルの内容 (出来事の要約とページの文) は、そのチャンネルを見られない人にも思い出される。ただし原文 (決め台詞の引用・根拠の発言の本文とリンク) は、そのチャンネルを見られる人にしか出さない (下の「原文を見せる範囲」)。`/memory exclude` で外すと以後は読まないが、読んだ分の記憶は残る。builder は Discord につながらないので、bot が起動時と30分ごとに `public_channels` へ控えを書き、builder はそこに無いチャンネルを読まない。控えが無ければ builder は何もしない。
 
 nsfw のチャンネルも公開なら読む。提供元が拒否した区切りは `failed` として記録され、`--retry-failed` で別のモデルに読み直させられる。
 
-記憶は公開範囲だけから作るので、そのサーバーの誰に見せてもよい。後から非公開になったチャンネル・削除された発言から書いた出来事とページの文は残る (根拠の発言は開けなくなる)。消したいときは `reset` して作り直す (原文のアーカイブには触らない)。
+記憶 (出来事の要約とページの文) は公開範囲と管理者が入れたチャンネルから作るので、そのサーバーの誰に見せてもよい。後から非公開になったチャンネル・削除された発言から書いた出来事とページの文は残る (根拠の発言は開けなくなる)。消したいときは `reset` して作り直す (原文のアーカイブには触らない)。
+
+原文を見せる範囲: 出来事の決め台詞と根拠の発言は発言そのもの (本文とリンク) なので、要約とは分けて、見る人ごとに絞る。どれも控え (`public_channels`) にあり消されていない発言のうち、
+
+- 本人だけの画面 (`/memory explore`・🔎 自分で開く・`/memory episode`): 開いた人がそのチャンネルを読める (ViewChannel と ReadMessageHistory) ものだけ。アーカイブ済みのスレッドは親チャンネルで判定する
+- 共有した画面 (📢 みんなに見せる): 共有したチャンネルの発言か、@everyone が読めるチャンネルの発言だけ (共有したメッセージを見る人の中に、元のチャンネルを見られない人がいるため)。NSFW チャンネルの発言は NSFW のチャンネルに共有したときだけ (1つの出来事の根拠は複数のチャンネルにまたがることがある)
+- 会話 agent の `memory` ツール: 呼び出しに依頼した人のチャンネルの範囲 (`channelScope`、検索と同じ `getChannelScope(guild, member)`) が渡されていれば、その範囲のものだけ。渡されなければ控えにあるもの全部 (builder の `show` / `episode` / `export` もこれ)
+
+省いた発言があるときは「見られないチャンネルの発言は省きました」と書く。
 
 ## 操作
 
@@ -111,22 +119,22 @@ Discord からは `/memory` で見る・止める。返事は本人にだけ見�
 |`explore`|記憶の本をメニューでたどって読む。ページはパンくず・本文 (リンクは太字の名前)・子ページ (20件ずつ)・つながり・最近の出来事。出来事は種類・日付・チャンネル・決め台詞の引用・根拠の発言へのリンク・前後の出来事。🕒 年表 (古い順に10件ずつ)、🔍 探す (入力欄)。📢 みんなに見せる で今の画面をチャンネルに出し、出したメッセージは誰が押しても全員の画面が変わる (一緒にたどる)。🔎 自分で開く で押した人にだけ同じ画面を開く。NSFW チャンネルの出来事は NSFW のチャンネルでだけ共有できる|誰でも|
 |`show` / `search` / `episode`|ページ・検索・出来事と根拠の発言 (リンク付き)|誰でも|
 
-builder を直接操作するとき:
+builder を直接操作するとき (TypeScript なので tsx を通す):
 
 ```sh
-node scripts/memory-tree.mjs status   --guild ID   # 進み具合。AI を呼ばない
-node scripts/memory-tree.mjs try      --guild ID [--model M]   # 次の区切りを1回だけ投げて出来事・知識を表示 (保存しない)
-node scripts/memory-tree.mjs run      --guild ID [--max-calls N] [--max-minutes M] [--retry-failed]
-node scripts/memory-tree.mjs show     --guild ID --path people/たこ [--with people/さば]
-node scripts/memory-tree.mjs episode  --guild ID --id e12
-node scripts/memory-tree.mjs search   --guild ID --query 統治
-node scripts/memory-tree.mjs recall   --guild ID --text "さばって何作ってたっけ"   # 会話でこう聞かれたら何を思い出すか
-node scripts/memory-tree.mjs root     --guild ID   # system に入る文面
-node scripts/memory-tree.mjs estimate --guild ID   # 未読の量と呼び出し回数の目安 (アーカイブを走査するので重い)
-node scripts/memory-tree.mjs export   --guild ID --out DIR   # ページを Markdown に、出来事を episodes.md に
-node scripts/memory-tree.mjs reset    --guild ID --yes
-node scripts/memory-tree.mjs reopen-empty --guild ID [--yes]   # 出来事が1つも無いまま「完了」になった長い区切りを読み直しに回す
-node scripts/memory-tree.mjs settle   --guild ID   # 結果の返らなかった呼び出しの予約を OpenRouter の実額で精算 (run も最初にやる)
+node --import tsx scripts/memory-tree.ts status   --guild ID   # 進み具合。AI を呼ばない
+node --import tsx scripts/memory-tree.ts try      --guild ID [--model M]   # 次の区切りを1回だけ投げて出来事・知識を表示 (保存しない)
+node --import tsx scripts/memory-tree.ts run      --guild ID [--max-calls N] [--max-minutes M] [--retry-failed]
+node --import tsx scripts/memory-tree.ts show     --guild ID --path people/たこ [--with people/さば]
+node --import tsx scripts/memory-tree.ts episode  --guild ID --id e12
+node --import tsx scripts/memory-tree.ts search   --guild ID --query 統治
+node --import tsx scripts/memory-tree.ts recall   --guild ID --text "さばって何作ってたっけ"   # 会話でこう聞かれたら何を思い出すか
+node --import tsx scripts/memory-tree.ts root     --guild ID   # system に入る文面
+node --import tsx scripts/memory-tree.ts estimate --guild ID   # 未読の量と呼び出し回数の目安 (アーカイブを走査するので重い)
+node --import tsx scripts/memory-tree.ts export   --guild ID --out DIR   # ページを Markdown に、出来事を episodes.md に
+node --import tsx scripts/memory-tree.ts reset    --guild ID --yes
+node --import tsx scripts/memory-tree.ts reopen-empty --guild ID [--yes]   # 出来事が1つも無いまま「完了」になった長い区切りを読み直しに回す
+node --import tsx scripts/memory-tree.ts settle   --guild ID   # 結果の返らなかった呼び出しの予約を OpenRouter の実額で精算 (run も最初にやる)
 ```
 
 予算の予約: 呼び出す前に「最も高い provider で入力も出力も上限まで使った」額を予約し、返ってきた実額で置き換える。プロセスごと止めたり応答が途中で切れたりすると予約のまま残り、1件あたり実費の約10倍で上限を埋める (2026-10-15 は 107 件・$4.40 が残り、実費は $0.46 だった)。run は最初に OpenRouter に今月の請求額を聞き、台帳で確定した額との差を1時間より古い未確定の呼び出しに按分して精算する。予約のせいで止まっていた予算はそれで再開する。

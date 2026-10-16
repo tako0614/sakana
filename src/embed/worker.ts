@@ -1,6 +1,6 @@
 // 埋め込みワーカーのライフサイクル。
 //
-// emotion.js の spawn トランスポートを踏襲するが、2点を変える。
+// emotion.ts の spawn トランスポートを踏襲するが、2点を変える。
 //   1. モデルのロードは1回だけ。プロセスを立てたままにする (常駐)。
 //      1件ごとにロードしていると数十万件のバックフィルは不可能。
 //   2. stdout を全部文字列連結しない。行単位で切り出して捨てる。
@@ -8,9 +8,11 @@
 //
 // 使われない間はアイドルで落とすので、24時間 1GiB 常駐にはならない。
 
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
+import type { Readable, Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
+import { isRecord, type JsonRecord } from '../ai/types.js';
 import { embedConfig } from './config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -21,20 +23,66 @@ const STDERR_RING = 20;
 const BACKOFF_MS = [1000, 5000, 30_000];
 const CIRCUIT_BREAK_MS = 600_000;
 
-let child = null;
-let ready = null; // Promise<info>
-let info = null;
+export type EmbedKind = 'passage' | 'query';
+export type EmbedEncode = 'int8' | 'float32';
+
+/** 1回の embed の結果。vectors は base64、scales は int8 の逆量子化の倍率 (float32 は 1)。 */
+export interface EmbedReply extends JsonRecord {
+  id: number;
+  ok: true;
+  dim: number;
+  vectors: string[];
+  scales: number[];
+}
+
+/** 起動時の ready の行 (モデル名・次元など)。 */
+export type WorkerInfo = JsonRecord;
+
+interface EmbedPayload {
+  op: 'embed';
+  kind: EmbedKind;
+  encode: EmbedEncode;
+  texts: readonly string[];
+}
+
+interface Task {
+  payload: EmbedPayload;
+  resolve: (message: EmbedReply) => void;
+  reject: (error: unknown) => void;
+}
+
+interface PendingEntry {
+  resolve: (message: EmbedReply) => void;
+  reject: (error: unknown) => void;
+  timer: NodeJS.Timeout;
+}
+
+type WorkerProcess = ChildProcessByStdio<Writable, Readable, Readable>;
+
+let child: WorkerProcess | null = null;
+let ready: Promise<WorkerInfo> | null = null;
+let info: WorkerInfo | null = null;
 let nextId = 1;
 
-const pending = new Map(); // id -> { resolve, reject, timer }
-const queue = []; // { payload, resolve, reject, priority }
+const pending = new Map<number, PendingEntry>(); // id -> { resolve, reject, timer }
+const queue: Task[] = []; // { payload, resolve, reject, priority }
 let inFlight = false;
-let stderrRing = [];
-let idleTimer = null;
+let stderrRing: string[] = [];
+let idleTimer: NodeJS.Timeout | null = null;
 let failures = 0;
 let disabledUntil = 0;
 
-function recordStderr(text) {
+// ワーカーに渡す環境変数。bot の秘密 (DISCORD_TOKEN・OPENROUTER_API_KEY・GOVERNANCE_LAW_API_TOKEN など) は渡さない
+// (モデルのコードは外から来る)。Hugging Face の設定 (HF_TOKEN を含む) はモデルの取得に要るので残す。
+// TOKENIZERS_PARALLELISM のような設定は名前の途中に TOKEN があるだけなので残る
+const SECRET_ENV = /SECRET|PASSWORD|PASSWD|CREDENTIAL|(TOKEN|_KEY)$/i;
+
+function workerEnv(): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(process.env)
+    .filter(([key, value]) => value !== undefined && (key.startsWith('HF_') || !SECRET_ENV.test(key))));
+}
+
+function recordStderr(text: unknown): void {
   for (const line of String(text).split('\n')) {
     if (!line.trim()) continue;
     stderrRing.push(line.slice(0, 300));
@@ -42,18 +90,18 @@ function recordStderr(text) {
   }
 }
 
-function stderrTail() {
+function stderrTail(): string {
   return stderrRing.slice(-5).join(' | ') || '(no stderr)';
 }
 
-function clearIdleTimer() {
+function clearIdleTimer(): void {
   if (idleTimer) {
     clearTimeout(idleTimer);
     idleTimer = null;
   }
 }
 
-function scheduleIdleShutdown() {
+function scheduleIdleShutdown(): void {
   clearIdleTimer();
   if (!child) return;
 
@@ -63,19 +111,19 @@ function scheduleIdleShutdown() {
   idleTimer.unref?.();
 }
 
-function rejectAll(error) {
+function rejectAll(error: unknown): void {
   for (const [id, entry] of pending) {
     pending.delete(id);
     clearTimeout(entry.timer);
     entry.reject(error);
   }
 
-  while (queue.length > 0) {
-    queue.shift().reject(error);
+  for (let task = queue.shift(); task; task = queue.shift()) {
+    task.reject(error);
   }
 }
 
-function teardown(error) {
+function teardown(error: unknown): void {
   const dying = child;
   child = null;
   ready = null;
@@ -94,7 +142,7 @@ function teardown(error) {
   rejectAll(error);
 }
 
-export function shutdown() {
+export function shutdown(): void {
   if (!child) return;
 
   try {
@@ -122,12 +170,25 @@ process.once('exit', () => {
   }
 });
 
-function handleLine(line) {
-  let message;
+const isStringList = (value: unknown): value is string[] => Array.isArray(value) && value.every((item: unknown) => typeof item === 'string');
+const isNumberList = (value: unknown): value is number[] => Array.isArray(value) && value.every((item: unknown) => typeof item === 'number');
+
+/** ワーカーが返した行は形を確かめてから使う (ベクトルと倍率が揃っていること)。 */
+function isEmbedReply(message: JsonRecord): message is EmbedReply {
+  return message.ok === true && typeof message.id === 'number' && typeof message.dim === 'number'
+    && isStringList(message.vectors) && isNumberList(message.scales);
+}
+
+function handleLine(line: string): void {
+  let message: unknown;
   try {
     message = JSON.parse(line);
   } catch {
     recordStderr(`unparsable line: ${line.slice(0, 200)}`);
+    return;
+  }
+  if (!isRecord(message)) {
+    recordStderr(`unexpected line: ${line.slice(0, 200)}`);
     return;
   }
 
@@ -141,17 +202,19 @@ function handleLine(line) {
     return;
   }
 
+  if (typeof message.id !== 'number') return;
   const entry = pending.get(message.id);
   if (!entry) return;
 
   pending.delete(message.id);
   clearTimeout(entry.timer);
 
-  if (message.ok) entry.resolve(message);
-  else entry.reject(new Error(message.error ?? 'embed failed'));
+  if (isEmbedReply(message)) entry.resolve(message);
+  else if (message.ok) entry.reject(new Error('embed worker returned a malformed reply'));
+  else entry.reject(new Error(typeof message.error === 'string' ? message.error : 'embed failed'));
 }
 
-function start() {
+function start(): Promise<WorkerInfo> {
   if (ready) return ready;
 
   if (Date.now() < disabledUntil) {
@@ -160,13 +223,14 @@ function start() {
 
   stderrRing = [];
 
-  ready = new Promise((resolvePromise, reject) => {
+  ready = new Promise<WorkerInfo>((resolvePromise, reject) => {
     let settled = false;
+    let worker: WorkerProcess;
 
     try {
-      child = spawn(embedConfig.pythonBin, [scriptPath], {
+      worker = spawn(embedConfig.pythonBin, [scriptPath], {
         env: {
-          ...process.env,
+          ...workerEnv(),
           SEMANTIC_MODEL_NAME: embedConfig.modelName,
           ...(embedConfig.modelRevision ? { SEMANTIC_MODEL_REVISION: embedConfig.modelRevision } : {}),
           SEMANTIC_MAX_LENGTH: String(embedConfig.maxLength),
@@ -176,6 +240,7 @@ function start() {
         },
         stdio: ['pipe', 'pipe', 'pipe']
       });
+      child = worker;
     } catch (error) {
       ready = null;
       reject(error);
@@ -193,8 +258,8 @@ function start() {
 
     // 行単位で切り出して即捨てる。全部溜めるとバックフィルで破綻する。
     let buffer = '';
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk) => {
+    worker.stdout.setEncoding('utf8');
+    worker.stdout.on('data', (chunk: string) => {
       buffer += chunk;
 
       let index = buffer.indexOf('\n');
@@ -220,15 +285,15 @@ function start() {
       }
     });
 
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk) => recordStderr(chunk));
+    worker.stderr.setEncoding('utf8');
+    worker.stderr.on('data', (chunk: string) => recordStderr(chunk));
 
-    child.on('error', (error) => {
+    worker.on('error', (error) => {
       teardown(error);
       if (!settled) { settled = true; clearTimeout(timer); reject(error); }
     });
 
-    child.on('exit', (code, signal) => {
+    worker.on('exit', (code, signal) => {
       const error = new Error(`embed worker exited (code=${code} signal=${signal}): ${stderrTail()}`);
 
       failures += 1;
@@ -245,10 +310,12 @@ function start() {
   return ready;
 }
 
-function pump() {
+function pump(): void {
   if (inFlight || queue.length === 0 || !child) return;
 
   const task = queue.shift();
+  if (!task) return;
+  const worker = child;
   inFlight = true;
 
   const id = nextId++;
@@ -283,7 +350,7 @@ function pump() {
   });
 
   try {
-    child.stdin.write(`${JSON.stringify(payload)}\n`);
+    worker.stdin.write(`${JSON.stringify(payload)}\n`);
   } catch (error) {
     pending.delete(id);
     clearTimeout(timer);
@@ -297,14 +364,15 @@ function pump() {
  * kind:'query' は優先度が高い — Discord のユーザーがバックフィル1バッチ
  * (約200ms) 以上待たないように、キューの先頭に差し込む。
  */
-export async function embedTexts(texts, { kind = 'passage', encode = 'int8' } = {}) {
+export async function embedTexts(texts: readonly string[],
+  { kind = 'passage', encode = 'int8' }: { kind?: EmbedKind; encode?: EmbedEncode } = {}): Promise<EmbedReply> {
   if (!embedConfig.enabled) throw new Error('semantic search is disabled');
 
   await start();
   clearIdleTimer();
 
-  return new Promise((resolvePromise, reject) => {
-    const task = { payload: { op: 'embed', kind, encode, texts }, resolve: resolvePromise, reject };
+  return new Promise<EmbedReply>((resolvePromise, reject) => {
+    const task: Task = { payload: { op: 'embed', kind, encode, texts }, resolve: resolvePromise, reject };
     if (kind === 'query') queue.unshift(task);
     else queue.push(task);
     pump();
@@ -312,7 +380,7 @@ export async function embedTexts(texts, { kind = 'passage', encode = 'int8' } = 
 }
 
 /** ロードだけ先に始める。await しないで呼ぶ。 */
-export function prewarm() {
+export function prewarm(): void {
   if (!embedConfig.enabled || !embedConfig.prewarm) return;
   if (child || Date.now() < disabledUntil) return;
 
@@ -321,10 +389,10 @@ export function prewarm() {
   });
 }
 
-export function workerInfo() {
+export function workerInfo(): WorkerInfo | null {
   return info;
 }
 
-export function isDisabled() {
+export function isDisabled(): boolean {
   return Date.now() < disabledUntil;
 }

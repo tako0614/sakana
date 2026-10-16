@@ -1,5 +1,7 @@
+import type { Statement } from 'better-sqlite3';
 import { db as archive } from '../archive/db.js';
 import { getCursor } from './store.js';
+import type { Cursor, LineEntry, Pack, RenderedSegment } from './types.js';
 
 // アーカイブを、AI に渡す短い台本にする。
 //
@@ -20,84 +22,116 @@ const MERGE_MS = 3 * 60_000;       // 同じ人がこの間に続けて書いた
 const MESSAGE_CHARS = 500;         // ログやコードの貼り付けで区切りを埋めない
 const PAGE = 500;
 
-const local = (ms) => new Date(ms + TZ_MS).toISOString();
+const local = (ms: number): string => new Date(ms + TZ_MS).toISOString();
 
 /** snowflake 同士の比較。桁数が違うと文字列比較は狂う。 */
-export function idAfter(a, b) {
+export function idAfter(a: string, b: string): boolean {
   const x = String(a);
   const y = String(b);
   return x.length !== y.length ? x.length > y.length : x > y;
 }
 
-const afterCursor = (row, cursor) => !cursor
+const afterCursor = (row: { created_at: number; message_id: string }, cursor: Cursor | null | undefined): boolean => !cursor
   || row.created_at > cursor.last_ms
   || (row.created_at === cursor.last_ms && idAfter(row.message_id, cursor.last_id));
 
-let statements = null;
-function sql() {
+interface MessageRow {
+  message_id: string;
+  author_id: string;
+  author_name: string;
+  content: string;
+  created_at: number;
+  reply_to: string | null;
+  attachment_count: number;
+  attachment_kinds: string;
+  sticker_count: number;
+  embed_count: number;
+}
+
+interface ChannelRow {
+  name: string;
+  is_thread: number;
+  parent_id: string | null;
+}
+
+interface Statements {
+  page: Statement<[string, number, number], MessageRow>;
+  head: Statement<[string, number], { message_id: string; created_at: number }>;
+  latestName: Statement<[string, string], { author_name: string }>;
+  replyAuthor: Statement<[string], { author_id: string; author_name: string }>;
+  channel: Statement<[string], ChannelRow>;
+}
+
+let statements: Statements | null = null;
+function sql(): Statements {
   statements ??= {
-    page: archive.prepare(`
+    page: archive.prepare<[string, number, number], MessageRow>(`
       SELECT message_id, author_id, author_name, content, created_at, reply_to,
         attachment_count, attachment_kinds, sticker_count, embed_count
       FROM messages
       WHERE channel_id = ? AND deleted = 0 AND is_bot = 0 AND created_at >= ?
       ORDER BY created_at LIMIT ?
     `),
-    head: archive.prepare(`
+    head: archive.prepare<[string, number], { message_id: string; created_at: number }>(`
       SELECT message_id, created_at FROM messages
       WHERE channel_id = ? AND deleted = 0 AND is_bot = 0 AND created_at >= ?
       ORDER BY created_at LIMIT 20
     `),
     // 表示名は時期で変わる。木の中で同じ人が別名に割れないよう、最新の名前に揃える。
-    latestName: archive.prepare(`
+    latestName: archive.prepare<[string, string], { author_name: string }>(`
       SELECT author_name FROM messages
       WHERE guild_id = ? AND author_id = ? AND author_name <> ''
       ORDER BY created_at DESC LIMIT 1
     `),
-    replyAuthor: archive.prepare('SELECT author_id, author_name FROM messages WHERE message_id = ?'),
-    channel: archive.prepare('SELECT name, is_thread, parent_id FROM channels WHERE channel_id = ?')
+    replyAuthor: archive.prepare<[string], { author_id: string; author_name: string }>('SELECT author_id, author_name FROM messages WHERE message_id = ?'),
+    channel: archive.prepare<[string], ChannelRow>('SELECT name, is_thread, parent_id FROM channels WHERE channel_id = ?')
   };
   return statements;
 }
 
 export class NameBook {
-  constructor(guildId) {
+  readonly guildId: string;
+  readonly names = new Map<string, string>();
+  readonly channels = new Map<string, string>();
+
+  constructor(guildId: string) {
     this.guildId = guildId;
-    this.names = new Map();
-    this.channels = new Map();
   }
 
-  person(authorId, fallback) {
-    if (!this.names.has(authorId)) {
+  person(authorId: string, fallback: string | null | undefined): string {
+    let name = this.names.get(authorId);
+    if (name === undefined) {
       const row = sql().latestName.get(this.guildId, authorId);
-      this.names.set(authorId, (row?.author_name || fallback || 'unknown').replace(/[\n:]/g, ' ').trim());
+      name = (row?.author_name || fallback || 'unknown').replace(/[\n:]/g, ' ').trim();
+      this.names.set(authorId, name);
     }
-    return this.names.get(authorId);
+    return name;
   }
 
-  channel(channelId) {
-    if (!this.channels.has(channelId)) {
+  channel(channelId: string): string {
+    let label = this.channels.get(channelId);
+    if (label === undefined) {
       const row = sql().channel.get(channelId);
-      let label = `#${row?.name ?? channelId}`;
+      label = `#${row?.name ?? channelId}`;
       if (row?.is_thread && row.parent_id) {
         const parent = sql().channel.get(row.parent_id);
         if (parent?.name) label = `#${parent.name} › ${row.name}`;
       }
       this.channels.set(channelId, label);
     }
-    return this.channels.get(channelId);
+    return label;
   }
 }
 
-function extrasOf(row) {
-  const out = [];
+function extrasOf(row: MessageRow): string {
+  const out: string[] = [];
   if (row.attachment_count > 0) out.push(/image/.test(row.attachment_kinds ?? '') ? '[画像]' : '[添付]');
   if (row.sticker_count > 0) out.push('[スタンプ]');
   if (row.embed_count > 0 && !row.content) out.push('[埋め込み]');
   return out.join('');
 }
 
-function cleanText(content) {
+function cleanText(content: string | null | undefined): string {
   let text = String(content ?? '')
     .replace(/https?:\/\/\S+/g, (url) => (url.length > 70 ? `${url.slice(0, 67)}…` : url))
     .replace(/<a?:(\w+):\d+>/g, ':$1:')
@@ -109,12 +143,12 @@ function cleanText(content) {
 }
 
 /** fromId の直前を指す cursor (失敗した区切りを最初から読み直す用)。 */
-export function cursorBefore(fromId, fromMs) {
+export function cursorBefore(fromId: string, fromMs: number): Cursor {
   return { last_id: (BigInt(fromId) - 1n).toString(), last_ms: fromMs };
 }
 
 /** 次に読む発言の時刻。無ければ null。 */
-export function nextMessageAt(channelId, cursor) {
+export function nextMessageAt(channelId: string, cursor: Cursor | null): number | null {
   for (const row of sql().head.all(channelId, cursor?.last_ms ?? 0)) {
     if (afterCursor(row, cursor)) return row.created_at;
   }
@@ -125,22 +159,32 @@ export function nextMessageAt(channelId, cursor) {
  * 1チャンネルぶんを cursor の続きから maxChars まで台本にする。
  * 空の発言 (本文も添付も無い) も cursor は進める。until を渡すとそこで止める。
  */
-export function renderSegment({ guildId, channelId, cursor, maxChars, until = null, lineStart = 1, book = new NameBook(guildId) }) {
+export interface RenderSegmentOptions {
+  guildId: string;
+  channelId: string;
+  cursor: Cursor | null;
+  maxChars: number;
+  until?: { id: string; ms: number } | null;
+  lineStart?: number;
+  book?: NameBook;
+}
+
+export function renderSegment({ guildId, channelId, cursor, maxChars, until = null, lineStart = 1, book = new NameBook(guildId) }: RenderSegmentOptions): RenderedSegment | null {
   const label = book.channel(channelId);
-  const lines = [];
+  const lines: string[] = [];
   let chars = 0;
   let consumed = 0;
-  let first = null;
-  let last = null;
-  let lastDate = null;
+  let first: MessageRow | null = null;
+  let last: MessageRow | null = null;
+  let lastDate: string | null = null;
   let lastTimeShown = -Infinity;
-  let prev = null;          // 直前の行 (まとめる判定用)
+  let prev: { author: string; at: number } | null = null;          // 直前の行 (まとめる判定用)
   let lineNo = lineStart;
-  const lineMap = new Map(); // 行番号 → { ids, channelId, firstMs, lastMs }
+  const lineMap = new Map<number, LineEntry>(); // 行番号 → { ids, channelId, firstMs, lastMs }
   let exhausted = false;
-  let position = cursor ? { ...cursor } : null;
+  let position: Cursor | null = cursor ? { ...cursor } : null;
 
-  const push = (line) => { lines.push(line); chars += line.length + 1; };
+  const push = (line: string): void => { lines.push(line); chars += line.length + 1; };
 
   outer:
   for (;;) {
@@ -164,7 +208,7 @@ export function renderSegment({ guildId, channelId, cursor, maxChars, until = nu
         }
         const canMerge = prev && prev.author === row.author_id && !target && date === lastDate
           && row.created_at - prev.at <= MERGE_MS;
-        let addition;
+        let addition: string;
         let header = '';
         if (canMerge) {
           addition = ` / ${body}`;
@@ -179,9 +223,12 @@ export function renderSegment({ guildId, channelId, cursor, maxChars, until = nu
         if (canMerge) {
           lines[lines.length - 1] += addition;
           chars += addition.length;
+          // まとめられるのは直前に書いた行 (canMerge は prev があるときだけ) なので、その行の対応は必ずある
           const entry = lineMap.get(lineNo - 1);
-          entry.ids.push(row.message_id);
-          entry.lastMs = row.created_at;
+          if (entry) {
+            entry.ids.push(row.message_id);
+            entry.lastMs = row.created_at;
+          }
         } else {
           if (header) push(header);
           push(addition);
@@ -200,12 +247,12 @@ export function renderSegment({ guildId, channelId, cursor, maxChars, until = nu
     }
     if (rows.length < PAGE) {
       // ページが尽きた = この時点の末尾まで読んだ
-      const more = sql().page.all(channelId, position.last_ms, 5).some((row) => afterCursor(row, position));
+      const more = sql().page.all(channelId, position?.last_ms ?? 0, 5).some((row) => afterCursor(row, position));
       if (!more) { exhausted = true; break; }
     }
   }
 
-  if (!first) return null;
+  if (!first || !last) return null;
   return {
     channelId,
     label,
@@ -229,8 +276,18 @@ export function renderSegment({ guildId, channelId, cursor, maxChars, until = nu
  * 新着の尻尾は貯まるまで待つ: 合計が minChars 未満で、どの区切りも
  * idleMs 以内に発言があったなら null (呼び出しの回数を新着の件数に比例させない)。
  */
-export function planPack({ guildId, channelIds, targetChars, minChars = 0, idleMs = 0, now = Date.now(), exclude = null }) {
-  const queue = [];
+export interface PlanPackOptions {
+  guildId: string;
+  channelIds: readonly string[];
+  targetChars: number;
+  minChars?: number;
+  idleMs?: number;
+  now?: number;
+  exclude?: ReadonlySet<string> | null;
+}
+
+export function planPack({ guildId, channelIds, targetChars, minChars = 0, idleMs = 0, now = Date.now(), exclude = null }: PlanPackOptions): Pack | null {
+  const queue: { channelId: string; cursor: Cursor | null; at: number }[] = [];
   for (const channelId of channelIds) {
     if (exclude?.has(channelId)) continue;   // 同じ波で別の区切りが読んでいるチャンネル
     const cursor = getCursor(guildId, channelId);
@@ -240,7 +297,7 @@ export function planPack({ guildId, channelIds, targetChars, minChars = 0, idleM
   queue.sort((a, b) => a.at - b.at);
 
   const book = new NameBook(guildId);
-  const segments = [];
+  const segments: RenderedSegment[] = [];
   let used = 0;
   let lineStart = 1;
   for (const entry of queue) {
@@ -260,8 +317,8 @@ export function planPack({ guildId, channelIds, targetChars, minChars = 0, idleM
 }
 
 /** 区切りの集まりを1回ぶんにする。行番号の対応表をまとめる。 */
-export function packOf(segments) {
-  const lineMap = new Map();
+export function packOf(segments: RenderedSegment[]): Pack {
+  const lineMap = new Map<number, LineEntry>();
   for (const segment of segments) for (const [n, entry] of segment.lineMap) lineMap.set(n, entry);
   return {
     segments,

@@ -2,12 +2,12 @@
 // SEMANTIC_MODEL_NAME が変わると既存ベクトルは全部意味を失うので、
 // モデルの同一性は embed_models に記録して突き合わせる。
 
-function number(value, fallback) {
+function number(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function flag(value, fallback) {
+function flag(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined || value === '') return fallback;
   return !['0', 'false', 'no', 'off'].includes(String(value).toLowerCase());
 }
