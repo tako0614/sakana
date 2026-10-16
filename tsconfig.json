@@ -1,0 +1,29 @@
+{
+  // 型の検査だけに使う (実行は tsx が .ts をそのまま読む)。import は今までどおり './x.js' と書き、
+  // tsc も tsx も同じ名前の .ts を見つける。
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "jsx": "react-jsx",
+    "noEmit": true,
+    "allowJs": true,
+    "checkJs": false,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noPropertyAccessFromIndexSignature": false,
+    "useUnknownInCatchVariables": true
+  },
+  "include": ["src/**/*", "scripts/*.ts"],
+  "exclude": ["node_modules", "web", "scripts/llm", "subprojects", "evex*", "judge", "src/**/*.py"]
+}

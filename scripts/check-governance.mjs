@@ -1971,7 +1971,7 @@ legacyDatabase.exec(`
   WHERE guild_id = 'g1';
 `);
 legacyDatabase.close();
-const migrationCheck = spawnSync(process.execPath, ['--input-type=module', '--eval', `
+const migrationCheck = spawnSync(process.execPath, [...process.execArgv, '--input-type=module', '--eval', `
   const db = await import('./src/governance/db.js');
   const guild = db.getGovernanceGuild('g1');
   const migration = db.getGovernanceSurfaceMigration('g1');

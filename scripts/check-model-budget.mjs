@@ -45,7 +45,7 @@ async function childMode() {
 
 function runChild(args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath,[fileURLToPath(import.meta.url),...args],{
+    const child = spawn(process.execPath,[...process.execArgv,fileURLToPath(import.meta.url),...args],{
       cwd:process.cwd(),env:process.env,stdio:['ignore','pipe','pipe']
     });
     let stdout = '', stderr = '';

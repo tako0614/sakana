@@ -13,7 +13,7 @@ process.env.ARCHIVE_FETCH_DELAY_MS='0';
 // into queue tables through triggers.
 const legacyCoverage=JSON.stringify({schema:1,guildId:'legacy-guild',mode:'full',complete:true,channelIds:['c']});
 {
-  const schema=spawnSync(process.execPath,['--input-type=module','-e',"await import('./src/archive/db.js')"],
+  const schema=spawnSync(process.execPath,[...process.execArgv,'--input-type=module','-e',"await import('./src/archive/db.js')"],
     {cwd:process.cwd(),env:process.env,encoding:'utf8'});
   assert.equal(schema.status,0,schema.stderr);
   const legacy=new Database(process.env.ARCHIVE_DB_PATH);
