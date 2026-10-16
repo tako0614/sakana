@@ -1,21 +1,55 @@
+import type { ToolDefinition } from '../ai/types.js';
 import { db as archive } from '../archive/db.js';
 import {
   topLevels, episodesFor, getEpisode, getNode, hasTree, linkedPages, listChildren, loadPublicChannels, nameOf,
-  normalizePath, searchEpisodes, searchNodes, sharedEpisodes
+  normalizePath, searchEpisodes, searchNodes, sharedEpisodes, type MemoryNode
 } from './store.js';
+import { scopeAllows, type ChannelScope, type QuoteFilter } from './types.js';
 
 // 会話 agent から見た記憶の本。根は system に常駐させ (毎回同じ文面なのでキャッシュが効く)、
 // それより下は memory ツールでたどる: ページ → つながったページ / 関わった出来事 → 根拠の発言。
-// 記憶は公開チャンネルだけから作っているので、そのサーバーの誰に見せてもよい。
-// 根拠の発言は開くときにもう一度、いま公開のチャンネルかどうかを確かめる。
+// 記憶 (要約とページ) は公開チャンネルと管理者が入れたチャンネルから作っていて、そのサーバーの誰に見せてもよい。
+// 根拠の発言 (原文) は開くときにもう一度、いま読んでよいチャンネルかどうかを確かめ、
+// 依頼した人の範囲 (channelScope / canQuote) が渡されていれば、その人が見られないチャンネルのものは出さない。
 
 const BODY_CHARS = 6000;
 const ROOT_PROMPT_CHARS = 2600;
 const TZ_MS = 9 * 3_600_000;
-const day = (ms) => new Date(ms + TZ_MS).toISOString().slice(0, 10);
-const minute = (ms) => new Date(ms + TZ_MS).toISOString().slice(5, 16).replace('T', ' ');
+const day = (ms: number): string => new Date(ms + TZ_MS).toISOString().slice(0, 10);
+const minute = (ms: number): string => new Date(ms + TZ_MS).toISOString().slice(5, 16).replace('T', ' ');
 
-export const memoryToolDefinition = {
+/** 根拠の発言に振る引用番号の表 (agent の RefTable)。add は番号を返す。 */
+export interface MemoryRefTable {
+  add(entry: {
+    guildId: string; channelId: string; channelName: string; messageId: string; authorId: string; authorName: string;
+    content: string; createdAt: number;
+  }): number | null | undefined;
+}
+
+/**
+ * memory ツールを呼ぶ文脈。
+ *   refs:         agent の RefTable。根拠の発言に引用番号を振る
+ *   channelScope: 依頼した人が読めるチャンネル (agent の ctx.channelScope = getChannelScope(guild, member))。
+ *                 渡すと、その人が見られないチャンネルの根拠の発言 (本文・引用番号) を出さない
+ *   canQuote:     同じ判定を関数で渡す (/memory episode は見ている人の権限で判定する)
+ * どちらも無ければ、記憶に入れたチャンネル全部の原文を出す (builder の CLI など、運用者が読むとき)。
+ */
+export interface MemoryToolContext {
+  guildId: string;
+  refs?: MemoryRefTable | null;
+  channelScope?: ChannelScope | null;
+  canQuote?: QuoteFilter | null;
+}
+
+/** モデル (または /memory) が渡す引数。どれも文字列のはずだが確かめてから使う。 */
+export interface MemoryToolArgs {
+  path?: unknown;
+  with?: unknown;
+  query?: unknown;
+  episode?: unknown;
+}
+
+export const memoryToolDefinition: ToolDefinition = {
   type: 'function',
   function: {
     name: 'memory',
@@ -33,13 +67,14 @@ export const memoryToolDefinition = {
   }
 };
 
-export function hasMemory(guildId) {
+export function hasMemory(guildId: string): boolean {
   try { return hasTree(guildId); } catch { return false; }
 }
 
-const episodeLine = (episode) => `e${episode.id} ${day(episode.at_ms)}${episode.kind ? ` [${episode.kind}]` : ''} ${episode.title}`;
+const episodeLine = (episode: { id: number; kind: string; title: string; at_ms: number }): string =>
+  `e${episode.id} ${day(episode.at_ms)}${episode.kind ? ` [${episode.kind}]` : ''} ${episode.title}`;
 
-function openPage(guildId, node) {
+function openPage(guildId: string, node: MemoryNode): string {
   const lines = [`# ${node.path || '(根)'}${node.summary ? ` — ${node.summary}` : ''}`];
   if (node.aliases.length) lines.push(`別名: ${node.aliases.join(', ')}`);
   if (node.first_at) {
@@ -69,10 +104,27 @@ function openPage(guildId, node) {
   return lines.join('\n');
 }
 
-function openEpisode(ctx, id) {
+interface SourceRow {
+  message_id: string;
+  channel_id: string;
+  author_id: string;
+  author_name: string;
+  content: string;
+  created_at: number;
+  channel_name: string | null;
+}
+
+/** 依頼した人にこのチャンネルの原文を見せてよいか (範囲が渡されていなければ見せる)。 */
+function quotable(ctx: MemoryToolContext, channelId: string): boolean {
+  if (ctx.channelScope && !scopeAllows(channelId, ctx.channelScope)) return false;
+  if (ctx.canQuote && !ctx.canQuote(channelId)) return false;
+  return true;
+}
+
+function openEpisode(ctx: MemoryToolContext, id: number): string {
   const episode = getEpisode(ctx.guildId, id);
   if (!episode) return `出来事 e${id} はありません。`;
-  const channel = archive.prepare('SELECT name FROM channels WHERE channel_id = ?').get(episode.channel_id);
+  const channel = archive.prepare<[string], { name: string }>('SELECT name FROM channels WHERE channel_id = ?').get(episode.channel_id);
   const lines = [
     `e${episode.id} ${day(episode.at_ms)} #${channel?.name ?? episode.channel_id}${episode.kind ? ` [${episode.kind}]` : ''} — ${episode.title}`,
     episode.summary,
@@ -81,17 +133,19 @@ function openEpisode(ctx, id) {
   if (episode.before.length) lines.push(`前の出来事: ${episode.before.map(episodeLine).join(' / ')}`);
   if (episode.after.length) lines.push(`後の出来事: ${episode.after.map(episodeLine).join(' / ')}`);
 
-  // 根拠の発言。いま公開のチャンネルで、消されていないものだけ
+  // 根拠の発言。いま読んでよいチャンネルで、消されていないものだけ。依頼した人が見られないチャンネルのものは省く
   const open = new Set(loadPublicChannels(ctx.guildId)?.channelIds ?? []);
   const ids = [...new Set([...(episode.highlights ?? []), ...episode.sources])].slice(0, 12);
-  const rows = ids.length ? archive.prepare(`
+  const rows = ids.length ? archive.prepare<string[], SourceRow>(`
     SELECT m.message_id, m.channel_id, m.author_id, m.author_name, m.content, m.created_at, c.name AS channel_name
     FROM messages m LEFT JOIN channels c ON c.channel_id = m.channel_id
     WHERE m.message_id IN (${ids.map(() => '?').join(',')}) AND m.deleted = 0 ORDER BY m.created_at
   `).all(...ids) : [];
-  const visible = rows.filter((row) => open.has(row.channel_id));
+  const readable = rows.filter((row) => open.has(row.channel_id));
+  const visible = readable.filter((row) => quotable(ctx, row.channel_id));
+  const hidden = readable.length - visible.length;
   if (visible.length === 0) {
-    lines.push('根拠の発言: (消されたか、非公開になって開けません)');
+    lines.push(hidden ? '根拠の発言: (見られないチャンネルの発言は省きました)' : '根拠の発言: (消されたか、非公開になって開けません)');
   } else {
     // 決め台詞・名言として残した発言を先に (原文そのまま)
     const highlighted = new Set(episode.highlights ?? []);
@@ -106,14 +160,16 @@ function openEpisode(ctx, id) {
       const text = row.content.replace(/\s*\n\s*/g, ' / ').slice(0, 300);
       lines.push(`${highlighted.has(row.message_id) ? '★ ' : ''}${ref ? `${ref}) ` : ''}${minute(row.created_at)} ${row.author_name}: ${text}`);
     }
+    if (hidden) lines.push('(見られないチャンネルの発言は省きました)');
   }
   return lines.join('\n');
 }
 
 /**
- * ctx: { guildId, refs? } (refs は agent の RefTable。根拠の発言に引用番号を振る)。
+ * ctx: { guildId, refs?, channelScope?, canQuote? } (MemoryToolContext)。
+ * agent から呼ぶときは channelScope に依頼した人の ctx.channelScope を渡す (見られないチャンネルの原文を出さない)。
  */
-export function runMemoryTool(ctx, args = {}) {
+export function runMemoryTool(ctx: MemoryToolContext, args: MemoryToolArgs = {}): string {
   const guildId = ctx.guildId;
   const episodeId = Number(String(args.episode ?? '').trim().replace(/^e/i, ''));
   if (args.episode && Number.isInteger(episodeId)) return openEpisode(ctx, episodeId);
@@ -152,7 +208,7 @@ export function runMemoryTool(ctx, args = {}) {
  * system に入れる根。概要と、最上位ごとの重いページの名前だけ。記憶が無ければ空文字。
  * 長さは固定上限で切るので、記憶が育っても毎回の入力は増えない。
  */
-export function memoryRootPrompt(guildId) {
+export function memoryRootPrompt(guildId: string): string {
   if (!hasMemory(guildId)) return '';
   const root = getNode(guildId, '');
   const lines = [

@@ -1,37 +1,44 @@
 import { execFile } from 'node:child_process';
-import { EmbedBuilder, MessageFlags, SlashCommandBuilder } from 'discord.js';
+import {
+  EmbedBuilder, MessageFlags, SlashCommandBuilder,
+  type ChatInputCommandInteraction, type InteractionEditReplyOptions
+} from 'discord.js';
 import { canManageIndex } from '../archive/permissions.js';
 import { pausedBy, setPaused, treeConfig } from './build.js';
-import { fitShared, rootView, viewFor } from './explore.js';
+import { fitShared, rootView, viewFor, viewerQuoteFilter } from './explore.js';
 import { snapshotPublicChannels } from './snapshot.js';
-import { memoryStatus } from './status.js';
+import { memoryStatus, type MemoryStatus } from './status.js';
 import {
   OTHERS, addTopLevel, includeChannel, includedChannels, listChildren, memoryDb, moveSubtree, normalizePath, removeIncluded,
   removeTopLevel, topLevels
 } from './store.js';
-import { hasMemory, runMemoryTool } from './tool.js';
+import { hasMemory, runMemoryTool, type MemoryRefTable } from './tool.js';
+import { errorMessage } from './types.js';
 
 // /memory: 記憶の本の進み具合を見る・止める (管理者)、ページや出来事を開く (誰でも)。
-// 記憶は公開チャンネルだけから作っているので、開くのは誰に見せてもよい。
-// 返事は本人にだけ見える形にする (チャンネルを流さない)。
+// 記憶 (要約とページ) は公開チャンネルと管理者が入れたチャンネルから作っていて、開くのは誰に見せてもよい。
+// ただし出来事の原文 (根拠の発言とそのリンク) は、開いた人が見られるチャンネルのものだけ出す。
+// 返事は本人にだけ見える形にし (チャンネルを流さない)、誰にも通知しない (allowedMentions)。
 
 const UNIT = process.env.MEMORY_TREE_SYSTEMD_UNIT ?? 'sakana-memory.service';
 const ADMIN_ONLY = new Set(['status', 'pause', 'resume', 'include', 'exclude', 'list', 'add', 'remove']);
+// 返事に入る名前やパスは利用者の入力。@everyone などを書かれても誰にも通知しない
+const NO_PINGS = { parse: [] };
 
 /** 最上位の一覧と、その下のページ数。 */
-function categoryList(guildId) {
-  const count = memoryDb().prepare("SELECT COUNT(*) AS c FROM nodes WHERE guild_id = ? AND path LIKE ? ESCAPE '\\'");
+function categoryList(guildId: string): string {
+  const count = memoryDb().prepare<[string, string], { c: number }>("SELECT COUNT(*) AS c FROM nodes WHERE guild_id = ? AND path LIKE ? ESCAPE '\\'");
   return topLevels(guildId).map((path) => {
     const node = listChildren(guildId, '', 50).find((row) => row.path === path);
-    const pages = count.get(guildId, `${path.replace(/[%_\\]/g, (c) => `\\${c}`)}/%`).c;
+    const pages = count.get(guildId, `${path.replace(/[%_\\]/g, (c) => `\\${c}`)}/%`)?.c ?? 0;
     return `- **${path}** (${pages}) ${node?.summary ?? ''}${path === OTHERS ? ' ← 受け皿' : ''}`;
   }).join('\n');
 }
-const number = (value) => Number(value ?? 0).toLocaleString('en-US');
-const percent = (part, whole) => (whole > 0 ? `${Math.min(100, (part / whole) * 100).toFixed(1)}%` : '-');
-const ago = (ms) => (ms ? `<t:${Math.floor(ms / 1000)}:R>` : '-');
+const number = (value: number | null | undefined): string => Number(value ?? 0).toLocaleString('en-US');
+const percent = (part: number, whole: number): string => (whole > 0 ? `${Math.min(100, (part / whole) * 100).toFixed(1)}%` : '-');
+const ago = (ms: number | null | undefined): string => (ms ? `<t:${Math.floor(ms / 1000)}:R>` : '-');
 
-function statusEmbed(status) {
+function statusEmbed(status: MemoryStatus & { included: string[] }): EmbedBuilder {
   const progress = status.totals
     ? `${number(status.read)} / ${number(status.totals.messages)} 件 (${percent(status.read, status.totals.messages)})`
     : `${number(status.read)} 件 (総数は builder の初回で数える)`;
@@ -61,7 +68,7 @@ function statusEmbed(status) {
 }
 
 /** builder をすぐ起こす。失敗しても timer が1時間以内に起こすので黙って諦める。 */
-function wakeBuilder() {
+function wakeBuilder(): Promise<boolean> {
   if (!UNIT) return Promise.resolve(false);
   return new Promise((resolve) => {
     execFile('systemctl', ['start', '--no-block', UNIT], { timeout: 10_000 }, (error) => resolve(!error));
@@ -69,7 +76,7 @@ function wakeBuilder() {
 }
 
 /** 根拠の発言へのリンク。memory ツールの「1) …」の番号に合わせる。 */
-function sourceLinks(guildId, refs) {
+function sourceLinks(guildId: string, refs: { entries: { channelId: string; messageId: string }[] }): string {
   if (!refs.entries.length) return '';
   return '\n\n根拠: ' + refs.entries
     .map((entry, i) => `[${i + 1}](https://discord.com/channels/${guildId}/${entry.channelId}/${entry.messageId})`)
@@ -104,7 +111,7 @@ export const memoryCommand = {
       .addSubcommand((sub) => sub.setName('remove').setDescription('最上位を消す。中身は others の下へ移す')
         .addStringOption((option) => option.setName('name').setDescription('消す最上位').setRequired(true)))),
 
-  async execute(interaction) {
+  async execute(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!interaction.guildId) {
       await interaction.reply({ content: 'サーバー内で使ってください。', flags: MessageFlags.Ephemeral });
       return;
@@ -112,24 +119,27 @@ export const memoryCommand = {
     const sub = interaction.options.getSubcommand();
     const guildId = interaction.guildId;
     if (ADMIN_ONLY.has(sub)) {
-      const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
+      const member = interaction.member ?? await interaction.guild?.members.fetch(interaction.user.id) ?? null;
       if (!canManageIndex(member)) {
         await interaction.reply({ content: 'この操作は「サーバー管理」権限を持つ人か `ARCHIVE_ADMIN_USERS` の人だけが使えます。', flags: MessageFlags.Ephemeral });
         return;
       }
     }
+    // 本人だけの返事でも利用者の入力を含むので、誰にも通知しない
+    const edit = (options: string | InteractionEditReplyOptions): Promise<unknown> =>
+      interaction.editReply(typeof options === 'string' ? { content: options, allowedMentions: NO_PINGS } : { ...options, allowedMentions: NO_PINGS });
 
     // DB を読む前に受け付ける (Discord の応答期限は3秒)
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       if (sub === 'status') {
         const status = { ...memoryStatus(guildId, { budgetUsd: treeConfig.budgetUsd }), included: includedChannels(guildId) };
-        await interaction.editReply({ embeds: [statusEmbed(status)] });
+        await edit({ embeds: [statusEmbed(status)] });
         return;
       }
       if (interaction.options.getSubcommandGroup?.(false) === 'category') {
         if (sub === 'list') {
-          await interaction.editReply({ embeds: [new EmbedBuilder().setColor('#2b2d31').setTitle('記憶の本の最上位')
+          await edit({ embeds: [new EmbedBuilder().setColor('#2b2d31').setTitle('記憶の本の最上位')
             .setDescription(`${categoryList(guildId)}\n\n書き手は必ずこの中から選び、合わなければ ${OTHERS} に入れる。最上位の下は自由。`)] });
           return;
         }
@@ -140,24 +150,24 @@ export const memoryCommand = {
           const path = addTopLevel(guildId, name, interaction.options.getString('description') ?? '');
           let moved = 0;
           if (from) moved = moveSubtree(guildId, from, path);
-          await interaction.editReply(`最上位 **${path}** を作りました。${from ? ` ${from} の ${moved} ページを移しました。` : ''}次の区切りから書き手が使います。`);
+          await edit(`最上位 **${path}** を作りました。${from ? ` ${from} の ${moved} ページを移しました。` : ''}次の区切りから書き手が使います。`);
           return;
         }
         if (sub === 'remove') {
           const name = interaction.options.getString('name') ?? '';
           const moved = removeTopLevel(guildId, name);
-          await interaction.editReply(`最上位 **${normalizePath(name)}** を消し、中身 ${moved} ページを ${OTHERS}/${normalizePath(name)} に移しました。`);
+          await edit(`最上位 **${normalizePath(name)}** を消し、中身 ${moved} ページを ${OTHERS}/${normalizePath(name)} に移しました。`);
           return;
         }
       }
       if (sub === 'include' || sub === 'exclude') {
-        const channel = interaction.options.getChannel('channel');
+        const channel = interaction.options.getChannel('channel', true);
         if (sub === 'include') includeChannel(guildId, channel.id, interaction.user.username);
         const removed = sub === 'exclude' && removeIncluded(guildId, channel.id);
         // 控えをすぐ書き直して builder を起こす (次の区切りから読む / 読まない)
         snapshotPublicChannels(interaction.client);
         const woke = sub === 'include' && await wakeBuilder();
-        await interaction.editReply(sub === 'include'
+        await edit(sub === 'include'
           ? `<#${channel.id}> とその下のスレッドを記憶に入れます。このチャンネルを見られない人にも思い出されます。${woke ? '読み込みを起動しました。' : ''}`
           : removed ? `<#${channel.id}> を外しました。これから先は読みません (読んだ分の記憶は残ります)。`
             : `<#${channel.id}> は追加したチャンネルではありません (公開チャンネルは外せません)。`);
@@ -165,38 +175,41 @@ export const memoryCommand = {
       }
       if (sub === 'pause') {
         setPaused(guildId, interaction.user.username);
-        await interaction.editReply('一時停止しました。読みかけの区切りが終わったところで止まります (読んだ分は失いません)。');
+        await edit('一時停止しました。読みかけの区切りが終わったところで止まります (読んだ分は失いません)。');
         return;
       }
       if (sub === 'resume') {
         const was = pausedBy(guildId);
         setPaused(guildId, null);
         const woke = await wakeBuilder();
-        await interaction.editReply(`${was ? '再開しました。' : '止まっていませんでした。'}${woke ? '読み込みを起動しました。' : 'builder は1時間以内に timer から起動します。'}`);
+        await edit(`${was ? '再開しました。' : '止まっていませんでした。'}${woke ? '読み込みを起動しました。' : 'builder は1時間以内に timer から起動します。'}`);
         return;
       }
       if (!hasMemory(guildId)) {
-        await interaction.editReply('記憶の本はまだできていません。');
+        await edit('記憶の本はまだできていません。');
         return;
       }
+      // 出来事の原文は、このコマンドを使った人が見られるチャンネルのものだけ
+      const canQuote = viewerQuoteFilter(interaction);
       if (sub === 'explore') {
         const path = (interaction.options.getString('path') ?? '').replace(/^\/+|\/+$/g, '').trim();
         const { getNode } = await import('./store.js');
         const node = path ? getNode(guildId, path) : null;
         // 最初の画面は新しいメッセージなので大きさの上限に収める (書き換えは上限が緩い)
-        await interaction.editReply(fitShared(node ? viewFor(guildId, `n:${node.id}`) : rootView(guildId)));
+        await edit(fitShared(node ? viewFor(guildId, `n:${node.id}`, { canQuote }) : rootView(guildId)));
         return;
       }
-      const refs = { entries: [], add(entry) { this.entries.push(entry); return this.entries.length; } };
+      const entries: { channelId: string; messageId: string }[] = [];
+      const refs: MemoryRefTable & { entries: typeof entries } = { entries, add(entry) { entries.push(entry); return entries.length; } };
       const args = sub === 'show' ? { path: interaction.options.getString('path') ?? '' }
         : sub === 'search' ? { query: interaction.options.getString('query') }
           : { episode: interaction.options.getString('id') };
-      const text = runMemoryTool({ guildId, refs }, args) + sourceLinks(guildId, refs);
-      await interaction.editReply({ embeds: [new EmbedBuilder().setColor('#2b2d31')
+      const text = runMemoryTool({ guildId, refs, canQuote }, args) + sourceLinks(guildId, refs);
+      await edit({ embeds: [new EmbedBuilder().setColor('#2b2d31')
         .setDescription(text.length > 4000 ? `${text.slice(0, 3990)}\n…(以下略)` : text)] });
     } catch (error) {
       console.error('memory command failed:', error);
-      await interaction.editReply(`失敗しました: ${String(error?.message ?? error).slice(0, 200)}`).catch(() => {});
+      await edit(`失敗しました: ${errorMessage(error).slice(0, 200)}`).catch(() => {});
     }
   }
 };

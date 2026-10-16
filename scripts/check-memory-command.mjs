@@ -2,6 +2,8 @@
 //   - status は管理者だけ。先に受け付けてから組み立て、読んだ割合・見込み・費用を出す
 //   - pause で builder が区切りの境目で止まり、resume で外れる
 //   - show / search / episode は誰でも開け、根拠の発言へのリンクが付く
+//   - 記憶に入れたロール限定チャンネルの原文 (引用・根拠の発言とリンク) は、見られる人にだけ出す。
+//     共有した画面は今のチャンネルか @everyone が読めるチャンネルのものだけ。agent は channelScope で絞る
 //
 // ARCHIVE_DB_PATH / MEMORY_DB_PATH を一時ファイルに向けて呼ぶこと。
 
@@ -17,6 +19,16 @@ const { memoryCommand } = await import('../src/memory/command.js');
 
 const GUILD = '910000000000000001';
 const CHANNEL = '910000000000000010';
+const ROLE_GATED = '910000000000000020';
+const NSFW = '910000000000000030';
+// 権限の偽物: CHANNEL と NSFW は誰でも読める、ROLE_GATED は gated の人だけ (@everyone は読めない)
+const EVERYONE = { id: GUILD };
+const allows = (allowed) => ({ has: () => allowed });
+const fakeGuild = { id: GUILD, members: { fetch: async () => null }, roles: { everyone: EVERYONE }, channels: { cache: new Map([
+  [CHANNEL, { id: CHANNEL, type: 0, permissionsFor: () => allows(true) }],
+  [ROLE_GATED, { id: ROLE_GATED, type: 0, permissionsFor: (who) => allows(Boolean(who?.gated)) }],
+  [NSFW, { id: NSFW, type: 0, nsfw: true, permissionsFor: () => allows(true) }]
+]) } };
 store.resetTree(GUILD);
 store.savePublicChannels(GUILD, [CHANNEL]);
 store.ensureSeeds(GUILD);
@@ -35,20 +47,23 @@ store.linkEpisodeNodes(GUILD, episode, ['people/たこ'], Date.now());
 const reservation = reserveModelCall({ model: 'z-ai/glm-5.3-flash', messages: [{ role: 'user', content: 'x' }], outputTokens: 10, guildId: GUILD, role: 'memory-segment' });
 finishModelCall(reservation, { usage: { prompt_tokens: 10, completion_tokens: 5, cost: 0.0033 } });
 
-const interaction = ({ sub, admin = true, options = {} }) => {
+const interaction = ({ sub, admin = true, gated = false, options = {} }) => {
   const calls = [];
   return {
     calls,
     guildId: GUILD,
-    guild: { members: { fetch: async () => null } },
+    guild: fakeGuild,
+    inCachedGuild: () => true,
     user: { id: 'u1', username: 'tako' },
-    member: { id: 'u1', permissions: { has: (flag) => admin && flag === PermissionFlagsBits.ManageGuild } },
+    member: { id: 'u1', gated, permissions: { has: (flag) => admin && flag === PermissionFlagsBits.ManageGuild } },
     options: { getSubcommand: () => sub, getString: (name) => options[name] ?? null },
     reply: async (payload) => { calls.push(['reply', payload]); },
     deferReply: async (payload) => { calls.push(['deferReply', payload]); },
     editReply: async (payload) => { calls.push(['editReply', payload]); }
   };
 };
+// 返事は誰にも通知しない形 ({ content, allowedMentions }) で来る
+const replyText = (payload) => (typeof payload === 'string' ? payload : payload.content);
 const embedText = (payload) => {
   const embed = payload.embeds?.[0]?.toJSON?.() ?? payload.embeds?.[0];
   return [embed?.description ?? '', ...(embed?.fields ?? []).map((f) => `${f.name}: ${f.value}`)].join('\n');
@@ -76,13 +91,13 @@ assert.equal(stopped.stopped, 'paused', 'a paused builder must stop before calli
 assert.equal(called, 0);
 const resume = interaction({ sub: 'resume' });
 await memoryCommand.execute(resume);
-assert.match(resume.calls[1][1], /再開しました/);
+assert.match(replyText(resume.calls[1][1]), /再開しました/);
+assert.deepEqual(resume.calls[1][1].allowedMentions, { parse: [] }, 'replies never ping');
 assert.equal(store.getState(`pause:${GUILD}`), null);
 setPaused(GUILD, null);
 
 // 追加したチャンネル: @everyone が見られないチャンネルとその下のスレッドを控えに入れる
 const { readableChannels } = await import('../src/memory/snapshot.js');
-const ROLE_GATED = '910000000000000020';
 const THREAD = '910000000000000021';
 const PRIVATE_THREAD = '910000000000000022';
 const guild = { id: GUILD, channels: { cache: new Map([
@@ -93,7 +108,7 @@ const include = interaction({ sub: 'include', options: {} });
 include.options.getChannel = () => ({ id: ROLE_GATED });
 include.client = { guilds: { cache: new Map() } };
 await memoryCommand.execute(include);
-assert.match(include.calls[1][1], /記憶に入れます/);
+assert.match(replyText(include.calls[1][1]), /記憶に入れます/);
 assert.deepEqual(store.includedChannels(GUILD), [ROLE_GATED]);
 const readable = readableChannels(guild, { threadsOf: () => ['910000000000000023'] });
 assert.ok(readable.includes(ROLE_GATED) && readable.includes(THREAD) && readable.includes('910000000000000023'), 'included channels bring their public threads');
@@ -102,7 +117,7 @@ const excluded = interaction({ sub: 'exclude', options: {} });
 excluded.options.getChannel = () => ({ id: ROLE_GATED });
 excluded.client = include.client;
 await memoryCommand.execute(excluded);
-assert.match(excluded.calls[1][1], /外しました/);
+assert.match(replyText(excluded.calls[1][1]), /外しました/);
 assert.deepEqual(store.includedChannels(GUILD), []);
 
 // /memory category: 一覧・昇格・削除 (管理者)
@@ -118,7 +133,7 @@ await memoryCommand.execute(listed);
 assert.match(embedText(listed.calls[1][1]), /others/);
 const promote = category('add', { name: 'flamewars', description: 'レスバの記録', from: 'others/レスバ集' });
 await memoryCommand.execute(promote);
-assert.match(promote.calls[1][1], /flamewars.*1 ページを移しました/);
+assert.match(replyText(promote.calls[1][1]), /flamewars.*1 ページを移しました/);
 // 昇格: others/レスバ集 そのものが最上位 flamewars になる (中身は直下へ)
 assert.ok(store.getNode(GUILD, 'flamewars') && !store.getNode(GUILD, 'others/レスバ集'), 'add with from must promote the subtree to the new top level');
 const drop = category('remove', { name: 'flamewars' });
@@ -160,7 +175,8 @@ const click = (fields) => {
   const replies = [];
   let pending = null;
   const user = fields.user ?? { id: 'u1', toString: () => '<@u1>' };
-  return { updates, modals, replies, guildId: GUILD, isButton: () => !fields.values && !fields.fields, isStringSelectMenu: () => Boolean(fields.values),
+  return { updates, modals, replies, guildId: GUILD, guild: fakeGuild, member: { id: user.id }, inCachedGuild: () => true,
+    isButton: () => !fields.values && !fields.fields, isStringSelectMenu: () => Boolean(fields.values),
     isModalSubmit: () => Boolean(fields.fields), createdTimestamp: Date.now(),
     update: async () => { throw new Error('acknowledge first (deferUpdate), then editReply'); },
     deferUpdate: async () => { pending = { kind: 'update' }; },
@@ -304,6 +320,91 @@ await handleMemoryComponent(nsfwShare);
 assert.equal(nsfwShare.replies[0].flags, MessageFlags.Ephemeral);
 assert.match(nsfwShare.replies[0].content, /NSFW/);
 
+// 記憶に入れたロール限定チャンネル: 要約は誰にでも出すが、原文 (引用・根拠の発言とリンク) は見られる人にだけ
+const SECRET = '1400000000000000002';
+store.savePublicChannels(GUILD, [CHANNEL, ROLE_GATED]);
+archive.prepare("INSERT OR REPLACE INTO messages (message_id, guild_id, channel_id, author_id, author_name, content, created_at, char_count) VALUES (?, ?, ?, 'u', 'たこ', '秘密の作戦会議をした', ?, 10)")
+  .run(SECRET, GUILD, ROLE_GATED, Date.now() - 1_800_000);
+const gatedEpisode = store.insertEpisode(GUILD, { title: '作戦会議', summary: 'たこが作戦会議を開いた。', channelId: ROLE_GATED,
+  atMs: Date.now() - 1_800_000, endMs: Date.now() - 1_800_000, sources: [SECRET], highlights: [SECRET], importance: 2 });
+const HIDDEN = /見られないチャンネルの発言は省きました/;
+const secretLink = new RegExp(`${ROLE_GATED}/${SECRET}`);
+const descriptionOf = (view) => json(view).embeds[0].description;
+const insider = { id: 'u3', gated: true, toString: () => '<@u3>' };
+// 本人だけの画面: 押した人がそのチャンネルを見られなければ、本文もリンクも出さない
+const outsiderView = click({ customId: `memx:e:${gatedEpisode}:0` });
+await handleMemoryComponent(outsiderView);
+assert.match(descriptionOf(outsiderView.updates[0]), /たこが作戦会議を開いた/, 'the summary stays for everyone');
+assert.doesNotMatch(descriptionOf(outsiderView.updates[0]), /秘密の作戦会議/, 'a quote from a role-gated channel must not reach someone who cannot see it');
+assert.doesNotMatch(descriptionOf(outsiderView.updates[0]), secretLink, 'nor its link');
+assert.match(descriptionOf(outsiderView.updates[0]), HIDDEN, 'say that quotes were left out');
+const insiderView = click({ customId: `memx:e:${gatedEpisode}:0`, user: insider, member: insider });
+await handleMemoryComponent(insiderView);
+assert.match(descriptionOf(insiderView.updates[0]), /秘密の作戦会議/, 'someone who can see the channel gets the quote');
+assert.match(descriptionOf(insiderView.updates[0]), secretLink);
+// 自分で開く (ephemeral) も押した人の権限で
+const mineGated = click({ customId: `memx:mine:e:${gatedEpisode}:0`, allowReply: true, message: { content: '-# 共有', flags: { has: () => false } } });
+await handleMemoryComponent(mineGated);
+assert.doesNotMatch(descriptionOf(mineGated.replies[0]), /秘密の作戦会議/);
+// 共有した画面: 見られる人が共有しても、今のチャンネルか @everyone が読めるチャンネルの原文だけ
+const sharedElsewhere = click({ customId: `memx:share:e:${gatedEpisode}:0`, allowReply: true, user: insider, member: insider, channelId: CHANNEL });
+await handleMemoryComponent(sharedElsewhere);
+assert.equal(sharedElsewhere.replies[0].flags, undefined);
+assert.doesNotMatch(descriptionOf(sharedElsewhere.replies[0]), /秘密の作戦会議/, 'sharing into another channel leaves the gated quote out');
+assert.doesNotMatch(descriptionOf(sharedElsewhere.replies[0]), secretLink);
+assert.match(descriptionOf(sharedElsewhere.replies[0]), HIDDEN);
+const sharedHere = click({ customId: `memx:share:e:${gatedEpisode}:0`, allowReply: true, user: insider, member: insider, channelId: ROLE_GATED });
+await handleMemoryComponent(sharedHere);
+assert.match(descriptionOf(sharedHere.replies[0]), /秘密の作戦会議/, 'sharing inside the source channel may quote it');
+// 共有したメッセージを見られる人が操作しても、共有の決まりのまま
+const onShared = click({ customId: `memx:e:${gatedEpisode}:0`, user: insider, member: insider, channelId: CHANNEL,
+  message: { content: '-# 共有', flags: { has: () => false } } });
+await handleMemoryComponent(onShared);
+assert.doesNotMatch(descriptionOf(onShared.updates[0]), /秘密の作戦会議/, 'a shared message never shows a gated quote outside its channel');
+// @everyone が読めるチャンネルの原文は、どこに共有しても出る
+const sharedPublic = click({ customId: `memx:share:e:${episode}:0`, allowReply: true, channelId: '910000000000000099' });
+await handleMemoryComponent(sharedPublic);
+assert.match(descriptionOf(sharedPublic.replies[0]), new RegExp(`${CHANNEL}/1400000000000000001`), 'public quotes can be shared anywhere');
+// /memory episode も開いた人の権限で
+const episodeOutsider = interaction({ sub: 'episode', admin: false, options: { id: `e${gatedEpisode}` } });
+await memoryCommand.execute(episodeOutsider);
+assert.match(embedText(episodeOutsider.calls[1][1]), /作戦会議/);
+assert.doesNotMatch(embedText(episodeOutsider.calls[1][1]), /秘密の作戦会議/);
+assert.doesNotMatch(embedText(episodeOutsider.calls[1][1]), secretLink, '/memory episode must not link a channel the viewer cannot see');
+assert.match(embedText(episodeOutsider.calls[1][1]), HIDDEN);
+const episodeInsider = interaction({ sub: 'episode', admin: false, gated: true, options: { id: `e${gatedEpisode}` } });
+await memoryCommand.execute(episodeInsider);
+assert.match(embedText(episodeInsider.calls[1][1]), /秘密の作戦会議/);
+assert.match(embedText(episodeInsider.calls[1][1]), secretLink);
+// agent の memory ツール: 依頼した人の channelScope を渡すと、その人が読めないチャンネルの原文と引用番号を出さない
+const { runMemoryTool } = await import('../src/memory/tool.js');
+const toolRefs = { entries: [], add(entry) { this.entries.push(entry); return this.entries.length; } };
+const scoped = runMemoryTool({ guildId: GUILD, refs: toolRefs, channelScope: { mode: 'exclude', ids: [ROLE_GATED] } }, { episode: `e${gatedEpisode}` });
+assert.doesNotMatch(scoped, /秘密の作戦会議/);
+assert.match(scoped, HIDDEN);
+assert.equal(toolRefs.entries.length, 0, 'no citation number for a hidden quote');
+assert.match(runMemoryTool({ guildId: GUILD, channelScope: { mode: 'all', ids: [] } }, { episode: `e${gatedEpisode}` }), /秘密の作戦会議/);
+assert.match(runMemoryTool({ guildId: GUILD }, { episode: `e${gatedEpisode}` }), /秘密の作戦会議/, 'without a scope (builder CLI) nothing changes');
+// 1つの出来事の根拠は複数のチャンネルにまたがる。NSFW のチャンネルの原文は、共有先が NSFW のときだけ
+const LEWD = '1400000000000000003';
+store.savePublicChannels(GUILD, [CHANNEL, ROLE_GATED, NSFW]);
+archive.prepare("INSERT OR REPLACE INTO messages (message_id, guild_id, channel_id, author_id, author_name, content, created_at, char_count) VALUES (?, ?, ?, 'u', 'たこ', 'きわどい冗談を言った', ?, 10)")
+  .run(LEWD, GUILD, NSFW, Date.now() - 1_700_000);
+const mixedEpisode = store.insertEpisode(GUILD, { title: '雑談', summary: 'たこが冗談を言った。', channelId: CHANNEL,
+  atMs: Date.now() - 1_700_000, endMs: Date.now() - 1_700_000, sources: [LEWD], highlights: [], importance: 1 });
+const sharedPlain = click({ customId: `memx:share:e:${mixedEpisode}:0`, allowReply: true, channelId: '910000000000000099', channel: { nsfw: false } });
+await handleMemoryComponent(sharedPlain);
+assert.doesNotMatch(descriptionOf(sharedPlain.replies[0]), /きわどい冗談/, 'an NSFW quote must not be shared into a non-NSFW channel');
+const sharedLewd = click({ customId: `memx:share:e:${mixedEpisode}:0`, allowReply: true, channelId: '910000000000000098', channel: { nsfw: true } });
+await handleMemoryComponent(sharedLewd);
+assert.match(descriptionOf(sharedLewd.replies[0]), /きわどい冗談/, 'an NSFW channel may show it');
+// ボタンの ID の数は確かめてから使う (負・大きすぎる何件目からはページを壊さない)
+for (const offset of ['-5', '1e400', '99999999999999999999']) {
+  const odd = click({ customId: `memx:n:${takoId}:${offset}` });
+  await handleMemoryComponent(odd);
+  assert.match(json(odd.updates[0]).embeds[0].title, /たこ/, `offset ${offset} still opens the page`);
+}
+
 store.resetTree(GUILD);
 archive.prepare('DELETE FROM messages WHERE guild_id = ?').run(GUILD);
-console.log('memory command ok (共有は普通のメッセージ・誰でも操作・自分で開く・NSFW の出来事は NSFW でだけ / status は管理者・先に受付・割合と見込みと費用 / pause で止まる / include・exclude / category / explore でたどる・年表・探す / 誰でも開ける・根拠にリンク)');
+console.log('memory command ok (共有は普通のメッセージ・誰でも操作・自分で開く・NSFW の出来事は NSFW でだけ / status は管理者・先に受付・割合と見込みと費用 / pause で止まる / include・exclude / category / explore でたどる・年表・探す / 誰でも開ける・根拠にリンク / ロール限定チャンネルの原文は見られる人にだけ・共有はそのチャンネルか @everyone / NSFW の原文は NSFW にだけ共有 / agent は channelScope で絞る / 返事は通知しない)');

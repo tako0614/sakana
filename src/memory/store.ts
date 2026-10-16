@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { tuneSqlite } from '../sqlite.js';
+import { isRecord, stringList, type Cursor, type SegmentRecord } from './types.js';
 
 // 記憶の本。過去ログを区切りごとに AI へ渡して、2層に整理する。
 //
@@ -12,7 +13,7 @@ import { tuneSqlite } from '../sqlite.js';
 // 根のページだけを会話の system に入れ、ほかは memory ツールで開く。会話に出た名前を
 // 手がかりに関係するページと出来事を自動で思い出す (recall.js)。
 //
-// アーカイブ (archive.sqlite) とは別ファイル。書くのは builder (scripts/memory-tree.mjs)
+// アーカイブ (archive.sqlite) とは別ファイル。書くのは builder (scripts/memory-tree.ts)
 // だけで、bot は読むのと公開チャンネルの控えを書くだけ。
 
 const dbPath = process.env.MEMORY_DB_PATH ?? 'memory.sqlite';
@@ -21,7 +22,7 @@ const dbPath = process.env.MEMORY_DB_PATH ?? 'memory.sqlite';
 // others に入れる (最上位を勝手に増やさない)。最上位を増やす・消すのは管理者 (/memory category)。
 // others に育ったまとまりは、そのまま最上位に昇格できる (moveSubtree)。
 export const OTHERS = 'others';
-export const TOP_LEVEL = [
+export const TOP_LEVEL: ReadonlyArray<readonly [string, string]> = [
   ['people', '人物 (性格・立場や意見・得意なこと・作ったもの・口癖・人との関係)'],
   ['projects', '作っているもの (bot・サービス・作品・リポジトリ)'],
   ['topics', 'よく出る話題・技術的な知見・議論の結論'],
@@ -37,9 +38,142 @@ export const MAX_TOP_LEVEL = 20;
 export const MAX_DEPTH = 4;
 const MAX_PART = 48;
 
-let db = null;
+// ---- 行の形 ----------------------------------------------------------------
 
-export function memoryDb() {
+export interface NodeRow {
+  id: number;
+  guild_id: string;
+  path: string;
+  parent: string | null;
+  summary: string;
+  body: string;
+  aliases: string;
+  pending: string;
+  pending_count: number;
+  weight: number;
+  first_at: number | null;
+  last_at: number | null;
+  updated_at: number;
+}
+
+/** 別名を配列に戻したページ。 */
+export interface MemoryNode extends Omit<NodeRow, 'aliases'> {
+  aliases: string[];
+}
+
+export interface EpisodeRow {
+  id: number;
+  guild_id: string;
+  kind: string;
+  title: string;
+  summary: string;
+  highlights: string;
+  channel_id: string;
+  at_ms: number;
+  end_ms: number;
+  sources: string;
+  importance: number;
+  created_at: number;
+}
+
+/** 前後の出来事への道しるべ。 */
+export interface EpisodeLinkRow {
+  id: number;
+  kind: string;
+  title: string;
+  at_ms: number;
+}
+
+export interface MemoryEpisode extends Omit<EpisodeRow, 'sources' | 'highlights'> {
+  sources: string[];
+  highlights: string[];
+  nodes: string[];
+  before: EpisodeLinkRow[];
+  after: EpisodeLinkRow[];
+}
+
+/** 一覧に出す出来事 (ページの出来事・年表)。 */
+export interface EpisodeBrief {
+  id: number;
+  kind: string;
+  title: string;
+  summary: string;
+  at_ms: number;
+  importance: number;
+}
+
+/** 検索・2つのページが両方関わった出来事。 */
+export type EpisodeHit = Omit<EpisodeBrief, 'importance'>;
+
+export interface ChildRow {
+  path: string;
+  summary: string;
+  weight: number;
+  chars: number;
+  children: number;
+}
+
+export interface LinkedPageRow {
+  path: string;
+  summary: string;
+  weight: number;
+}
+
+export interface NodeHit {
+  path: string;
+  summary: string;
+  snippet: string;
+}
+
+export interface PendingNodeRow {
+  path: string;
+  body_chars: number;
+  pending_chars: number;
+  pending_count: number;
+}
+
+export interface NodeName {
+  name: string;
+  path: string;
+  weight: number;
+}
+
+export interface EmptySegmentRow {
+  channel_id: string;
+  from_id: string;
+  messages: number;
+  chars: number;
+}
+
+export interface SegmentStatRow {
+  status: string;
+  segments: number;
+  messages: number;
+  chars: number;
+  latest: number | null;
+}
+
+export interface SegmentRow extends EmptySegmentRow {
+  id: number;
+  guild_id: string;
+  to_id: string;
+  from_ms: number;
+  to_ms: number;
+  status: string;
+  model: string | null;
+  error: string | null;
+  done_at: number;
+}
+
+interface CountRow { c: number }
+interface PathRow { path: string }
+
+let db: Database.Database | null = null;
+
+const columnNames = (d: Database.Database, table: string): string[] =>
+  d.prepare<[], { name: string }>(`PRAGMA table_info(${table})`).all().map((row) => row.name);
+
+export function memoryDb(): Database.Database {
   if (db) return db;
   db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
@@ -175,11 +309,11 @@ export function memoryDb() {
   `);
 
   // 種類名と決め台詞の列 (2026-10-15 に追加)。古い DB には足す
-  const columns = new Set(db.pragma('table_info(episodes)').map((row) => row.name));
+  const columns = new Set(columnNames(db, 'episodes'));
   if (!columns.has('kind')) db.exec("ALTER TABLE episodes ADD COLUMN kind TEXT NOT NULL DEFAULT ''");
   if (!columns.has('highlights')) db.exec("ALTER TABLE episodes ADD COLUMN highlights TEXT NOT NULL DEFAULT '[]'");
   // 出来事の全文検索は種類名も引く (「レスバ」で探せるように)。列が違えば作り直す
-  const ftsColumns = db.pragma('table_info(episodes_fts)').map((row) => row.name);
+  const ftsColumns = columnNames(db, 'episodes_fts');
   if (!ftsColumns.includes('kind')) {
     db.exec(`
       DROP TRIGGER IF EXISTS episodes_ai;
@@ -202,12 +336,13 @@ export function memoryDb() {
   return db;
 }
 
-export function closeMemoryDb() {
+export function closeMemoryDb(): void {
   db?.close();
   db = null;
 }
 
-const json = (text, fallback) => { try { return JSON.parse(text); } catch { return fallback; } };
+// JSON の列 (別名・根拠の ID・state の値) は読むまで中身が分からない
+const json = (text: string): unknown => { try { return JSON.parse(text); } catch { return null; } };
 
 // ---- パス -----------------------------------------------------------------
 
@@ -215,7 +350,7 @@ const json = (text, fallback) => { try { return JSON.parse(text); } catch { retu
  * モデルが書いたパスを木の中の位置に直す。空・`..` は null、深すぎる分は切る。
  * 英字の最上位は小文字にそろえる。新しい最上位を許すかは placeTopLevel が決める。
  */
-export function normalizePath(raw) {
+export function normalizePath(raw: unknown): string | null {
   const parts = String(raw ?? '')
     .replace(/^\[\[|\]\]$/g, '')
     .replace(/\\/g, '/')
@@ -223,7 +358,8 @@ export function normalizePath(raw) {
     .map((part) => part.replace(/[\s　]+/g, ' ').replace(/[#`*<>|?"[\]]/g, '').trim().slice(0, MAX_PART))
     .filter((part) => part && part !== '.' && part !== '..');
   if (parts.length === 0) return null;
-  if (/^[\x20-\x7e]+$/.test(parts[0])) parts[0] = parts[0].toLowerCase();
+  const [head] = parts;
+  if (head !== undefined && /^[\x20-\x7e]+$/.test(head)) parts[0] = head.toLowerCase();
   return parts.slice(0, MAX_DEPTH).join('/');
 }
 
@@ -231,15 +367,15 @@ export function normalizePath(raw) {
  * 書き手が書いたパスを、必ずどれかの最上位の下に置く。既にある最上位ならそのまま、
  * 知らない最上位なら others の下へ (最上位は管理者だけが増やす)。
  */
-export function placeTopLevel(guildId, path) {
+export function placeTopLevel(guildId: string, path: string): string {
   if (!path) return path;
-  const top = path.split('/')[0];
+  const top = path.split('/')[0] ?? path;
   if (memoryDb().prepare("SELECT 1 FROM nodes WHERE guild_id = ? AND parent = '' AND path = ?").get(guildId, top)) return path;
   return [OTHERS, ...path.split('/')].slice(0, MAX_DEPTH).join('/');
 }
 
 /** 最上位を足す (管理者)。既にあれば説明だけ直す。 */
-export function addTopLevel(guildId, name, summary = '', now = Date.now()) {
+export function addTopLevel(guildId: string, name: unknown, summary = '', now = Date.now()): string {
   const path = normalizePath(name);
   if (!path || path.includes('/')) throw new Error('最上位の名前に / は使えません');
   const exists = getNode(guildId, path);
@@ -248,7 +384,7 @@ export function addTopLevel(guildId, name, summary = '', now = Date.now()) {
   }
   ensureNode(guildId, path, { summary, now });
   if (summary) memoryDb().prepare('UPDATE nodes SET summary = ? WHERE guild_id = ? AND path = ?').run(summary, guildId, path);
-  const removed = (getState(`removed-top:${guildId}`) ?? []).filter((item) => item !== path);
+  const removed = stringList(getState(`removed-top:${guildId}`)).filter((item) => item !== path);
   setState(`removed-top:${guildId}`, removed.length ? removed : null);
   return path;
 }
@@ -257,23 +393,25 @@ export function addTopLevel(guildId, name, summary = '', now = Date.now()) {
  * 部分木ごと別の場所へ移す (others に育ったまとまりの昇格・最上位の削除)。
  * ページのパス・親、出来事とのつながり、ページどうしのつながり、本文と統合待ちの [[リンク]] を書き換える。
  */
-export function moveSubtree(guildId, from, to, now = Date.now()) {
+export function moveSubtree(guildId: string, from: string, to: string, now = Date.now()): number {
   const d = memoryDb();
   if (!getNode(guildId, from)) throw new Error(`ページ ${from} はありません`);
   if (to === from || to.startsWith(`${from}/`)) throw new Error('自分の下には移せません');
-  const rewrite = (path) => (path === from ? to : path.startsWith(`${from}/`) ? `${to}${path.slice(from.length)}` : path);
-  const escapeLike = (text) => text.replace(/[%_\\]/g, (c) => `\\${c}`);
-  const rows = d.prepare(`SELECT path FROM nodes WHERE guild_id = ? AND (path = ? OR path LIKE ? ESCAPE '\\') ORDER BY length(path)`)
+  const rewrite = (path: string): string => (path === from ? to : path.startsWith(`${from}/`) ? `${to}${path.slice(from.length)}` : path);
+  const escapeLike = (text: string): string => text.replace(/[%_\\]/g, (c) => `\\${c}`);
+  const rows = d.prepare<[string, string, string], PathRow>(`SELECT path FROM nodes WHERE guild_id = ? AND (path = ? OR path LIKE ? ESCAPE '\\') ORDER BY length(path)`)
     .all(guildId, from, `${escapeLike(from)}/%`);
   d.transaction(() => {
     // 移し先の途中のページ (新しい最上位など) を先に作る
-    if (parentOf(to)) ensureNode(guildId, parentOf(to), { now });
+    const toParent = parentOf(to);
+    if (toParent) ensureNode(guildId, toParent, { now });
     for (const { path } of rows) {
       const target = rewrite(path);
       if (getNode(guildId, target)) {
         // 同じ名前のページが移し先にあれば、本文を統合待ちに回して1つにする
         const moving = getNode(guildId, path);
-        if (moving.body || moving.pending) addPending(guildId, target, `${moving.body}\n${moving.pending}`.split('\n'), { now });
+        // (移すページは同じトランザクションの中で読んだので必ずある)
+        if (moving && (moving.body || moving.pending)) addPending(guildId, target, `${moving.body}\n${moving.pending}`.split('\n'), { now });
         d.prepare('DELETE FROM nodes WHERE guild_id = ? AND path = ?').run(guildId, path);
       } else {
         d.prepare('UPDATE nodes SET path = ?, parent = ?, updated_at = ? WHERE guild_id = ? AND path = ?')
@@ -287,7 +425,7 @@ export function moveSubtree(guildId, from, to, now = Date.now()) {
     }
     // 本文と統合待ちに書かれた [[リンク]] も追いかける
     const link = new RegExp(`\\[\\[${from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=[\\]/])`, 'g');
-    for (const node of d.prepare('SELECT path, body, pending FROM nodes WHERE guild_id = ? AND (body LIKE ? OR pending LIKE ?)')
+    for (const node of d.prepare<[string, string, string], { path: string; body: string; pending: string }>('SELECT path, body, pending FROM nodes WHERE guild_id = ? AND (body LIKE ? OR pending LIKE ?)')
       .all(guildId, `%[[${from}%`, `%[[${from}%`)) {
       d.prepare('UPDATE nodes SET body = ?, pending = ? WHERE guild_id = ? AND path = ?')
         .run(node.body.replace(link, `[[${to}`), node.pending.replace(link, `[[${to}`), guildId, node.path);
@@ -297,36 +435,36 @@ export function moveSubtree(guildId, from, to, now = Date.now()) {
 }
 
 /** 最上位を消す (管理者)。中身は others の下へ移すので失わない。others は消せない。 */
-export function removeTopLevel(guildId, name) {
+export function removeTopLevel(guildId: string, name: string): number {
   const path = normalizePath(name);
   if (!path || path.includes('/') || !getNode(guildId, path)) throw new Error(`最上位 ${name} はありません`);
   if (path === OTHERS) throw new Error('others は受け皿なので消せません');
   ensureNode(guildId, OTHERS);
   const moved = moveSubtree(guildId, path, `${OTHERS}/${path}`);
   if (TOP_LEVEL.some(([seed]) => seed === path)) {
-    setState(`removed-top:${guildId}`, [...new Set([...(getState(`removed-top:${guildId}`) ?? []), path])]);
+    setState(`removed-top:${guildId}`, [...new Set([...stringList(getState(`removed-top:${guildId}`)), path])]);
   }
   return moved;
 }
 
 /** 根の直下 (種と、モデルが作ったもの)。重い順。 */
-export function topLevels(guildId, limit = MAX_TOP_LEVEL) {
+export function topLevels(guildId: string, limit = MAX_TOP_LEVEL): string[] {
   return listChildren(guildId, '', limit).map((row) => row.path);
 }
 
-export const parentOf = (path) => (path === '' ? null : path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
-export const nameOf = (path) => path.slice(path.lastIndexOf('/') + 1);
-export const depthOf = (path) => (path ? path.split('/').length : 0);
+export const parentOf = (path: string): string | null => (path === '' ? null : path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
+export const nameOf = (path: string): string => path.slice(path.lastIndexOf('/') + 1);
+export const depthOf = (path: string): number => (path ? path.split('/').length : 0);
 
 // ---- ページ ---------------------------------------------------------------
 
-export function ensureSeeds(guildId, now = Date.now()) {
+export function ensureSeeds(guildId: string, now = Date.now()): void {
   const d = memoryDb();
-  const insert = d.prepare(`
+  const insert = d.prepare<[string, string, string | null, string, number]>(`
     INSERT OR IGNORE INTO nodes (guild_id, path, parent, summary, updated_at) VALUES (?, ?, ?, ?, ?)
   `);
   // 管理者が消した種は作り直さない (others だけは受け皿なので必ず置く)
-  const removed = new Set(getState(`removed-top:${guildId}`) ?? []);
+  const removed = new Set(stringList(getState(`removed-top:${guildId}`)));
   d.transaction(() => {
     insert.run(guildId, '', null, 'このサーバーの記憶の根', now);
     for (const [name, summary] of TOP_LEVEL) {
@@ -335,13 +473,13 @@ export function ensureSeeds(guildId, now = Date.now()) {
   })();
 }
 
-export function getNode(guildId, path) {
-  const row = memoryDb().prepare('SELECT * FROM nodes WHERE guild_id = ? AND path = ?').get(guildId, path);
-  return row ? { ...row, aliases: json(row.aliases, []) } : null;
+export function getNode(guildId: string, path: string): MemoryNode | null {
+  const row = memoryDb().prepare<[string, string], NodeRow>('SELECT * FROM nodes WHERE guild_id = ? AND path = ?').get(guildId, path);
+  return row ? { ...row, aliases: stringList(json(row.aliases)) } : null;
 }
 
-export function listChildren(guildId, path, limit = 200) {
-  return memoryDb().prepare(`
+export function listChildren(guildId: string, path: string, limit = 200): ChildRow[] {
+  return memoryDb().prepare<[string, string, number], ChildRow>(`
     SELECT path, summary, weight, length(body) AS chars,
       (SELECT COUNT(*) FROM nodes c WHERE c.guild_id = n.guild_id AND c.parent = n.path) AS children
     FROM nodes n WHERE guild_id = ? AND parent = ?
@@ -349,38 +487,38 @@ export function listChildren(guildId, path, limit = 200) {
   `).all(guildId, path, limit);
 }
 
-export function countNodes(guildId) {
-  return memoryDb().prepare("SELECT COUNT(*) AS c FROM nodes WHERE guild_id = ? AND path <> ''").get(guildId).c;
+export function countNodes(guildId: string): number {
+  return memoryDb().prepare<[string], CountRow>("SELECT COUNT(*) AS c FROM nodes WHERE guild_id = ? AND path <> ''").get(guildId)?.c ?? 0;
 }
 
-export function hasTree(guildId) {
-  return Boolean(memoryDb().prepare(
+export function hasTree(guildId: string): boolean {
+  return Boolean(memoryDb().prepare<[string]>(
     "SELECT 1 FROM nodes WHERE guild_id = ? AND (path = '' AND body <> '' OR weight > 0) LIMIT 1"
   ).get(guildId));
 }
 
-const nameKey = (value) => String(value).toLowerCase().replace(/[\s_\-・.]+/g, '');
+const nameKey = (value: unknown): string => String(value).toLowerCase().replace(/[\s_\-・.]+/g, '');
 
 /**
  * 同じ親の下で、名前の表記ゆれ (大文字小文字・空白・別名) が一致する既存ページがあれば
  * そちらへ寄せる。索引に載せきれなかった小さいページを別名で作り直されるのを防ぐ。
  */
-export function resolveExisting(guildId, path) {
+export function resolveExisting(guildId: string, path: string): string {
   const d = memoryDb();
-  if (d.prepare('SELECT 1 FROM nodes WHERE guild_id = ? AND path = ?').get(guildId, path)) return path;
+  if (d.prepare<[string, string]>('SELECT 1 FROM nodes WHERE guild_id = ? AND path = ?').get(guildId, path)) return path;
   const target = nameKey(nameOf(path));
-  for (const row of d.prepare('SELECT path, aliases FROM nodes WHERE guild_id = ? AND parent = ?').all(guildId, parentOf(path))) {
+  for (const row of d.prepare<[string, string | null], { path: string; aliases: string }>('SELECT path, aliases FROM nodes WHERE guild_id = ? AND parent = ?').all(guildId, parentOf(path))) {
     if (nameKey(nameOf(row.path)) === target) return row.path;
-    if (json(row.aliases, []).some((alias) => nameKey(alias) === target)) return row.path;
+    if (stringList(json(row.aliases)).some((alias) => nameKey(alias) === target)) return row.path;
   }
   return path;
 }
 
 /** 途中のページも作る。既存なら何もしない (説明が空なら埋める)。 */
-export function ensureNode(guildId, path, { summary = '', now = Date.now() } = {}) {
+export function ensureNode(guildId: string, path: string, { summary = '', now = Date.now() }: { summary?: string; now?: number } = {}): void {
   const d = memoryDb();
   const parts = path.split('/');
-  const insert = d.prepare('INSERT OR IGNORE INTO nodes (guild_id, path, parent, summary, updated_at) VALUES (?, ?, ?, ?, ?)');
+  const insert = d.prepare<[string, string, string | null, string, number]>('INSERT OR IGNORE INTO nodes (guild_id, path, parent, summary, updated_at) VALUES (?, ?, ?, ?, ?)');
   for (let i = 1; i <= parts.length; i += 1) {
     const current = parts.slice(0, i).join('/');
     insert.run(guildId, current, parentOf(current), i === parts.length ? summary : '', now);
@@ -388,7 +526,7 @@ export function ensureNode(guildId, path, { summary = '', now = Date.now() } = {
   if (summary) d.prepare("UPDATE nodes SET summary = ? WHERE guild_id = ? AND path = ? AND summary = ''").run(summary, guildId, path);
 }
 
-export function addAliases(guildId, path, aliases) {
+export function addAliases(guildId: string, path: string, aliases: readonly unknown[]): void {
   const node = getNode(guildId, path);
   if (!node) return;
   const merged = [...node.aliases];
@@ -402,17 +540,18 @@ export function addAliases(guildId, path, aliases) {
   }
 }
 
-const lineKey = (line) => line.replace(/^[-・*\s]+/, '').replace(/\[e\d+\]/g, '').replace(/\s+/g, ' ').trim();
+const lineKey = (line: string): string => line.replace(/^[-・*\s]+/, '').replace(/\[e\d+\]/g, '').replace(/\s+/g, ' ').trim();
 
 /**
  * 統合待ちの知識を足す。本文には直接書かない (統合の呼び出しが書き直す)。
  * 統合待ち・本文に同じ行があれば足さない。
  */
-export function addPending(guildId, path, lines, { firstAt, lastAt, now = Date.now() } = {}) {
+export function addPending(guildId: string, path: string, lines: readonly unknown[],
+  { firstAt, lastAt, now = Date.now() }: { firstAt?: number | null; lastAt?: number | null; now?: number } = {}): number {
   const node = getNode(guildId, path);
   if (!node) throw new Error(`node missing: ${path}`);
   const seen = new Set(`${node.body}\n${node.pending}`.split('\n').map(lineKey).filter(Boolean));
-  const fresh = [];
+  const fresh: string[] = [];
   for (const raw of lines) {
     const text = String(raw ?? '').replace(/\s*\n\s*/g, ' ').trim().slice(0, 400);
     const key = lineKey(text);
@@ -430,7 +569,8 @@ export function addPending(guildId, path, lines, { firstAt, lastAt, now = Date.n
   return fresh.length;
 }
 
-export function writePage(guildId, path, { summary, body, aliases, now = Date.now() }) {
+export function writePage(guildId: string, path: string,
+  { summary, body, aliases, now = Date.now() }: { summary?: string; body: string; aliases?: readonly unknown[]; now?: number }): void {
   memoryDb().prepare(`
     UPDATE nodes SET summary = COALESCE(?, summary), body = ?, pending = '', pending_count = 0, updated_at = ?
     WHERE guild_id = ? AND path = ?
@@ -439,15 +579,16 @@ export function writePage(guildId, path, { summary, body, aliases, now = Date.no
 }
 
 /** 統合に何度も失敗したページは、知識を落とさないよう統合待ちをそのまま本文の末尾へ移す。 */
-export function flushPendingRaw(guildId, path, now = Date.now()) {
+export function flushPendingRaw(guildId: string, path: string, now = Date.now()): void {
   memoryDb().prepare(`
     UPDATE nodes SET body = trim(body || char(10) || pending), pending = '', pending_count = 0, updated_at = ?
     WHERE guild_id = ? AND path = ?
   `).run(now, guildId, path);
 }
 
-export function pendingNodes(guildId, { minChars = 0, limit = 200, newOnly = false } = {}) {
-  return memoryDb().prepare(`
+export function pendingNodes(guildId: string,
+  { minChars = 0, limit = 200, newOnly = false }: { minChars?: number; limit?: number; newOnly?: boolean } = {}): PendingNodeRow[] {
+  return memoryDb().prepare<[string, number, number], PendingNodeRow>(`
     SELECT path, length(body) AS body_chars, length(pending) AS pending_chars, pending_count FROM nodes
     WHERE guild_id = ? AND pending_count > 0 AND length(pending) >= ? ${newOnly ? "AND body = ''" : ''}
     ORDER BY length(pending) DESC LIMIT ?
@@ -458,12 +599,12 @@ export function pendingNodes(guildId, { minChars = 0, limit = 200, newOnly = fal
  * 呼び出しに渡す木の索引。最上位から、知識の多いページの順に、文字数の上限まで。
  * 本文は渡さない (パスと1行説明だけで振り分けさせる)。
  */
-export function treeIndex(guildId, maxChars = 6000) {
-  const rows = memoryDb().prepare(`
+export function treeIndex(guildId: string, maxChars = 6000): { text: string; shown: number; total: number } {
+  const rows = memoryDb().prepare<[string], { path: string; summary: string }>(`
     SELECT path, summary FROM nodes WHERE guild_id = ? AND path <> ''
     ORDER BY (instr(path, '/') = 0) DESC, weight DESC, path
   `).all(guildId);
-  const lines = [];
+  const lines: string[] = [];
   let used = 0;
   for (const row of rows) {
     const line = row.summary ? `${row.path} — ${row.summary}` : row.path;
@@ -475,15 +616,15 @@ export function treeIndex(guildId, maxChars = 6000) {
 }
 
 /** 想起と照合に使う名前の一覧 (ページ名と別名)。2文字未満と最上位の名前は除く。 */
-export function nodeNames(guildId) {
+export function nodeNames(guildId: string): NodeName[] {
   // 人のページの子 (people/あかり/Linux・環境) は話題の切り口で、名前で呼ばれる人やものではない。
   // 照合に入れると「Linux」と言うだけで あかり の Linux 観を思い出してしまう
-  const rows = memoryDb().prepare(`
+  const rows = memoryDb().prepare<[string], { path: string; aliases: string; weight: number }>(`
     SELECT path, aliases, weight FROM nodes WHERE guild_id = ? AND instr(path, '/') > 0 AND path NOT LIKE 'people/%/%'
   `).all(guildId);
-  const names = [];
+  const names: NodeName[] = [];
   for (const row of rows) {
-    for (const name of [nameOf(row.path), ...json(row.aliases, [])]) {
+    for (const name of [nameOf(row.path), ...stringList(json(row.aliases))]) {
       if ([...name].length >= 2) names.push({ name, path: row.path, weight: row.weight });
     }
   }
@@ -492,17 +633,31 @@ export function nodeNames(guildId) {
 
 // ---- 出来事 ---------------------------------------------------------------
 
-export function insertEpisode(guildId, { kind = '', title, summary, channelId, atMs, endMs, sources, highlights = [], importance, now = Date.now() }) {
+export interface EpisodeInput {
+  kind?: string;
+  title: string;
+  summary: string;
+  channelId: string;
+  atMs: number;
+  endMs: number;
+  sources: readonly string[];
+  highlights?: readonly string[];
+  importance: number;
+  now?: number;
+}
+
+export function insertEpisode(guildId: string,
+  { kind = '', title, summary, channelId, atMs, endMs, sources, highlights = [], importance, now = Date.now() }: EpisodeInput): number {
   return Number(memoryDb().prepare(`
     INSERT INTO episodes (guild_id, kind, title, summary, channel_id, at_ms, end_ms, sources, highlights, importance, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(guildId, kind, title, summary, channelId, atMs, endMs, JSON.stringify(sources), JSON.stringify(highlights), importance, now).lastInsertRowid);
 }
 
-export function linkEpisodeNodes(guildId, episodeId, paths, at) {
+export function linkEpisodeNodes(guildId: string, episodeId: number, paths: readonly string[], at: number): void {
   const d = memoryDb();
-  const insert = d.prepare('INSERT OR IGNORE INTO episode_nodes (episode_id, guild_id, path) VALUES (?, ?, ?)');
-  const bump = d.prepare(`
+  const insert = d.prepare<[number, string, string]>('INSERT OR IGNORE INTO episode_nodes (episode_id, guild_id, path) VALUES (?, ?, ?)');
+  const bump = d.prepare<[string, string, string, number]>(`
     INSERT INTO links (guild_id, src, dst, weight, last_at) VALUES (?, ?, ?, 1, ?)
     ON CONFLICT(guild_id, src, dst) DO UPDATE SET weight = weight + 1, last_at = MAX(COALESCE(last_at, 0), excluded.last_at)
   `);
@@ -511,10 +666,10 @@ export function linkEpisodeNodes(guildId, episodeId, paths, at) {
   for (const a of unique) for (const b of unique) if (a !== b) bump.run(guildId, a, b, at);
 }
 
-export function linkEpisodes(guildId, fromId, toIds) {
+export function linkEpisodes(guildId: string, fromId: number, toIds: readonly number[]): number {
   const d = memoryDb();
-  const exists = d.prepare('SELECT 1 FROM episodes WHERE guild_id = ? AND id = ?');
-  const insert = d.prepare('INSERT OR IGNORE INTO episode_links (guild_id, from_id, to_id) VALUES (?, ?, ?)');
+  const exists = d.prepare<[string, number]>('SELECT 1 FROM episodes WHERE guild_id = ? AND id = ?');
+  const insert = d.prepare<[string, number, number]>('INSERT OR IGNORE INTO episode_links (guild_id, from_id, to_id) VALUES (?, ?, ?)');
   let linked = 0;
   for (const id of toIds) {
     if (id !== fromId && exists.get(guildId, id)) { insert.run(guildId, fromId, id); linked += 1; }
@@ -523,39 +678,39 @@ export function linkEpisodes(guildId, fromId, toIds) {
 }
 
 /** 本文の [[path]] をページどうしのつながりに数える。 */
-export function linkPageMentions(guildId, path, body, at = Date.now()) {
-  const bump = memoryDb().prepare(`
+export function linkPageMentions(guildId: string, path: string, body: string, at = Date.now()): void {
+  const bump = memoryDb().prepare<[string, string, string, number]>(`
     INSERT INTO links (guild_id, src, dst, weight, last_at) VALUES (?, ?, ?, 1, ?)
     ON CONFLICT(guild_id, src, dst) DO UPDATE SET weight = weight + 1, last_at = MAX(COALESCE(last_at, 0), excluded.last_at)
   `);
-  const exists = memoryDb().prepare('SELECT 1 FROM nodes WHERE guild_id = ? AND path = ?');
+  const exists = memoryDb().prepare<[string, string]>('SELECT 1 FROM nodes WHERE guild_id = ? AND path = ?');
   for (const match of String(body).matchAll(/\[\[([^\]]+)\]\]/g)) {
     const target = normalizePath(match[1]);
     if (target && target !== path && exists.get(guildId, target)) bump.run(guildId, path, target, at);
   }
 }
 
-export function getEpisode(guildId, id) {
-  const row = memoryDb().prepare('SELECT * FROM episodes WHERE guild_id = ? AND id = ?').get(guildId, id);
+export function getEpisode(guildId: string, id: number): MemoryEpisode | null {
+  const row = memoryDb().prepare<[string, number], EpisodeRow>('SELECT * FROM episodes WHERE guild_id = ? AND id = ?').get(guildId, id);
   if (!row) return null;
   const d = memoryDb();
   return {
     ...row,
-    sources: json(row.sources, []),
-    highlights: json(row.highlights, []),
-    nodes: d.prepare('SELECT path FROM episode_nodes WHERE episode_id = ?').all(id).map((r) => r.path),
-    before: d.prepare(`SELECT e.id, e.kind, e.title, e.at_ms FROM episode_links l JOIN episodes e ON e.id = l.to_id
+    sources: stringList(json(row.sources)),
+    highlights: stringList(json(row.highlights)),
+    nodes: d.prepare<[number], PathRow>('SELECT path FROM episode_nodes WHERE episode_id = ?').all(id).map((r) => r.path),
+    before: d.prepare<[string, number], EpisodeLinkRow>(`SELECT e.id, e.kind, e.title, e.at_ms FROM episode_links l JOIN episodes e ON e.id = l.to_id
       WHERE l.guild_id = ? AND l.from_id = ? ORDER BY e.at_ms`).all(guildId, id),
-    after: d.prepare(`SELECT e.id, e.kind, e.title, e.at_ms FROM episode_links l JOIN episodes e ON e.id = l.from_id
+    after: d.prepare<[string, number], EpisodeLinkRow>(`SELECT e.id, e.kind, e.title, e.at_ms FROM episode_links l JOIN episodes e ON e.id = l.from_id
       WHERE l.guild_id = ? AND l.to_id = ? ORDER BY e.at_ms`).all(guildId, id)
   };
 }
 
 /** ページに関わる出来事。重要なもの・新しいものから。 */
-export function episodesFor(guildId, path, limit = 8) {
+export function episodesFor(guildId: string, path: string, limit = 8): EpisodeBrief[] {
   // 子ページ経由で同じ出来事が何度も当たるので1件ずつにまとめる
   // (重複したまま /memory explore のメニューに並べると Discord が拒否した)
-  return memoryDb().prepare(`
+  return memoryDb().prepare<[string, string, string, string, number], EpisodeBrief>(`
     SELECT e.id, e.kind, e.title, e.summary, e.at_ms, e.importance FROM episodes e
     WHERE e.guild_id = ? AND e.id IN (
       SELECT n.episode_id FROM episode_nodes n WHERE n.guild_id = ? AND (n.path = ? OR n.path LIKE ? ESCAPE '\\')
@@ -565,27 +720,28 @@ export function episodesFor(guildId, path, limit = 8) {
 }
 
 /** ページ (と子ページ) に関わる出来事を古い順に。年表用。件数も返す。 */
-export function episodeTimeline(guildId, path, { offset = 0, limit = 10 } = {}) {
+export function episodeTimeline(guildId: string, path: string,
+  { offset = 0, limit = 10 }: { offset?: number; limit?: number } = {}): { total: number; rows: EpisodeBrief[] } {
   const like = `${path.replace(/[%_\\]/g, (c) => `\\${c}`)}/%`;
   const where = `e.guild_id = ? AND e.id IN (
     SELECT n.episode_id FROM episode_nodes n WHERE n.guild_id = ? AND (n.path = ? OR n.path LIKE ? ESCAPE '\\')
   )`;
   const d = memoryDb();
   return {
-    total: d.prepare(`SELECT COUNT(*) AS c FROM episodes e WHERE ${where}`).get(guildId, guildId, path, like).c,
-    rows: d.prepare(`SELECT e.id, e.kind, e.title, e.summary, e.at_ms, e.importance FROM episodes e WHERE ${where}
+    total: d.prepare<[string, string, string, string], CountRow>(`SELECT COUNT(*) AS c FROM episodes e WHERE ${where}`).get(guildId, guildId, path, like)?.c ?? 0,
+    rows: d.prepare<[string, string, string, string, number, number], EpisodeBrief>(`SELECT e.id, e.kind, e.title, e.summary, e.at_ms, e.importance FROM episodes e WHERE ${where}
       ORDER BY e.at_ms, e.id LIMIT ? OFFSET ?`).all(guildId, guildId, path, like, limit, offset)
   };
 }
 
 /** 子ページの数 (explore のページ送り用)。 */
-export function countChildren(guildId, path) {
-  return memoryDb().prepare('SELECT COUNT(*) AS c FROM nodes WHERE guild_id = ? AND parent = ?').get(guildId, path).c;
+export function countChildren(guildId: string, path: string): number {
+  return memoryDb().prepare<[string, string], CountRow>('SELECT COUNT(*) AS c FROM nodes WHERE guild_id = ? AND parent = ?').get(guildId, path)?.c ?? 0;
 }
 
 /** 2つのページが両方関わった出来事 (時系列)。 */
-export function sharedEpisodes(guildId, a, b, limit = 15) {
-  return memoryDb().prepare(`
+export function sharedEpisodes(guildId: string, a: string, b: string, limit = 15): EpisodeHit[] {
+  return memoryDb().prepare<[string, string, string, number], EpisodeHit>(`
     SELECT e.id, e.kind, e.title, e.summary, e.at_ms FROM episodes e
     WHERE e.guild_id = ?
       AND EXISTS (SELECT 1 FROM episode_nodes x WHERE x.episode_id = e.id AND x.path = ?)
@@ -594,8 +750,8 @@ export function sharedEpisodes(guildId, a, b, limit = 15) {
   `).all(guildId, a, b, limit);
 }
 
-export function linkedPages(guildId, path, limit = 8) {
-  return memoryDb().prepare(`
+export function linkedPages(guildId: string, path: string, limit = 8): LinkedPageRow[] {
+  return memoryDb().prepare<[string, string, string, string, string, number], LinkedPageRow>(`
     SELECT l.dst AS path, n.summary, SUM(l.weight) AS weight FROM (
       SELECT dst, weight FROM links WHERE guild_id = ? AND src = ?
       UNION ALL SELECT src AS dst, weight FROM links WHERE guild_id = ? AND dst = ?
@@ -605,8 +761,8 @@ export function linkedPages(guildId, path, limit = 8) {
 }
 
 /** 区切りを書く前に渡す「最近の出来事」。続きの出来事を前のものと結ばせる。 */
-export function recentEpisodesFor(guildId, path, limit = 3) {
-  return memoryDb().prepare(`
+export function recentEpisodesFor(guildId: string, path: string, limit = 3): EpisodeLinkRow[] {
+  return memoryDb().prepare<[string, string, number], EpisodeLinkRow>(`
     SELECT e.id, e.kind, e.title, e.at_ms FROM episode_nodes n JOIN episodes e ON e.id = n.episode_id
     WHERE n.guild_id = ? AND n.path = ? ORDER BY e.at_ms DESC LIMIT ?
   `).all(guildId, path, limit);
@@ -614,47 +770,48 @@ export function recentEpisodesFor(guildId, path, limit = 3) {
 
 // ---- 検索 ----------------------------------------------------------------
 
-const ftsPhrase = (term) => `"${term.replace(/"/g, '""')}"`;
-const splitTerms = (query) => String(query ?? '').split(/[\s　]+/).map((t) => t.trim()).filter(Boolean).slice(0, 8);
+const ftsPhrase = (term: string): string => `"${term.replace(/"/g, '""')}"`;
+const splitTerms = (query: unknown): string[] => String(query ?? '').split(/[\s　]+/).map((t) => t.trim()).filter(Boolean).slice(0, 8);
 
-function ftsSearch(sql, terms, params, limit) {
+function ftsSearch<Row extends { id?: number; path?: string }>(sql: string, terms: string[], params: string[], limit: number): Row[] {
   const long = terms.filter((t) => [...t].length >= 3);
   if (long.length === 0) return [];
-  const run = (match) => memoryDb().prepare(sql).all(match, ...params, limit);
+  const run = (match: string): Row[] => memoryDb().prepare<unknown[], Row>(sql).all(match, ...params, limit);
   const rows = run(long.map(ftsPhrase).join(' AND '));
   if (rows.length >= limit || long.length === 1) return rows;
   const seen = new Set(rows.map((row) => row.id ?? row.path));
   return [...rows, ...run(long.map(ftsPhrase).join(' OR ')).filter((row) => !seen.has(row.id ?? row.path))].slice(0, limit);
 }
 
-export function searchNodes(guildId, query, limit = 8) {
+export function searchNodes(guildId: string, query: unknown, limit = 8): NodeHit[] {
   const terms = splitTerms(query);
   if (terms.length === 0) return [];
-  const results = new Map();
-  for (const row of ftsSearch(`
+  const results = new Map<string, NodeHit>();
+  for (const row of ftsSearch<NodeHit>(`
     SELECT n.path, n.summary, snippet(nodes_fts, 2, '[', ']', '…', 16) AS snippet
     FROM nodes_fts JOIN nodes n ON n.id = nodes_fts.rowid
     WHERE nodes_fts MATCH ? AND n.guild_id = ? ORDER BY bm25(nodes_fts, 4.0, 2.0, 1.0, 3.0) LIMIT ?
   `, terms, [guildId], limit)) results.set(row.path, row);
 
   const short = terms.filter((t) => [...t].length < 3);
-  if (results.size < limit && short.length > 0) {
+  const [firstShort] = short;
+  if (results.size < limit && firstShort !== undefined) {
     // 2文字の名前 (たこ 等) は trigram に引っかからない。ページ数は数千なので LIKE で足りる。
     const where = short.map(() => '(path LIKE ? OR summary LIKE ? OR aliases LIKE ? OR body LIKE ?)').join(' AND ');
     const params = short.flatMap((t) => { const p = `%${t.replace(/[%_]/g, '')}%`; return [p, p, p, p]; });
-    for (const row of memoryDb().prepare(`SELECT path, summary, body FROM nodes WHERE guild_id = ? AND path <> '' AND ${where}
-      ORDER BY (path LIKE ?) DESC, weight DESC LIMIT ?`).all(guildId, ...params, `%${short[0]}%`, limit)) {
+    for (const row of memoryDb().prepare<unknown[], { path: string; summary: string; body: string }>(`SELECT path, summary, body FROM nodes WHERE guild_id = ? AND path <> '' AND ${where}
+      ORDER BY (path LIKE ?) DESC, weight DESC LIMIT ?`).all(guildId, ...params, `%${firstShort}%`, limit)) {
       if (results.has(row.path)) continue;
-      const at = row.body.indexOf(short[0]);
+      const at = row.body.indexOf(firstShort);
       results.set(row.path, { path: row.path, summary: row.summary, snippet: at < 0 ? '' : `…${row.body.slice(Math.max(0, at - 30), at + 50)}…` });
     }
   }
   return [...results.values()].slice(0, limit);
 }
 
-export function searchEpisodes(guildId, query, limit = 8) {
+export function searchEpisodes(guildId: string, query: unknown, limit = 8): EpisodeHit[] {
   const terms = splitTerms(query);
-  const rows = ftsSearch(`
+  const rows = ftsSearch<EpisodeHit>(`
     SELECT e.id, e.kind, e.title, e.summary, e.at_ms FROM episodes_fts JOIN episodes e ON e.id = episodes_fts.rowid
     WHERE episodes_fts MATCH ? AND e.guild_id = ? ORDER BY bm25(episodes_fts, 3.0, 1.0, 2.0) LIMIT ?
   `, terms, [guildId], limit);
@@ -663,7 +820,7 @@ export function searchEpisodes(guildId, query, limit = 8) {
     const where = short.map(() => '(title LIKE ? OR summary LIKE ? OR kind LIKE ?)').join(' AND ');
     const params = short.flatMap((t) => { const p = `%${t.replace(/[%_]/g, '')}%`; return [p, p, p]; });
     const seen = new Set(rows.map((row) => row.id));
-    for (const row of memoryDb().prepare(`SELECT id, kind, title, summary, at_ms FROM episodes WHERE guild_id = ? AND ${where}
+    for (const row of memoryDb().prepare<unknown[], EpisodeHit>(`SELECT id, kind, title, summary, at_ms FROM episodes WHERE guild_id = ? AND ${where}
       ORDER BY importance DESC, at_ms DESC LIMIT ?`).all(guildId, ...params, limit)) {
       if (!seen.has(row.id)) rows.push(row);
     }
@@ -673,19 +830,20 @@ export function searchEpisodes(guildId, query, limit = 8) {
 
 // ---- 進み具合 -------------------------------------------------------------
 
-export function getCursor(guildId, channelId) {
-  return memoryDb().prepare('SELECT last_id, last_ms FROM cursors WHERE guild_id = ? AND channel_id = ?')
+export function getCursor(guildId: string, channelId: string): Cursor | null {
+  return memoryDb().prepare<[string, string], Cursor>('SELECT last_id, last_ms FROM cursors WHERE guild_id = ? AND channel_id = ?')
     .get(guildId, channelId) ?? null;
 }
 
-export function setCursor(guildId, channelId, lastId, lastMs) {
-  memoryDb().prepare(`
+export function setCursor(guildId: string, channelId: string, lastId: string, lastMs: number): void {
+  memoryDb().prepare<[string, string, string, number]>(`
     INSERT INTO cursors (guild_id, channel_id, last_id, last_ms) VALUES (?, ?, ?, ?)
     ON CONFLICT(guild_id, channel_id) DO UPDATE SET last_id = excluded.last_id, last_ms = excluded.last_ms
   `).run(guildId, channelId, lastId, lastMs);
 }
 
-export function recordSegment(guildId, segment, { status, model = null, error = null, now = Date.now() }) {
+export function recordSegment(guildId: string, segment: SegmentRecord,
+  { status, model = null, error = null, now = Date.now() }: { status: 'done' | 'failed'; model?: string | null; error?: string | null; now?: number }): void {
   memoryDb().prepare(`
     INSERT INTO segments (guild_id, channel_id, from_id, to_id, from_ms, to_ms, messages, chars, status, model, error, done_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -700,16 +858,17 @@ export function recordSegment(guildId, segment, { status, model = null, error = 
  * 読み終えたことになっているのに出来事が1つも無い長い区切りを failed に戻す
  * (次の run --retry-failed で読み直す)。provider が空の結果を返していた期間の後始末。
  */
-export function reopenEmptySegments(guildId, { minChars = 4000, apply = false, now = Date.now() } = {}) {
+export function reopenEmptySegments(guildId: string,
+  { minChars = 4000, apply = false, now = Date.now() }: { minChars?: number; apply?: boolean; now?: number } = {}): EmptySegmentRow[] {
   const d = memoryDb();
-  const rows = d.prepare(`
+  const rows = d.prepare<[string, number], EmptySegmentRow>(`
     SELECT s.channel_id, s.from_id, s.messages, s.chars FROM segments s
     WHERE s.guild_id = ? AND s.status = 'done' AND s.chars >= ?
       AND NOT EXISTS (SELECT 1 FROM episodes e WHERE e.guild_id = s.guild_id AND e.channel_id = s.channel_id
         AND e.at_ms <= s.to_ms AND e.end_ms >= s.from_ms)
   `).all(guildId, minChars);
   if (apply) {
-    const mark = d.prepare(`UPDATE segments SET status = 'failed', error = 'empty output (reopened)', done_at = ?
+    const mark = d.prepare<[number, string, string, string]>(`UPDATE segments SET status = 'failed', error = 'empty output (reopened)', done_at = ?
       WHERE guild_id = ? AND channel_id = ? AND from_id = ?`);
     d.transaction(() => {
       for (const row of rows) {
@@ -721,31 +880,41 @@ export function reopenEmptySegments(guildId, { minChars = 4000, apply = false, n
   return rows;
 }
 
-export function segmentStats(guildId) {
-  return memoryDb().prepare(`
+export function segmentStats(guildId: string): SegmentStatRow[] {
+  return memoryDb().prepare<[string], SegmentStatRow>(`
     SELECT status, COUNT(*) AS segments, COALESCE(SUM(messages), 0) AS messages, COALESCE(SUM(chars), 0) AS chars,
       MAX(to_ms) AS latest
     FROM segments WHERE guild_id = ? GROUP BY status
   `).all(guildId);
 }
 
-export function memoryCounts(guildId) {
+export interface MemoryCounts {
+  pages: number;
+  episodes: number;
+  links: number;
+  pendingPages: number;
+  pendingChars: number;
+}
+
+export function memoryCounts(guildId: string): MemoryCounts {
   const d = memoryDb();
+  const count = (sql: string): number => d.prepare<[string], CountRow>(sql).get(guildId)?.c ?? 0;
   return {
     pages: countNodes(guildId),
-    episodes: d.prepare('SELECT COUNT(*) AS c FROM episodes WHERE guild_id = ?').get(guildId).c,
-    links: d.prepare('SELECT COUNT(*) AS c FROM links WHERE guild_id = ?').get(guildId).c,
-    pendingPages: d.prepare('SELECT COUNT(*) AS c FROM nodes WHERE guild_id = ? AND pending_count > 0').get(guildId).c,
-    pendingChars: d.prepare('SELECT COALESCE(SUM(length(pending)), 0) AS c FROM nodes WHERE guild_id = ?').get(guildId).c
+    episodes: count('SELECT COUNT(*) AS c FROM episodes WHERE guild_id = ?'),
+    links: count('SELECT COUNT(*) AS c FROM links WHERE guild_id = ?'),
+    pendingPages: count('SELECT COUNT(*) AS c FROM nodes WHERE guild_id = ? AND pending_count > 0'),
+    pendingChars: count('SELECT COALESCE(SUM(length(pending)), 0) AS c FROM nodes WHERE guild_id = ?')
   };
 }
 
-export function getState(key) {
-  const row = memoryDb().prepare('SELECT value FROM state WHERE key = ?').get(key);
-  return row ? json(row.value, null) : null;
+/** 控えた値。JSON なので、使う側が形を確かめる。 */
+export function getState(key: string): unknown {
+  const row = memoryDb().prepare<[string], { value: string }>('SELECT value FROM state WHERE key = ?').get(key);
+  return row ? json(row.value) : null;
 }
 
-export function setState(key, value) {
+export function setState(key: string, value: unknown): void {
   if (value === null || value === undefined) {
     memoryDb().prepare('DELETE FROM state WHERE key = ?').run(key);
     return;
@@ -756,43 +925,43 @@ export function setState(key, value) {
 
 // ---- 公開チャンネルの控え --------------------------------------------------
 
-export function savePublicChannels(guildId, channelIds, now = Date.now()) {
+export function savePublicChannels(guildId: string, channelIds: readonly string[], now = Date.now()): void {
   const d = memoryDb();
   d.transaction(() => {
     d.prepare('DELETE FROM public_channels WHERE guild_id = ?').run(guildId);
-    const insert = d.prepare('INSERT OR IGNORE INTO public_channels (guild_id, channel_id) VALUES (?, ?)');
+    const insert = d.prepare<[string, string]>('INSERT OR IGNORE INTO public_channels (guild_id, channel_id) VALUES (?, ?)');
     for (const id of channelIds) insert.run(guildId, String(id));
     setState(`public-channels:${guildId}`, { at: now, count: channelIds.length });
   })();
 }
 
-export function loadPublicChannels(guildId) {
+export function loadPublicChannels(guildId: string): { at: number; channelIds: string[] } | null {
   const meta = getState(`public-channels:${guildId}`);
-  if (!meta) return null;
-  const ids = memoryDb().prepare('SELECT channel_id FROM public_channels WHERE guild_id = ?').all(guildId)
+  if (!isRecord(meta) || typeof meta.at !== 'number') return null;
+  const ids = memoryDb().prepare<[string], { channel_id: string }>('SELECT channel_id FROM public_channels WHERE guild_id = ?').all(guildId)
     .map((row) => row.channel_id);
   return { at: meta.at, channelIds: ids };
 }
 
-export function includeChannel(guildId, channelId, by = null, now = Date.now()) {
+export function includeChannel(guildId: string, channelId: string, by: string | null = null, now = Date.now()): void {
   memoryDb().prepare(`
     INSERT INTO included_channels (guild_id, channel_id, added_by, added_at) VALUES (?, ?, ?, ?)
     ON CONFLICT(guild_id, channel_id) DO NOTHING
   `).run(guildId, String(channelId), by, now);
 }
 
-export function removeIncluded(guildId, channelId) {
+export function removeIncluded(guildId: string, channelId: string): boolean {
   return memoryDb().prepare('DELETE FROM included_channels WHERE guild_id = ? AND channel_id = ?')
     .run(guildId, String(channelId)).changes > 0;
 }
 
-export function includedChannels(guildId) {
-  return memoryDb().prepare('SELECT channel_id FROM included_channels WHERE guild_id = ? ORDER BY added_at')
+export function includedChannels(guildId: string): string[] {
+  return memoryDb().prepare<[string], { channel_id: string }>('SELECT channel_id FROM included_channels WHERE guild_id = ? ORDER BY added_at')
     .all(guildId).map((row) => row.channel_id);
 }
 
 /** 記憶を作り直す。原文 (アーカイブ) と公開チャンネルの控えには触らない。 */
-export function resetTree(guildId) {
+export function resetTree(guildId: string): void {
   const d = memoryDb();
   d.transaction(() => {
     for (const table of ['nodes', 'segments', 'cursors', 'links', 'episode_nodes', 'episode_links']) {

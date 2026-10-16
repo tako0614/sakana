@@ -1,10 +1,79 @@
 import { randomUUID } from 'node:crypto';
 import { db } from '../archive/db.js';
+import { isRecord } from './types.js';
 
 let ready = false;
 const BUDGET_TOTALS_VERSION = 1;
 
-function ledger() {
+/** 100万トークンあたりの USD (request は1回あたり)。input / output 以外は無ければ input / output と同じ扱い。 */
+export interface ModelRates {
+  input: number;
+  output: number;
+  cached?: number;
+  cacheWrite?: number;
+  reasoning?: number;
+  request?: number;
+  verifiedRoute?: 'free' | 'paid';
+}
+
+export interface StoredModelRates extends ModelRates {
+  checkedAt: number;
+}
+
+export interface ModelReservation {
+  id: string;
+  rates: StoredModelRates | null;
+  capped: boolean;
+  budgetId: string | null;
+}
+
+export interface ModelBudgetStatus {
+  id: string;
+  guildId: string;
+  limitUsd: number;
+  paused: boolean;
+  pauseReason: string | null;
+  reportedUsd: number;
+  estimatedUsd: number;
+  spentUsd: number;
+  reservedUsd: number;
+  committedUsd: number;
+  remainingUsd: number;
+  calls: number;
+  unknownCalls: number;
+}
+
+/** code を持つエラー (予算の MODEL_BUDGET_* など)。どの予算のことかを details で添える。 */
+export interface CodedError extends Error {
+  code: string;
+  retryable: boolean;
+  budgetId?: string;
+  guildId?: string;
+  limitUsd?: number;
+  remainingUsd?: number;
+}
+
+type CodedDetails = Pick<CodedError, 'budgetId' | 'guildId' | 'limitUsd' | 'remainingUsd'>;
+
+interface BudgetRow {
+  id: string;
+  guild_id: string;
+  limit_usd: number;
+  paused: number;
+  pause_reason: string | null;
+  created_at: number;
+  updated_at: number;
+  calls: number;
+  reported_usd: number;
+  estimated_usd: number;
+  reserved_usd: number;
+  unknown_calls: number;
+  totals_version: number;
+}
+
+interface ColumnRow { name: string }
+
+function ledger(): void {
   if (ready) return;
   // ロック待ちは archive/db.js の接続設定 (30秒) に任せる。ここで 5秒に下げると
   // 同じ接続を使う取り込みまで巻き込んで SQLITE_BUSY で落ちる。
@@ -22,12 +91,12 @@ function ledger() {
       estimated_usd REAL NOT NULL DEFAULT 0,reserved_usd REAL NOT NULL DEFAULT 0,
       unknown_calls INTEGER NOT NULL DEFAULT 0,totals_version INTEGER NOT NULL DEFAULT 0
     );`);
-    if (!db.prepare('PRAGMA table_info(ai_model_calls)').all().some(column => column.name === 'estimated_usd'))
+    if (!db.prepare<[], ColumnRow>('PRAGMA table_info(ai_model_calls)').all().some(column => column.name === 'estimated_usd'))
       db.exec('ALTER TABLE ai_model_calls ADD COLUMN estimated_usd REAL');
-    if (!db.prepare('PRAGMA table_info(ai_model_calls)').all().some(column => column.name === 'budget_id'))
+    if (!db.prepare<[], ColumnRow>('PRAGMA table_info(ai_model_calls)').all().some(column => column.name === 'budget_id'))
       db.exec('ALTER TABLE ai_model_calls ADD COLUMN budget_id TEXT');
-    const budgetColumns = new Set(db.prepare('PRAGMA table_info(ai_model_budgets)').all().map(column => column.name));
-    const additions = [
+    const budgetColumns = new Set(db.prepare<[], ColumnRow>('PRAGMA table_info(ai_model_budgets)').all().map(column => column.name));
+    const additions: [string, string][] = [
       ['pause_reason','TEXT'],
       ['calls','INTEGER NOT NULL DEFAULT 0'],
       ['reported_usd','REAL NOT NULL DEFAULT 0'],
@@ -40,7 +109,7 @@ function ledger() {
       if (!budgetColumns.has(name)) db.exec(`ALTER TABLE ai_model_budgets ADD COLUMN ${name} ${definition}`);
     }
     db.exec('CREATE INDEX IF NOT EXISTS idx_ai_model_calls_budget ON ai_model_calls(budget_id,started_at)');
-    if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_writer_calls'").get()) {
+    if (db.prepare<[]>("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_writer_calls'").get()) {
       db.exec(`INSERT OR IGNORE INTO ai_model_calls
         (id,started_at,guild_id,role,run_id,model,provider,generation_id,status,reserved_usd,rates,usage,reported_usd,estimated_usd)
         SELECT id,started_at,NULL,'writer',NULL,model,'deepseek',NULL,
@@ -51,7 +120,7 @@ function ledger() {
     // Upgrade prior lifetime budgets once. The temporary aggregate scans the
     // immutable call ledger once, then each budget is filled by a primary-key
     // lookup. Future reserve/finish/status paths only touch one budget row.
-    if (db.prepare('SELECT 1 FROM ai_model_budgets WHERE totals_version<? LIMIT 1')
+    if (db.prepare<[number]>('SELECT 1 FROM ai_model_budgets WHERE totals_version<? LIMIT 1')
       .get(BUDGET_TOTALS_VERSION)) {
       db.exec(`DROP TABLE IF EXISTS temp.ai_model_budget_backfill;
         CREATE TEMP TABLE ai_model_budget_backfill (
@@ -78,30 +147,44 @@ function ledger() {
   ready = true;
 }
 
-function codedError(code, message, details = {}) {
+function codedError(code: string, message: string, details: CodedDetails = {}): CodedError {
   return Object.assign(new Error(message), { code, retryable: false, ...details });
 }
 
-function budgetInput({ id, guildId, limitUsd = 30 }) {
+export interface ModelBudgetInput {
+  id: string;
+  guildId: string;
+  limitUsd?: number;
+}
+
+function budgetInput({ id, guildId, limitUsd = 30 }: ModelBudgetInput): Required<ModelBudgetInput> {
   if (typeof id !== 'string' || !id.trim()) throw codedError('MODEL_BUDGET_INVALID', 'Model budget requires a nonempty id');
   if (typeof guildId !== 'string' || !guildId.trim()) throw codedError('MODEL_BUDGET_INVALID', 'Model budget requires a nonempty guildId');
   if (!Number.isFinite(limitUsd) || limitUsd < 0) throw codedError('MODEL_BUDGET_INVALID', 'Model budget limit must be a nonnegative USD amount');
   return { id: id.trim(), guildId: guildId.trim(), limitUsd };
 }
 
-function budgetRow(id) {
-  const row = db.prepare('SELECT * FROM ai_model_budgets WHERE id=?').get(id);
+function budgetRow(id: string): BudgetRow {
+  const row = db.prepare<[string], BudgetRow>('SELECT * FROM ai_model_budgets WHERE id=?').get(id);
   if (!row) throw codedError('MODEL_BUDGET_NOT_FOUND', `Unknown model budget: ${id}`, { budgetId: id });
   return row;
 }
 
-function budgetTotals(row) {
+interface BudgetTotals {
+  calls: number;
+  reported_usd: number;
+  estimated_usd: number;
+  reserved_usd: number;
+  unknown_calls: number;
+}
+
+function budgetTotals(row: BudgetRow): BudgetTotals {
   return { calls:Number(row.calls) || 0,reported_usd:Number(row.reported_usd) || 0,
     estimated_usd:Number(row.estimated_usd) || 0,reserved_usd:Number(row.reserved_usd) || 0,
     unknown_calls:Number(row.unknown_calls) || 0 };
 }
 
-export function ensureModelBudget(input) {
+export function ensureModelBudget(input: ModelBudgetInput): ModelBudgetStatus {
   ledger();
   const { id, guildId, limitUsd } = budgetInput(input);
   const now = Date.now();
@@ -118,7 +201,7 @@ export function ensureModelBudget(input) {
   return modelBudgetStatus(id);
 }
 
-export function modelBudgetStatus(id) {
+export function modelBudgetStatus(id: string): ModelBudgetStatus {
   ledger();
   if (typeof id !== 'string' || !id.trim()) throw codedError('MODEL_BUDGET_INVALID', 'Model budget requires a nonempty id');
   const row = budgetRow(id.trim());
@@ -143,15 +226,23 @@ export function modelBudgetStatus(id) {
  * に置き換える。予約より大きくはしない。差の方が予約より大きければ何もしない。
  * 前提: 今月の呼び出しは全部このキーで行った (途中でキーを替えると差が小さく出る)。
  */
-export function settleUnknownCalls({ monthUsageUsd, olderThanMs = 3_600_000, now = Date.now() }) {
+export interface SettleResult {
+  settled: number;
+  heldUsd: number;
+  gapUsd: number;
+  releasedUsd: number;
+}
+
+export function settleUnknownCalls({ monthUsageUsd, olderThanMs = 3_600_000, now = Date.now() }:
+  { monthUsageUsd: number; olderThanMs?: number; now?: number }): SettleResult {
   ledger();
   if (!Number.isFinite(monthUsageUsd) || monthUsageUsd < 0) throw codedError('MODEL_BUDGET_INVALID', 'Monthly usage must be a nonnegative USD amount');
   const date = new Date(now);
   const monthStart = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1);
-  return db.transaction(() => {
-    const known = db.prepare(`SELECT coalesce(sum(reported_usd),0)+coalesce(sum(estimated_usd),0) AS usd
-      FROM ai_model_calls WHERE started_at>=?`).get(monthStart).usd;
-    const open = db.prepare(`SELECT id,budget_id,reserved_usd,started_at FROM ai_model_calls
+  return db.transaction((): SettleResult => {
+    const known = db.prepare<[number], { usd: number }>(`SELECT coalesce(sum(reported_usd),0)+coalesce(sum(estimated_usd),0) AS usd
+      FROM ai_model_calls WHERE started_at>=?`).get(monthStart)?.usd ?? 0;
+    const open = db.prepare<[number], { id: string; budget_id: string | null; reserved_usd: number; started_at: number }>(`SELECT id,budget_id,reserved_usd,started_at FROM ai_model_calls
       WHERE started_at>=? AND status IN ('pending','unknown') AND reported_usd IS NULL AND estimated_usd IS NULL`).all(monthStart);
     const gap = Math.max(0, monthUsageUsd - known);
     // 新しい呼び出しはまだ走っているかもしれないので精算は古いものだけ。差は全部古いものに負わせる
@@ -160,8 +251,8 @@ export function settleUnknownCalls({ monthUsageUsd, olderThanMs = 3_600_000, now
     const held = settle.reduce((sum, call) => sum + call.reserved_usd, 0);
     if (settle.length === 0 || gap >= held) return { settled:0, heldUsd:held, gapUsd:gap, releasedUsd:0 };
     const ratio = held > 0 ? gap / held : 0;
-    const mark = db.prepare(`UPDATE ai_model_calls SET status='estimated',estimated_usd=? WHERE id=? AND status IN ('pending','unknown')`);
-    const budgets = new Map();
+    const mark = db.prepare<[number, string]>(`UPDATE ai_model_calls SET status='estimated',estimated_usd=? WHERE id=? AND status IN ('pending','unknown')`);
+    const budgets = new Map<string, { reserved: number; estimated: number; calls: number }>();
     let released = 0;
     for (const call of settle) {
       const estimate = call.reserved_usd * ratio;
@@ -174,51 +265,82 @@ export function settleUnknownCalls({ monthUsageUsd, olderThanMs = 3_600_000, now
       }
     }
     for (const [id, entry] of budgets) {
-      db.prepare(`UPDATE ai_model_budgets SET reserved_usd=max(0,reserved_usd-?),estimated_usd=estimated_usd+?,
+      db.prepare<[number, number, number, number, string]>(`UPDATE ai_model_budgets SET reserved_usd=max(0,reserved_usd-?),estimated_usd=estimated_usd+?,
         unknown_calls=max(0,unknown_calls-?),updated_at=? WHERE id=?`).run(entry.reserved, entry.estimated, entry.calls, now, id);
       // 予約のせいで止まっていたなら、空きができたので再開する (手で止めたものはそのまま)
       const row = budgetRow(id);
       const totals = budgetTotals(row);
       if (row.paused && row.pause_reason === 'exhausted'
         && totals.reported_usd + totals.estimated_usd + totals.reserved_usd < row.limit_usd) {
-        db.prepare('UPDATE ai_model_budgets SET paused=0,pause_reason=NULL,updated_at=? WHERE id=?').run(now, id);
+        db.prepare<[number, string]>('UPDATE ai_model_budgets SET paused=0,pause_reason=NULL,updated_at=? WHERE id=?').run(now, id);
       }
     }
     return { settled:settle.length, heldUsd:held, gapUsd:gap, releasedUsd:released };
   }).immediate();
 }
 
-export function setModelBudgetPaused(id, paused) {
+export function setModelBudgetPaused(id: string, paused: boolean): ModelBudgetStatus {
   ledger();
   if (typeof id !== 'string' || !id.trim()) throw codedError('MODEL_BUDGET_INVALID', 'Model budget requires a nonempty id');
   if (typeof paused !== 'boolean') throw codedError('MODEL_BUDGET_INVALID', 'Model budget paused state must be boolean');
-  const changed = db.prepare(`UPDATE ai_model_budgets SET paused=?,pause_reason=?,updated_at=? WHERE id=?`)
+  const changed = db.prepare<[number, string | null, number, string]>(`UPDATE ai_model_budgets SET paused=?,pause_reason=?,updated_at=? WHERE id=?`)
     .run(paused ? 1 : 0,paused ? 'manual' : null,Date.now(),id.trim());
   if (!changed.changes) throw codedError('MODEL_BUDGET_NOT_FOUND', `Unknown model budget: ${id}`, { budgetId:id });
   return modelBudgetStatus(id.trim());
 }
-export function modelRates(model) {
-  ledger();
-  const row = db.prepare('SELECT checked_at,rates FROM ai_model_rates WHERE model=?').get(model);
-  return row ? { ...JSON.parse(row.rates), checkedAt: row.checked_at } : null;
+// 保存した値段の JSON。input / output が数でなければ「値段が分からない」(NaN) として扱い
+// (予約・上限の計算で弾かれる)、ほかの欄は数でなければ無いものとする
+function storedRates(text: string, checkedAt: number): StoredModelRates {
+  const parsed: unknown = JSON.parse(text);
+  const saved = isRecord(parsed) ? parsed : {};
+  const rates: StoredModelRates = { ...saved,
+    input: typeof saved.input === 'number' ? saved.input : NaN,
+    output: typeof saved.output === 'number' ? saved.output : NaN, checkedAt };
+  for (const key of ['cached', 'cacheWrite', 'reasoning', 'request'] as const) {
+    if (typeof saved[key] !== 'number') delete rates[key];
+  }
+  if (saved.verifiedRoute !== 'free' && saved.verifiedRoute !== 'paid') delete rates.verifiedRoute;
+  return rates;
 }
-export function saveModelRates(model, rates, now = Date.now()) {
+
+export function modelRates(model: string): StoredModelRates | null {
   ledger();
-  for (const key of ['input','output','cached','cacheWrite','reasoning','request'])
+  const row = db.prepare<[string], { checked_at: number; rates: string }>('SELECT checked_at,rates FROM ai_model_rates WHERE model=?').get(model);
+  return row ? storedRates(row.rates, row.checked_at) : null;
+}
+export function saveModelRates(model: string, rates: ModelRates, now = Date.now()): void {
+  ledger();
+  for (const key of ['input','output','cached','cacheWrite','reasoning','request'] as const)
     if (!Number.isFinite(rates[key] ?? 0) || (rates[key] ?? 0) < 0) throw new Error('Invalid model price');
-  db.prepare('INSERT INTO ai_model_rates VALUES(?,?,?) ON CONFLICT(model) DO UPDATE SET checked_at=excluded.checked_at,rates=excluded.rates')
+  db.prepare<[string, number, string]>('INSERT INTO ai_model_rates VALUES(?,?,?) ON CONFLICT(model) DO UPDATE SET checked_at=excluded.checked_at,rates=excluded.rates')
     .run(model,now,JSON.stringify(rates));
 }
-export function usageCost(usage, rates) {
-  if (Number.isFinite(usage?.cost) && usage.cost >= 0) return usage.cost;
-  if (!rates || !Number.isFinite(usage?.prompt_tokens) || !Number.isFinite(usage?.completion_tokens)) return null;
-  const cached = usage.prompt_tokens_details?.cached_tokens ?? usage.prompt_cache_hit_tokens ?? 0;
-  if (!Number.isFinite(cached)) return null;
-  const input = Math.max(0,usage.prompt_tokens), hits = Math.min(input,Math.max(0,cached));
-  return ((input-hits)*rates.input + hits*(rates.cached ?? rates.input) + Math.max(0,usage.completion_tokens)*rates.output)/1e6 + (rates.request ?? 0);
+export function usageCost(usage: unknown, rates: ModelRates | null | undefined): number | null {
+  const used = isRecord(usage) ? usage : {};
+  if (typeof used.cost === 'number' && Number.isFinite(used.cost) && used.cost >= 0) return used.cost;
+  const prompt = used.prompt_tokens;
+  const completion = used.completion_tokens;
+  if (!rates || typeof prompt !== 'number' || !Number.isFinite(prompt) || typeof completion !== 'number' || !Number.isFinite(completion)) return null;
+  const details = isRecord(used.prompt_tokens_details) ? used.prompt_tokens_details : {};
+  const cached = details.cached_tokens ?? used.prompt_cache_hit_tokens ?? 0;
+  if (typeof cached !== 'number' || !Number.isFinite(cached)) return null;
+  const input = Math.max(0,prompt), hits = Math.min(input,Math.max(0,cached));
+  return ((input-hits)*rates.input + hits*(rates.cached ?? rates.input) + Math.max(0,completion)*rates.output)/1e6 + (rates.request ?? 0);
 }
+
+export interface ReserveModelCallInput {
+  model: string;
+  messages: unknown;
+  tools?: unknown;
+  outputTokens: number;
+  guildId?: string | null;
+  role?: string;
+  runId?: string | null;
+  budgetId?: string | null;
+}
+
 export function reserveModelCall({ model, messages, tools, outputTokens, guildId = null, role = 'chat', runId = null,
-  budgetId = null }, now = Date.now()) {
+  budgetId = null }: ReserveModelCallInput, now = Date.now()): ModelReservation {
   ledger();
   if (budgetId !== null && (typeof budgetId !== 'string' || !budgetId.trim()))
     throw codedError('MODEL_BUDGET_INVALID', 'Model budget requires a nonempty id');
@@ -234,7 +356,7 @@ export function reserveModelCall({ model, messages, tools, outputTokens, guildId
   // A floating-point representation must never round a reservation below the
   // verified price bound used to admit it.
   const upper = rates ? Math.ceil(rawUpper*1e12)/1e12 : 0;
-  const result = db.transaction(() => {
+  const result = db.transaction((): { error: CodedError } | ModelReservation => {
     if (budgetId) {
       const budget = budgetRow(budgetId);
       if (budget.guild_id !== guildId) return { error:codedError('MODEL_BUDGET_CONFLICT', 'Model budget guild does not match the request', {
@@ -245,39 +367,43 @@ export function reserveModelCall({ model, messages, tools, outputTokens, guildId
       const committed = budgetTotals(budget);
       const charged = committed.reported_usd + committed.estimated_usd + committed.reserved_usd;
       if (charged+upper > budget.limit_usd) {
-        db.prepare("UPDATE ai_model_budgets SET paused=1,pause_reason='exhausted',updated_at=? WHERE id=?").run(now,budgetId);
+        db.prepare<[number, string]>("UPDATE ai_model_budgets SET paused=1,pause_reason='exhausted',updated_at=? WHERE id=?").run(now,budgetId);
         return { error:codedError('MODEL_BUDGET_EXHAUSTED', 'Model budget is exhausted', {
           budgetId,remainingUsd:Math.max(0,budget.limit_usd-charged)
         }) };
       }
     }
     const id = randomUUID();
-    db.prepare(`INSERT INTO ai_model_calls
+    db.prepare<[string, number, string | null, string, string | null, string, string, number, string, string | null]>(`INSERT INTO ai_model_calls
       (id,started_at,guild_id,role,run_id,model,status,reserved_usd,rates,budget_id) VALUES(?,?,?,?,?,?,?,?,?,?)`)
       .run(id,now,guildId,role,runId,model,'pending',upper,JSON.stringify(rates),budgetId);
-    if (budgetId) db.prepare(`UPDATE ai_model_budgets SET calls=calls+1,
+    if (budgetId) db.prepare<[number, number, string]>(`UPDATE ai_model_budgets SET calls=calls+1,
       reserved_usd=reserved_usd+?,unknown_calls=unknown_calls+1,updated_at=? WHERE id=?`)
       .run(upper,now,budgetId);
     return { id, rates, capped: !!budgetId, budgetId };
   }).immediate();
-  if (result.error) throw result.error;
+  if ('error' in result) throw result.error;
   return result;
 }
-export function finishModelCall(reservation, data, { noCharge = false, status } = {}) {
+/** data は provider の応答そのもの (途中で失敗したときは読めた分だけ、または無し)。 */
+export function finishModelCall(reservation: Pick<ModelReservation, 'id'>, data: unknown,
+  { noCharge = false, status }: { noCharge?: boolean; status?: string } = {}): void {
   ledger();
-  const reported = data?.usage?.cost;
+  const response = isRecord(data) ? data : {};
+  const reported = isRecord(response.usage) ? response.usage.cost : undefined;
   // A token-derived estimate is not an OpenRouter bill. Keep unknown reservations.
-  const cost = noCharge ? 0 : Number.isFinite(reported) && reported >= 0 ? reported : null;
+  const cost = noCharge ? 0 : typeof reported === 'number' && Number.isFinite(reported) && reported >= 0 ? reported : null;
+  const text = (value: unknown): string | null => (typeof value === 'string' ? value : null);
   db.transaction(() => {
-    const call = db.prepare('SELECT budget_id,status,reserved_usd FROM ai_model_calls WHERE id=?').get(reservation.id);
+    const call = db.prepare<[string], { budget_id: string | null; status: string; reserved_usd: number }>('SELECT budget_id,status,reserved_usd FROM ai_model_calls WHERE id=?').get(reservation.id);
     if (!call || call.status !== 'pending') return;
-    const updated = db.prepare(`UPDATE ai_model_calls SET status=?,provider=?,generation_id=?,usage=?,reported_usd=?
+    const updated = db.prepare<[string, string | null, string | null, string | null, number | null, string]>(`UPDATE ai_model_calls SET status=?,provider=?,generation_id=?,usage=?,reported_usd=?
       WHERE id=? AND status='pending'`)
-      .run(status ?? (noCharge ? 'no_charge' : cost === null ? 'unknown' : 'reported'),data?.provider ?? null,
-        data?.id ?? null,data?.usage ? JSON.stringify(data.usage) : null,cost,reservation.id);
+      .run(status ?? (noCharge ? 'no_charge' : cost === null ? 'unknown' : 'reported'),text(response.provider),
+        text(response.id),response.usage ? JSON.stringify(response.usage) : null,cost,reservation.id);
     if (!updated.changes) return;
     if (call.budget_id) {
-      if (cost !== null) db.prepare(`UPDATE ai_model_budgets SET
+      if (cost !== null) db.prepare<[number, number, number, string]>(`UPDATE ai_model_budgets SET
         reported_usd=reported_usd+?,reserved_usd=max(0,reserved_usd-?),
         unknown_calls=max(0,unknown_calls-1),updated_at=? WHERE id=?`)
         .run(cost,call.reserved_usd,Date.now(),call.budget_id);
@@ -285,24 +411,42 @@ export function finishModelCall(reservation, data, { noCharge = false, status } 
       const totals = budgetTotals(budget);
       const committed = totals.reported_usd+totals.estimated_usd+totals.reserved_usd;
       if (committed > 0 && committed >= budget.limit_usd)
-        db.prepare("UPDATE ai_model_budgets SET paused=1,pause_reason='exhausted',updated_at=? WHERE id=?")
+        db.prepare<[number, string]>("UPDATE ai_model_budgets SET paused=1,pause_reason='exhausted',updated_at=? WHERE id=?")
           .run(Date.now(),call.budget_id);
     }
   }).immediate();
 }
-export function modelCostReport({ role, guildId, guildIds, now = Date.now() } = {}) {
+
+interface CostTotals {
+  calls: number;
+  reportedUsd: number;
+  estimatedUsd: number;
+  unconfirmedReservedUsd: number;
+  unpricedCalls: number;
+  unconfirmedCalls: number;
+}
+
+export interface ModelCostReport extends CostTotals {
+  currency: 'USD';
+  period: string;
+  byModel: { role: string; model: string; provider: string | null; calls: number; reportedUsd: number | null }[];
+}
+
+export function modelCostReport({ role, guildId, guildIds, now = Date.now() }:
+  { role?: string; guildId?: string | null; guildIds?: readonly (string | null)[]; now?: number } = {}): ModelCostReport {
   ledger();
-  const day = Math.floor(now/86400000)*86400000, args = [day,day+86400000];
+  const day = Math.floor(now/86400000)*86400000, args: (string | number | null)[] = [day,day+86400000];
   let where = 'started_at>=? AND started_at<?';
   if (role) { where+=' AND role=?'; args.push(role); }
   const scope = guildIds ?? (guildId === undefined ? undefined : [guildId]);
   if (scope !== undefined) { where+= scope.length ? ` AND guild_id IN (${scope.map(() => '?').join(',')})` : ' AND 0'; args.push(...scope); }
-  const totals = db.prepare(`SELECT count(*) calls,coalesce(sum(reported_usd),0) reportedUsd,
+  const totals = db.prepare<unknown[], CostTotals>(`SELECT count(*) calls,coalesce(sum(reported_usd),0) reportedUsd,
     coalesce(sum(estimated_usd),0) estimatedUsd,
     coalesce(sum(CASE WHEN reported_usd IS NULL AND estimated_usd IS NULL THEN reserved_usd ELSE 0 END),0) unconfirmedReservedUsd,
     coalesce(sum(reported_usd IS NULL AND estimated_usd IS NULL AND rates='null'),0) unpricedCalls,
     coalesce(sum(reported_usd IS NULL AND estimated_usd IS NULL),0) unconfirmedCalls
-    FROM ai_model_calls WHERE ${where}`).get(...args);
+    FROM ai_model_calls WHERE ${where}`).get(...args)
+    ?? { calls:0,reportedUsd:0,estimatedUsd:0,unconfirmedReservedUsd:0,unpricedCalls:0,unconfirmedCalls:0 };
   return { currency:'USD',period:new Date(day).toISOString().slice(0,10),...totals,
-    byModel: db.prepare(`SELECT role,model,provider,count(*) calls,sum(reported_usd) reportedUsd FROM ai_model_calls WHERE ${where} GROUP BY role,model,provider`).all(...args) };
+    byModel: db.prepare<unknown[], ModelCostReport['byModel'][number]>(`SELECT role,model,provider,count(*) calls,sum(reported_usd) reportedUsd FROM ai_model_calls WHERE ${where} GROUP BY role,model,provider`).all(...args) };
 }

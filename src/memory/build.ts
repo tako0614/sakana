@@ -1,16 +1,20 @@
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
-import { requestModel } from '../ai/provider.js';
+import { requestModel, type MaxPrice, type ReasoningOptions } from '../ai/provider.js';
 import { db as archive } from '../archive/db.js';
 import { ensureModelBudget } from '../ai/cost.js';
 import {
   MAX_DEPTH, addAliases, placeTopLevel, topLevels, addPending, depthOf, ensureNode, ensureSeeds, flushPendingRaw, getNode, getState,
   parentOf,
   insertEpisode, linkEpisodeNodes, linkEpisodes, linkPageMentions, listChildren, loadPublicChannels, memoryDb, nameOf,
-  normalizePath, pendingNodes, recordSegment, resolveExisting, setCursor, setState, treeIndex, writePage
+  normalizePath, pendingNodes, recordSegment, resolveExisting, setCursor, setState, treeIndex, writePage, type SegmentRow
 } from './store.js';
 import { forgetNames, knownPagesFor } from './recall.js';
 import { cursorBefore, packOf, planPack, renderSegment } from './transcript.js';
+import {
+  arrayOf, countOf, detailsOf, errorMessage, isLockState, isPauseState, isRecord, isTotals,
+  type JsonRecord, type LineEntry, type Pack, type PauseState, type Totals
+} from './types.js';
 
 // 区切りごとに会話ログを AI へ渡して、記憶の本を育てる。
 //
@@ -31,15 +35,16 @@ import { cursorBefore, packOf, planPack, renderSegment } from './transcript.js';
 // 無料モデル (:free) も使えるが、1分20回・1日50回 (購入累計10ドル以上で1000回) で、
 // 混雑の 429 や思考で出力枠を使い切るものが多かった。日の上限に当たったら止めて、次の起動で続きから読む。
 
-const REASONING = {
+const REASONING: Record<string, ReasoningOptions | undefined> = {
   low: { effort: 'low', exclude: true },   // 考えすぎて出力枠を使い切るモデルがあった (deepseek-v4-flash・gpt-oss)
   off: { enabled: false },
   default: undefined
 };
 
-const list = (value, fallback) => (value || fallback).split(',').map((item) => item.trim()).filter(Boolean);
-function priceOf(value) {
+const list = (value: string | undefined, fallback: string): string[] => (value || fallback).split(',').map((item) => item.trim()).filter(Boolean);
+function priceOf(value: string | undefined): Required<MaxPrice> | null {
   const [prompt, completion] = list(value, '').map(Number);
+  if (prompt === undefined || completion === undefined) return null;
   return Number.isFinite(prompt) && Number.isFinite(completion) && prompt > 0 && completion > 0 ? { prompt, completion } : null;
 }
 
@@ -168,19 +173,21 @@ const ROOT_SYSTEM = `あなたは Discord サーバーの「記憶の本」の�
 // ---- モデル呼び出し ----------------------------------------------------------
 
 export class StopRun extends Error {
-  constructor(message, reason) {
+  readonly reason: string;
+  constructor(message: string, reason: string) {
     super(message);
     this.reason = reason;
   }
 }
 
-const badOutput = (message, cause) => Object.assign(new Error(message), { code: 'BAD_OUTPUT', cause });
+const badOutput = (message: string, cause?: unknown): Error & { code: 'BAD_OUTPUT'; cause: unknown } =>
+  Object.assign(new Error(message), { code: 'BAD_OUTPUT' as const, cause });
 
-/** 推論モデルの <think> やコードフェンスを剥がして、最初の JSON オブジェクトを読む。 */
-export function parseModelJson(content) {
+/** 推論モデルの <think> やコードフェンスを剥がして、最初の JSON オブジェクトを読む。中身はまだ確かめていない。 */
+export function parseModelJson(content: unknown): unknown {
   let text = String(content ?? '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenced) text = fenced[1].trim();
+  if (fenced?.[1] !== undefined) text = fenced[1].trim();
   const start = text.indexOf('{');
   const end = text.lastIndexOf('}');
   if (start < 0 || end <= start) throw badOutput('model output had no JSON object');
@@ -197,9 +204,9 @@ export function parseModelJson(content) {
   }
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-function budgetFor(guildId, models) {
+function budgetFor(guildId: string, models: readonly string[]): string | null {
   const paid = models.filter((model) => !model.endsWith(':free'));
   if (paid.length === 0) return null;
   if (!(treeConfig.budgetUsd > 0)) {
@@ -214,7 +221,7 @@ function budgetFor(guildId, models) {
 }
 
 /** 予算の台帳の id。月 (UTC) ごとに新しい枠になる。 */
-export function budgetIdFor(guildId, now = Date.now()) {
+export function budgetIdFor(guildId: string, now = Date.now()): string {
   return `memory-tree:${guildId}:${new Date(now).toISOString().slice(0, 7)}:${treeConfig.budgetUsd}`;
 }
 
@@ -230,11 +237,11 @@ const BAD_PROVIDER_MS = 3_600_000;
 // 2026-10-16、いちばん安くまともな StreamLake が出力の暴走3回 (25回中) で外れ、続いて Novita と
 // GMICloud も外れて、単価の上限に残った DeepInfra が 429 を連発し読み込みがほぼ止まった。
 // 出力の暴走はどの provider でも時々起きる。外すのは壊れている割合が高いものだけ
-const providerRecord = new Map();
+const providerRecord = new Map<string, { at: number; bad: boolean }[]>();
 const RECORD_MS = 3_600_000;
 
 /** 結果を記録し、外すべきなら true。直近1時間に3回以上、かつ4回に1回以上壊れていたら外す。 */
-export function recordProvider(name, bad, now = Date.now()) {
+export function recordProvider(name: string | null | undefined, bad: boolean, now = Date.now()): boolean {
   if (!name) return false;
   const list = (providerRecord.get(name) ?? []).filter((entry) => entry.at > now - RECORD_MS);
   list.push({ at: now, bad });
@@ -243,24 +250,48 @@ export function recordProvider(name, bad, now = Date.now()) {
   return bad && bads >= 3 && bads * 4 >= list.length;
 }
 
-export function forgetProviderRecord() {
+export function forgetProviderRecord(): void {
   providerRecord.clear();
 }
 
-export function avoidedProviders(now = Date.now()) {
-  const saved = getState(BAD_PROVIDERS) ?? {};
-  const live = Object.fromEntries(Object.entries(saved).filter(([, until]) => until > now));
+/** 外した provider と、外す期限 (ms)。 */
+function savedAvoided(): JsonRecord {
+  const saved = getState(BAD_PROVIDERS);
+  return isRecord(saved) ? saved : {};
+}
+
+export function avoidedProviders(now = Date.now()): string[] {
+  const saved = savedAvoided();
+  const live = Object.fromEntries(Object.entries(saved).filter(([, until]) => typeof until === 'number' && until > now));
   if (Object.keys(live).length !== Object.keys(saved).length) setState(BAD_PROVIDERS, Object.keys(live).length ? live : null);
   return [...new Set([...treeConfig.ignoreProviders, ...Object.keys(live)])];
 }
 
-export function avoidProvider(name, now = Date.now()) {
-  if (name) setState(BAD_PROVIDERS, { ...(getState(BAD_PROVIDERS) ?? {}), [name]: now + BAD_PROVIDER_MS });
+export function avoidProvider(name: string | null | undefined, now = Date.now()): void {
+  if (name) setState(BAD_PROVIDERS, { ...savedAvoided(), [name]: now + BAD_PROVIDER_MS });
 }
 
-export function forgetAvoidedProviders() {
+export function forgetAvoidedProviders(): void {
   setState(BAD_PROVIDERS, null);
 }
+
+/** builder がモデルへ投げる1回。check は読めた JSON の検査 (落ちたら投げる)。 */
+export interface CallInput {
+  kind: string;
+  system: string;
+  user: string;
+  check?: (json: unknown) => void;
+}
+
+/** json はモデルの出力 (まだ確かめていない)。差し替えた call (検査) は model を返さないことがある。 */
+export interface CallResult {
+  json: unknown;
+  model?: string;
+  provider?: string | null;
+  usage?: unknown;
+}
+
+export type MemoryCaller = (input: CallInput) => Promise<CallResult>;
 
 /**
  * 1回の呼び出し。待てば済む 429 は待って同じ入力を送り直し、日の上限・認証・
@@ -268,11 +299,12 @@ export function forgetAvoidedProviders() {
  * check は読めた JSON の検査 (空の結果など)。落ちたら、または途中で切れたら、すぐ送り直す (2回まで)。
  * 壊れている割合が高い provider だけ1時間外す (recordProvider)。
  */
-export function openRouterCaller({ guildId, models = treeConfig.models, runId = randomUUID() } = {}) {
+export function openRouterCaller({ guildId, models = treeConfig.models, runId = randomUUID() }:
+  { guildId: string; models?: readonly string[]; runId?: string }): MemoryCaller {
   const budgetId = budgetFor(guildId, models);
-  return async function call({ kind, system, user, check }) {
+  return async function call({ kind, system, user, check }: CallInput): Promise<CallResult> {
     for (let transient = 0, swapped = 0, cleared = false; ; transient += 1) {
-      let provider = null;
+      let provider: string | null = null;
       const ignored = avoidedProviders();
       try {
         const data = await requestModel({
@@ -290,27 +322,31 @@ export function openRouterCaller({ guildId, models = treeConfig.models, runId = 
         recordProvider(provider, false);
         return { json, model: data.model ?? models[0], provider, usage: data.usage };
       } catch (error) {
-        const blame = provider ?? error.provider;
-        const broken = error.code === 'BAD_OUTPUT' || /truncated/.test(error.message);
+        const details = detailsOf(error);
+        const message = errorMessage(error);
+        const blame = provider ?? (typeof details.provider === 'string' ? details.provider : null);
+        const broken = details.code === 'BAD_OUTPUT' || /truncated/.test(message);
         if (broken && recordProvider(blame, true)) {
           avoidProvider(blame);
-          console.warn(`memory: ${blame} を ${BAD_PROVIDER_MS / 3_600_000} 時間外す (直近1時間に壊れた出力が続いた: ${error.message})`);
+          console.warn(`memory: ${blame} を ${BAD_PROVIDER_MS / 3_600_000} 時間外す (直近1時間に壊れた出力が続いた: ${message})`);
         }
         if (broken && swapped < 2) { swapped += 1; continue; }
         if (broken) throw error;
+        const status = typeof details.status === 'number' ? details.status : null;
         // 外しすぎて回す先が無くなった (404) ら、外したものを忘れて1回だけ送り直す
-        if (error.status === 404 && ignored.length > treeConfig.ignoreProviders.length && !cleared) {
+        if (status === 404 && ignored.length > treeConfig.ignoreProviders.length && !cleared) {
           forgetAvoidedProviders();
           cleared = true;
           continue;
         }
-        if ([401, 402, 403].includes(error.status)) throw new StopRun(`OpenRouter HTTP ${error.status}`, 'auth');
-        if (/BUDGET/.test(error.code ?? '')) throw new StopRun(error.message, 'budget');
-        const wait = Number.isFinite(error.retryAt) ? error.retryAt - Date.now() : null;
-        if (wait !== null && wait > treeConfig.maxWaitMs) {
-          throw new StopRun(`無料枠の上限 (再開 ${new Date(error.retryAt).toISOString()})`, 'quota');
+        if (status !== null && [401, 402, 403].includes(status)) throw new StopRun(`OpenRouter HTTP ${status}`, 'auth');
+        if (/BUDGET/.test(String(details.code ?? ''))) throw new StopRun(message, 'budget');
+        const retryAt = typeof details.retryAt === 'number' && Number.isFinite(details.retryAt) ? details.retryAt : null;
+        const wait = retryAt !== null ? retryAt - Date.now() : null;
+        if (retryAt !== null && wait !== null && wait > treeConfig.maxWaitMs) {
+          throw new StopRun(`無料枠の上限 (再開 ${new Date(retryAt).toISOString()})`, 'quota');
         }
-        if (!error.retryable || transient >= 5) throw error;
+        if (!details.retryable || transient >= 5) throw error;
         await sleep(Math.max(wait ?? 0, 5000 * (transient + 1)));
       }
     }
@@ -319,10 +355,10 @@ export function openRouterCaller({ guildId, models = treeConfig.models, runId = 
 
 // ---- 出力の検査 -------------------------------------------------------------
 
-const flat = (text) => String(text ?? '').replace(/\[e\d+\]|\[\[[^\]]*\]\]/g, '').replace(/^\d+\|/gm, '').replace(/\s+/g, '');
+const flat = (text: unknown): string => String(text ?? '').replace(/\[e\d+\]|\[\[[^\]]*\]\]/g, '').replace(/^\d+\|/gm, '').replace(/\s+/g, '');
 
 /** 文のうち、ログと10字以上そのまま一致する部分の割合 (丸写しの検出)。 */
-export function copiedRatio(text, flatTranscript) {
+export function copiedRatio(text: unknown, flatTranscript: string): number {
   const chars = [...flat(text)];
   if (chars.length < 16) return 0;
   let hit = 0;
@@ -334,8 +370,9 @@ export function copiedRatio(text, flatTranscript) {
   return total ? hit / total : 0;
 }
 
-const linesOf = (value) => (Array.isArray(value) ? value : [value]).filter((item) => typeof item === 'string' && item.trim());
-const pathOf = (guildId, raw) => {
+const linesOf = (value: unknown): string[] => (Array.isArray(value) ? arrayOf(value) : [value])
+  .filter((item): item is string => typeof item === 'string' && Boolean(item.trim()));
+const pathOf = (guildId: string, raw: unknown): string | null => {
   const normalized = normalizePath(raw);
   return normalized ? resolveExisting(guildId, placeTopLevel(guildId, normalized)) : null;
 };
@@ -345,11 +382,13 @@ const pathOf = (guildId, raw) => {
  * provider が空の JSON を返した、または実在しない行番号の出来事を1件だけ返した
  * (Morph がそうした。知識は出来事にぶら下がるので、出来事が無ければ全部捨てられる)。
  */
-export function checkSegmentOutput(pack, json) {
+const rec = (value: unknown): JsonRecord => (isRecord(value) ? value : {});
+
+export function checkSegmentOutput(pack: { text: string; lineMap?: ReadonlyMap<number, LineEntry> }, json: unknown): void {
   if (pack.text.length < treeConfig.emptyChars) return;
-  const episodes = Array.isArray(json?.episodes) ? json.episodes : [];
-  const usable = episodes.filter((episode) => String(episode?.title ?? '').trim() && String(episode?.summary ?? '').trim()
-    && (Array.isArray(episode?.lines) ? episode.lines : []).some((n) => pack.lineMap?.has(Number(n))));
+  const episodes = arrayOf(rec(json).episodes);
+  const usable = episodes.map(rec).filter((episode) => String(episode.title ?? '').trim() && String(episode.summary ?? '').trim()
+    && arrayOf(episode.lines).some((n) => pack.lineMap?.has(Number(n))));
   if (usable.length === 0) {
     throw badOutput(`segment output had no usable episode for ${pack.text.length} chars (${episodes.length} returned)`);
   }
@@ -359,57 +398,78 @@ export function checkSegmentOutput(pack, json) {
  * 区切りの結果を、区切りの記録・cursor と同じトランザクションで入れる。
  * 出来事は根拠の行が1つも実在しなければ捨てる (たどれない出来事を作らない)。
  */
-export function applySegmentResult(guildId, pack, result, { model, now = Date.now(), advance = true } = {}) {
-  if (!result || typeof result !== 'object') throw badOutput('segment output is not an object');
+export interface DroppedCounts {
+  noSource: number;
+  copied: number;
+  unsourced: number;
+}
+
+export interface SegmentReport {
+  episodes: number;
+  facts: number;
+  related: number;
+  dropped: DroppedCounts;
+  pages: string[];
+}
+
+const isLine = (line: LineEntry | undefined): line is LineEntry => Boolean(line);
+const isId = (id: string | undefined): id is string => Boolean(id);
+
+export function applySegmentResult(guildId: string, pack: Pack, output: unknown,
+  { model, now = Date.now(), advance = true }: { model?: string | null; now?: number; advance?: boolean } = {}): SegmentReport {
+  if (!isRecord(output)) throw badOutput('segment output is not an object');
+  const result = output;
   if (!Array.isArray(result.episodes) && !Array.isArray(result.facts)) throw badOutput('segment output has no episodes/facts');
-  const episodes = Array.isArray(result.episodes) ? result.episodes : [];
-  const facts = Array.isArray(result.facts) ? result.facts : [];
-  const created = Array.isArray(result.new) ? result.new : [];
+  const episodes = arrayOf(result.episodes);
+  const facts = arrayOf(result.facts);
+  const created = arrayOf(result.new);
 
   const flatTranscript = flat(pack.text);
-  const report = { episodes: 0, facts: 0, related: 0, dropped: { noSource: 0, copied: 0, unsourced: 0 }, pages: new Set() };
+  const report = { episodes: 0, facts: 0, related: 0, dropped: { noSource: 0, copied: 0, unsourced: 0 }, pages: new Set<string>() };
   memoryDb().transaction(() => {
     // 新しいページの説明と別名 (出来事より先に作る)
-    for (const entry of created.slice(0, 60)) {
-      const path = pathOf(guildId, entry?.path);
+    for (const entry of created.slice(0, 60).map(rec)) {
+      const path = pathOf(guildId, entry.path);
       if (!path || depthOf(path) < 2) continue;
       ensureNode(guildId, path, { summary: String(entry.summary ?? '').trim().slice(0, 80), now });
       addAliases(guildId, path, linesOf(entry.aliases ?? []));
     }
 
-    const ids = [];
-    for (const episode of episodes.slice(0, 60)) {
-      const cited = (Array.isArray(episode?.lines) ? episode.lines : [])
-        .map((n) => pack.lineMap.get(Number(n))).filter(Boolean).slice(0, 8);
-      const title = String(episode?.title ?? '').trim().slice(0, 60);
-      const summary = String(episode?.summary ?? '').trim().slice(0, 400);
-      if (cited.length === 0 || !title || !summary) { ids.push(null); report.dropped.noSource += 1; continue; }
+    const ids: ({ id: number; at: number; end: number } | null)[] = [];
+    for (const episode of episodes.slice(0, 60).map(rec)) {
+      const cited = arrayOf(episode.lines)
+        .map((n) => pack.lineMap.get(Number(n))).filter(isLine).slice(0, 8);
+      const title = String(episode.title ?? '').trim().slice(0, 60);
+      const summary = String(episode.summary ?? '').trim().slice(0, 400);
+      const [first] = cited;
+      if (!first || !title || !summary) { ids.push(null); report.dropped.noSource += 1; continue; }
       const at = Math.min(...cited.map((line) => line.firstMs));
       const end = Math.max(...cited.map((line) => line.lastMs));
       // 決め台詞は行番号で指させて、原文はアーカイブの発言をそのまま使う (写させない)
-      const highlights = [...new Set((Array.isArray(episode.quotes) ? episode.quotes : [])
-        .map((n) => pack.lineMap.get(Number(n))?.ids[0]).filter(Boolean))].slice(0, 3);
+      const highlights = [...new Set(arrayOf(episode.quotes)
+        .map((n) => pack.lineMap.get(Number(n))?.ids[0]).filter(isId))].slice(0, 3);
       const id = insertEpisode(guildId, {
         kind: String(episode.kind ?? '').replace(/[\s\n]+/g, ' ').trim().slice(0, KIND_CHARS),
-        title, summary, channelId: cited[0].channelId, atMs: at, endMs: end,
+        title, summary, channelId: first.channelId, atMs: at, endMs: end,
         sources: [...new Set([...cited.flatMap((line) => line.ids.slice(0, 2)), ...highlights])].slice(0, 12),
         highlights,
         importance: [1, 2, 3].includes(Number(episode.importance)) ? Number(episode.importance) : 2, now
       });
       ids.push({ id, at, end });
-      const paths = linesOf(episode.nodes ?? []).map((raw) => pathOf(guildId, raw)).filter((path) => path && depthOf(path) >= 2);
+      const paths = linesOf(episode.nodes ?? []).map((raw) => pathOf(guildId, raw))
+        .filter((path): path is string => Boolean(path) && path !== null && depthOf(path) >= 2);
       for (const path of paths) ensureNode(guildId, path, { now });
       linkEpisodeNodes(guildId, id, paths, now);
-      const related = (Array.isArray(episode.related) ? episode.related : [])
-        .map((value) => Number(String(value).replace(/^e/i, ''))).filter(Number.isInteger);
+      const related = arrayOf(episode.related)
+        .map((value) => Number(String(value).replace(/^e/i, ''))).filter((value) => Number.isInteger(value));
       report.related += linkEpisodes(guildId, id, related);
       report.episodes += 1;
     }
 
-    for (const fact of facts.slice(0, 200)) {
-      const path = pathOf(guildId, fact?.path);
-      const text = String(fact?.text ?? '').trim();
-      const source = ids[Number(fact?.episode)];
+    for (const fact of facts.slice(0, 200).map(rec)) {
+      const path = pathOf(guildId, fact.path);
+      const text = String(fact.text ?? '').trim();
+      const source = ids[Number(fact.episode)];
       if (!path || !text || depthOf(path) < 2) continue;
       if (!source) { report.dropped.unsourced += 1; continue; }
       if (copiedRatio(text, flatTranscript) >= treeConfig.copyRatio) { report.dropped.copied += 1; continue; }
@@ -430,75 +490,90 @@ export function applySegmentResult(guildId, pack, result, { model, now = Date.no
 }
 
 /** 読めない出力が続いた区切りは failed として記録し、先へ進む (止まり続けない)。 */
-function skipPack(guildId, pack, error, now = Date.now()) {
+function skipPack(guildId: string, pack: Pack, error: unknown, now = Date.now()): void {
   memoryDb().transaction(() => {
     for (const segment of pack.segments) {
-      recordSegment(guildId, segment, { status: 'failed', error: String(error?.message ?? error).slice(0, 300), now });
+      recordSegment(guildId, segment, { status: 'failed', error: String(detailsOf(error).message ?? error).slice(0, 300), now });
       setCursor(guildId, segment.channelId, segment.toId, segment.toMs);
     }
   })();
 }
 
-const childName = (name) => String(name ?? '').replace(/[/\\[\]]/g, ' ').replace(/[\s　]+/g, ' ').trim().slice(0, 48);
-const refsIn = (text) => new Set([...String(text ?? '').matchAll(/\[e(\d+)\]/g)].map((m) => m[1]));
+const childName = (name: unknown): string => String(name ?? '').replace(/[/\\[\]]/g, ' ').replace(/[\s　]+/g, ' ').trim().slice(0, 48);
+const refsIn = (text: unknown): Set<string> => new Set([...String(text ?? '').matchAll(/\[e(\d+)\]/g)].map((m) => m[1] ?? ''));
+
+/** 統合・仕分けに渡したページと、渡した統合待ちの部分。 */
+export interface PendingJob {
+  path: string;
+  consumed: string;
+}
+
+/** 渡したはずのページが無い (管理者が途中で移した・消した)。元の挙動どおり組ごと失敗にする。 */
+function nodeFor(guildId: string, path: string): NonNullable<ReturnType<typeof getNode>> {
+  const node = getNode(guildId, path);
+  if (!node) throw new Error(`node missing: ${path}`);
+  return node;
+}
 
 /**
  * 統合の結果を入れる。batch は { path, consumed } (渡した統合待ちの部分) の配列。
  * 渡したのに書かれなかったページ・検査に落ちたページは統合待ちのまま残して数える。
  */
-export function applyIntegrateResult(guildId, batch, result, { now = Date.now() } = {}) {
-  const pages = Array.isArray(result?.pages) ? result.pages : null;
+export function applyIntegrateResult(guildId: string, batch: readonly PendingJob[], result: unknown,
+  { now = Date.now() }: { now?: number } = {}): { done: string[]; failed: { path: string; problem: string }[] } {
+  const pages = isRecord(result) && Array.isArray(result.pages) ? arrayOf(result.pages) : null;
   if (!pages) throw badOutput('integrate output has no pages');
-  const byPath = new Map();
+  const byPath = new Map<string, JsonRecord>();
   for (const page of pages) {
-    const path = normalizePath(page?.path);
+    if (!isRecord(page)) continue;
+    const path = normalizePath(page.path);
     if (path) byPath.set(path, page);
   }
-  const done = [];
-  const failed = [];
+  const done: string[] = [];
+  const failed: { path: string; problem: string }[] = [];
   memoryDb().transaction(() => {
     for (const item of batch) {
       const page = byPath.get(item.path);
-      const node = getNode(guildId, item.path);
+      const node = nodeFor(guildId, item.path);
       const body = typeof page?.body === 'string' ? page.body.trim() : '';
-      const children = Array.isArray(page?.children) ? page.children : [];
+      const children = arrayOf(page?.children).map(rec);
       const deepest = depthOf(item.path) >= MAX_DEPTH;
       const before = `${node.body}\n${item.consumed}`.trim();
-      const kept = body.length + children.reduce((sum, child) => sum + String(child?.body ?? '').length, 0);
+      const kept = body.length + children.reduce((sum, child) => sum + String(child.body ?? '').length, 0);
       const floor = deepest ? 0.15 : 0.3;
       const problem = !page ? 'not returned'
         : !body ? 'empty body'
         : body.length > treeConfig.nodeChars ? 'body too long'
         : kept < before.length * floor ? `dropped too much (${kept}/${before.length})`
-        : refsIn(before).size > 0 && refsIn(body).size === 0 && children.every((child) => refsIn(child?.body).size === 0)
+        : refsIn(before).size > 0 && refsIn(body).size === 0 && children.every((child) => refsIn(child.body).size === 0)
           ? 'lost every [e] reference'
         : deepest && children.length > 0 ? 'children at max depth'
         : null;
-      if (problem) { failed.push({ path: item.path, problem }); continue; }
+      if (problem || !page) { failed.push({ path: item.path, problem: problem ?? 'not returned' }); continue; }
 
       // 統合待ちは渡したぶんだけ消す (渡した後に足されたぶんは残す)
       const rest = node.pending.startsWith(item.consumed) ? node.pending.slice(item.consumed.length) : '';
       writePage(guildId, item.path, { summary: String(page.summary ?? '').trim().slice(0, 80), body,
         aliases: linesOf(page.aliases ?? []), now });
       if (rest.trim()) {
-        memoryDb().prepare('UPDATE nodes SET pending = ?, pending_count = ? WHERE guild_id = ? AND path = ?')
+        memoryDb().prepare<[string, number, string, string]>('UPDATE nodes SET pending = ?, pending_count = ? WHERE guild_id = ? AND path = ?')
           .run(rest, rest.split('\n').filter(Boolean).length, guildId, item.path);
       }
       linkPageMentions(guildId, item.path, body, now);
 
       for (const child of children.slice(0, 20)) {
-        const name = childName(child?.name);
-        const childBody = String(child?.body ?? '').trim();
+        const name = childName(child.name);
+        const childBody = String(child.body ?? '').trim();
         if (!name || !childBody) continue;
         const target = resolveExisting(guildId, `${item.path}/${name}`);
         ensureNode(guildId, target, { summary: String(child.summary ?? '').trim().slice(0, 80), now });
         const existing = getNode(guildId, target);
-        if (existing.body) {
+        if (existing?.body) {
           // 既にある子は、移された内容を統合待ちに回す (次の統合で既存の本文と混ぜる)
           addPending(guildId, target, childBody.split('\n'), { firstAt: node.first_at ?? now, lastAt: node.last_at ?? now, now });
         } else {
           writePage(guildId, target, { summary: String(child.summary ?? '').trim().slice(0, 80), body: childBody, now });
-          memoryDb().prepare('UPDATE nodes SET weight = weight + ?, first_at = ?, last_at = ? WHERE guild_id = ? AND path = ?')
+          memoryDb().prepare<[number, number | null, number | null, string, string]>('UPDATE nodes SET weight = weight + ?, first_at = ?, last_at = ? WHERE guild_id = ? AND path = ?')
             .run(Math.max(1, refsIn(childBody).size), node.first_at, node.last_at, guildId, target);
           linkPageMentions(guildId, target, childBody, now);
         }
@@ -515,26 +590,27 @@ export function applyIntegrateResult(guildId, batch, result, { now = Date.now() 
  * 子ページからも出来事をたどれるように、行が引いている出来事を子にも結ぶ。
  * main と、どこにも入らなかった行は親の統合待ちの末尾へ戻す (次の仕分けで同じ行を先頭から読み直さない)。
  */
-export function applySortResult(guildId, job, result, { now = Date.now() } = {}) {
-  const children = Array.isArray(result?.children) ? result.children : null;
+export function applySortResult(guildId: string, job: PendingJob, result: unknown,
+  { now = Date.now() }: { now?: number } = {}): { moved: number; kept: number; children: string[] } {
+  const children = isRecord(result) && Array.isArray(result.children) ? arrayOf(result.children) : null;
   if (!children) throw badOutput('sort output has no children');
   if (depthOf(job.path) >= MAX_DEPTH) throw badOutput('cannot sort at max depth');
   const lines = sortLines(job.consumed);
-  const owner = new Map();
-  const groups = [];
+  const owner = new Map<number, number>();
+  const groups: { name: string; summary: string; lines: number[] }[] = [];
   // 兄弟や祖先と同じ名前の子は作らない (people/あかり/Linux・環境 を「技術・言語観」1つへ丸ごと移した)
   // (兄弟を見るのは深いページだけ。people/あかり の兄弟は人の名前なので見ても意味がない)
-  const siblings = depthOf(job.path) >= 3 ? listChildren(guildId, parentOf(job.path), 200).map((row) => nameOf(row.path)) : [];
+  const siblings = depthOf(job.path) >= 3 ? listChildren(guildId, parentOf(job.path) ?? '', 200).map((row) => nameOf(row.path)) : [];
   const taken = new Set([...job.path.split('/'), ...siblings].map(nameKeyOf));
   const own = new Set(listChildren(guildId, job.path, 200).map((row) => nameKeyOf(nameOf(row.path))));
-  for (const child of children.slice(0, 10)) {
-    const name = childName(child?.name).slice(0, 24);
+  for (const child of children.slice(0, 10).map(rec)) {
+    const name = childName(child.name).slice(0, 24);
     if (!name || (taken.has(nameKeyOf(name)) && !own.has(nameKeyOf(name)))) continue;
-    const picked = [...new Set((Array.isArray(child?.lines) ? child.lines : []).map(Number))]
+    const picked = [...new Set(arrayOf(child.lines).map(Number))]
       .filter((n) => Number.isInteger(n) && n >= 1 && n <= lines.length && !owner.has(n));
     if (picked.length === 0) continue;
     for (const n of picked) owner.set(n, groups.length);
-    groups.push({ name, summary: String(child?.summary ?? '').trim().slice(0, 80), lines: picked });
+    groups.push({ name, summary: String(child.summary ?? '').trim().slice(0, 80), lines: picked });
   }
   // 子へ4割も回さないなら仕分けになっていない (本文に戻すだけで終わる)。1つの子へ9割以上なら、名前を変えただけ
   if (groups.length === 0 || owner.size < lines.length * 0.4) {
@@ -544,16 +620,17 @@ export function applySortResult(guildId, job, result, { now = Date.now() } = {})
     throw badOutput(`sort did not split (${groups.map((group) => `${group.name}:${group.lines.length}`).join(', ')})`);
   }
   const main = lines.filter((_, i) => !owner.has(i + 1));
-  const known = memoryDb().prepare('SELECT 1 FROM episodes WHERE guild_id = ? AND id = ?');
-  const moved = [];
+  const known = memoryDb().prepare<[string, number]>('SELECT 1 FROM episodes WHERE guild_id = ? AND id = ?');
+  const moved: string[] = [];
   memoryDb().transaction(() => {
     const node = getNode(guildId, job.path);
     // 仕分けている間に足された知識は末尾にある。渡した部分が先頭に無ければ、誰かが書き換えている
-    if (!node.pending.startsWith(job.consumed)) throw badOutput('pending changed during the sort');
+    if (!node || !node.pending.startsWith(job.consumed)) throw badOutput('pending changed during the sort');
     for (const group of groups) {
       const target = resolveExisting(guildId, `${job.path}/${group.name}`);
       ensureNode(guildId, target, { summary: group.summary, now });
-      const text = group.lines.map((n) => lines[n - 1]);
+      // 番号は 1〜lines.length に絞ってあるので、どの行もある
+      const text = group.lines.map((n) => lines[n - 1]).filter((line): line is string => line !== undefined);
       addPending(guildId, target, text, { firstAt: node.first_at ?? now, lastAt: node.last_at ?? now, now });
       const refs = new Set(text.flatMap((line) => [...line.matchAll(/\[e(\d+)\]/g)].map((m) => Number(m[1]))));
       for (const id of refs) if (known.get(guildId, id)) linkEpisodeNodes(guildId, id, [target], now);
@@ -561,7 +638,7 @@ export function applySortResult(guildId, job, result, { now = Date.now() } = {})
     }
     const rest = node.pending.slice(job.consumed.length);
     const pending = `${rest}${main.length ? `${main.join('\n')}\n` : ''}`;
-    memoryDb().prepare('UPDATE nodes SET pending = ?, pending_count = ?, updated_at = ? WHERE guild_id = ? AND path = ?')
+    memoryDb().prepare<[string, number, number, string, string]>('UPDATE nodes SET pending = ?, pending_count = ?, updated_at = ? WHERE guild_id = ? AND path = ?')
       .run(pending, pending.split('\n').filter(Boolean).length, now, guildId, job.path);
   })();
   forgetNames(guildId);
@@ -570,7 +647,7 @@ export function applySortResult(guildId, job, result, { now = Date.now() } = {})
 
 // ---- プロンプト ---------------------------------------------------------------
 
-export function segmentPrompt(guildId, pack) {
+export function segmentPrompt(guildId: string, pack: Pack): string {
   const index = treeIndex(guildId, treeConfig.indexChars);
   const known = knownPagesFor(guildId, pack.text, { maxChars: treeConfig.knownChars });
   const tops = topLevels(guildId).map((path) => `${path} — ${getNode(guildId, path)?.summary ?? ''}`);
@@ -591,10 +668,10 @@ export function segmentPrompt(guildId, pack) {
   ].join('\n');
 }
 
-function integratePrompt(guildId, batch) {
+function integratePrompt(guildId: string, batch: readonly PendingJob[]): string {
   const index = treeIndex(guildId, 4000);
   const blocks = batch.map((item) => {
-    const node = getNode(guildId, item.path);
+    const node = nodeFor(guildId, item.path);
     const children = listChildren(guildId, item.path, 30).map((child) => `${nameOf(child.path)} — ${child.summary || ''}`);
     return [
       `### ${item.path}`,
@@ -616,14 +693,14 @@ function integratePrompt(guildId, batch) {
   return [`木の索引 (リンクに使えるパス):\n${index.text}`, ...blocks, '各ページを書き直して JSON だけで出力してください。'].join('\n\n');
 }
 
-const sortLines = (consumed) => consumed.split('\n').filter((line) => line.trim());
-const nameKeyOf = (name) => String(name ?? '').normalize('NFKC').toLowerCase().replace(/[\s・･_\-]/g, '');
+const sortLines = (consumed: string): string[] => consumed.split('\n').filter((line) => line.trim());
+const nameKeyOf = (name: unknown): string => String(name ?? '').normalize('NFKC').toLowerCase().replace(/[\s・･_\-]/g, '');
 
-export function sortPrompt(guildId, job) {
-  const node = getNode(guildId, job.path);
+export function sortPrompt(guildId: string, job: PendingJob): string {
+  const node = nodeFor(guildId, job.path);
   const children = listChildren(guildId, job.path, 30).map((child) => `${nameOf(child.path)} — ${child.summary || ''}`);
   const lines = sortLines(job.consumed);
-  const parent = parentOf(job.path);
+  const parent = parentOf(job.path) ?? '';
   const siblings = depthOf(job.path) >= 3
     ? listChildren(guildId, parent, 30).map((row) => nameOf(row.path)).filter((name) => name !== nameOf(job.path)) : [];
   return [
@@ -641,8 +718,8 @@ export function sortPrompt(guildId, job) {
   ].join('\n');
 }
 
-function rootPrompt(guildId) {
-  const parts = [];
+function rootPrompt(guildId: string): string {
+  const parts: string[] = [];
   let used = 0;
   for (const top of topLevels(guildId)) {
     const node = getNode(guildId, top);
@@ -664,44 +741,45 @@ function rootPrompt(guildId) {
 
 // ---- ロック ----------------------------------------------------------------
 
-function alive(pid) {
-  try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (error) { return detailsOf(error).code === 'EPERM'; }
 }
 
-export function acquireLock(guildId, now = Date.now()) {
+export function acquireLock(guildId: string, now = Date.now()): () => void {
   const key = `lock:${guildId}`;
   return memoryDb().transaction(() => {
     const held = getState(key);
-    const live = held && held.pid !== process.pid
+    const live = isLockState(held) && held.pid !== process.pid
       && (held.host === hostname() ? alive(held.pid) && now - held.at < 6 * 3_600_000 : now - held.at < 30 * 60_000);
     if (live) throw new StopRun(`別の builder (pid ${held.pid}) が実行中です`, 'locked');
     setState(key, { pid: process.pid, host: hostname(), at: now });
-    return () => { if (getState(key)?.pid === process.pid) setState(key, null); };
+    return () => { const current = getState(key); if (isRecord(current) && current.pid === process.pid) setState(key, null); };
   }).immediate();
 }
 
 // ---- 一時停止と進捗の分母 ---------------------------------------------------
 
 /** Discord の /memory pause が書く。builder は区切りの境目で止まる (読みかけは失わない)。 */
-export function setPaused(guildId, by, now = Date.now()) {
+export function setPaused(guildId: string, by: string | null, now = Date.now()): void {
   setState(`pause:${guildId}`, by ? { by, at: now } : null);
 }
 
-export function pausedBy(guildId) {
-  return getState(`pause:${guildId}`);
+export function pausedBy(guildId: string): PauseState | null {
+  const paused = getState(`pause:${guildId}`);
+  return isPauseState(paused) ? paused : null;
 }
 
 /**
  * 読む対象 (公開チャンネルの人間の発言) の総数。/memory status の分母。
  * 全件を数えるので bot ではなく builder が6時間に1回だけ数えて控える。
  */
-export function refreshTotals(guildId, channelIds, now = Date.now()) {
+export function refreshTotals(guildId: string, channelIds: readonly string[], now = Date.now()): Totals {
   const key = `totals:${guildId}`;
   const held = getState(key);
-  if (held && now - held.at < 6 * 3_600_000 && held.channels === channelIds.length) return held;
-  const count = archive.prepare('SELECT COUNT(*) AS n FROM messages WHERE channel_id = ? AND deleted = 0 AND is_bot = 0');
+  if (isTotals(held) && now - held.at < 6 * 3_600_000 && held.channels === channelIds.length) return held;
+  const count = archive.prepare<[string], { n: number }>('SELECT COUNT(*) AS n FROM messages WHERE channel_id = ? AND deleted = 0 AND is_bot = 0');
   let messages = 0;
-  for (const channelId of channelIds) messages += count.get(channelId).n;
+  for (const channelId of channelIds) messages += count.get(channelId)?.n ?? 0;
   const totals = { messages, channels: channelIds.length, at: now };
   setState(key, totals);
   return totals;
@@ -713,12 +791,13 @@ export function refreshTotals(guildId, channelIds, now = Date.now()) {
  * 統合する組。統合待ちの多いページから、合計の文字数上限まで。
  * 1ページの統合待ちが大きすぎるときは先頭から渡せるぶんだけ渡す (残りは次)。
  */
-function integrationBatch(guildId, { minChars, skip, newOnly = false }) {
-  const batch = [];
+function integrationBatch(guildId: string,
+  { minChars, skip, newOnly = false }: { minChars: number; skip: ReadonlySet<string>; newOnly?: boolean }): PendingJob[] | null {
+  const batch: PendingJob[] = [];
   let used = 0;
   for (const row of pendingNodes(guildId, { minChars, limit: 60, newOnly })) {
     if (skip.has(row.path) || needsSort(guildId, row.path, row.pending_chars)) continue;
-    const failures = getState(`integrate-fail:${guildId}:${row.path}`)?.count ?? 0;
+    const failures = countOf(getState(`integrate-fail:${guildId}:${row.path}`));
     if (failures >= treeConfig.failuresBeforeSkip) {
       // 統合できないページでも知識は落とさない (本文の末尾へそのまま移す)
       flushPendingRaw(guildId, row.path);
@@ -726,6 +805,7 @@ function integrationBatch(guildId, { minChars, skip, newOnly = false }) {
       continue;
     }
     const node = getNode(guildId, row.path);
+    if (!node) continue;   // 今読んだ行なので必ずある
     const room = Math.max(1500, treeConfig.integrateBatchChars - used - node.body.length - 400);
     if (batch.length > 0 && treeConfig.integrateBatchChars - used - node.body.length - 400 < 1500) break;
     let consumed = node.pending;
@@ -741,16 +821,18 @@ function integrationBatch(guildId, { minChars, skip, newOnly = false }) {
 }
 
 /** 書き直す前に子ページへ仕分けるページか。仕分けに3回失敗したら普通の統合へ戻す。 */
-function needsSort(guildId, path, pendingChars) {
+function needsSort(guildId: string, path: string, pendingChars: number): boolean {
   return pendingChars >= treeConfig.sortChars && depthOf(path) < MAX_DEPTH
-    && (getState(`sort-fail:${guildId}:${path}`)?.count ?? 0) < treeConfig.failuresBeforeSkip;
+    && countOf(getState(`sort-fail:${guildId}:${path}`)) < treeConfig.failuresBeforeSkip;
 }
 
 /** 仕分けるページを1つ。統合待ちの多い順に、先頭から渡せるぶんだけ (残りは次の仕分けで)。 */
-function sortJob(guildId, { skip }) {
+function sortJob(guildId: string, { skip }: { skip: ReadonlySet<string> }): PendingJob | null {
   for (const row of pendingNodes(guildId, { minChars: treeConfig.sortChars, limit: 30 })) {
     if (skip.has(row.path) || !needsSort(guildId, row.path, row.pending_chars)) continue;
-    const { pending } = getNode(guildId, row.path);
+    const node = getNode(guildId, row.path);
+    if (!node) continue;   // 今読んだ行なので必ずある
+    const { pending } = node;
     const cut = pending.lastIndexOf('\n', treeConfig.sortBatchChars);
     return { path: row.path, consumed: pending.length <= treeConfig.sortBatchChars ? pending : pending.slice(0, cut + 1) };
   }
@@ -761,22 +843,52 @@ function sortJob(guildId, { skip }) {
  * 記憶を育てる。上限 (回数・時間) に達するか、読むものが無くなるか、無料枠が尽きたら止まる。
  * 何度止めても cursor と統合待ちの続きから再開できる。
  */
+export interface BuildStats {
+  calls: number;
+  segments: number;
+  messages: number;
+  episodes: number;
+  facts: number;
+  related: number;
+  integrated: number;
+  sorted: number;
+  dropped: DroppedCounts;
+  failed: number;
+  root: boolean;
+  stopped: string;
+  message?: string;
+}
+
+type Log = (line: string) => void;
+type SegmentRunner = (pack: Pack, options?: { advance?: boolean }) => Promise<boolean>;
+
+export interface RunBuildOptions {
+  guildId: string;
+  call: MemoryCaller;
+  maxCalls?: number;
+  maxMs?: number;
+  retryFailed?: boolean;
+  now?: () => number;
+  log?: Log;
+}
+
 export async function runBuild({
   guildId, call, maxCalls = Infinity, maxMs = Infinity, retryFailed = false,
   now = () => Date.now(), log = () => {}
-}) {
+}: RunBuildOptions): Promise<BuildStats> {
   const started = now();
   const release = acquireLock(guildId, started);
   ensureSeeds(guildId, started);
-  const stats = {
+  const stats: BuildStats = {
     calls: 0, segments: 0, messages: 0, episodes: 0, facts: 0, related: 0, integrated: 0, sorted: 0,
     dropped: { noSource: 0, copied: 0, unsourced: 0 }, failed: 0, root: false, stopped: 'done'
   };
-  const spent = () => stats.calls >= maxCalls || now() - started >= maxMs;
-  const skip = new Set();   // この実行で統合に失敗したページ (同じ実行では繰り返さない)
+  const spent = (): boolean => stats.calls >= maxCalls || now() - started >= maxMs;
+  const skip = new Set<string>();   // この実行で統合に失敗したページ (同じ実行では繰り返さない)
 
-  const segment = async (pack, { advance = true } = {}) => {
-    const key = `pack-fail:${guildId}:${pack.segments[0].channelId}:${pack.segments[0].fromId}`;
+  const segment: SegmentRunner = async (pack, { advance = true } = {}) => {
+    const head = pack.segments[0];
+    const key = `pack-fail:${guildId}:${head?.channelId}:${head?.fromId}`;
     stats.calls += 1;
     try {
       const result = await call({ kind: 'segment', system: SEGMENT_SYSTEM, user: segmentPrompt(guildId, pack),
@@ -790,15 +902,15 @@ export async function runBuild({
       stats.episodes += applied.episodes;
       stats.facts += applied.facts;
       stats.related += applied.related;
-      for (const k of Object.keys(stats.dropped)) stats.dropped[k] += applied.dropped[k];
+      for (const k of ['noSource', 'copied', 'unsourced'] as const) stats.dropped[k] += applied.dropped[k];
       log(`segment ${pack.segments.map((s) => `${s.label}(${s.messages})`).join(' ')} → 出来事 ${applied.episodes} / 知識 ${applied.facts}`
         + ` / つながり ${applied.related} / 捨てた ${JSON.stringify(applied.dropped)} [${result.model}]`);
       return true;
     } catch (error) {
       if (error instanceof StopRun) throw error;
-      const count = (getState(key)?.count ?? 0) + 1;
-      setState(key, { count, error: String(error.message).slice(0, 200) });
-      log(`segment failed (${count}/${treeConfig.failuresBeforeSkip}): ${error.message}`);
+      const count = countOf(getState(key)) + 1;
+      setState(key, { count, error: errorMessage(error).slice(0, 200) });
+      log(`segment failed (${count}/${treeConfig.failuresBeforeSkip}): ${errorMessage(error)}`);
       if (count >= treeConfig.failuresBeforeSkip && advance) {
         skipPack(guildId, pack, error, now());
         setState(key, null);
@@ -808,7 +920,7 @@ export async function runBuild({
     }
   };
 
-  const sortPage = async (job) => {
+  const sortPage = async (job: PendingJob): Promise<void> => {
     stats.calls += 1;
     const key = `sort-fail:${guildId}:${job.path}`;
     try {
@@ -822,16 +934,16 @@ export async function runBuild({
     } catch (error) {
       if (error instanceof StopRun) throw error;
       skip.add(job.path);
-      setState(key, { count: (getState(key)?.count ?? 0) + 1, problem: String(error.message).slice(0, 120) });
-      log(`sort failed ${job.path}: ${error.message}`);
+      setState(key, { count: countOf(getState(key)) + 1, problem: errorMessage(error).slice(0, 120) });
+      log(`sort failed ${job.path}: ${errorMessage(error)}`);
     }
   };
 
-  const integrate = async (batch) => {
+  const integrate = async (batch: PendingJob[]): Promise<void> => {
     stats.calls += 1;
-    const fail = (path, problem) => {
+    const fail = (path: string, problem: string): void => {
       skip.add(path);
-      const count = (getState(`integrate-fail:${guildId}:${path}`)?.count ?? 0) + 1;
+      const count = countOf(getState(`integrate-fail:${guildId}:${path}`)) + 1;
       setState(`integrate-fail:${guildId}:${path}`, { count, problem });
     };
     try {
@@ -843,8 +955,8 @@ export async function runBuild({
       log(`integrate ${done.join(', ') || '-'}${failed.length ? ` / 失敗 ${failed.map((f) => `${f.path}(${f.problem})`).join(', ')}` : ''}`);
     } catch (error) {
       if (error instanceof StopRun) throw error;
-      for (const item of batch) fail(item.path, String(error.message).slice(0, 120));
-      log(`integrate failed: ${error.message}`);
+      for (const item of batch) fail(item.path, errorMessage(error).slice(0, 120));
+      log(`integrate failed: ${errorMessage(error)}`);
     }
   };
 
@@ -862,22 +974,23 @@ export async function runBuild({
     refreshTotals(guildId, channelIds, now());
     if (retryFailed) await retryFailedSegments(guildId, channelIds, segment, spent, log);
 
-    let sinceRoot = getState(`root:${guildId}`)?.segments ?? 0;
+    let sinceRoot = rootSegments(guildId);
     const width = treeConfig.concurrency;
     // 作業プール: 1本終わるたびに、空いているチャンネル・ページから次の仕事を組んで投げる。
     // (波ごとに全部の終わりを待つと、2〜3分かかる統合に速い区切りが待たされていた)
     // 区切りはチャンネルが、統合はページが重ならないようにする。結果の反映はそれぞれの
     // トランザクションで1つずつ (統合待ちは末尾に足すだけなので、統合と区切りが同じページに
     // 触っても食い違わない)。
-    const inFlight = new Set();
-    const busyChannels = new Set();
+    const inFlight = new Set<Promise<void>>();
+    const busyChannels = new Set<string>();
     const busyPages = new Set(skip);
     let integrations = 0;
     let rootRunning = false;
-    let stopError = null;
-    const room = () => !stopError && inFlight.size < width && !spent();
-    const launch = (work, release) => {
-      const task = (async () => {
+    // 止める理由 (StopRun)。一時停止の確認が DB のエラーで落ちたときもここに入れ、走っている仕事を終えてから投げる
+    let stopError: unknown = null;
+    const room = (): boolean => !stopError && inFlight.size < width && !spent();
+    const launch = (work: () => Promise<unknown>, release: () => void): void => {
+      const run = async (): Promise<void> => {
         try {
           await work();
         } catch (error) {
@@ -887,10 +1000,11 @@ export async function runBuild({
           release();
           inFlight.delete(task);
         }
-      })();
+      };
+      const task = run();
       inFlight.add(task);
     };
-    const integrateLater = (batch, done = () => {}) => {
+    const integrateLater = (batch: PendingJob[], done: () => void = () => {}): void => {
       for (const item of batch) busyPages.add(item.path);
       integrations += 1;
       launch(() => integrate(batch), () => {
@@ -900,7 +1014,7 @@ export async function runBuild({
         for (const item of batch) if (!skip.has(item.path)) busyPages.delete(item.path);
       });
     };
-    const sortLater = (job) => {
+    const sortLater = (job: PendingJob): void => {
       busyPages.add(job.path);
       integrations += 1;
       launch(() => sortPage(job), () => {
@@ -909,7 +1023,7 @@ export async function runBuild({
       });
     };
     let newPageBatches = 0;
-    const fill = () => {
+    const fill = (): void => {
       const slots = Math.max(1, Math.floor(width / 2));
       // 溜まりすぎたページは書き直す前に子ページへ仕分ける (1ページ1本)
       while (room() && integrations < slots) {
@@ -941,7 +1055,7 @@ export async function runBuild({
         launch(async () => {
           if (await segment(pack)) {
             sinceRoot += 1;
-            setState(`root:${guildId}`, { ...(getState(`root:${guildId}`) ?? {}), segments: sinceRoot });
+            setState(`root:${guildId}`, { ...rootState(guildId), segments: sinceRoot });
           }
         }, () => { for (const s of pack.segments) busyChannels.delete(s.channelId); });
       }
@@ -965,7 +1079,7 @@ export async function runBuild({
         launch(() => rebuildRoot(guildId, call, stats, log), () => {
           rootRunning = false;
           sinceRoot = Math.max(0, sinceRoot - counted);
-          setState(`root:${guildId}`, { ...(getState(`root:${guildId}`) ?? {}), segments: sinceRoot });
+          setState(`root:${guildId}`, { ...rootState(guildId), segments: sinceRoot });
         });
       }
     };
@@ -981,8 +1095,8 @@ export async function runBuild({
     if (stopError) throw stopError;
 
     if (spent()) stats.stopped = 'limit';
-    const grown = memoryDb().prepare('SELECT 1 FROM nodes WHERE guild_id = ? AND weight > 0 LIMIT 1').get(guildId);
-    if (!spent() && grown && (!getNode(guildId, '')?.body || (getState(`root:${guildId}`)?.segments ?? 0) > 0)) {
+    const grown = memoryDb().prepare<[string]>('SELECT 1 FROM nodes WHERE guild_id = ? AND weight > 0 LIMIT 1').get(guildId);
+    if (!spent() && grown && (!getNode(guildId, '')?.body || rootSegments(guildId) > 0)) {
       await rebuildRoot(guildId, call, stats, log);
     }
   } catch (error) {
@@ -996,11 +1110,23 @@ export async function runBuild({
   return stats;
 }
 
-async function rebuildRoot(guildId, call, stats, log) {
+/** 根を書き直してから読んだ区切りの数 (state の root:<guild>)。 */
+function rootState(guildId: string): JsonRecord {
+  const saved = getState(`root:${guildId}`);
+  return isRecord(saved) ? saved : {};
+}
+
+function rootSegments(guildId: string): number {
+  const segments = rootState(guildId).segments;
+  return typeof segments === 'number' ? segments : 0;
+}
+
+async function rebuildRoot(guildId: string, call: MemoryCaller, stats: BuildStats, log: Log): Promise<void> {
   stats.calls += 1;
   try {
     const result = await call({ kind: 'root', system: ROOT_SYSTEM, user: rootPrompt(guildId) });
-    const body = typeof result.json?.body === 'string' ? result.json.body.trim() : '';
+    const json = rec(result.json);
+    const body = typeof json.body === 'string' ? json.body.trim() : '';
     if (!body) throw new Error('root body was empty');
     writePage(guildId, '', { body: body.slice(0, Math.round(treeConfig.rootChars * 1.5)) });
     linkPageMentions(guildId, '', body);
@@ -1009,19 +1135,19 @@ async function rebuildRoot(guildId, call, stats, log) {
     log(`root: ${body.length} 字`);
   } catch (error) {
     if (error instanceof StopRun) throw error;
-    log(`root failed: ${error.message}`);
+    log(`root failed: ${errorMessage(error)}`);
   }
 }
 
-async function retryFailedSegments(guildId, channelIds, segment, spent, log) {
+async function retryFailedSegments(guildId: string, channelIds: readonly string[], segment: SegmentRunner, spent: () => boolean, log: Log): Promise<void> {
   const allowed = new Set(channelIds);
-  const rows = memoryDb().prepare("SELECT * FROM segments WHERE guild_id = ? AND status = 'failed' ORDER BY from_ms").all(guildId)
+  const rows = memoryDb().prepare<[string], SegmentRow>("SELECT * FROM segments WHERE guild_id = ? AND status = 'failed' ORDER BY from_ms").all(guildId)
     .filter((row) => allowed.has(row.channel_id));   // 非公開になったチャンネルは読み直さない
   // チャンネルごとに古い順、チャンネルどうしは並べて読む (1本ずつだと66区切りに2時間かかった)
-  const byChannel = new Map();
+  const byChannel = new Map<string, SegmentRow[]>();
   for (const row of rows) byChannel.set(row.channel_id, [...(byChannel.get(row.channel_id) ?? []), row]);
   const queues = [...byChannel.values()];
-  const worker = async () => {
+  const worker = async (): Promise<void> => {
     for (let queue = queues.shift(); queue; queue = queues.shift()) {
       for (const row of queue) {
         if (spent()) return;
@@ -1032,10 +1158,10 @@ async function retryFailedSegments(guildId, channelIds, segment, spent, log) {
   await Promise.all(Array.from({ length: Math.max(1, treeConfig.concurrency) }, worker));
 }
 
-async function retryOne(guildId, row, segment, log) {
+async function retryOne(guildId: string, row: SegmentRow, segment: SegmentRunner, log: Log): Promise<void> {
   // 内容ごと拒否される区切りを毎回読み直して払い続けない (3回までで諦め、failed のまま残す)
   const key = `retry:${guildId}:${row.channel_id}:${row.from_id}`;
-  const tried = getState(key)?.count ?? 0;
+  const tried = countOf(getState(key));
   if (tried >= treeConfig.failuresBeforeSkip) return;
   const rendered = renderSegment({ guildId, channelId: row.channel_id, cursor: cursorBefore(row.from_id, row.from_ms),
     maxChars: Infinity, until: { id: row.to_id, ms: row.to_ms } });
