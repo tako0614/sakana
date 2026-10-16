@@ -6,7 +6,31 @@
 
 import { memoryRootPrompt } from '../memory/tool.js';
 import { agentConfig } from './config.js';
-import { formatMessages, shortTime } from './format.js';
+import { formatMessages, shortTime, type RefTable } from './format.js';
+import type { AgentContext, AgentMessage, ReplyChain } from './types.js';
+
+/** プロンプトの出し分けに使う可用性。tools.js の buildToolset が返すもの。 */
+export interface ToolAvailability {
+  archiveAvailable?: boolean;
+  semanticAvailable?: boolean;
+  governanceAvailable?: boolean;
+  memoryAvailable?: boolean;
+  browserAvailable?: boolean;
+}
+
+type PromptContext = Pick<AgentContext, 'browserFull'> & { guild?: Pick<AgentContext['guild'], 'id'> };
+
+/** 依頼メッセージ。返信の鎖をどこで止めたかを持たせて渡す。 */
+type RequestMessage = AgentMessage & { referenceState?: ReplyChain['referenceState'] };
+
+/** buildUserContent が見る文脈。検証では一部だけを持つ偽物を渡す。 */
+interface UserContentContext {
+  guild: { name: string };
+  channel: { id: string; name?: string | null };
+  member?: { displayName?: string; id?: string } | null;
+  me?: { displayName?: string } | null;
+  client?: { user?: { id?: string; displayName?: string; username?: string } | null } | null;
+}
 
 /**
  * ここは1文字も可変にしない。
@@ -16,7 +40,7 @@ import { formatMessages, shortTime } from './format.js';
  * 可変な情報は buildUserContent の側に置く。
  * 変わるのは可用性で出し入れする末尾のツール行だけ (ギルド単位でほぼ固定)。
  */
-export function buildSystemPrompt(ctx, toolset) {
+export function buildSystemPrompt(ctx: PromptContext, toolset: ToolAvailability): string {
   // チャンネル一覧はここに載せない。数の多いサーバーだと毎ターン払うことになるので、
   // 必要になったときだけ channels で取りに行かせる。
   const lines = [
@@ -149,7 +173,7 @@ export function buildSystemPrompt(ctx, toolset) {
     }
   }
 
-  if (toolset.memoryAvailable) {
+  if (toolset.memoryAvailable && ctx.guild) {
     const root = memoryRootPrompt(ctx.guild.id);
     if (root) lines.push('', root);
   }
@@ -165,8 +189,17 @@ const BACKGROUND_WITH_CHAIN = 10;
  * 最初のユーザーメッセージ。ここで直近の会話も一緒に渡してしまう。
  * ツールを1往復減らせるので、結果的にトークンが減る。
  */
-export function buildUserContent({ ctx, prompt, extras, recent, replyChain, requestMessage, refs, recall = '' }) {
-  const sections = [];
+export function buildUserContent({ ctx, prompt, extras, recent, replyChain, requestMessage, refs, recall = '' }: {
+  ctx: UserContentContext;
+  prompt: string;
+  extras?: string;
+  recent?: AgentMessage[];
+  replyChain?: AgentMessage[];
+  requestMessage?: RequestMessage;
+  refs: RefTable;
+  recall?: string;
+}): string {
+  const sections: string[] = [];
   const selfId = ctx.client?.user?.id;
 
   // 自分の表示名。行の `←自分の発言` は発言者が自分のときにしか付かないので、
@@ -205,7 +238,8 @@ export function buildUserContent({ ctx, prompt, extras, recent, replyChain, requ
   // 会話に出た名前から思い出したこと (記憶の本)。背景知識なので会話より前に置く。
   if (recall) sections.push(`## ${recall}`);
 
-  const hasChain = Boolean(replyChain?.length);
+  const chain = replyChain ?? [];
+  const hasChain = chain.length > 0;
 
   // 背景を先、返信の鎖を後に置く。
   //
@@ -232,10 +266,10 @@ export function buildUserContent({ ctx, prompt, extras, recent, replyChain, requ
 
   if (hasChain) {
     // 鎖の最後が「いま返信された相手」。ここが本題の起点なので明示する。
-    const target = replyChain[replyChain.length - 1];
+    const target = chain[chain.length - 1];
     sections.push([
       '## いま答えるべき話 (古い順。返信でつながっているぶんだけ)',
-      formatMessages(replyChain, {
+      formatMessages(chain, {
         refs,
         showChannel: false,
         bodyChars: 1200,

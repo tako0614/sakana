@@ -28,7 +28,7 @@ const PARTICLE_BRIDGE = /[\p{Script=Han}\p{Script=Katakana}ーA-Za-z0-9][はが�
  * 判定は意図的に甘い。誤検知の代償は「キーワードで既に0件だったときに
  * ローカルのベクトル走査が1回増える」だけで、見逃しの代償は機能そのもの。
  */
-export function looksLikeSentence(text) {
+export function looksLikeSentence(text: unknown): boolean {
   const flat = String(text ?? '').normalize('NFKC').trim();
   const chars = Array.from(flat);
 

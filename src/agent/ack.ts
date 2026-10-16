@@ -28,7 +28,7 @@ const ACKS = new Set([
  * メンション・カスタム絵文字・チャンネル参照・絵文字・句読点を落として、
  * 残りが空 (スタンプや画像だけのリプライ) か、相槌の語そのものなら true。
  */
-export function isBareAck(text) {
+export function isBareAck(text: unknown): boolean {
   const raw = String(text ?? '').trim();
 
   // 疑問符が付いていたら追撃。中身が「なるほど？」でも聞き返している。

@@ -7,8 +7,9 @@
 // stop() が即座に行を落とすので、この表はほぼ常に空。
 // agent_replies (ratelimit.js) と同じ考え方。
 
+import type { Client } from 'discord.js';
 import { db } from '../db.js';
-import { isAllowedGuild } from '../guilds.js';
+import { archive } from './boundary.js';
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS agent_indicators (
@@ -18,13 +19,18 @@ db.exec(`
   );
 `);
 
-const insertStmt = db.prepare(
+interface IndicatorRow {
+  message_id: string;
+  channel_id: string;
+}
+
+const insertStmt = db.prepare<[string, string, number]>(
   'INSERT OR REPLACE INTO agent_indicators (message_id, channel_id, created_at) VALUES (?, ?, ?)'
 );
-const deleteStmt = db.prepare('DELETE FROM agent_indicators WHERE message_id = ?');
-const listStmt = db.prepare('SELECT message_id, channel_id FROM agent_indicators');
+const deleteStmt = db.prepare<[string]>('DELETE FROM agent_indicators WHERE message_id = ?');
+const listStmt = db.prepare<[], IndicatorRow>('SELECT message_id, channel_id FROM agent_indicators');
 
-export function rememberIndicator(messageId, channelId) {
+export function rememberIndicator(messageId: string | null | undefined, channelId: string | null | undefined): void {
   if (!messageId || !channelId) return;
 
   try {
@@ -35,7 +41,7 @@ export function rememberIndicator(messageId, channelId) {
   }
 }
 
-export function forgetIndicator(messageId) {
+export function forgetIndicator(messageId: string | null | undefined): void {
   if (!messageId) return;
 
   try {
@@ -46,8 +52,8 @@ export function forgetIndicator(messageId) {
 }
 
 /** 前回の実行が消し損ねた経過表示を消す。起動時に1回だけ呼ぶ。 */
-export async function sweepStaleIndicators(client) {
-  let rows;
+export async function sweepStaleIndicators(client: Client): Promise<void> {
+  let rows: IndicatorRow[];
   try {
     rows = listStmt.all();
   } catch (error) {
@@ -63,7 +69,7 @@ export async function sweepStaleIndicators(client) {
 
     const channel = await client.channels.fetch(row.channel_id).catch(() => null);
     if (!channel?.isTextBased?.()) continue;
-    if (!isAllowedGuild(channel.guildId)) continue;
+    if (!('guildId' in channel) || !archive.isAllowedGuild(channel.guildId)) continue;
 
     await channel.messages.delete(row.message_id).catch(() => {});
   }

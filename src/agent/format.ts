@@ -1,14 +1,32 @@
 // Discord sources use structured JSON lines. Short citation numbers remain a
 // presentation convenience; author ids, reply targets and source state are explicit.
 
+import type { Message } from 'discord.js';
 import { TZ_OFFSET_HOURS } from '../archive/query.js';
-import { archiveStructure, discordStructure, discordExtraText, messageEnvelope } from '../conversation/message.js';
+import { discordStructure, discordExtraText } from '../conversation/message.js';
+import { conversation, type ArchiveRow } from './boundary.js';
+import {
+  isRecord,
+  numberField,
+  recordField,
+  stringField,
+  type AgentMessage,
+  type RefEntry,
+  type RefInput,
+  type ResolvedRef
+} from './types.js';
 
 const TZ_OFFSET_MS = TZ_OFFSET_HOURS * 3_600_000;
 
 // Discord のリンク。`https://discord.com/channels/<guild>/<channel>/<message>`
 // で、末尾のメッセージは無いこと (チャンネルへのリンク) もある。DM は guild が `@me`。
 const DISCORD_LINK = /discord(?:app)?\.com\/channels\/(\d{16,21}|@me)\/(\d{16,21})(?:\/(\d{16,21}))?/;
+
+export interface DiscordRef {
+  guildId: string | null;
+  channelId: string | null;
+  messageId: string | null;
+}
 
 /**
  * 貼られた文字列から Discord の参照を取り出す。
@@ -18,25 +36,23 @@ const DISCORD_LINK = /discord(?:app)?\.com\/channels\/(\d{16,21}|@me)\/(\d{16,21
  * 「これ何？」と聞くと、サーバー ID をメッセージ ID として読みに行っていた。
  *
  * リンクなら channel まで分かるので、どのチャンネルを読めばいいかも同時に確定する。
- *
- * @returns {{ guildId: string|null, channelId: string|null, messageId: string|null }|null}
  */
-export function parseDiscordRef(value) {
+export function parseDiscordRef(value: unknown): DiscordRef | null {
   const text = String(value ?? '');
 
   const link = DISCORD_LINK.exec(text);
   if (link) {
-    const [, guild, second, third] = link;
+    const [, guild, second = null, third] = link;
     return third
       // guild/channel/message
-      ? { guildId: guild === '@me' ? null : guild, channelId: second, messageId: third }
+      ? { guildId: guild === '@me' ? null : guild ?? null, channelId: second, messageId: third }
       // guild/channel (チャンネルへのリンク)
-      : { guildId: guild === '@me' ? null : guild, channelId: second, messageId: null };
+      : { guildId: guild === '@me' ? null : guild ?? null, channelId: second, messageId: null };
   }
 
   // リンクでなければ素のスノーフレーク。`<#123>` のようなメンションもここで拾う。
-  const bare = /(\d{16,21})/.exec(text);
-  return bare ? { guildId: null, channelId: null, messageId: bare[1] } : null;
+  const bare = /(\d{16,21})/.exec(text)?.[1];
+  return bare ? { guildId: null, channelId: null, messageId: bare } : null;
 }
 
 /**
@@ -44,26 +60,29 @@ export function parseDiscordRef(value) {
  * モデルには番号だけを見せ、番号 → 実 ID の変換はこちらで持つ。
  */
 export class RefTable {
+  entries: RefEntry[];
+  byMessageId: Map<string, RefEntry>;
+
   constructor() {
     this.entries = [];
     this.byMessageId = new Map();
   }
 
-  add(message) {
+  add(message: RefInput | null | undefined): number | null {
     if (!message?.messageId) return null;
 
     const existing = this.byMessageId.get(message.messageId);
     if (existing) return existing.ref;
 
     const ref = this.entries.length + 1;
-    const entry = { ref, ...message };
+    const entry: RefEntry = { ref, ...message, messageId: message.messageId };
     this.entries.push(entry);
     this.byMessageId.set(message.messageId, entry);
     return ref;
   }
 
   /** 番号でも生の ID でも引けるようにする (モデルはどちらを渡してくるか読めない)。 */
-  resolve(value) {
+  resolve(value: unknown): ResolvedRef | null {
     if (value === null || value === undefined) return null;
 
     const text = String(value).trim().replace(/^[#[]|]$/g, '');
@@ -93,12 +112,12 @@ export class RefTable {
     return { messageId: parsed.messageId, channelId: parsed.channelId ?? null };
   }
 
-  get(ref) {
+  get(ref: number): RefEntry | null {
     return this.entries[ref - 1] ?? null;
   }
 }
 
-export function messageLink(entry) {
+export function messageLink(entry: ResolvedRef | null | undefined): string | null {
   if (!entry?.guildId || !entry?.channelId || !entry?.messageId) return null;
   return `https://discord.com/channels/${entry.guildId}/${entry.channelId}/${entry.messageId}`;
 }
@@ -118,14 +137,22 @@ export function messageLink(entry) {
  * 入っているので、全部並べると数百行になる。
  * 引けなかった番号は本文から消すだけで、末尾には出さない (リンク切れを作らない)。
  */
-export function expandCitations(text, refs, { label = null, selfId = null } = {}) {
+export function expandCitations(
+  text: unknown,
+  refs: RefTable,
+  { label = null, selfId = null }: { label?: string | null; selfId?: string | null } = {}
+): string {
   const raw = String(text ?? '');
-  const urls = [];
-  const seen = new Set();
+  const urls: string[] = [];
+  const seen = new Set<number>();
 
   // 直前の空白ごと食う。番号を抜いた跡に空白が残ると句点の前が空く。
   // 全角スペースも食う (日本語で書かせているので混ざる)。
-  const body = raw.replace(/[ \t　]*\[(\d{1,4})\]/g, (match, digits, offset) => {
+  //
+  // 空白の連なりは先頭からしか試さない (否定の後読み)。これが無いと、番号の続かない
+  // 長い空白の列で開始位置ごとに列の端まで読み直し、文字数の2乗で時間がかかる
+  // (回答はモデルが書くので、入力として長さを抑えられない)。一致する箇所は変わらない。
+  const body = raw.replace(/(?<![ \t　])[ \t　]*\[(\d{1,4})\]/g, (match: string, digits: string, offset: number) => {
     const ref = Number(digits);
     const entry = refs.get(ref);
     const url = messageLink(entry);
@@ -157,22 +184,22 @@ export function expandCitations(text, refs, { label = null, selfId = null } = {}
   return `${body.trim()}\n\n-# ${tail.join(' ')}`;
 }
 
-function collapse(text) {
+function collapse(text: unknown): string {
   return String(text ?? '').replace(/\s+/g, ' ').trim();
 }
 
-export function truncate(text, limit) {
+export function truncate(text: unknown, limit: number): string {
   const flat = collapse(text);
   if (flat.length <= limit) return flat;
   return `${flat.slice(0, limit)}…`;
 }
 
-function pad(value) {
+function pad(value: number): string {
   return String(value).padStart(2, '0');
 }
 
 /** MM/DD HH:MM 形式。年が今年と違うときだけ年を足す。 */
-export function shortTime(timestamp, now = Date.now()) {
+export function shortTime(timestamp: unknown, now = Date.now()): string {
   const local = new Date(Number(timestamp) + TZ_OFFSET_MS);
   const current = new Date(now + TZ_OFFSET_MS);
 
@@ -183,7 +210,7 @@ export function shortTime(timestamp, now = Date.now()) {
 }
 
 /** アーカイブ DB の行を共通形にそろえる。 */
-export function fromArchiveRow(row, channelName) {
+export function fromArchiveRow(row: ArchiveRow, channelName?: string | null): AgentMessage {
   return {
     guildId: row.guild_id,
     channelId: row.channel_id,
@@ -200,11 +227,13 @@ export function fromArchiveRow(row, channelName) {
     reactionCount: row.reaction_count ?? 0,
     replyTo: row.reply_to ?? null,
     attachmentCount: row.attachment_count ?? 0,
-    structure: archiveStructure(row)
+    structure: conversation.archiveStructure(row)
   };
 }
 
-/** discord.js の Message を共通形にそろえる。 */
+/** describeExtras が見る部分。偽物のメッセージ (検証用) でも同じ形を持つ。 */
+type MessageExtras = Pick<Message, 'attachments' | 'embeds' | 'stickers'>;
+
 /**
  * 本文が無いメッセージの中身。画像だけ・埋め込みだけの発言は content が空なので、
  * そのまま渡すと `(本文なし)` になって何が貼られたのか分からない。
@@ -212,8 +241,8 @@ export function fromArchiveRow(row, channelName) {
  * アーカイブの取り込みは同じものを extra に集めていて (`indexer.js`)、
  * 本文と添付・引用は別フィールドで保持し、共通envelopeでも出典を区別する。
  */
-export function describeExtras(message) {
-  const parts = [];
+export function describeExtras(message: MessageExtras): string {
+  const parts: string[] = [];
 
   for (const attachment of message.attachments?.values() ?? []) {
     parts.push(attachment.description ? `${attachment.name}: ${attachment.description}` : attachment.name);
@@ -233,11 +262,20 @@ export function describeExtras(message) {
   return parts.filter(Boolean).length ? truncate(parts.filter(Boolean).join(' / '), 120) : '';
 }
 
-export function fromDiscordMessage(message, channelName) {
+/**
+ * チャンネル名。DM には名前が無く、検証用の偽物は channel 自体を持たないことがある。
+ */
+function channelNameOf(message: Message): string | undefined {
+  const channel: unknown = message.channel;
+  return stringField(channel, 'name');
+}
+
+/** discord.js の Message を共通形にそろえる。 */
+export function fromDiscordMessage(message: Message, channelName?: string | null): AgentMessage {
   return {
     guildId: message.guildId ?? message.guild?.id ?? null,
     channelId: message.channelId,
-    channelName: channelName ?? message.channel?.name,
+    channelName: channelName ?? channelNameOf(message),
     messageId: message.id,
     authorId: message.author?.id ?? '0',
     authorName:
@@ -259,46 +297,73 @@ export function fromDiscordMessage(message, channelName) {
   };
 }
 
+/** Discord API の検索結果に入っている生のメッセージ。id と channel_id だけは確かめてある。 */
+export interface RawMessage {
+  id: string;
+  channel_id: string;
+  [key: string]: unknown;
+}
+
+export function isRawMessage(value: unknown): value is RawMessage {
+  return isRecord(value) && typeof value.id === 'string' && typeof value.channel_id === 'string';
+}
+
+function parsedTime(value: unknown): number | null {
+  return typeof value === 'string' && value ? Date.parse(value) : null;
+}
+
 /** Discord API の生 JSON (検索結果) を共通形にそろえる。 */
-export function fromRawMessage(raw, guildId, channelName) {
-  const member = raw.member ?? {};
+export function fromRawMessage(raw: RawMessage, guildId: string, channelName?: string | null): AgentMessage {
+  const author = recordField(raw, 'author');
+  const reactions = raw.reactions;
+  const attachments = raw.attachments;
   return {
-    guildId: raw.guild_id ?? guildId,
+    guildId: stringField(raw, 'guild_id') ?? guildId,
     channelId: raw.channel_id,
     channelName,
     messageId: raw.id,
-    authorId: raw.author?.id ?? '0',
+    authorId: stringField(author, 'id') ?? '0',
     authorName:
-      member.nick
-      ?? raw.author?.global_name
-      ?? raw.author?.username
+      stringField(raw.member, 'nick')
+      ?? stringField(author, 'global_name')
+      ?? stringField(author, 'username')
       ?? 'unknown',
-    isBot: Boolean(raw.author?.bot),
-    content: raw.content ?? '',
+    isBot: Boolean(author?.bot),
+    content: stringField(raw, 'content') ?? '',
     extra: discordExtraText(raw),
-    createdAt: raw.timestamp ? Date.parse(raw.timestamp) : Date.now(),
-    editedAt: raw.edited_timestamp ? Date.parse(raw.edited_timestamp) : null,
+    createdAt: parsedTime(raw.timestamp) ?? Date.now(),
+    editedAt: parsedTime(raw.edited_timestamp),
     deleted: false,
-    reactionCount: Array.isArray(raw.reactions) ? raw.reactions.reduce((sum, reaction) => sum + (reaction.count ?? 0), 0) : null,
-    replyTo: raw.referenced_message?.id ?? raw.message_reference?.message_id ?? null,
-    attachmentCount: raw.attachments?.length ?? 0,
+    reactionCount: Array.isArray(reactions)
+      ? reactions.reduce((sum: number, reaction: unknown) => sum + (numberField(reaction, 'count') ?? 0), 0)
+      : null,
+    replyTo: stringField(raw.referenced_message, 'id') ?? stringField(raw.message_reference, 'message_id') ?? null,
+    attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
     structure: discordStructure(raw)
   };
+}
+
+export interface FormatOptions {
+  refs?: RefTable | undefined;
+  showChannel?: boolean;
+  bodyChars?: number;
+  tailOf?: ((message: AgentMessage) => string | null) | null;
+  selfId?: string | null | undefined;
 }
 
 /**
  * メッセージ列を1行1件の構造化JSONで書き出す。本文の改行はJSON内に保つ。
  */
 export function formatMessages(
-  messages,
-  { refs, showChannel = false, bodyChars = 300, tailOf = null, selfId = null } = {}
-) {
+  messages: AgentMessage[],
+  { refs, showChannel = false, bodyChars = 300, tailOf = null, selfId = null }: FormatOptions = {}
+): string {
   // Allocate references first: a reply can appear before its parent in search results.
   for (const message of messages) refs?.add(message);
   return messages.map((message) => {
     const ref = refs?.add(message);
-    const envelope = messageEnvelope(message, {
-      lookup: (id) => refs?.byMessageId.get(id), selfId, bodyChars
+    const envelope = conversation.messageEnvelope(message, {
+      lookup: (id) => refs?.byMessageId.get(id), selfId: selfId ?? null, bodyChars
     });
     if (!showChannel) delete envelope.location.channelName;
     const note = tailOf?.(message);
@@ -308,7 +373,7 @@ export function formatMessages(
 }
 
 /** そのテキストがコードブロックを開いたまま終わっているか。 */
-function fenceLeftOpen(text) {
+function fenceLeftOpen(text: string): boolean {
   return ((text.match(/```/g) ?? []).length % 2) === 1;
 }
 
@@ -319,8 +384,8 @@ function fenceLeftOpen(text) {
  * インデントも等幅も消える。切った側を閉じて、次の先頭で開き直す
  * (言語指定は引き継がない。素の ``` で開き直す)。
  */
-export function chunkForDiscord(text, limit = 1900, maxChunks = 3) {
-  const chunks = [];
+export function chunkForDiscord(text: unknown, limit = 1900, maxChunks = 3): string[] {
+  const chunks: string[] = [];
   let rest = String(text ?? '').trim();
   // 前のチャンクが開いたままだったコードブロックの続き
   let prefix = '';
@@ -352,8 +417,9 @@ export function chunkForDiscord(text, limit = 1900, maxChunks = 3) {
   }
 
   // 打ち切ったことを黙っていると、途中で切れた回答を完結したものと読まれてしまう。
-  if (rest.length > 0 && chunks.length > 0) {
-    chunks[chunks.length - 1] += '\n\n*(長すぎるため以降を省略しました)*';
+  const last = chunks.length - 1;
+  if (rest.length > 0 && last >= 0) {
+    chunks[last] = `${chunks[last] ?? ''}\n\n*(長すぎるため以降を省略しました)*`;
   }
 
   return chunks.filter(Boolean);

@@ -4,6 +4,12 @@
 // (tools.js が semantic.js を読み込んでいるので、逆向きに import すると循環する)。
 
 import { db as archiveDb } from '../archive/db.js';
+import { archive } from './boundary.js';
+import type { AgentContext } from './types.js';
+
+// channelScope は呼んだ人に見えるチャンネル。退出済みの人をアーカイブの表示名から引くときに、
+// 見えないチャンネルにしか書いていない人の名前と ID を引き当てないために要る。
+type MemberContext = Pick<AgentContext, 'guild' | 'channelScope'>;
 
 /**
  * 表示名から ID を引く。
@@ -12,13 +18,14 @@ import { db as archiveDb } from '../archive/db.js';
  * キャッシュに載っていないだけの人や退出済みの人で行き止まりにしないよう、
  * メンバー検索とアーカイブまで見る。
  */
-export async function resolveMemberId(ctx, value) {
+export async function resolveMemberId(ctx: MemberContext, value: unknown): Promise<string | null> {
   if (!value) return null;
 
   const id = /(\d{16,21})/.exec(String(value))?.[1];
   if (id) return id;
 
-  const name = String(value).replace(/^@/, '').toLowerCase();
+  // モデルが渡す文字列なので長さを抑える (ID は上で取り出し済み。表示名は100字もあれば足りる)
+  const name = String(value).replace(/^@/, '').toLowerCase().slice(0, 100);
   if (!name) return null;
 
   const member = ctx.guild.members.cache.find((candidate) => (
@@ -40,14 +47,19 @@ export async function resolveMemberId(ctx, value) {
   if (found) return found.id;
 
   // 退出済みはメンバー検索にも出ない。アーカイブは当時の表示名を覚えている。
+  // ただし呼んだ人に見えるチャンネルの発言だけを手がかりにする。見えないチャンネルに
+  // しか書いていない人の名前から ID を引けると、そこに誰がいるかを探る道具になる。
   try {
     const pattern = `%${name.replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
-    const row = archiveDb.prepare(`
-      SELECT author_id FROM messages
+    const rows = archiveDb.prepare<[string, string], { author_id: string | null; channel_id: string }>(`
+      SELECT author_id, channel_id FROM messages
       WHERE guild_id = ? AND author_name LIKE ? ESCAPE '\\'
-      ORDER BY created_at DESC LIMIT 1
-    `).get(ctx.guild.id, pattern);
+      ORDER BY created_at DESC LIMIT 50
+    `).all(ctx.guild.id, pattern);
 
+    const row = rows.find((candidate) => (
+      candidate.author_id && archive.isChannelAllowed(candidate.channel_id, ctx.channelScope)
+    ));
     if (row?.author_id) return row.author_id;
   } catch {
     // アーカイブが無い構成でも動くようにする
@@ -64,7 +76,7 @@ export async function resolveMemberId(ctx, value) {
  * (「ずっといるのに直近しかヒットしない」の主因)。引けるなら ID にする。
  * 引けなければ元の文字列に戻す (名前で当たる可能性は残す)。
  */
-export async function resolveAuthorFilter(ctx, value) {
+export async function resolveAuthorFilter(ctx: MemberContext, value: unknown): Promise<unknown> {
   if (!value) return value;
   return (await resolveMemberId(ctx, value)) ?? value;
 }

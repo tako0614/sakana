@@ -11,13 +11,15 @@ import {
   EmbedBuilder,
   InteractionContextType,
   MessageFlags,
-  SlashCommandBuilder
+  SlashCommandBuilder,
+  type ChatInputCommandInteraction
 } from 'discord.js';
 
-import { canManageIndex } from '../archive/permissions.js';
+import { archive } from './boundary.js';
 import { agentConfig } from './config.js';
 import {
   TUNABLES,
+  type TunableKey,
   getTunable,
   getUsage,
   grantDailyUsd,
@@ -28,7 +30,7 @@ import {
 } from './ratelimit.js';
 import { AGENT_ENGINES } from './engines.js';
 
-const KEY_LABELS = {
+const KEY_LABELS: Record<TunableKey, string> = {
   user_daily_usd: '1人あたり/日 ($)',
   global_daily_usd: '全体/日 ($)',
   request_usd: '1リクエストの上限 ($)',
@@ -38,12 +40,12 @@ const KEY_LABELS = {
   max_concurrent: '同時実行数'
 };
 
-function usageEmbed(userId) {
+function usageEmbed(userId: string): EmbedBuilder {
   const usage = getUsage(userId);
   const hours = Math.round(agentConfig.userWindowMs / 3_600_000);
   const window = hours === 24 ? '直近24時間' : `直近 ${hours} 時間`;
 
-  const line = (used, limit) => (
+  const line = (used: number, limit: number): string => (
     limit > 0 ? `$${used.toFixed(3)} / $${limit.toFixed(2)}` : `$${used.toFixed(3)} / 無制限`
   );
 
@@ -94,12 +96,17 @@ function usageEmbed(userId) {
   return embed;
 }
 
-async function requireAdmin(interaction) {
-  const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
-  if (canManageIndex(member)) return true;
+async function requireAdmin(interaction: ChatInputCommandInteraction): Promise<boolean> {
+  // キャッシュ済みのサーバーなら GuildMember が載っている。載っていなければ取りに行く
+  // (API の生のメンバーは permissions が文字列なので、そのままでは判定できない)。
+  const member = interaction.inCachedGuild()
+    ? interaction.member
+    : (await interaction.guild?.members.fetch(interaction.user.id).catch(() => null)) ?? null;
+  if (archive.canManageIndex(member)) return true;
 
   await interaction.reply({
     content: '上限を変えられるのは「サーバー管理」権限を持つ人か、`ARCHIVE_ADMIN_USERS` に登録された人だけです。',
+    allowedMentions: { parse: [] },
     flags: MessageFlags.Ephemeral
   });
   return false;
@@ -154,12 +161,13 @@ export const agentCommands = [
           .setDescription('この人だけ。省略すると全員')
           .setRequired(false))),
 
-    async execute(interaction) {
+    async execute(interaction: ChatInputCommandInteraction): Promise<void> {
       const sub = interaction.options.getSubcommand();
 
       if (sub === 'show') {
         await interaction.reply({
           embeds: [usageEmbed(interaction.user.id)],
+          allowedMentions: { parse: [] },
           flags: MessageFlags.Ephemeral
         });
         return;
@@ -183,11 +191,12 @@ export const agentCommands = [
       }
 
       if (sub === 'grant' || sub === 'revoke') {
-        const target = interaction.options.getUser('user');
+        // user は必須の項目なので必ず入っている
+        const target = interaction.options.getUser('user', true);
         const usd = sub === 'grant' ? interaction.options.getNumber('usd') : null;
 
         if (!grantDailyUsd(target.id, usd, interaction.user.id)) {
-          await interaction.reply({ content: `その値は使えません: ${usd}`, flags: MessageFlags.Ephemeral });
+          await interaction.reply({ content: `その値は使えません: ${usd}`, allowedMentions: { parse: [] }, flags: MessageFlags.Ephemeral });
           return;
         }
 
@@ -207,7 +216,7 @@ export const agentCommands = [
 
       // value 省略で既定に戻す。戻す手段が無いと怖くて触れない。
       if (!setTunable(key, value ?? null, interaction.user.id)) {
-        await interaction.reply({ content: `その値は使えません: ${value}`, flags: MessageFlags.Ephemeral });
+        await interaction.reply({ content: `その値は使えません: ${value}`, allowedMentions: { parse: [] }, flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -216,6 +225,7 @@ export const agentCommands = [
           ? `${key} を .env の既定に戻しました。`
           : `${key} を ${value} にしました。`,
         embeds: [usageEmbed(interaction.user.id)],
+        allowedMentions: { parse: [] },
         flags: MessageFlags.Ephemeral
       });
     }

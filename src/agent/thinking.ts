@@ -12,27 +12,29 @@
 // 答えができたらこのメッセージは削除し、回答は新しいメッセージとして送り直す。
 // 編集で置き換えると、待っている間に他の人が喋った場合に回答が過去の位置に埋まってしまう。
 
+import type { Message, MessageCreateOptions, MessageEditOptions } from 'discord.js';
 import { agentConfig } from './config.js';
 import { forgetIndicator, rememberIndicator } from './indicators.js';
+import { errorCode, errorStatus, stringField } from './types.js';
 
-const NO_MENTIONS = { parse: [], repliedUser: false };
+const NO_MENTIONS = { parse: [], repliedUser: false } satisfies MessageCreateOptions['allowedMentions'];
 
 /**
  * ツール名をそのまま出すと `· search` のような英語が会話に流れる。
  * ここは人が読む場所なので日本語にする。mode まで見て何をしているか出す。
  */
-export function toolLabel(name, args = {}) {
+export function toolLabel(name: string, args: unknown = {}): string {
   if (name === 'search') {
-    const mode = String(args.mode ?? '').trim().toLowerCase();
+    const mode = String(stringField(args, 'mode') ?? '').trim().toLowerCase();
     if (mode === 'count') return '集計';
     if (mode === 'meaning') return '意味検索';
     return '検索';
   }
 
-  if (name === 'read') return args.direction === 'replies' ? '返信をたどる' : '読み込み';
+  if (name === 'read') return stringField(args, 'direction') === 'replies' ? '返信をたどる' : '読み込み';
   if (name === 'channels') return 'チャンネル一覧';
   if (name === 'governance') return '統治記録';
-  if (name === 'browser') return args.action === 'search' ? 'web 検索' : 'ブラウザ';
+  if (name === 'browser') return stringField(args, 'action') === 'search' ? 'web 検索' : 'ブラウザ';
 
   return name;
 }
@@ -50,13 +52,31 @@ export function toolLabel(name, args = {}) {
 export const INDICATOR_PREFIX = '-# thinking ';
 
 /** その発言が経過表示かどうか。直近の会話に混ぜないために使う。 */
-export function isIndicatorMessage(message, selfId) {
+export function isIndicatorMessage(message: { authorId?: string; content?: string } | null | undefined, selfId: string | null | undefined): boolean {
   if (!selfId || message?.authorId !== selfId) return false;
-  return String(message.content ?? '').startsWith(INDICATOR_PREFIX);
+  return String(message?.content ?? '').startsWith(INDICATOR_PREFIX);
+}
+
+/** 経過表示を出す先。送れて、id を持っていればいい。 */
+export interface IndicatorChannel {
+  id: string;
+  send(options: MessageCreateOptions): Promise<Message>;
 }
 
 export class ThinkingIndicator {
-  constructor(channel) {
+  channel: IndicatorChannel;
+  startedAt: number;
+  message: Message | null;
+  timer: ReturnType<typeof setTimeout> | null;
+  status: string | null;
+  lastRendered: string | null;
+  lastEditAt: number;
+  busy: boolean;
+  stopped: boolean;
+  editable: boolean;
+  editFailures: number;
+
+  constructor(channel: IndicatorChannel) {
     this.channel = channel;
     this.startedAt = Date.now();
     this.message = null;
@@ -73,17 +93,17 @@ export class ThinkingIndicator {
     this.editFailures = 0;
   }
 
-  render() {
+  render(): string {
     const suffix = this.status ? ` · ${this.status}` : '';
     return `${INDICATOR_PREFIX}<t:${Math.floor(this.startedAt / 1000)}:R>${suffix}`;
   }
 
   /** 直近の会話から自分の経過表示を外すのに使う (start に失敗していたら null)。 */
-  get messageId() {
+  get messageId(): string | null {
     return this.message?.id ?? null;
   }
 
-  async start() {
+  async start(): Promise<void> {
     try {
       const content = this.render();
       this.message = await this.channel.send({ content, allowedMentions: NO_MENTIONS });
@@ -102,7 +122,7 @@ export class ThinkingIndicator {
    * ここでしか編集は起きない。1ラウンドで複数のツールが呼ばれると連続で
    * 来るので、少し待ってまとめる。
    */
-  setStatus(status) {
+  setStatus(status: string): void {
     if (this.stopped || status === this.status) return;
 
     this.status = status;
@@ -121,7 +141,7 @@ export class ThinkingIndicator {
     this.timer.unref?.();
   }
 
-  async flush() {
+  async flush(): Promise<void> {
     if (this.stopped || this.busy || !this.message || !this.editable) return;
 
     const content = this.render();
@@ -129,15 +149,16 @@ export class ThinkingIndicator {
 
     this.busy = true;
     try {
-      await this.message.edit({ content, allowedMentions: NO_MENTIONS });
+      const edit: MessageEditOptions = { content, allowedMentions: NO_MENTIONS };
+      await this.message.edit(edit);
       this.lastRendered = content;
       this.lastEditAt = Date.now();
       this.editFailures = 0;
     } catch (error) {
       // メッセージ自体が消えているときだけ本当に諦める (10008 = Unknown Message)。
-      if (error?.code === 10008 || error?.status === 404) {
+      if (errorCode(error) === 10008 || errorStatus(error) === 404) {
         // もう無いものを次の起動で消しに行かせない
-        forgetIndicator(this.message.id);
+        forgetIndicator(this.message?.id);
         this.editable = false;
         this.message = null;
         this.stopTimer();
@@ -157,7 +178,7 @@ export class ThinkingIndicator {
     }
   }
 
-  stopTimer() {
+  stopTimer(): void {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -165,7 +186,7 @@ export class ThinkingIndicator {
   }
 
   /** 経過表示を消す。何度呼んでも安全。 */
-  async stop() {
+  async stop(): Promise<void> {
     this.stopped = true;
     this.stopTimer();
 

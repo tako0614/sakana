@@ -12,20 +12,33 @@
 // 見せると「0.79 も高いから似ている」と誤読するので、順位と併記し、
 // 相対値であることを明記する。
 
-import { chunkCoverage, chunkMessages, hasChunkVectors } from '../archive/chunks.js';
-import { fetchChunks, scanChunksTopK } from '../archive/vectors.js';
-import { resolveModel } from '../archive/embed-job.js';
+import { hasChunkVectors } from '../archive/chunks.js';
 import { embedConfig } from '../embed/config.js';
-import { embedTexts, isDisabled } from '../embed/worker.js';
+import { isDisabled } from '../embed/worker.js';
+import { archive, isArchiveRow, type ArchiveRow, type ChunkFilters } from './boundary.js';
 import { agentConfig } from './config.js';
 import { shortTime, truncate } from './format.js';
+import { errorMessage, isRecord, type AgentContext } from './types.js';
+
+type SemanticContext = Pick<AgentContext, 'guild' | 'refs' | 'channelScope'>;
+
+// embed/config.js の値は env から来るので、数として読み直す
+const maxCandidates = Number(embedConfig.maxCandidates);
+const relativeCutoff = Number(embedConfig.relativeCutoff);
+
+/** 埋め込みの子プロセスが返したベクトル (base64)。形が違えば null。 */
+function firstVector(embedded: unknown): string | null {
+  const vectors = isRecord(embedded) ? embedded.vectors : undefined;
+  const first: unknown = Array.isArray(vectors) ? vectors[0] : undefined;
+  return typeof first === 'string' ? first : null;
+}
 
 /** ベクトルが1件も無い / サーキットブレーク中はモードを出さない。 */
-export async function semanticAvailable(guildId) {
+export async function semanticAvailable(guildId: string): Promise<boolean> {
   if (!embedConfig.enabled || isDisabled()) return false;
 
   try {
-    const { modelId } = await resolveModel();
+    const { modelId } = await archive.resolveModel();
     return hasChunkVectors(guildId, modelId);
   } catch {
     return false;
@@ -33,7 +46,7 @@ export async function semanticAvailable(guildId) {
 }
 
 /** 参加者を「たこ/さば/りん」の形にする。3人を超えたら数で出す。 */
-function participantLabel(rows) {
+function participantLabel(rows: ArchiveRow[]): string {
   const names = [...new Set(rows.map((row) => row.author_name || 'unknown'))];
   return names.length <= 3 ? names.join('/') : `${names.slice(0, 3).join('/')}他${names.length - 3}人`;
 }
@@ -48,34 +61,45 @@ function participantLabel(rows) {
  * escalated: キーワード検索が0件だったので自動で続けて走らせた場合。
  * 頼まれていない検索なので、見出しと絞り込みの案内を変える。
  */
-export async function runSemanticSearch(ctx, {
+export async function runSemanticSearch(ctx: SemanticContext, {
   queryText,
   filters = {},
   excludeId = null,
   limit = 10,
   escalated = false
-}) {
+}: {
+  queryText: unknown;
+  filters?: ChunkFilters;
+  excludeId?: string | null;
+  limit?: number;
+  escalated?: boolean;
+}): Promise<string> {
   const text = String(queryText ?? '').trim();
   if (!text) return 'query を指定してください。';
 
-  const { modelId, dim } = await resolveModel();
-  const stats = chunkCoverage(ctx.guild.id, modelId);
+  const { modelId, dim } = await archive.resolveModel();
+  const stats = archive.chunkCoverage(ctx.guild.id, modelId);
 
   if (stats.done === 0) {
     return '意味検索用のベクトルがまだありません。管理者が `/index embed` を実行すると使えるようになります。';
   }
 
-  let embedded;
+  let embedded: unknown;
   try {
-    embedded = await embedTexts([text], { kind: 'query', encode: 'float32' });
+    embedded = await archive.embedTexts([text], { kind: 'query', encode: 'float32' });
   } catch (error) {
-    return `意味検索は今使えません (${truncate(error.message, 120)})。言い換えを何通りか試してください。`;
+    return `意味検索は今使えません (${truncate(errorMessage(error), 120)})。言い換えを何通りか試してください。`;
   }
 
-  const bytes = Buffer.from(embedded.vectors[0], 'base64');
+  // 子プロセスの出力。ベクトルが無い・次元が足りないときは埋め込み失敗と同じ扱いにする
+  const vector = firstVector(embedded);
+  const bytes = vector === null ? Buffer.alloc(0) : Buffer.from(vector, 'base64');
+  if (bytes.byteLength < dim * Float32Array.BYTES_PER_ELEMENT) {
+    return '意味検索は今使えません (埋め込みの結果を読めませんでした)。言い換えを何通りか試してください。';
+  }
   const queryVec = new Float32Array(bytes.buffer, bytes.byteOffset, dim);
 
-  const result = scanChunksTopK({
+  const result = archive.scanChunksTopK({
     guildId: ctx.guild.id,
     modelId,
     queryVec,
@@ -90,20 +114,21 @@ export async function runSemanticSearch(ctx, {
     return escalated
       ? `(意味検索も試したが候補が ${result.total.toLocaleString()} 件で多すぎた。author か channel で絞れば mode:meaning で引ける)`
       : [
-        `候補が ${result.total.toLocaleString()} 件で上限 ${embedConfig.maxCandidates.toLocaleString()} 件を超えました。`,
+        `候補が ${result.total.toLocaleString()} 件で上限 ${maxCandidates.toLocaleString()} 件を超えました。`,
         'author / channel / after のどれかで絞ってください',
         '(この道具は「誰かの発言の中から」探すのが一番効きます)。'
       ].join('');
   }
 
-  const chunks = fetchChunks(result.hits.map((hit) => hit.cid));
+  const hits = result.hits ?? [];
+  const chunks = archive.fetchChunks(hits.map((hit) => hit.cid));
 
   // 起点にした発言そのものが入っているまとまりは外す。
   // 残すと必ず1位を占め、下の相対カットオフの基準を押し上げて、
   // 本当に近いまとまりまで切り落とす。
-  const scoreById = new Map(result.hits.map((hit) => [hit.cid, hit.score]));
+  const scoreById = new Map(hits.map((hit) => [hit.cid, hit.score]));
   const loaded = chunks
-    .map((chunk) => ({ chunk, rows: chunkMessages(chunk), score: scoreById.get(chunk.chunk_id) ?? 0 }))
+    .map((chunk) => ({ chunk, rows: archive.chunkMessages(chunk).filter(isArchiveRow), score: scoreById.get(chunk.chunk_id) ?? 0 }))
     .filter(({ rows }) => !(excludeId && rows.some((row) => row.message_id === excludeId)));
 
   if (loaded.length === 0) {
@@ -113,9 +138,10 @@ export async function runSemanticSearch(ctx, {
   // 相対カットオフ。閾値では絞れないので「1位からどれだけ落ちたか」で切る。
   // これが無いと limit の枠を埋めるために無関係な会話が並び、モデルが
   // 「これも関連している」と誤読する。
-  const top = loaded[0].score;
+  // 上で0件のときは返してあるので、先頭は必ずある
+  const top = loaded[0]?.score ?? 0;
   const picked = loaded
-    .filter((entry) => entry.score >= top - embedConfig.relativeCutoff)
+    .filter((entry) => entry.score >= top - relativeCutoff)
     .slice(0, limit);
 
   const dropped = loaded.length - picked.length;
@@ -153,7 +179,7 @@ export async function runSemanticSearch(ctx, {
   });
 
   return [
-    `意味が近い会話 ${ordered.length} 件 (類似度 ${top.toFixed(2)}〜${picked[picked.length - 1].score.toFixed(2)}、候補 ${result.total.toLocaleString()} 件)`,
+    `意味が近い会話 ${ordered.length} 件 (類似度 ${top.toFixed(2)}〜${(picked[picked.length - 1]?.score ?? top).toFixed(2)}、候補 ${result.total.toLocaleString()} 件)`,
     `埋め込み済み: このサーバーの会話の ${Math.round(stats.ratio * 100)}%`
       + (stats.ratio < 0.99 ? '。ここに無い=言っていない、ではない。' : ''),
     dropped > 0 ? `(1位から離れすぎた ${dropped} 件は関連が薄いので除外した)` : '',
@@ -166,6 +192,6 @@ export async function runSemanticSearch(ctx, {
   ].filter(Boolean).join('\n');
 }
 
-function channelLabel(ctx, channelId) {
+function channelLabel(ctx: SemanticContext, channelId: string): string {
   return ctx.guild.channels.cache.get(channelId)?.name ?? channelId;
 }

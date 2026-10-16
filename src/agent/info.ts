@@ -10,16 +10,33 @@
 // (read が `(続きは at:… )` を書いているのと同じ)。
 
 import { getTopXP } from '../db.js';
-import { chunkCoverage } from '../archive/chunks.js';
 import { db as archiveDb, reactionUsers } from '../archive/db.js';
-import { resolveModel } from '../archive/embed-job.js';
-import { aggregateSearch, buildSearch, isChannelAllowed, searchSummary, topReactionEmojis } from '../archive/search.js';
+import { archive, type SearchOptions } from './boundary.js';
 import { shortTime, truncate } from './format.js';
 import { resolveMemberId } from './members.js';
+import { numberField, stringField, type AgentContext, type ToolArgs, type ToolDefinition } from './types.js';
+
+type InfoContext = Pick<AgentContext, 'guild' | 'refs' | 'channelScope'>;
 
 const ACTIONS = ['member', 'guild', 'emoji', 'activity', 'reactions'];
 
-export const infoDefinition = {
+/** getTopXP の行。src/db.js の SQL が返す形。 */
+function xpRow(value: unknown): { id: string; xp: number } | null {
+  const id = stringField(value, 'id');
+  const xp = numberField(value, 'xp');
+  return id !== undefined && xp !== undefined ? { id, xp } : null;
+}
+
+/** reactionUsers の行。 */
+function reactionUserRow(value: unknown): { emoji: string; user_id: string } | null {
+  const emoji = stringField(value, 'emoji');
+  const userId = stringField(value, 'user_id');
+  return emoji !== undefined && userId !== undefined ? { emoji, user_id: userId } : null;
+}
+
+const present = <T>(value: T | null): value is T => value !== null;
+
+export const infoDefinition: ToolDefinition = {
   type: 'function',
   function: {
     name: 'info',
@@ -39,7 +56,7 @@ export const infoDefinition = {
   }
 };
 
-function periodMs(value) {
+function periodMs(value: unknown): number | null {
   const text = String(value ?? '').trim().toLowerCase();
   const match = /^(\d+)\s*d$/.exec(text);
   if (match) return Number(match[1]) * 86_400_000;
@@ -51,7 +68,7 @@ function periodMs(value) {
 
 // ---------------------------------------------------------------- member
 
-async function memberInfo(ctx, args) {
+async function memberInfo(ctx: InfoContext, args: ToolArgs): Promise<string> {
   const who = String(args.who ?? '').trim();
   if (!who) return 'who に人を指定してください (表示名かユーザー ID)。';
 
@@ -61,7 +78,7 @@ async function memberInfo(ctx, args) {
   const member = ctx.guild.members.cache.get(id)
     ?? await ctx.guild.members.fetch(id).catch(() => null);
 
-  const lines = [];
+  const lines: string[] = [];
 
   if (member) {
     const roles = [...member.roles.cache.values()]
@@ -82,7 +99,7 @@ async function memberInfo(ctx, args) {
   }
 
   // 発言の履歴はアーカイブから。取り込み前なら素性だけ返す。
-  const options = {
+  const options: SearchOptions = {
     guildId: ctx.guild.id,
     query: '',
     extra: [{ key: 'from', value: id }],
@@ -93,7 +110,7 @@ async function memberInfo(ctx, args) {
 
   let summary = null;
   try {
-    summary = searchSummary(options);
+    summary = archive.searchSummary(options);
   } catch {
     // アーカイブが無い構成でも動く
   }
@@ -108,10 +125,10 @@ async function memberInfo(ctx, args) {
     + ` ・ 平均 ${Math.round(summary.avg_length ?? 0)} 文字 ・ ${summary.channels} チャンネル`
   );
 
-  const channels = aggregateSearch(options, 'channel', { limit: 3 });
+  const channels = archive.aggregateSearch(options, 'channel', { limit: 3 });
   if (channels.length > 0) {
     const label = channels
-      .map((row) => `#${channelLabel(ctx, row.bucket)}(${row.count})`)
+      .map((row) => `#${channelLabel(ctx, String(row.bucket))}(${row.count})`)
       .join(' ');
     lines.push(`よく居る: ${label}`);
   }
@@ -121,7 +138,7 @@ async function memberInfo(ctx, args) {
     lines.push(`よく返信する相手: ${partners.map((row) => `${row.name}(${row.count})`).join(' ')}`);
   }
 
-  const hours = aggregateSearch(options, 'hour', { limit: 3 });
+  const hours = archive.aggregateSearch(options, 'hour', { limit: 3 });
   if (hours.length > 0) {
     lines.push(`よく喋る時間: ${hours.map((row) => `${String(row.bucket).padStart(2, '0')}時`).join(' ')}`);
   }
@@ -130,12 +147,14 @@ async function memberInfo(ctx, args) {
   return lines.join('\n');
 }
 
-function channelLabel(ctx, channelId) {
+function channelLabel(ctx: InfoContext, channelId: string): string {
   const cached = ctx.guild.channels.cache.get(channelId);
   if (cached?.name) return cached.name;
 
   try {
-    const row = archiveDb.prepare('SELECT name FROM channels WHERE guild_id = ? AND channel_id = ?').get(ctx.guild.id, channelId);
+    const row = archiveDb.prepare<[string, string], { name: string | null }>(
+      'SELECT name FROM channels WHERE guild_id = ? AND channel_id = ?'
+    ).get(ctx.guild.id, channelId);
     if (row?.name) return row.name;
   } catch {
     // アーカイブが無い構成でも動く
@@ -150,10 +169,10 @@ function channelLabel(ctx, channelId) {
  * 「誰と話しているか」はチャンネルでは分からない (同じチャンネルに全員居る)。
  * reply_to を辿って初めて相手が出る。idx_msg_reply があるのでこの向きで引ける。
  */
-function replyPartners(ctx, userId) {
+function replyPartners(ctx: InfoContext, userId: string): { id: string; name: string | null; count: number }[] {
   try {
-    const visible = buildSearch({ guildId: ctx.guild.id, channelScope: ctx.channelScope });
-    const rows = archiveDb.prepare(`
+    const visible = archive.buildSearch({ guildId: ctx.guild.id, channelScope: ctx.channelScope });
+    const rows = archiveDb.prepare<(string | number)[], { id: string; name: string | null; count: number }>(`
       WITH visible AS (SELECT m.* FROM messages m WHERE ${visible.where})
       SELECT p.author_id AS id, p.author_name AS name, COUNT(*) AS count
       FROM visible m
@@ -172,7 +191,32 @@ function replyPartners(ctx, userId) {
 
 // ---------------------------------------------------------------- guild
 
-async function guildInfo(ctx) {
+/**
+ * 取り込み済みの量。数えるのは呼んだ人に見えるチャンネルだけ。
+ *
+ * 以前はサーバー全体を数えていたので、件数・チャンネル数・最終発言の日時から
+ * 見えないチャンネルがあること・いつ動いていたかが分かってしまっていた。
+ */
+function visibleArchiveStats(ctx: InfoContext): { total: number; firstAt: number | null; lastAt: number | null; channels: number; threads: number } {
+  const channels = archiveDb.prepare<[string], { channel_id: string; is_thread: number | null }>(
+    'SELECT channel_id, is_thread FROM channels WHERE guild_id = ?'
+  ).all(ctx.guild.id).filter((row) => archive.isChannelAllowed(row.channel_id, ctx.channelScope));
+
+  const visible = archive.buildSearch({ guildId: ctx.guild.id, channelScope: ctx.channelScope });
+  const range = archiveDb.prepare<(string | number)[], { first_at: number | null; last_at: number | null; total: number }>(
+    `SELECT MIN(m.created_at) AS first_at, MAX(m.created_at) AS last_at, COUNT(*) AS total FROM messages m WHERE ${visible.where}`
+  ).get(...visible.params);
+
+  return {
+    total: range?.total ?? 0,
+    firstAt: range?.first_at ?? null,
+    lastAt: range?.last_at ?? null,
+    channels: channels.length,
+    threads: channels.filter((row) => row.is_thread).length
+  };
+}
+
+async function guildInfo(ctx: InfoContext): Promise<string> {
   const guild = ctx.guild;
   const lines = [
     `${guild.name} (ID ${guild.id})`,
@@ -180,20 +224,12 @@ async function guildInfo(ctx) {
   ];
 
   try {
-    const stats = archiveDb.prepare(`
-      SELECT COUNT(*) AS channels, COALESCE(SUM(message_count), 0) AS messages,
-             SUM(is_thread) AS threads
-      FROM channels WHERE guild_id = ?
-    `).get(guild.id);
+    const stats = visibleArchiveStats(ctx);
 
-    const range = archiveDb.prepare(
-      'SELECT MIN(created_at) AS first_at, MAX(created_at) AS last_at, COUNT(*) AS total FROM messages WHERE guild_id = ?'
-    ).get(guild.id);
-
-    if (range?.total > 0) {
+    if (stats.total > 0) {
       lines.push(
-        `取り込み済み: ${range.total} 件 (${shortTime(range.first_at)} 〜 ${shortTime(range.last_at)})`
-        + ` ・ ${stats.channels} チャンネル (うちスレッド ${stats.threads ?? 0})`
+        `取り込み済み: ${stats.total} 件 (${shortTime(stats.firstAt)} 〜 ${shortTime(stats.lastAt)})`
+        + ` ・ ${stats.channels} チャンネル (うちスレッド ${stats.threads})`
       );
     } else {
       lines.push('取り込み済みのログはありません (管理者が `/index build` を実行するまで過去ログは引けない)。');
@@ -203,8 +239,8 @@ async function guildInfo(ctx) {
   }
 
   try {
-    const { modelId } = await resolveModel();
-    const coverage = chunkCoverage(guild.id, modelId);
+    const { modelId } = await archive.resolveModel();
+    const coverage = archive.chunkCoverage(guild.id, modelId);
     if (coverage.done > 0) {
       lines.push(`意味検索: 会話の ${Math.round(coverage.ratio * 100)}% が埋め込み済み`);
     }
@@ -217,13 +253,34 @@ async function guildInfo(ctx) {
 
 // ---------------------------------------------------------------- emoji
 
-function emojiInfo(ctx, args) {
+/**
+ * よく押されている絵文字。呼んだ人に見えるチャンネルの発言についたぶんだけ数える。
+ *
+ * archive/search.js の topReactionEmojis はサーバー全体を数えるので、見えない
+ * チャンネルで使われている絵文字まで出ていた。絞り方は search と同じ buildSearch。
+ */
+function visibleReactionEmojis(ctx: InfoContext, { limit, since }: { limit: number; since: number | null }): { emoji: string; count: number }[] {
+  const visible = archive.buildSearch({ guildId: ctx.guild.id, channelScope: ctx.channelScope });
+  const params: (string | number)[] = [...visible.params, ...(since ? [since] : []), limit];
+
+  return archiveDb.prepare<(string | number)[], { emoji: string; count: number }>(`
+    SELECT mr.emoji AS emoji, SUM(mr.count) AS count
+    FROM message_reactions mr
+    JOIN messages m ON m.message_id = mr.message_id
+    WHERE ${visible.where}${since ? ' AND m.created_at >= ?' : ''}
+    GROUP BY mr.emoji
+    ORDER BY count DESC
+    LIMIT ?
+  `).all(...params);
+}
+
+function emojiInfo(ctx: InfoContext, args: ToolArgs): string {
   const span = periodMs(args.period);
   const since = span ? Date.now() - span : null;
 
-  let rows = [];
+  let rows: { emoji: string; count: number }[] = [];
   try {
-    rows = topReactionEmojis(ctx.guild.id, { limit: 12, since });
+    rows = visibleReactionEmojis(ctx, { limit: 12, since });
   } catch {
     return '絵文字の集計はローカルの取り込みが要る。管理者が `/index build` を実行するまでは使えません。';
   }
@@ -231,7 +288,7 @@ function emojiInfo(ctx, args) {
   if (rows.length === 0) return 'リアクションの記録がありません。';
 
   return [
-    `よく押されている絵文字${since ? ` (直近${Math.round(span / 86_400_000)}日)` : ' (全期間)'}`,
+    `よく押されている絵文字${since && span ? ` (直近${Math.round(span / 86_400_000)}日)` : ' (全期間)'}`,
     rows.map((row) => `${row.emoji} ${row.count}`).join(' ・ '),
     '特定の絵文字が付いた発言を探すなら search の query に `reaction:👍`。'
   ].join('\n');
@@ -239,18 +296,24 @@ function emojiInfo(ctx, args) {
 
 // ---------------------------------------------------------------- activity
 
-function activityInfo(ctx, args) {
+const XP_PERIODS = { day: '直近24時間', week: '直近7日', month: '直近30日', all: '全期間' };
+type XpPeriod = keyof typeof XP_PERIODS;
+
+const isXpPeriod = (value: string): value is XpPeriod => Object.hasOwn(XP_PERIODS, value);
+
+function activityInfo(ctx: InfoContext, args: ToolArgs): string {
   const text = String(args.period ?? '').trim().toLowerCase();
   // getTopXP は day / week / month / all しか受けない
-  const period = ['day', 'week', 'month', 'all'].includes(text) ? text : 'month';
+  const period: XpPeriod = isXpPeriod(text) ? text : 'month';
 
-  const render = (rows) => (
-    rows.length === 0
+  const render = (rows: unknown[]): string => {
+    const valid = rows.map(xpRow).filter(present);
+    return valid.length === 0
       ? '該当なし'
-      : rows.map((row, index) => `${index + 1}. ${memberLabel(ctx, row.id)} ${row.xp}`).join(' / ')
-  );
+      : valid.map((row, index) => `${index + 1}. ${memberLabel(ctx, row.id)} ${row.xp}`).join(' / ');
+  };
 
-  const label = { day: '直近24時間', week: '直近7日', month: '直近30日', all: '全期間' }[period];
+  const label = XP_PERIODS[period];
 
   return [
     `活動量 (${label}) ・ XP は発言と通話から付く目安で、発言数そのものではない`,
@@ -260,12 +323,12 @@ function activityInfo(ctx, args) {
   ].join('\n');
 }
 
-function memberLabel(ctx, userId) {
+function memberLabel(ctx: InfoContext, userId: string): string {
   const cached = ctx.guild.members.cache.get(userId);
   if (cached?.displayName) return cached.displayName;
 
   try {
-    const row = archiveDb.prepare(`
+    const row = archiveDb.prepare<[string, string], { author_name: string | null }>(`
       SELECT author_name FROM messages
       WHERE guild_id = ? AND author_id = ? AND author_name != ''
       ORDER BY created_at DESC LIMIT 1
@@ -280,20 +343,20 @@ function memberLabel(ctx, userId) {
 
 // ---------------------------------------------------------------- reactions
 
-function reactionsInfo(ctx, args) {
+function reactionsInfo(ctx: InfoContext, args: ToolArgs): string {
   const entry = ctx.refs.resolve(args.at);
   if (!entry?.messageId) {
     return 'at に参照番号かメッセージ ID を渡してください (検索してから番号を渡す)。';
   }
 
   const location = locate(ctx, entry.messageId);
-  if (!location || !isChannelAllowed(location, ctx.channelScope)) {
+  if (!location || !archive.isChannelAllowed(location, ctx.channelScope)) {
     return 'その発言はこのサーバーに無いか、閲覧権限がありません。';
   }
-  let counts = [];
+  let counts: { emoji: string; count: number }[] = [];
   try {
     counts = archiveDb
-      .prepare('SELECT emoji, count FROM message_reactions WHERE message_id = ? ORDER BY count DESC')
+      .prepare<[string], { emoji: string; count: number }>('SELECT emoji, count FROM message_reactions WHERE message_id = ? ORDER BY count DESC')
       .all(entry.messageId);
   } catch {
     return 'リアクションの記録はローカルの取り込みが要る。管理者が `/index build` を実行するまでは使えません。';
@@ -301,11 +364,12 @@ function reactionsInfo(ctx, args) {
 
   if (counts.length === 0) return 'その発言にリアクションは付いていません (取り込み済みの範囲では)。';
 
-  const users = reactionUsers(entry.messageId);
-  const byEmoji = new Map();
+  const users = reactionUsers(entry.messageId).map(reactionUserRow).filter(present);
+  const byEmoji = new Map<string, string[]>();
   for (const row of users) {
-    if (!byEmoji.has(row.emoji)) byEmoji.set(row.emoji, []);
-    byEmoji.get(row.emoji).push(memberLabel(ctx, row.user_id));
+    const names = byEmoji.get(row.emoji) ?? [];
+    names.push(memberLabel(ctx, row.user_id));
+    byEmoji.set(row.emoji, names);
   }
 
   const lines = counts.map((row) => {
@@ -323,10 +387,10 @@ function reactionsInfo(ctx, args) {
   return lines.join('\n');
 }
 
-function locate(ctx, messageId) {
+function locate(ctx: InfoContext, messageId: string): string | null {
   try {
     return archiveDb
-      .prepare('SELECT channel_id FROM messages WHERE guild_id = ? AND message_id = ? AND deleted = 0')
+      .prepare<[string, string], { channel_id: string }>('SELECT channel_id FROM messages WHERE guild_id = ? AND message_id = ? AND deleted = 0')
       .get(ctx.guild.id, String(messageId))?.channel_id ?? null;
   } catch {
     return null;
@@ -335,7 +399,7 @@ function locate(ctx, messageId) {
 
 // ---------------------------------------------------------------- 入口
 
-export async function runInfo(ctx, args = {}) {
+export async function runInfo(ctx: InfoContext, args: ToolArgs = {}): Promise<string> {
   const action = String(args.action ?? '').trim().toLowerCase();
 
   switch (action) {
@@ -345,6 +409,6 @@ export async function runInfo(ctx, args = {}) {
     case 'activity': return activityInfo(ctx, args);
     case 'reactions': return reactionsInfo(ctx, args);
     default:
-      return `action が不正です: ${args.action}。使えるのは ${ACTIONS.join(' / ')} です。`;
+      return `action が不正です: ${String(args.action)}。使えるのは ${ACTIONS.join(' / ')} です。`;
   }
 }

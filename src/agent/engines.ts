@@ -8,8 +8,14 @@ export const AGENT_ENGINES = {
   qwen: process.env.AGENT_MODEL_QWEN || 'qwen/qwen3.7-flash'
 };
 
-export const DEFAULT_AGENT_ENGINE = 'ling';
+export type AgentEngine = keyof typeof AGENT_ENGINES;
 
-export const isAgentEngine = (engine) => Object.hasOwn(AGENT_ENGINES, engine);
+export const DEFAULT_AGENT_ENGINE: AgentEngine = 'ling';
 
-export const agentModelFor = (engine) => AGENT_ENGINES[engine] ?? AGENT_ENGINES[DEFAULT_AGENT_ENGINE];
+export const isAgentEngine = (engine: unknown): engine is AgentEngine => (
+  typeof engine === 'string' && Object.hasOwn(AGENT_ENGINES, engine)
+);
+
+export const agentModelFor = (engine: unknown): string => (
+  isAgentEngine(engine) ? AGENT_ENGINES[engine] : AGENT_ENGINES[DEFAULT_AGENT_ENGINE]
+);

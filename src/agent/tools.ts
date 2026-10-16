@@ -3,14 +3,29 @@
 // 数を絞るのが方針。ツール定義は毎ターン送り直すので、1つ増やすたびに
 // 全往復ぶんのトークンが増える。使えないツールは最初から出さない
 // (アーカイブ未構築なら検索系を出さない / Chrome が居なければブラウザを出さない)。
+//
+// ここにあるツールはどれも読み取りだけで、書き込み・投稿・権限の変更はしない。
+// 引数はモデルが組み立てたもの (= 外から来た値) なので、どれも unknown として受け、
+// 使う場所で形を確かめる。結果の本文にもユーザーの発言が入るが、それは材料であって命令ではない。
 
+import type { GuildBasedChannel, Message } from 'discord.js';
 import { hasMemory, memoryToolDefinition, runMemoryTool } from '../memory/tool.js';
 import { db as archiveDb, getGuildState, msToSnowflake, snowflakeToMs } from '../archive/db.js';
-import { MESSAGE_CHANNEL_TYPES, canRead, isForumType, isThreadType } from '../archive/permissions.js';
-import { QueryError, collectTerms, parseDateRange, parseQuery } from '../archive/query.js';
-import { aggregateSearch, isChannelAllowed, search, searchSummary, searchThreads } from '../archive/search.js';
-import { topTerms } from '../archive/terms.js';
+import { MESSAGE_CHANNEL_TYPES } from '../archive/permissions.js';
+import { QueryError, parseDateRange } from '../archive/query.js';
 import { prewarm } from '../embed/worker.js';
+import {
+  archive,
+  governance as governanceRecords,
+  type AgentToolset,
+  type ArchiveRow,
+  type ChunkFilters,
+  type QueryNode,
+  type SearchFilter,
+  type SearchOptions,
+  type SearchSummary,
+  type ThreadRow
+} from './boundary.js';
 import { browserToolDefinition, runBrowserAction } from './browser.js';
 import { infoDefinition, runInfo } from './info.js';
 import { governanceDefinition, runGovernanceInfo } from './governance.js';
@@ -19,25 +34,83 @@ import { looksLikeSentence } from './sentence.js';
 import { runSemanticSearch, semanticAvailable } from './semantic.js';
 import { cdpAvailable } from './cdp.js';
 import { agentConfig } from './config.js';
-import { getGovernanceGuild } from '../governance/db.js';
 import {
   formatMessages,
   fromArchiveRow,
   fromDiscordMessage,
   fromRawMessage,
+  isRawMessage,
   parseDiscordRef,
   shortTime,
-  truncate
+  truncate,
+  type RawMessage
 } from './format.js';
+import {
+  errorMessage,
+  isRecord,
+  type AgentContext,
+  type AgentMessage,
+  type ToolArgs,
+  type ToolDefinition
+} from './types.js';
 
 const WEEKDAY_LABELS = ['日', '月', '火', '水', '木', '金', '土'];
 
-function channelName(ctx, channelId) {
+// MESSAGE_CHANNEL_TYPES は JS 側の推論で「列挙値の部分集合」の Set になり、has() に
+// 任意のチャンネル種別を渡せない。数値の集合として読み直す。
+const MESSAGE_TYPES: ReadonlySet<number> = MESSAGE_CHANNEL_TYPES;
+
+// モデルが渡す文字列の長さの上限。ここを超えるぶんは検索にも解析にも使わない
+// (パーサや LIKE パターンに長大な入力を流さない)。
+const MAX_QUERY_CHARS = 500;
+const MAX_ARG_CHARS = 200;
+const MAX_NAME_CHARS = 100;
+// 読む位置の飛ばし幅。Discord の検索 API の offset 上限に近い値で頭打ちにする。
+const MAX_OFFSET = 10_000;
+// チャンネル指定の個数。読めるのは MAX_CHANNELS_PER_READ までだが、超えたことは伝えたいので少し余裕を持たせる。
+const MAX_CHANNEL_ARGS = 20;
+
+/** 検索ツールが何を出せるか。定義の出し分けと実行時の振り分けの両方で使う。 */
+export interface SearchFlags {
+  archiveAvailable: boolean;
+  semanticAvailable: boolean;
+}
+
+/** 検索の1モードの結果。empty は「0件だった」(自動で意味検索に回す判断に使う)。 */
+interface SearchOutcome {
+  empty: boolean;
+  text: string;
+}
+
+type Direction = 'around' | 'before' | 'after';
+
+const isWindowDirection = (value: string): value is Direction => (
+  value === 'around' || value === 'before' || value === 'after'
+);
+
+/** at を解いた起点。 */
+export type Anchor =
+  | { kind: 'none' }
+  | { kind: 'error'; message: string }
+  | { kind: 'message'; messageId: string; channelId: string | null; createdAt: number | null }
+  | { kind: 'time'; messageId: string; channelId: null; createdAt: number };
+
+/** メッセージ一覧を取れるチャンネル。フォーラム本体のように取れないものは入らない。 */
+type MessageHost = Extract<GuildBasedChannel, { messages: unknown }>;
+
+/** discord.js の型には載らない偽物 (検証用) も通るよう、実際に fetch できるかで見分ける。 */
+function hasMessageManager(channel: GuildBasedChannel): channel is MessageHost {
+  return 'messages' in channel && typeof channel.messages?.fetch === 'function';
+}
+
+function channelName(ctx: Pick<AgentContext, 'guild'>, channelId: string): string {
   const cached = ctx.guild.channels.cache.get(channelId);
   if (cached?.name) return cached.name;
 
   try {
-    const row = archiveDb.prepare('SELECT name FROM channels WHERE guild_id = ? AND channel_id = ?').get(ctx.guild.id, channelId);
+    const row = archiveDb
+      .prepare<[string, string], { name: string | null }>('SELECT name FROM channels WHERE guild_id = ? AND channel_id = ?')
+      .get(ctx.guild.id, channelId);
     if (row?.name) return row.name;
   } catch {
     // アーカイブが無い構成でも動くようにする
@@ -52,12 +125,12 @@ function channelName(ctx, channelId) {
  * 表示名まで見る。生の ID を出すのは最後の手段 (19桁はトークンの無駄で、
  * モデルにも人間にも読めない)。
  */
-function authorLabel(ctx, authorId) {
+function authorLabel(ctx: Pick<AgentContext, 'guild'>, authorId: string): string {
   const cached = ctx.guild.members.cache.get(authorId);
   if (cached?.displayName) return cached.displayName;
 
   try {
-    const row = archiveDb.prepare(`
+    const row = archiveDb.prepare<[string, string], { author_name: string | null }>(`
       SELECT author_name FROM messages
       WHERE guild_id = ? AND author_id = ? AND author_name != ''
       ORDER BY created_at DESC LIMIT 1
@@ -80,10 +153,10 @@ function authorLabel(ctx, authorId) {
  * 非公開スレッドは名前で掘り当てられないようにする。getChannelScope が
  * 「親の権限では判定できない」として弾いている相手を、ここから通してはいけない。
  */
-function archivedThreadId(ctx, name) {
+function archivedThreadId(ctx: Pick<AgentContext, 'guild'>, name: string): string | null {
   try {
-    const pattern = `%${name.replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
-    const row = archiveDb.prepare(`
+    const pattern = `%${name.slice(0, MAX_NAME_CHARS).replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
+    const row = archiveDb.prepare<[string, string], { channel_id: string }>(`
       SELECT channel_id FROM channels
       WHERE guild_id = ? AND is_thread = 1 AND is_private = 0 AND name LIKE ? ESCAPE '\\'
       ORDER BY LENGTH(name), message_count DESC
@@ -97,7 +170,10 @@ function archivedThreadId(ctx, name) {
   }
 }
 
-export async function resolveChannel(ctx, value) {
+export async function resolveChannel(
+  ctx: Pick<AgentContext, 'guild' | 'channel'>,
+  value: unknown
+): Promise<GuildBasedChannel | null> {
   if (!value) return ctx.channel;
 
   // リンクなら channel の位置から取る。先頭のスノーフレークを掴むと
@@ -110,10 +186,11 @@ export async function resolveChannel(ctx, value) {
 
     // アーカイブ済みスレッドはキャッシュに載っていない。ID が分かっているなら取りに行く。
     // これが無いと、検索でスレッドの発言が出ても前後を読めない。
+    // guild.channels.fetch はこのサーバーの中だけを引く (別サーバーの ID は null になる)。
     return ctx.guild.channels.fetch(id).catch(() => null);
   }
 
-  const name = String(value).replace(/^#/, '').toLowerCase();
+  const name = String(value).slice(0, MAX_NAME_CHARS).replace(/^#/, '').toLowerCase();
   const channels = [...ctx.guild.channels.cache.values()];
 
   const cached = channels.find((channel) => channel.name?.toLowerCase() === name)
@@ -127,23 +204,50 @@ export async function resolveChannel(ctx, value) {
 }
 
 /** チャンネル指定を配列にそろえる。"a, b" でも ["a","b"] でも受ける。 */
-function normalizeChannelArg(value) {
+function normalizeChannelArg(value: unknown): string[] | null {
   if (value === null || value === undefined || value === '') return null;
 
-  const list = Array.isArray(value)
-    ? value
-    : String(value).split(/[,、]/);
+  // 長さを抑えてから割る (モデルが巨大な配列や文字列を渡しても、ここから先は固定量)
+  const list: unknown[] = Array.isArray(value)
+    ? value.slice(0, MAX_CHANNEL_ARGS)
+    : String(value).slice(0, MAX_ARG_CHARS * MAX_CHANNEL_ARGS).split(/[,、]/).slice(0, MAX_CHANNEL_ARGS);
 
-  const cleaned = list.map((entry) => String(entry).trim()).filter(Boolean);
+  const cleaned = list.map((entry) => String(entry).trim().slice(0, MAX_ARG_CHARS)).filter(Boolean);
   return cleaned.length > 0 ? cleaned : null;
 }
 
-function compactCount(value) {
+function compactCount(value: unknown): string {
   const n = Number(value ?? 0);
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 10_000) return `${Math.round(n / 1000)}k`;
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   return String(n);
+}
+
+/** channels 表の1行 (describeChannels が使う列)。 */
+interface ChannelRow {
+  channel_id: string;
+  parent_id: string | null;
+  is_thread: number | null;
+  message_count: number | null;
+  topic: string | null;
+}
+
+/** discord.js のチャンネルの説明文。持たない種類 (ボイスやスレッド) は空。 */
+function topicOf(channel: GuildBasedChannel): string {
+  return 'topic' in channel ? channel.topic ?? '' : '';
+}
+
+function positionOf(channel: GuildBasedChannel): number {
+  return 'rawPosition' in channel ? channel.rawPosition ?? 0 : 0;
+}
+
+export interface ChannelDescription {
+  total: number;
+  hiddenByFilter: number;
+  hasThreads: boolean;
+  truncated: boolean;
+  text: string;
 }
 
 /**
@@ -161,16 +265,19 @@ function compactCount(value) {
  *   - 閉じた投稿はどちらにも出ない
  * 「どこに話が溜まっているか」を知るための道具なので、入れ物で数えるのが正しい。
  */
-export function describeChannels(ctx, { limit = 30, filter = null } = {}) {
+export function describeChannels(
+  ctx: Pick<AgentContext, 'guild' | 'member'>,
+  { limit = 30, filter = null }: { limit?: number; filter?: unknown } = {}
+): ChannelDescription | null {
   // 自分の発言数と、ぶら下がっているスレッドの発言数を分けて持つ
-  const own = new Map();
-  const childMessages = new Map();
-  const childCount = new Map();
-  const topics = new Map();
+  const own = new Map<string, number>();
+  const childMessages = new Map<string, number>();
+  const childCount = new Map<string, number>();
+  const topics = new Map<string, string>();
 
   try {
     const rows = archiveDb
-      .prepare('SELECT channel_id, parent_id, is_thread, message_count, topic FROM channels WHERE guild_id = ?')
+      .prepare<[string], ChannelRow>('SELECT channel_id, parent_id, is_thread, message_count, topic FROM channels WHERE guild_id = ?')
       .all(ctx.guild.id);
 
     for (const row of rows) {
@@ -188,17 +295,17 @@ export function describeChannels(ctx, { limit = 30, filter = null } = {}) {
     // アーカイブが無い構成でも動く
   }
 
-  const needle = filter ? String(filter).replace(/^#/, '').toLowerCase() : null;
+  const needle = filter ? String(filter).slice(0, MAX_NAME_CHARS).replace(/^#/, '').toLowerCase() : null;
 
-  const visible = [];
+  const visible: { channel: GuildBasedChannel; count: number; threads: number; forum: boolean; topic: string }[] = [];
   let hiddenByFilter = 0;
 
   for (const channel of ctx.guild.channels.cache.values()) {
     // スレッドは親に足し込んであるので個別には出さない。
     // フォーラム / メディアは自分では発言を持たないが、投稿の置き場なので出す。
-    const holdsMessages = MESSAGE_CHANNEL_TYPES.has(channel.type) && !isThreadType(channel.type);
-    if (!holdsMessages && !isForumType(channel.type)) continue;
-    if (!canRead(channel, ctx.member)) continue;
+    const holdsMessages = MESSAGE_TYPES.has(channel.type) && !archive.isThreadType(channel.type);
+    if (!holdsMessages && !archive.isForumType(channel.type)) continue;
+    if (!archive.canRead(channel, ctx.member)) continue;
 
     if (needle && !channel.name?.toLowerCase().includes(needle)) {
       hiddenByFilter += 1;
@@ -209,9 +316,9 @@ export function describeChannels(ctx, { limit = 30, filter = null } = {}) {
       channel,
       count: (own.get(channel.id) ?? 0) + (childMessages.get(channel.id) ?? 0),
       threads: childCount.get(channel.id) ?? 0,
-      forum: isForumType(channel.type),
+      forum: archive.isForumType(channel.type),
       // 取り込み前でもキャッシュには載っている
-      topic: topics.get(channel.id) ?? channel.topic ?? ''
+      topic: topics.get(channel.id) ?? topicOf(channel)
     });
   }
 
@@ -221,7 +328,7 @@ export function describeChannels(ctx, { limit = 30, filter = null } = {}) {
   visible.sort((a, b) => (
     hasCounts
       ? b.count - a.count
-      : (a.channel.rawPosition ?? 0) - (b.channel.rawPosition ?? 0)
+      : positionOf(a.channel) - positionOf(b.channel)
   ));
 
   const shown = visible.slice(0, limit);
@@ -231,7 +338,7 @@ export function describeChannels(ctx, { limit = 30, filter = null } = {}) {
   const withTopics = shown.length <= 10 && shown.some((entry) => entry.topic);
 
   const names = shown.map((entry) => {
-    const parts = [];
+    const parts: string[] = [];
     if (hasCounts && entry.count > 0) parts.push(compactCount(entry.count));
     // 投稿がぶら下がっていることは出す。フォーラムでは発言数より件数が効く。
     if (entry.threads > 0) parts.push(`${entry.forum ? '投稿' : 'スレ'}${compactCount(entry.threads)}`);
@@ -250,7 +357,7 @@ export function describeChannels(ctx, { limit = 30, filter = null } = {}) {
   };
 }
 
-export const channelsDefinition = {
+export const channelsDefinition: ToolDefinition = {
   type: 'function',
   function: {
     name: 'channels',
@@ -270,13 +377,14 @@ export const channelsDefinition = {
   }
 };
 
-function listChannels(ctx, args) {
+function listChannels(ctx: AgentContext, args: ToolArgs): string {
   const limit = clampLimit(args.limit, 30, 100);
-  const result = describeChannels(ctx, { limit, filter: args.filter ?? null });
+  const filter = args.filter ? String(args.filter).slice(0, MAX_NAME_CHARS) : null;
+  const result = describeChannels(ctx, { limit, filter });
 
   if (!result) {
-    return args.filter
-      ? `"${args.filter}" に一致する、読めるチャンネルはありませんでした。`
+    return filter
+      ? `"${filter}" に一致する、読めるチャンネルはありませんでした。`
       : '読めるチャンネルがありませんでした。';
   }
 
@@ -304,24 +412,31 @@ function listChannels(ctx, args) {
 }
 
 /** 実行者に見えないチャンネルは、ツール経由でも絶対に見せない。 */
-function assertReadable(ctx, channel) {
+function assertReadable<T extends GuildBasedChannel>(ctx: Pick<AgentContext, 'guild' | 'member'>, channel: T | null | undefined): T {
   if (!channel) throw new Error('そのチャンネルは見つかりませんでした。');
   const owner = channel.guildId ?? channel.guild?.id;
   if (owner && String(owner) !== String(ctx.guild.id)) throw new Error('別サーバーのチャンネルは読めません。');
-  if (!canRead(channel, ctx.member)) {
+  if (!archive.canRead(channel, ctx.member)) {
     throw new Error('そのチャンネルは呼び出した人に閲覧権限がないので読めません。');
   }
   return channel;
 }
 
-function collectExtra(args) {
-  const extra = [];
+function collectExtra(args: ToolArgs): SearchFilter[] {
+  const extra: SearchFilter[] = [];
   if (args.author) extra.push({ key: 'from', value: String(args.author) });
   if (args.channel) extra.push({ key: 'in', value: String(args.channel) });
   if (args.after) extra.push({ key: 'after', value: String(args.after) });
   if (args.before) extra.push({ key: 'before', value: String(args.before) });
   if (args.has) extra.push({ key: 'has', value: String(args.has) });
   return extra;
+}
+
+/** searchOptions が作る options。query / extra / sort は必ず入っている。 */
+interface ResolvedSearchOptions extends SearchOptions {
+  query: string;
+  extra: SearchFilter[];
+  sort: string;
 }
 
 /**
@@ -332,7 +447,11 @@ function collectExtra(args) {
  * author_name LIKE になっていた (author_name は書いた時点のスナップショットなので、
  * 改名した人の集計が黙って減る)。組み立てが1本なら二度と分岐しない。
  */
-async function searchOptions(ctx, args, { query, sort, extra = [] } = {}) {
+async function searchOptions(
+  ctx: AgentContext,
+  args: ToolArgs,
+  { query, sort, extra = [] }: { query?: unknown; sort?: string; extra?: SearchFilter[] } = {}
+): Promise<ResolvedSearchOptions> {
   return {
     guildId: ctx.guild.id,
     query: String(query ?? args.query ?? ''),
@@ -346,10 +465,31 @@ async function searchOptions(ctx, args, { query, sort, extra = [] } = {}) {
   };
 }
 
-function clampLimit(value, fallback, max) {
+function clampLimit(value: unknown, fallback: number, max: number): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(1, Math.min(max, Math.floor(parsed)));
+}
+
+/** 読み飛ばす件数。負や NaN は 0、大きすぎる値は MAX_OFFSET で止める。 */
+function offsetOf(args: ToolArgs): number {
+  return Math.min(MAX_OFFSET, Math.max(0, Math.floor(Number(args.offset) || 0)));
+}
+
+/**
+ * 文字列の引数を上限の長さで切った写しを作る。
+ *
+ * パーサ・LIKE・日付の解釈には、モデルが渡した長さのまま流さない。
+ * 文字列でない値 (配列など) は触らない。
+ */
+function boundedArgs(args: ToolArgs): ToolArgs {
+  const out: ToolArgs = {};
+  for (const [key, value] of Object.entries(args)) {
+    out[key] = typeof value === 'string'
+      ? value.slice(0, key === 'query' ? MAX_QUERY_CHARS : MAX_ARG_CHARS)
+      : value;
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- search
@@ -361,7 +501,7 @@ const ARCHIVE_QUERY_HELP = [
   '`is:bot|human|edited|pinned|unanswered`。'
 ].join(' ');
 
-export function searchToolDefinition({ archiveAvailable, semanticAvailable }) {
+export function searchToolDefinition({ archiveAvailable, semanticAvailable }: SearchFlags): ToolDefinition {
   // 使えないモードは出さない。定義は毎ターン送り直すので、出せば毎ターン払う。
   const modes = [
     'keyword',
@@ -415,7 +555,8 @@ export function searchToolDefinition({ archiveAvailable, semanticAvailable }) {
  * 同じ6キーの options を3箇所で組んでいて実際に2箇所ずれていたし、定義の
  * 7割は JSON Schema の枠なので、ツールを減らすほど毎ターンの固定費が減る。
  */
-export async function runSearch(ctx, args, flags) {
+export async function runSearch(ctx: AgentContext, rawArgs: ToolArgs, flags: SearchFlags): Promise<string> {
+  const args = boundedArgs(rawArgs);
   const mode = lower(args.mode) || 'keyword';
   const limit = clampLimit(args.limit, 10, 25);
 
@@ -441,7 +582,7 @@ export async function runSearch(ctx, args, flags) {
   }
 
   if (mode !== 'keyword') {
-    return `mode が不正です: ${args.mode}。keyword / meaning / count / posts のどれかです。`;
+    return `mode が不正です: ${String(args.mode)}。keyword / meaning / count / posts のどれかです。`;
   }
 
   const { source, needs } = pickSearchSource(args, flags.archiveAvailable);
@@ -472,20 +613,25 @@ export async function runSearch(ctx, args, flags) {
 // 発言単位の条件 (regex / reactions / len / has ...) はまとまりには掛けられない。
 const CHUNK_FILTER_KEYS = new Set(['from', 'in', 'after', 'before', 'during', 'on']);
 
+/** chunkFilters の結果。error があれば絞り込みは作れていない。 */
+type ChunkFilterResult =
+  | { error: string }
+  | { error?: undefined; filters: ChunkFilters; unusable: string[] };
+
 /**
  * 意味検索の絞り込みを解く。
  * まとまりの属性 (参加者・チャンネル・期間) しか使えないので、
  * 掛けられない条件は黙って落とさず呼び出し側に返して報告させる。
  */
-async function chunkFilters(ctx, args, lifted = []) {
-  const filters = {};
-  const unusable = [];
+async function chunkFilters(ctx: AgentContext, args: ToolArgs, lifted: SearchFilter[] = []): Promise<ChunkFilterResult> {
+  const filters: ChunkFilters = {};
+  const unusable: string[] = [];
 
-  let author = args.author ?? null;
+  let author: unknown = args.author ?? null;
   const channels = normalizeChannelArg(args.channel) ?? [];
-  let after = args.after ?? null;
-  let before = args.before ?? null;
-  let during = null;
+  let after: unknown = args.after ?? null;
+  let before: unknown = args.before ?? null;
+  let during: string | null = null;
 
   for (const entry of lifted) {
     if (!CHUNK_FILTER_KEYS.has(entry.key)) {
@@ -501,12 +647,12 @@ async function chunkFilters(ctx, args, lifted = []) {
 
   if (author) {
     const id = await resolveMemberId(ctx, author);
-    if (!id) return { error: `"${author}" という人が見つかりませんでした。表示名を確認するか、ユーザー ID を指定してください。` };
+    if (!id) return { error: `"${String(author)}" という人が見つかりませんでした。表示名を確認するか、ユーザー ID を指定してください。` };
     filters.authorId = id;
   }
 
   if (channels.length > 0) {
-    const ids = [];
+    const ids: string[] = [];
     for (const name of channels.slice(0, 5)) {
       const channel = assertReadable(ctx, await resolveChannel(ctx, name));
       ids.push(channel.id);
@@ -530,10 +676,10 @@ async function chunkFilters(ctx, args, lifted = []) {
  * query を省略されたら「いまの会話」を query にする。
  * 「これ前にも話した？」がキーワードを思い付かずに成立するのが要点。
  */
-function recentConversationText(ctx) {
+function recentConversationText(ctx: AgentContext): string {
   // 話題が並行しているチャンネルでは直近12件が混ざったログになるので、
   // 返信でつながっている側があるならそれを使う (それが今の話題そのもの)。
-  const source = (ctx.thread?.length ?? 0) >= 2 ? ctx.thread : (ctx.recent ?? []);
+  const source = (ctx.thread?.length ?? 0) >= 2 ? ctx.thread ?? [] : (ctx.recent ?? []);
   const selfId = ctx.client?.user?.id;
 
   // 自分の過去の回答は外す。探したいのは人が書いた発言なので、
@@ -542,13 +688,19 @@ function recentConversationText(ctx) {
     .filter((message) => message.content?.trim() && message.authorId !== selfId)
     .slice(-12);
   if (recent.length < 2) return '';
-  return recent.map((message) => `${message.authorName}: ${message.content}`).join('\n');
+  // 1件ずつ長さを抑える (埋め込みに渡す文字数に上限を持たせる)
+  return recent.map((message) => `${message.authorName}: ${message.content.slice(0, MAX_QUERY_CHARS)}`).join('\n');
 }
 
 /**
  * 意味検索。query は「埋め込む文」と「絞り込み」に割ってから渡す。
  */
-async function meaningSearch(ctx, args, limit, { escalated = false } = {}) {
+async function meaningSearch(
+  ctx: AgentContext,
+  args: ToolArgs,
+  limit: number,
+  { escalated = false }: { escalated?: boolean } = {}
+): Promise<string> {
   const raw = String(args.query ?? '').trim();
 
   // 参照番号を渡されたらその発言文を query にする (「これに似た発言」が無料で付く)
@@ -562,7 +714,7 @@ async function meaningSearch(ctx, args, limit, { escalated = false } = {}) {
   if (!queryText) return 'query を指定してください (省略するといまの会話を使いますが、会話がまだ短いです)。';
 
   const resolved = await chunkFilters(ctx, args, split.lifted);
-  if (resolved.error) return resolved.error;
+  if (resolved.error !== undefined) return resolved.error;
 
   if (!escalated) ctx.usedMeaning = true;
 
@@ -599,7 +751,7 @@ async function meaningSearch(ctx, args, limit, { escalated = false } = {}) {
  * 撃つのは0件のときだけ。件数が少ないだけなら正しく絞れているのが普通で、
  * 「言っていない」と誤読されるのは0件のときにしか起きない。
  */
-async function escalateToMeaning(ctx, args, limit, flags) {
+async function escalateToMeaning(ctx: AgentContext, args: ToolArgs, limit: number, flags: SearchFlags): Promise<string | null> {
   if (!flags.semanticAvailable) return null;
   // 1実行1回だけ。モデルが自分で意味検索を使ったなら重ねない
   if (ctx.escalated || ctx.usedMeaning) return null;
@@ -612,7 +764,7 @@ async function escalateToMeaning(ctx, args, limit, flags) {
   ctx.setStatus?.('検索 → 意味検索');
 
   const body = await meaningSearch(ctx, args, limit, { escalated: true })
-    .catch((error) => {
+    .catch((error: unknown) => {
       console.error('Meaning escalation failed:', error);
       return null;
     });
@@ -628,14 +780,15 @@ async function escalateToMeaning(ctx, args, limit, flags) {
 // Discord の検索 API が受ける has: の値。ローカルはこれ以外も持っているので、
 // 差がそのまま「ローカルにしか無い条件」になる。
 const DISCORD_HAS = new Set(['link', 'embed', 'file', 'video', 'image', 'sound', 'sticker', 'poll']);
-const HAS_ALIASES = { url: 'link', attachment: 'file', audio: 'sound' };
+// Map で引く (オブジェクトだと `constructor` のような名前が Object.prototype の関数に当たる)
+const HAS_ALIASES = new Map([['url', 'link'], ['attachment', 'file'], ['audio', 'sound']]);
 
 // Discord 側にある並び順。reactions / long / random はローカルの ORDER BY なので無い。
 const DISCORD_SORTS = new Set(['', 'new', 'old', 'relevance']);
 
 // sort / source は大小と前後の空白がぶれる。1か所で揃えないと
 // `=== 'relevance'` の比較が静かに外れて、指定した並び順が黙って無視される。
-function lower(value) {
+function lower(value: unknown): string {
   return String(value ?? '').trim().toLowerCase();
 }
 
@@ -647,15 +800,15 @@ function lower(value) {
  * 解釈できないクエリは DSL ではない素の語とみなす (Discord 側に DSL は無いので、
  * 記号混じりの語はそのまま渡すのが正しい)。
  */
-function archiveOnlyNeeds(args) {
-  const needs = new Set();
+function archiveOnlyNeeds(args: ToolArgs): string[] {
+  const needs = new Set<string>();
 
   const sort = lower(args.sort);
   if (!DISCORD_SORTS.has(sort)) needs.add(`sort:${sort}`);
 
   if (args.has) {
     const has = lower(args.has);
-    if (!DISCORD_HAS.has(HAS_ALIASES[has] ?? has)) needs.add(`has:${has}`);
+    if (!DISCORD_HAS.has(HAS_ALIASES.get(has) ?? has)) needs.add(`has:${has}`);
   }
 
   // Discord は語も人もチャンネルも無い「期間だけ」の検索を受けない。
@@ -665,17 +818,17 @@ function archiveOnlyNeeds(args) {
   }
 
   try {
-    const { ast, directives } = parseQuery(String(args.query ?? ''));
+    const { ast, directives } = archive.parseQuery(String(args.query ?? ''));
 
     if (directives.sort && !DISCORD_SORTS.has(directives.sort)) needs.add(`sort:${directives.sort}`);
 
-    const walk = (node) => {
+    const walk = (node: QueryNode | null | undefined): void => {
       if (!node) return;
       if (node.type === 'filter') needs.add(`${node.key}:`);
       if (node.type === 'or') needs.add('OR');
       if (node.type === 'not') needs.add('-除外');
       if (node.node) walk(node.node);
-      if (node.nodes) node.nodes.forEach(walk);
+      if (node.nodes) node.nodes.forEach((child) => walk(child));
     };
 
     walk(ast);
@@ -686,6 +839,8 @@ function archiveOnlyNeeds(args) {
   return [...needs];
 }
 
+export type SearchSource = 'archive' | 'discord' | 'unsupported' | 'unavailable';
+
 /**
  * どちらの検索元を使うか決める。
  *
@@ -694,7 +849,7 @@ function archiveOnlyNeeds(args) {
  * 常に中身を持っている側を既定にする。ローカルにしか無い条件を使っている
  * ときだけそちらへ回し、回したことは出力の1行目で必ず言う。
  */
-export function pickSearchSource(args, archiveAvailable) {
+export function pickSearchSource(args: ToolArgs, archiveAvailable: boolean): { source: SearchSource; needs: string[] } {
   const asked = lower(args.source);
   const needs = archiveOnlyNeeds(args);
 
@@ -711,7 +866,7 @@ export function pickSearchSource(args, archiveAvailable) {
   return { source: 'discord', needs };
 }
 
-async function searchViaArchive(ctx, args, limit, note = null) {
+async function searchViaArchive(ctx: AgentContext, args: ToolArgs, limit: number, note: string | null = null): Promise<SearchOutcome> {
   const options = await searchOptions(ctx, args);
 
   if (!options.query && options.extra.length === 0) {
@@ -719,7 +874,7 @@ async function searchViaArchive(ctx, args, limit, note = null) {
   }
 
   const origin = `検索元: ローカル${note ? ` (${note})` : ''}`;
-  const summary = searchSummary(options);
+  const summary = archive.searchSummary(options);
 
   if (!summary.count) {
     // 0件を「言っていない」と読まれると困る。取り込みの穴の可能性を示す。
@@ -732,8 +887,8 @@ async function searchViaArchive(ctx, args, limit, note = null) {
     };
   }
 
-  const offset = Math.max(0, Math.floor(Number(args.offset) || 0));
-  const { rows } = search(options, { limit, offset });
+  const offset = offsetOf(args);
+  const { rows } = archive.search(options, { limit, offset });
   const messages = rows.map((row) => fromArchiveRow(row, channelName(ctx, row.channel_id)));
 
   const shown = offset > 0 ? `表示 ${offset + 1}〜${offset + messages.length} 件` : `表示 ${messages.length} 件`;
@@ -758,8 +913,18 @@ async function searchViaArchive(ctx, args, limit, note = null) {
   return { empty: false, text: lines.join('\n') };
 }
 
-function channelCountLabel(summary) {
+function channelCountLabel(summary: SearchSummary): string {
   return `${summary.channels} チャンネル`;
+}
+
+/** splitMeaningQuery の結果。 */
+export interface MeaningQuery {
+  /** 埋め込む文 */
+  text: string;
+  /** 絞り込みに持ち上げた filter */
+  lifted: SearchFilter[];
+  /** OR / 否定の下にあって使えなかった filter のキー */
+  dropped: string[];
 }
 
 /**
@@ -774,32 +939,38 @@ function channelCountLabel(summary) {
  * トップレベルの AND に混ぜると条件の意味が変わる
  * (`(from:@a OR from:@b)` を両方 AND にすると必ず0件になる)。
  */
-export function splitMeaningQuery(raw) {
+export function splitMeaningQuery(raw: unknown): MeaningQuery {
   const text = String(raw ?? '');
 
-  let ast;
+  let ast: QueryNode | null;
   try {
-    ({ ast } = parseQuery(text));
+    ({ ast } = archive.parseQuery(text));
   } catch {
     // 解釈できない = DSL ではない。素の文として扱う
     return { text, lifted: [], dropped: [] };
   }
 
-  const lifted = [];
-  const dropped = [];
+  const lifted: SearchFilter[] = [];
+  const dropped: string[] = [];
 
-  const collectFilterKeys = (node, out) => {
+  const collectFilterKeys = (node: QueryNode | null | undefined, out: string[]): void => {
     if (!node) return;
-    if (node.type === 'filter') out.push(node.key);
+    if (node.type === 'filter') out.push(node.key ?? '');
     if (node.node) collectFilterKeys(node.node, out);
     if (node.nodes) node.nodes.forEach((child) => collectFilterKeys(child, out));
   };
 
-  const walk = (node) => {
+  const walk = (node: QueryNode | null | undefined): void => {
     if (!node) return;
-    if (node.type === 'and') return node.nodes.forEach(walk);
-    if (node.type === 'filter') return void lifted.push({ key: node.key, value: node.value });
-    if (node.type === 'or' || node.type === 'not') return collectFilterKeys(node, dropped);
+    if (node.type === 'and') {
+      node.nodes?.forEach((child) => walk(child));
+      return;
+    }
+    if (node.type === 'filter') {
+      lifted.push({ key: node.key ?? '', value: node.value ?? '' });
+      return;
+    }
+    if (node.type === 'or' || node.type === 'not') collectFilterKeys(node, dropped);
   };
 
   walk(ast);
@@ -807,7 +978,7 @@ export function splitMeaningQuery(raw) {
   return {
     // 持ち上げが無いなら生の文字列をそのまま返す (collectTerms は括弧と
     // 引用符を落とすので、割る必要が無いときは触らない)
-    text: lifted.length === 0 ? text : collectTerms(ast).join(' '),
+    text: lifted.length === 0 ? text : archive.collectTerms(ast).join(' '),
     lifted,
     dropped
   };
@@ -819,10 +990,10 @@ export function splitMeaningQuery(raw) {
  * 素の語だけを渡す。AST は `a b` と `a AND b` を区別できないので生の文字列を
  * 渡すと AND がそれ自体検索語として飛ぶ。空白を含む語は句なので引用符を戻す。
  */
-function discordContent(raw) {
+function discordContent(raw: string): string {
   try {
-    const { ast } = parseQuery(raw);
-    const terms = collectTerms(ast).map((term) => (/\s/.test(term) ? `"${term}"` : term));
+    const { ast } = archive.parseQuery(raw);
+    const terms = archive.collectTerms(ast).map((term) => (/\s/.test(term) ? `"${term}"` : term));
     return terms.length > 0 ? terms.join(' ') : raw;
   } catch {
     return raw;
@@ -838,8 +1009,8 @@ function discordContent(raw) {
  *   after:2024-05-01  → その日を含む   (created_at >= start)
  *   before:2024-05-01 → その日を含まない (created_at < start)
  */
-function dateBounds(args) {
-  const bounds = {};
+function dateBounds(args: ToolArgs): { minId?: string; maxId?: string; error?: string } {
+  const bounds: { minId?: string; maxId?: string; error?: string } = {};
 
   if (args.after) {
     const { start } = parseDateRange(String(args.after));
@@ -852,7 +1023,7 @@ function dateBounds(args) {
     const { start } = parseDateRange(String(args.before));
     const id = BigInt(msToSnowflake(start) ?? '0');
     if (id <= 0n) {
-      return { error: `${args.before} より前の発言は Discord にはありません (Discord は 2015 年から)。` };
+      return { error: `${String(args.before)} より前の発言は Discord にはありません (Discord は 2015 年から)。` };
     }
     // created_at < start と同じにするため境目の ID を1つ戻す
     // (max_id が境界を含むかは公開されていないので、含む側に寄せておく)
@@ -872,16 +1043,19 @@ function dateBounds(args) {
  * (Discord は一致した発言を中心に前後を付ける)。外しても採るのは1件なので、
  * 件数と limit の関係は狂わない。
  */
-function pickHits(data) {
-  const groups = Array.isArray(data?.messages) ? data.messages : [];
+function pickHits(data: unknown): RawMessage[] {
+  const groups: unknown[] = isRecord(data) && Array.isArray(data.messages) ? data.messages : [];
+  const hits: RawMessage[] = [];
 
-  return groups
-    .map((group) => {
-      const list = (Array.isArray(group) ? group : [group]).filter(Boolean);
-      if (list.length <= 1) return list[0] ?? null;
-      return list.find((message) => message.hit) ?? list[Math.floor(list.length / 2)];
-    })
-    .filter(Boolean);
+  for (const group of groups) {
+    const list: unknown[] = (Array.isArray(group) ? group : [group]).filter(Boolean);
+    const picked = list.length <= 1
+      ? list[0]
+      : list.find((message) => isRecord(message) && message.hit) ?? list[Math.floor(list.length / 2)];
+    if (isRawMessage(picked)) hits.push(picked);
+  }
+
+  return hits;
 }
 
 /**
@@ -890,24 +1064,26 @@ function pickHits(data) {
  * ただしアーカイブ済みスレッドはキャッシュに載らないことが多いので、
  * getChannelScope と同じ規則で親チャンネルの権限を見る。
  */
-function canSeeHit(ctx, channelId) {
+function canSeeHit(ctx: AgentContext, channelId: string): boolean {
   const cached = ctx.guild.channels.cache.get(channelId);
-  if (cached) return canRead(cached, ctx.member);
+  if (cached) return archive.canRead(cached, ctx.member);
 
   try {
     const row = archiveDb
-      .prepare('SELECT parent_id, is_thread, is_private FROM channels WHERE guild_id = ? AND channel_id = ?')
+      .prepare<[string, string], { parent_id: string | null; is_thread: number | null; is_private: number | null }>(
+        'SELECT parent_id, is_thread, is_private FROM channels WHERE guild_id = ? AND channel_id = ?'
+      )
       .get(ctx.guild.id, channelId);
 
     if (!row?.is_thread || row.is_private || !row.parent_id) return false;
     const parent = ctx.guild.channels.cache.get(row.parent_id);
-    return parent ? canRead(parent, ctx.member) : false;
+    return parent ? archive.canRead(parent, ctx.member) : false;
   } catch {
     return false;
   }
 }
 
-async function searchViaDiscord(ctx, args, limit, archiveAvailable) {
+async function searchViaDiscord(ctx: AgentContext, args: ToolArgs, limit: number, archiveAvailable: boolean): Promise<SearchOutcome> {
   const query = new URLSearchParams();
   query.set('limit', String(Math.min(limit, 25)));
 
@@ -918,7 +1094,7 @@ async function searchViaDiscord(ctx, args, limit, archiveAvailable) {
     // 直せないときは黙って無視せず、そう伝える (絞れていない結果を渡すと誤読される)。
     const author = await resolveMemberId(ctx, args.author);
     if (!author) {
-      return { empty: false, text: `"${args.author}" という人が見つかりませんでした。表示名を確認するか、ユーザー ID を指定してください。` };
+      return { empty: false, text: `"${String(args.author)}" という人が見つかりませんでした。表示名を確認するか、ユーザー ID を指定してください。` };
     }
     query.set('author_id', author);
   }
@@ -931,7 +1107,7 @@ async function searchViaDiscord(ctx, args, limit, archiveAvailable) {
   // ローカルの別名 (audio / attachment / url) をそのまま送ると 400 になる
   if (args.has) {
     const has = lower(args.has);
-    query.set('has', HAS_ALIASES[has] ?? has);
+    query.set('has', HAS_ALIASES.get(has) ?? has);
   }
 
   // 絞り込みが1つも無いと Discord 側で弾かれるので、並び順だけの指定は条件と数えない。
@@ -948,20 +1124,21 @@ async function searchViaDiscord(ctx, args, limit, archiveAvailable) {
   if (sort === 'relevance') query.set('sort_by', 'relevance');
   if (sort === 'old') query.set('sort_order', 'asc');
 
-  const offset = Math.max(0, Math.floor(Number(args.offset) || 0));
+  const offset = offsetOf(args);
   if (offset > 0) query.set('offset', String(offset));
 
-  let data;
+  let data: unknown;
   try {
     data = await ctx.client.rest.get(`/guilds/${ctx.guild.id}/messages/search`, { query });
   } catch (error) {
-    return { empty: false, text: `Discord の検索 API が失敗しました: ${truncate(error.message, 200)}` };
+    return { empty: false, text: `Discord の検索 API が失敗しました: ${truncate(errorMessage(error), 200)}` };
   }
 
   // インデックス構築中は 202。retry_after は 0 で来ることがあるので真偽で見ない
   // (0 を未指定と読むと、この分岐を抜けて「0件」として報告してしまう)。
-  const retryAfter = Number(data?.retry_after);
-  if (data?.code === 110000 || Number.isFinite(retryAfter) || data?.doing_deep_historical_index) {
+  const reply = isRecord(data) ? data : {};
+  const retryAfter = Number(reply.retry_after);
+  if (reply.code === 110000 || Number.isFinite(retryAfter) || reply.doing_deep_historical_index) {
     return {
       empty: false,
       text: [
@@ -972,16 +1149,16 @@ async function searchViaDiscord(ctx, args, limit, archiveAvailable) {
     };
   }
 
-  const hits = pickHits(data);
-  const visible = hits.filter((message) => canSeeHit(ctx, message.channel_id));
-  const hidden = visible.length < hits.length;
+  // 読めないチャンネルのヒットは、件数にも注記にも一切出さない。
+  // 「除いた」と言うだけで、読めないチャンネルにその語があるかどうかが分かってしまう
+  // (権限の無い人が語を変えながら呼べば、非公開チャンネルの中身を探る道具になる)。
+  const visible = pickHits(data).filter((message) => canSeeHit(ctx, message.channel_id));
 
   if (visible.length === 0) {
     return {
       empty: true,
       text: [
         '該当するメッセージはありませんでした (検索元: Discord)。',
-        hidden ? '(読めないチャンネルのヒットは除いた) ' : '',
         'Discord の検索は語の切れ目に厳しいので、短い語や言い換えで引き直すと出ることがある。',
         archiveAvailable ? '正規表現・OR・リアクション数で攻めるならローカル側も引ける。' : ''
       ].join('')
@@ -999,8 +1176,7 @@ async function searchViaDiscord(ctx, args, limit, archiveAvailable) {
     text: [
       `表示 ${messages.length} 件 ・ 検索元: Discord`
         + (sort === 'relevance' ? ' (関連度順)' : '')
-        + (hits.length >= limit ? ' ・ limit ぶん埋まったのでこれで全部とは限らない' : '')
-        + (hidden ? ' ・ 読めないチャンネルのヒットは除外済' : ''),
+        + (visible.length >= limit ? ' ・ limit ぶん埋まったのでこれで全部とは限らない' : ''),
       formatMessages(messages, {
         refs: ctx.refs,
         selfId: ctx.client?.user?.id,
@@ -1020,7 +1196,7 @@ async function searchViaDiscord(ctx, args, limit, archiveAvailable) {
  * 発言単位で返すと「どの投稿の話か」が読み手に分からない。フォーラムでは
  * 1投稿 = 1話題なので、そこを単位にしないと「○○の投稿ある？」に答えられない。
  */
-async function searchPosts(ctx, args, limit) {
+async function searchPosts(ctx: AgentContext, args: ToolArgs, limit: number): Promise<string> {
   const options = await searchOptions(ctx, args);
 
   if (!options.query && options.extra.length === 0) {
@@ -1028,17 +1204,17 @@ async function searchPosts(ctx, args, limit) {
   }
 
   // タイトル一致に使う素の語。フィルタ (from: など) は語ではないので外れる。
-  let titleTerms = [];
+  let titleTerms: string[] = [];
   try {
-    const { ast } = parseQuery(options.query);
-    titleTerms = collectTerms(ast).slice(0, 4);
+    const { ast } = archive.parseQuery(options.query);
+    titleTerms = archive.collectTerms(ast).slice(0, 4);
   } catch {
     // 解釈できないクエリは素の語として扱う
     titleTerms = options.query ? [options.query] : [];
   }
 
-  const offset = Math.max(0, Math.floor(Number(args.offset) || 0));
-  const rows = searchThreads(options, { limit, offset, titleTerms });
+  const offset = offsetOf(args);
+  const rows: ThreadRow[] = archive.searchThreads(options, { limit, offset, titleTerms });
 
   if (rows.length === 0) {
     return [
@@ -1057,11 +1233,11 @@ async function searchPosts(ctx, args, limit) {
       authorId: '0',
       authorName: 'unknown',
       content: row.name,
-      createdAt: snowflakeToMs(row.oldest_id ?? row.newest_id ?? '0')
+      createdAt: snowflakeToMs(row.oldest_id ?? row.newest_id ?? '0') ?? undefined
     });
 
     const where = row.parent_id ? `#${channelName(ctx, row.parent_id)}` : '';
-    const last = snowflakeToMs(row.newest_id ?? '0');
+    const last = snowflakeToMs(row.newest_id ?? '0') ?? 0;
     const tags = String(row.applied_tags ?? '').trim();
 
     const tail = [
@@ -1092,7 +1268,7 @@ async function searchPosts(ctx, args, limit) {
 
 // ---------------------------------------------------------------- read
 
-export function readDefinition(archiveAvailable) {
+export function readDefinition(archiveAvailable: boolean): ToolDefinition {
   const directions = ['around', 'before', 'after', ...(archiveAvailable ? ['replies'] : [])];
 
   return {
@@ -1129,50 +1305,105 @@ export function readDefinition(archiveAvailable) {
 
 const MAX_CHANNELS_PER_READ = 5;
 
+// Discord のメッセージ ID の形。起点に使う前にこれで確かめる
+// (BigInt() に渡す文字列がこの形でないと SyntaxError で落ちる)。
+const SNOWFLAKE_PATTERN = /^\d{1,20}$/;
+
+/**
+ * 起点の前後を読む。
+ *
+ * around は「そのチャンネルに実在するメッセージ ID」でしか当てにできない。
+ * 別チャンネルのヒットや日付から作った ID は、そのチャンネルには存在しないので
+ * around には渡せない (合成しても元の ID と位置的に同じで、状況は変わらない)。
+ * before / after は ID の大小比較として動くので、そちらを2回引いて挟む。
+ */
+async function fetchAround(channel: MessageHost, anchorId: string, limit: number, { exact }: { exact: boolean }): Promise<Message<true>[]> {
+  if (exact) return [...(await channel.messages.fetch({ around: anchorId, limit })).values()];
+
+  const back = Math.ceil(limit / 2);
+  const forward = Math.max(1, limit - back);
+
+  const [older, newer] = await Promise.all([
+    channel.messages.fetch({ before: anchorId, limit: back }).then((c) => [...c.values()]).catch((): Message<true>[] => []),
+    // 境目を含めたいので1つ戻す (dateBounds と同じ考え方)
+    channel.messages.fetch({ after: String(BigInt(anchorId) - 1n), limit: forward }).then((c) => [...c.values()]).catch((): Message<true>[] => [])
+  ]);
+
+  return [...older, ...newer];
+}
+
+/**
+ * 起点と向きに応じてメッセージを取る。起点が無ければ最新から。
+ * 起点の ID が Discord のメッセージ ID の形でなければ、取りに行く前に断る
+ * (参照表の ID はモデルが渡した文字列を含みうる。呼び出し側の try で文面になる)。
+ */
+async function fetchWindow(
+  channel: MessageHost,
+  anchor: Anchor,
+  direction: Direction,
+  limit: number,
+  exact: boolean
+): Promise<Message<true>[]> {
+  if (anchor.kind === 'none' || anchor.kind === 'error') {
+    return [...(await channel.messages.fetch({ limit })).values()];
+  }
+
+  if (!SNOWFLAKE_PATTERN.test(anchor.messageId)) {
+    throw new Error('起点がメッセージ ID の形ではないので読めません。検索し直した番号か、日付を渡してください。');
+  }
+
+  // 日付から作った ID はどのチャンネルにも実在しないので around は挟み込みで読む
+  if (direction === 'around') return fetchAround(channel, anchor.messageId, limit, { exact });
+
+  const page = direction === 'before'
+    ? { before: anchor.messageId, limit }
+    : { after: anchor.messageId, limit };
+  return [...(await channel.messages.fetch(page)).values()];
+}
+
 /**
  * 1回の呼び出しで複数チャンネルを読む。往復を増やさずに横断できるようにするため。
  * 日付の起点は全チャンネルに効く (「2020年4月頃、この2つで何を話していたか」)。
  */
-async function readManyChannels(ctx, wanted, args, { anchor = { kind: 'none' }, direction = 'around' } = {}) {
+async function readManyChannels(
+  ctx: AgentContext,
+  wanted: string[],
+  args: ToolArgs,
+  { anchor = { kind: 'none' }, direction = 'around' }: { anchor?: Anchor; direction?: Direction } = {}
+): Promise<string> {
   const targets = wanted.slice(0, MAX_CHANNELS_PER_READ);
   const total = clampLimit(args.limit, 30, 100);
   const perChannel = Math.max(5, Math.floor(total / targets.length));
 
-  const sections = [];
-  const problems = [];
+  const sections: string[] = [];
+  const problems: string[] = [];
 
   for (const name of targets) {
-    let channel;
+    let channel: GuildBasedChannel;
     try {
       channel = assertReadable(ctx, await resolveChannel(ctx, name));
     } catch (error) {
-      problems.push(`${name}: ${error.message}`);
+      problems.push(`${name}: ${errorMessage(error)}`);
       continue;
     }
 
     // フォーラムが混ざっていても行き止まりにしない。投稿の一覧を1区画として出す。
-    if (isForumType(channel.type)) {
+    if (archive.isForumType(channel.type)) {
       sections.push(await listThreadContainer(ctx, channel, Math.min(perChannel, 20)));
       continue;
     }
 
-    if (typeof channel.messages?.fetch !== 'function') {
+    if (!hasMessageManager(channel)) {
       problems.push(`#${channel.name}: メッセージを取得できない種類のチャンネルです`);
       continue;
     }
 
-    let fetched;
+    let fetched: Message<true>[];
     try {
-      if (anchor.kind === 'none') {
-        fetched = [...(await channel.messages.fetch({ limit: perChannel })).values()];
-      } else if (direction === 'around') {
-        // 日付から作った ID はどのチャンネルにも実在しないので必ず挟み込みで読む
-        fetched = await fetchAround(channel, anchor.messageId, perChannel, { exact: false });
-      } else {
-        fetched = [...(await channel.messages.fetch({ [direction]: anchor.messageId, limit: perChannel })).values()];
-      }
+      // 日付から作った ID はどのチャンネルにも実在しないので必ず挟み込みで読む (exact: false)
+      fetched = await fetchWindow(channel, anchor, direction, perChannel, false);
     } catch (error) {
-      problems.push(`#${channel.name}: ${truncate(error.message, 80)}`);
+      problems.push(`#${channel.name}: ${truncate(errorMessage(error), 80)}`);
       continue;
     }
 
@@ -1215,16 +1446,16 @@ async function readManyChannels(ctx, wanted, args, { anchor = { kind: 'none' }, 
  * 実行者に見えないチャンネルは返さない。ここを通すと、ID を知っているだけで
  * 権限のないチャンネルの前後が読めてしまう。
  */
-function locateMessage(ctx, messageId) {
+function locateMessage(ctx: Pick<AgentContext, 'guild' | 'channelScope'>, messageId: string | null | undefined): string | null {
   if (!messageId) return null;
 
   try {
     const row = archiveDb
-      .prepare('SELECT channel_id FROM messages WHERE guild_id = ? AND message_id = ?')
+      .prepare<[string, string], { channel_id: string }>('SELECT channel_id FROM messages WHERE guild_id = ? AND message_id = ?')
       .get(ctx.guild.id, String(messageId));
 
     if (!row?.channel_id) return null;
-    return isChannelAllowed(row.channel_id, ctx.channelScope) ? row.channel_id : null;
+    return archive.isChannelAllowed(row.channel_id, ctx.channelScope) ? row.channel_id : null;
   } catch {
     // アーカイブが無い構成でも動くようにする
     return null;
@@ -1238,8 +1469,8 @@ function locateMessage(ctx, messageId) {
  * 表に無ければエラーにする。parseDateRange の Date.parse フォールバックは緩く、
  * ここを素通りさせると古い番号が黙って謎の日付になる。
  */
-export function resolveAnchor(ctx, at) {
-  const text = String(at ?? '').trim();
+export function resolveAnchor(ctx: Pick<AgentContext, 'guild' | 'refs' | 'channelScope'>, at: unknown): Anchor {
+  const text = String(at ?? '').trim().slice(0, MAX_ARG_CHARS);
   if (!text) return { kind: 'none' };
 
   const entry = ctx.refs.resolve(text);
@@ -1273,27 +1504,15 @@ export function resolveAnchor(ctx, at) {
   }
 }
 
-/**
- * 起点の前後を読む。
- *
- * around は「そのチャンネルに実在するメッセージ ID」でしか当てにできない。
- * 別チャンネルのヒットや日付から作った ID は、そのチャンネルには存在しないので
- * around には渡せない (合成しても元の ID と位置的に同じで、状況は変わらない)。
- * before / after は ID の大小比較として動くので、そちらを2回引いて挟む。
- */
-async function fetchAround(channel, anchorId, limit, { exact }) {
-  if (exact) return [...(await channel.messages.fetch({ around: anchorId, limit })).values()];
-
-  const back = Math.ceil(limit / 2);
-  const forward = Math.max(1, limit - back);
-
-  const [older, newer] = await Promise.all([
-    channel.messages.fetch({ before: anchorId, limit: back }).then((c) => [...c.values()]).catch(() => []),
-    // 境目を含めたいので1つ戻す (dateBounds と同じ考え方)
-    channel.messages.fetch({ after: String(BigInt(anchorId) - 1n), limit: forward }).then((c) => [...c.values()]).catch(() => [])
-  ]);
-
-  return [...older, ...newer];
+/** 会話のまとまりに刈った結果。trimmed が false なら刈っていない。 */
+interface ConversationCut {
+  messages: AgentMessage[];
+  trimmed: boolean;
+  threshold?: number;
+  gapBefore?: number | null;
+  gapAfter?: number | null;
+  hitStart?: boolean;
+  hitEnd?: boolean;
 }
 
 /**
@@ -1302,12 +1521,15 @@ async function fetchAround(channel, anchorId, limit, { exact }) {
  * 閾値は固定しない。静かなチャンネルでは全部が別会話になり、賑やかな
  * チャンネルでは一晩が1会話になるので、ページ内の間隔の中央値から決める。
  */
-function trimToConversation(messages, anchorId) {
+function trimToConversation(messages: AgentMessage[], anchorId: string): ConversationCut {
   if (messages.length < 3) return { messages, trimmed: false };
 
-  const gaps = [];
+  // i は 0 〜 messages.length - 1 の範囲でしか呼ばない
+  const at = (i: number): number => messages[i]?.createdAt ?? 0;
+
+  const gaps: number[] = [];
   for (let i = 1; i < messages.length; i += 1) {
-    gaps.push(messages[i].createdAt - messages[i - 1].createdAt);
+    gaps.push(at(i) - at(i - 1));
   }
 
   const sorted = [...gaps].sort((a, b) => a - b);
@@ -1318,8 +1540,8 @@ function trimToConversation(messages, anchorId) {
   let start = center;
   let end = center;
 
-  while (start > 0 && messages[start].createdAt - messages[start - 1].createdAt <= threshold) start -= 1;
-  while (end < messages.length - 1 && messages[end + 1].createdAt - messages[end].createdAt <= threshold) end += 1;
+  while (start > 0 && at(start) - at(start - 1) <= threshold) start -= 1;
+  while (end < messages.length - 1 && at(end + 1) - at(end) <= threshold) end += 1;
 
   // 短すぎると文脈にならないので最低5件は返す
   while (end - start + 1 < Math.min(5, messages.length)) {
@@ -1332,18 +1554,27 @@ function trimToConversation(messages, anchorId) {
     messages: messages.slice(start, end + 1),
     trimmed: true,
     threshold,
-    gapBefore: start > 0 ? messages[start].createdAt - messages[start - 1].createdAt : null,
-    gapAfter: end < messages.length - 1 ? messages[end + 1].createdAt - messages[end].createdAt : null,
+    gapBefore: start > 0 ? at(start) - at(start - 1) : null,
+    gapAfter: end < messages.length - 1 ? at(end + 1) - at(end) : null,
     hitStart: start === 0,
     hitEnd: end === messages.length - 1
   };
 }
 
-function durationLabel(ms) {
+function durationLabel(ms: number): string {
   const minutes = Math.round(ms / 60_000);
   if (minutes < 60) return `${minutes}分`;
   const hours = Math.round(minutes / 60);
   return hours < 24 ? `${hours}時間` : `${Math.round(hours / 24)}日`;
+}
+
+/** listThreadContainer が使う channels 表の行。 */
+interface ThreadListRow {
+  channel_id: string;
+  name: string;
+  message_count: number | null;
+  oldest_id: string | null;
+  newest_id: string | null;
 }
 
 /**
@@ -1357,10 +1588,10 @@ function durationLabel(ms) {
  * スレッド ID は「そのスレッドが始まった親の発言」なので、投稿の中では
  * around の起点にならないことがある (フォーラムだけは両者が一致する)。
  */
-async function listThreadContainer(ctx, container, limit) {
-  let rows = [];
+async function listThreadContainer(ctx: AgentContext, container: GuildBasedChannel, limit: number): Promise<string> {
+  let rows: ThreadListRow[] = [];
   try {
-    rows = archiveDb.prepare(`
+    rows = archiveDb.prepare<[string, string, number], ThreadListRow>(`
       SELECT channel_id, name, message_count, oldest_id, newest_id
       FROM channels
       WHERE guild_id = ? AND parent_id = ? AND is_thread = 1 AND is_private = 0
@@ -1371,13 +1602,17 @@ async function listThreadContainer(ctx, container, limit) {
     // アーカイブが無い構成でも動く
   }
 
-  const label = isForumType(container.type) ? '投稿' : 'スレッド';
-  const visible = rows.filter((row) => isChannelAllowed(row.channel_id, ctx.channelScope));
+  const label = archive.isForumType(container.type) ? '投稿' : 'スレッド';
+  const visible = rows.filter((row) => archive.isChannelAllowed(row.channel_id, ctx.channelScope));
 
   // 取り込み前でも行き止まりにしない。生きている投稿だけは API から拾える。
   if (visible.length === 0) {
-    const active = await container.threads?.fetchActive?.().catch(() => null);
-    const threads = [...(active?.threads?.values() ?? [])].slice(0, limit);
+    const threadManager = 'threads' in container ? container.threads : undefined;
+    const active = await threadManager?.fetchActive?.().catch(() => null);
+    // fetchActive は権限を見ずに全部返す。非公開スレッドなど、呼んだ人に読めないものは出さない。
+    const threads = [...(active?.threads?.values() ?? [])]
+      .filter((thread) => archive.canRead(thread, ctx.member))
+      .slice(0, limit);
 
     if (threads.length === 0) return `#${container.name} には読める${label}がありませんでした。`;
 
@@ -1412,10 +1647,10 @@ async function listThreadContainer(ctx, container, limit) {
       authorId: '0',
       authorName: 'unknown',
       content: row.name,
-      createdAt: snowflakeToMs(row.oldest_id ?? row.newest_id ?? '0')
+      createdAt: snowflakeToMs(row.oldest_id ?? row.newest_id ?? '0') ?? undefined
     });
 
-    const last = snowflakeToMs(row.newest_id ?? '0');
+    const last = snowflakeToMs(row.newest_id ?? '0') ?? 0;
     const tail = [`${row.message_count ?? 0}件`, last > 0 ? `最終 ${shortTime(last)}` : null]
       .filter(Boolean)
       .join(' ');
@@ -1430,7 +1665,8 @@ async function listThreadContainer(ctx, container, limit) {
   ].join('\n');
 }
 
-export async function runRead(ctx, args) {
+export async function runRead(ctx: AgentContext, rawArgs: ToolArgs): Promise<string> {
+  const args = boundedArgs(rawArgs);
   const wanted = normalizeChannelArg(args.channel);
   const direction = lower(args.direction) || 'around';
   const anchor = resolveAnchor(ctx, args.at);
@@ -1440,11 +1676,11 @@ export async function runRead(ctx, args) {
   if (direction === 'replies') {
     if (anchor.kind !== 'message') return 'replies には at に参照番号かメッセージ ID を渡してください。';
     if (wanted && wanted.length > 1) return 'replies は1つの発言を起点にするので、channel を複数渡さないでください。';
-    return readReplies(ctx, anchor, args);
+    return readReplies(ctx, anchor.messageId, args);
   }
 
-  if (!['around', 'before', 'after'].includes(direction)) {
-    return `direction が不正です: ${args.direction}。around / before / after / replies のどれかです。`;
+  if (!isWindowDirection(direction)) {
+    return `direction が不正です: ${String(args.direction)}。around / before / after / replies のどれかです。`;
   }
 
   // 複数チャンネル: 日付の起点は全部に効くが、参照番号は1チャンネルの話なので断る
@@ -1457,40 +1693,35 @@ export async function runRead(ctx, args) {
 
   // 参照番号から来た channel_id は確定値なので名前解決を通さない。
   // 呼ばれたチャンネルを既定にすると、別チャンネルのヒットの前後が追えない。
+  const named = wanted?.[0];
   const channel = assertReadable(
     ctx,
-    wanted
-      ? await resolveChannel(ctx, wanted[0])
-      : anchor.channelId
+    named !== undefined
+      ? await resolveChannel(ctx, named)
+      : anchor.kind === 'message' && anchor.channelId
         ? ctx.guild.channels.cache.get(anchor.channelId)
           ?? await ctx.guild.channels.fetch(anchor.channelId).catch(() => null)
         : ctx.channel
   );
 
   // フォーラム / メディアは中身が全部スレッドなので、投稿の一覧を返す
-  if (isForumType(channel.type)) {
+  if (archive.isForumType(channel.type)) {
     return listThreadContainer(ctx, channel, clampLimit(args.limit, 20, 50));
   }
 
-  if (typeof channel.messages?.fetch !== 'function') {
+  if (!hasMessageManager(channel)) {
     return 'そのチャンネルからはメッセージを取得できません。';
   }
 
   const limit = clampLimit(args.limit, 30, 100);
-  let raw;
+  let raw: Message<true>[];
 
   try {
-    if (anchor.kind === 'none') {
-      raw = [...(await channel.messages.fetch({ limit })).values()];
-    } else if (direction === 'around') {
-      // 同一チャンネルの実在メッセージなら around が使える
-      const exact = anchor.kind === 'message' && (!anchor.channelId || anchor.channelId === channel.id);
-      raw = await fetchAround(channel, anchor.messageId, limit, { exact });
-    } else {
-      raw = [...(await channel.messages.fetch({ [direction]: anchor.messageId, limit })).values()];
-    }
+    // 同一チャンネルの実在メッセージなら around が使える
+    const exact = anchor.kind === 'message' && (!anchor.channelId || anchor.channelId === channel.id);
+    raw = await fetchWindow(channel, anchor, direction, limit, exact);
   } catch (error) {
-    return `メッセージを取得できませんでした: ${truncate(error.message, 200)}`;
+    return `メッセージを取得できませんでした: ${truncate(errorMessage(error), 200)}`;
   }
 
   let messages = raw
@@ -1499,14 +1730,14 @@ export async function runRead(ctx, args) {
 
   if (messages.length === 0) return 'メッセージがありませんでした。';
 
-  const notes = [];
+  const notes: string[] = [];
 
   if (lower(args.expand) === 'conversation') {
-    const cut = trimToConversation(messages, anchor.messageId);
+    const cut = trimToConversation(messages, anchor.kind === 'message' || anchor.kind === 'time' ? anchor.messageId : '');
     messages = cut.messages;
 
     if (cut.trimmed) {
-      const parts = [];
+      const parts: string[] = [];
       // 端に当たったことを言わないと、切れた会話を完結したものとして読まれる
       if (cut.hitStart) parts.push('前はページの端まで続いている');
       else if (cut.gapBefore) parts.push(`前は${durationLabel(cut.gapBefore)}の無言`);
@@ -1518,7 +1749,7 @@ export async function runRead(ctx, args) {
 
   const sameChannel = channel.id === ctx.channel.id;
   const period = messages.length > 1
-    ? ` ${shortTime(messages[0].createdAt)}〜${shortTime(messages[messages.length - 1].createdAt)}`
+    ? ` ${shortTime(messages[0]?.createdAt)}〜${shortTime(messages[messages.length - 1]?.createdAt)}`
     : '';
 
   return [
@@ -1541,12 +1772,14 @@ export async function runRead(ctx, args) {
  * reply_to と idx_msg_reply を持っているのはこのためで、ここが初めての利用箇所。
  * 時系列に並べれば返信は必ず親より後に来るので、既存の ↩N 表示が木の形を描く。
  */
-async function readReplies(ctx, anchor, args) {
+async function readReplies(ctx: AgentContext, anchorMessageId: string, args: ToolArgs): Promise<string> {
   const limit = clampLimit(args.limit, 30, 100);
 
-  let target;
+  let target: ArchiveRow | undefined;
   try {
-    target = archiveDb.prepare('SELECT * FROM messages WHERE guild_id = ? AND message_id = ? AND deleted = 0').get(ctx.guild.id, anchor.messageId);
+    target = archiveDb
+      .prepare<[string, string], ArchiveRow>('SELECT * FROM messages WHERE guild_id = ? AND message_id = ? AND deleted = 0')
+      .get(ctx.guild.id, anchorMessageId);
   } catch {
     return '返信の辿り方はローカルの取り込みが要る。管理者が `/index build` を実行するまでは direction:around で周辺を読んでください。';
   }
@@ -1555,13 +1788,13 @@ async function readReplies(ctx, anchor, args) {
     return 'その発言はローカルに取り込まれていません (直近の発言か、取り込みの穴)。direction:around で周辺を読んでください。';
   }
 
-  if (!isChannelAllowed(target.channel_id, ctx.channelScope)) {
+  if (!archive.isChannelAllowed(target.channel_id, ctx.channelScope)) {
     return 'その発言があるチャンネルは読めません。';
   }
 
-  const byId = new Map();
-  const add = (row) => {
-    if (!row || row.guild_id !== ctx.guild.id || row.deleted || !isChannelAllowed(row.channel_id, ctx.channelScope)) return false;
+  const byId = new Map<string, ArchiveRow>();
+  const add = (row: ArchiveRow | undefined): boolean => {
+    if (!row || row.guild_id !== ctx.guild.id || row.deleted || !archive.isChannelAllowed(row.channel_id, ctx.channelScope)) return false;
     byId.set(row.message_id, row);
     return true;
   };
@@ -1569,8 +1802,10 @@ async function readReplies(ctx, anchor, args) {
   add(target);
 
   // 親を遡る (8ホップまで)
-  const parentStmt = archiveDb.prepare('SELECT * FROM messages WHERE guild_id = ? AND message_id = ? AND deleted = 0');
-  let cursor = target.reply_to;
+  const parentStmt = archiveDb.prepare<[string, string], ArchiveRow>(
+    'SELECT * FROM messages WHERE guild_id = ? AND message_id = ? AND deleted = 0'
+  );
+  let cursor: string | null | undefined = target.reply_to;
   for (let hop = 0; hop < 8 && cursor; hop += 1) {
     const parent = parentStmt.get(ctx.guild.id, cursor);
     if (!parent || byId.has(parent.message_id)) break;
@@ -1579,12 +1814,12 @@ async function readReplies(ctx, anchor, args) {
   }
 
   // 子を深さ3まで
-  const childStmt = archiveDb.prepare(
+  const childStmt = archiveDb.prepare<[string, string, number], ArchiveRow>(
     'SELECT * FROM messages WHERE guild_id = ? AND reply_to = ? AND deleted = 0 ORDER BY created_at LIMIT ?'
   );
   let frontier = [target.message_id];
   for (let depth = 0; depth < 3 && frontier.length > 0 && byId.size < limit; depth += 1) {
-    const next = [];
+    const next: string[] = [];
     for (const id of frontier) {
       for (const child of childStmt.all(ctx.guild.id, id, limit)) {
         if (byId.has(child.message_id)) continue;
@@ -1626,8 +1861,8 @@ const AGGREGATE_AXES = ['author', 'channel', 'year', 'month', 'day', 'hour', 'we
  * 標本であることを必ず書く。ここに無い語を「言っていない」と読まれると、
  * ダブスタ判定のような用途で結論が逆になる。
  */
-function formatTermAggregate(options, summary) {
-  const result = topTerms(options, {
+function formatTermAggregate(options: SearchOptions, summary: SearchSummary): string {
+  const result = archive.topTerms(options, {
     range: { from: summary.first_at, to: summary.last_at, total: summary.count }
   });
 
@@ -1659,7 +1894,7 @@ function formatTermAggregate(options, summary) {
   return lines.join('\n');
 }
 
-async function aggregateMessages(ctx, args) {
+async function aggregateMessages(ctx: AgentContext, args: ToolArgs): Promise<string> {
   const options = await searchOptions(ctx, args, { sort: 'new' });
 
   // 未知の軸を黙って author にすり替えると、モデルは「頼んだ軸の集計を得た」と
@@ -1673,18 +1908,18 @@ async function aggregateMessages(ctx, args) {
     return `by が不正です: ${by}。使えるのは ${AGGREGATE_AXES.join(' / ')} です。`;
   }
 
-  const summary = searchSummary(options);
+  const summary = archive.searchSummary(options);
   if (!summary.count) return '該当するメッセージはありませんでした。';
 
   // term は SQL の GROUP BY ではなく本文のトークン化なので別処理
   if (by === 'term') return formatTermAggregate(options, summary);
 
-  const rows = aggregateSearch(options, by, { limit: clampLimit(args.limit, by === 'month' ? 24 : 15, 50) });
+  const rows = archive.aggregateSearch(options, by, { limit: clampLimit(args.limit, by === 'month' ? 24 : 15, 50) });
 
-  const label = (bucket) => {
-    if (by === 'author') return authorLabel(ctx, bucket);
-    if (by === 'channel') return `#${channelName(ctx, bucket)}`;
-    if (by === 'weekday') return `${WEEKDAY_LABELS[bucket]}曜`;
+  const label = (bucket: string | number): string => {
+    if (by === 'author') return authorLabel(ctx, String(bucket));
+    if (by === 'channel') return `#${channelName(ctx, String(bucket))}`;
+    if (by === 'weekday') return `${WEEKDAY_LABELS[Number(bucket)] ?? String(bucket)}曜`;
     if (by === 'hour') return `${String(bucket).padStart(2, '0')}時`;
     return String(bucket);
   };
@@ -1703,15 +1938,33 @@ async function aggregateMessages(ctx, args) {
 
 // ---------------------------------------------------------------- 組み立て
 
+// JS 側の推論ではツール定義の type が string に広がるので、'function' に固定した写しを使う。
+const memoryDefinition: ToolDefinition = { ...memoryToolDefinition, type: 'function' };
+
+/** 1つのツール。定義とハンドラを組にして持つ。 */
+interface ToolEntry {
+  definition: ToolDefinition;
+  handler: (args: ToolArgs) => string | Promise<string>;
+}
+
+/** buildToolset の結果。runtime に渡す部分に加えて、プロンプトの出し分けに使う可用性を持つ。 */
+export interface Toolset extends AgentToolset {
+  archiveAvailable: boolean;
+  browserAvailable: boolean;
+  governanceAvailable: boolean;
+  memoryAvailable: boolean;
+  semanticAvailable: boolean;
+}
+
 /**
  * この実行で使えるツールだけを集める。
  */
-export async function buildToolset(ctx) {
+export async function buildToolset(ctx: AgentContext): Promise<Toolset> {
   const archiveAvailable = Boolean(getGuildState(ctx.guild.id));
   // 記憶の本ができているサーバーだけ。根は system に、残りはこのツールでたどる
-  const memoryAvailable = hasMemory(ctx.guild.id);
+  const memoryAvailable = Boolean(hasMemory(ctx.guild.id));
   const browserAvailable = await cdpAvailable();
-  const governanceAvailable = Boolean(getGovernanceGuild(ctx.guild.id));
+  const governanceAvailable = Boolean(governanceRecords.getGovernanceGuild(ctx.guild.id));
 
   // ベクトルがあるときだけ意味検索のモードを出す。無いギルドで定義ぶんを払わない。
   const semanticReady = archiveAvailable && await semanticAvailable(ctx.guild.id);
@@ -1722,28 +1975,33 @@ export async function buildToolset(ctx) {
     prewarm();
   }
 
-  const flags = { archiveAvailable, semanticAvailable: semanticReady };
+  const flags: SearchFlags = { archiveAvailable, semanticAvailable: semanticReady };
 
   // 定義とハンドラを1つのリストから作る。別々に持つと名前を1つ間違えただけで
   // 「そのツールはありません」がその会話の残り全部で返り、しかも気付けない。
-  const entries = [
+  const entries: ToolEntry[] = [
     { definition: searchToolDefinition(flags), handler: (args) => runSearch(ctx, args, flags) },
     { definition: readDefinition(archiveAvailable), handler: (args) => runRead(ctx, args) },
-    { definition: channelsDefinition, handler: (args) => listChannels(ctx, args) },
-    ...(governanceAvailable
-      ? [{ definition: governanceDefinition, handler: (args) => runGovernanceInfo(ctx, args) }]
-      : []),
-    { definition: infoDefinition, handler: (args) => runInfo(ctx, args) },
-    ...(memoryAvailable
-      ? [{ definition: memoryToolDefinition, handler: (args) => runMemoryTool({ guildId: ctx.guild.id, refs: ctx.refs }, args) }]
-      : []),
-    ...(browserAvailable
-      ? [{ definition: browserToolDefinition(ctx.browserFull), handler: (args) => runBrowserAction(ctx, args) }]
-      : [])
+    { definition: channelsDefinition, handler: (args) => listChannels(ctx, args) }
   ];
+  if (governanceAvailable) {
+    entries.push({ definition: governanceDefinition, handler: (args) => runGovernanceInfo(ctx, args) });
+  }
+  entries.push({ definition: infoDefinition, handler: (args) => runInfo(ctx, args) });
+  if (memoryAvailable) {
+    entries.push({
+      definition: memoryDefinition,
+      handler: (args) => String(runMemoryTool({ guildId: ctx.guild.id, refs: ctx.refs }, args))
+    });
+  }
+  if (browserAvailable) {
+    entries.push({ definition: browserToolDefinition(ctx.browserFull), handler: (args) => runBrowserAction(ctx, args) });
+  }
 
   const definitions = entries.map((entry) => entry.definition);
-  const handlers = Object.fromEntries(entries.map((entry) => [entry.definition.function.name, entry.handler]));
+  // Map で引く。モデルが渡す名前を素のオブジェクトの添字にすると、
+  // `constructor` や `toString` が Object.prototype の関数に当たってしまう。
+  const handlers = new Map(entries.map((entry) => [entry.definition.function.name, entry.handler] as const));
 
   return {
     definitions,
@@ -1753,16 +2011,16 @@ export async function buildToolset(ctx) {
     memoryAvailable,
     semanticAvailable: semanticReady,
 
-    async call(name, args) {
-      const handler = handlers[name];
-      if (!handler) return `そのツールはありません: ${name}`;
+    async call(name: string, args: unknown): Promise<string> {
+      const handler = handlers.get(name);
+      if (!handler) return `そのツールはありません: ${String(name).slice(0, MAX_NAME_CHARS)}`;
 
       try {
-        return String((await handler(args ?? {})) ?? '');
+        return String((await handler(isRecord(args) ? args : {})) ?? '');
       } catch (error) {
         if (error instanceof QueryError) return `クエリが不正です: ${error.message}`;
         console.error(`Agent tool ${name} failed:`, error);
-        return `ツールの実行に失敗しました: ${truncate(error.message ?? String(error), 200)}`;
+        return `ツールの実行に失敗しました: ${truncate(errorMessage(error), 200)}`;
       }
     }
   };

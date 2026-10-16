@@ -2,17 +2,17 @@ import { providerConfig } from '../ai/provider.js';
 // AI エージェントの設定。
 // OPENROUTER_API_KEY が無ければ機能ごと無効になるので、既存の bot 動作には影響しない。
 
-function number(value, fallback) {
+function number(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function flag(value, fallback) {
+function flag(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined || value === '') return fallback;
   return !['0', 'false', 'no', 'off'].includes(String(value).toLowerCase());
 }
 
-function list(value) {
+function list(value: string | undefined): string[] {
   return String(value ?? '').split(/[\s,]+/).filter(Boolean);
 }
 
