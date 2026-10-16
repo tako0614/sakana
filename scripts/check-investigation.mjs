@@ -348,4 +348,50 @@ failTools = false;
   assert.match(missing.error, /unknown heading/, '存在しない見出しは拒否して目次を返す');
 }
 
+// --- @通報 は申立ての制限と違憲審査の回数枠を迂回させない ---------------------
+// 通報は bot 名義の公式申立てになるので、申立権を止められた本人の依頼から事件を作らない。
+// 文面に「違憲」が無くても席が違憲審査と読んだら、違憲審査の回数枠を使う。
+{
+  const { handleGovernanceMention } = await import('../src/governance/intake.js');
+  const replies = [];
+  const mention = (id, author, text) => ({
+    id, guildId: GUILD_ID, channelId: 'public', content: `<@&report-role> ${text}`, reference: null,
+    author: { id: author, bot: false },
+    member: { id: author, guild: { id: GUILD_ID }, roles: { cache: new Map() } },
+    mentions: { roles: { has: (roleId) => roleId === 'report-role' }, users: new Map() },
+    client: { user: { id: 'governance-bot' } },
+    guild: { id: GUILD_ID, roles: { everyone: { id: GUILD_ID } }, members: { fetch: async () => null }, channels: { fetch: async () => null } },
+    channel: { sendTyping: async () => {} },
+    reply: async (payload) => {
+      replies.push(payload.content);
+      return { id: `${id}-progress`, edit: async (next) => { replies.push(next.content); } };
+    }
+  });
+  const blockedCase = db.createCase({ guildId: GUILD_ID, reporterId: 'reporter', accusedId: 'restricted-reporter', lawId: law.id, offenseCode: 'O1',
+    summary: '申立てを止める処分', constitutionId: activeConstitution.id });
+  const blockedSanction = db.createSanction({ guildId: GUILD_ID, caseId: blockedCase.id, userId: 'restricted-reporter', type: 'restriction',
+    durationSeconds: 3600, status: 'executed', requiredApprovals: 0, definitionCode: 'NO_PETITIONS' });
+  db.activateRestriction({ sanctionId: blockedSanction.id, guildId: GUILD_ID, userId: 'restricted-reporter', definitionId: 0,
+    profile: { code: 'NO_PETITIONS', rules: [{ primitive: 'block_petitions', enabled: true }] }, startedAt: Date.now(), endsAt: Date.now() + 3_600_000 });
+  const casesBefore = db.listCases(GUILD_ID, { limit: 1000 }).length;
+  requestCount = 0;
+  assert.equal(await handleGovernanceMention(mention('blocked-mention', 'restricted-reporter', 'accused の連投がひどい')), true);
+  assert.ok(replies.includes('事件申立てが制裁により停止されています。'), '申立権を止められた人の通報は受け付けない');
+  assert.equal(requestCount, 0, '止められた通報で警察の席を動かさない');
+  assert.equal(db.listCases(GUILD_ID, { limit: 1000 }).length, casesBefore, '止められた通報から事件を作らない');
+
+  for (let index = 0; index < 3; index += 1) {
+    assert.equal(db.reserveAgentAttempt(GUILD_ID, 'quota-user', false, 3, 86_400_000, 'constitutional_challenge').ok, true);
+  }
+  plan = [];
+  conclusion = () => ({ intent: 'constitutional_challenge', summary: 'この法律は表現の自由を制限している', lawId: null,
+    offenseCode: null, targetType: 'law', targetId: law.id, caseId: null, question: null });
+  requestCount = 0;
+  assert.equal(await handleGovernanceMention(mention('quota-mention', 'quota-user', '連投制限法の上訴をしたい')), true);
+  assert.equal(requestCount, 1, '依頼の読み取りだけを行う');
+  assert.ok(replies.some((text) => /24時間回数枠に達しました \(3\/3\)/.test(String(text))),
+    '言い回しが違っても、違憲審査として受けるなら違憲審査の回数枠で止める');
+  assert.equal(db.findOpenConstitutionalCase(GUILD_ID, 'law', law.id), null, '回数枠を越えた違憲審査を開始しない');
+}
+
 console.log('check-investigation: ok');

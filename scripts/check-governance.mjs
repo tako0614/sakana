@@ -1784,12 +1784,12 @@ assert.match(operations.content, /Bot技術運用/);
 assert.match(operations.content, /記録のみ/);
 assert.match(operations.content, /貴族院/);
 assert.equal(operations.components.length, 2);
-const uxSource = readFileSync(new URL('../src/governance/ux.js', import.meta.url), 'utf8');
+const uxSource = readFileSync(new URL('../src/governance/ux.ts', import.meta.url), 'utf8');
 assert.doesNotMatch(uxSource, /GOVERNANCE_GUIDE_NAME|createGovernanceGuideChannel/,
   '案内専用channelを再作成しない');
 assert.match(uxSource, /GOVERNANCE_PROCEDURE_NAME/,
   '公開の操作ハブは手続channelに集約する');
-const discordSource = readFileSync(new URL('../src/governance/discord.js', import.meta.url), 'utf8');
+const discordSource = readFileSync(new URL('../src/governance/discord.ts', import.meta.url), 'utf8');
 assert.doesNotMatch(discordSource, /name: '裁判当事者用'/, '新規導入では裁判当事者用channelを作らない');
 assert.match(discordSource, /発言状態:/, '事件投稿に裁判中の発言状態を表示する');
 assert.match(discordSource, /いま必要なこと:/, '事件投稿の説明を次の行動へ絞る');
@@ -1802,7 +1802,7 @@ assert.match(discordSource, /await closeRecordThread\(thread\)/,
   '結果を記録した完了済みの議会・裁判所投稿はロックしてアーカイブする');
 assert.doesNotMatch(discordSource, /postGazette|GAZETTE_TOPIC/,
   '新しい統治記録を官報へ複製しない');
-const intakeSource = readFileSync(new URL('../src/governance/intake.js', import.meta.url), 'utf8');
+const intakeSource = readFileSync(new URL('../src/governance/intake.ts', import.meta.url), 'utf8');
 assert.doesNotMatch(intakeSource, /参照番号:|適用法: #|違憲審査対象: \$\{caseRecord\.challenged_type\}:\$\{caseRecord\.challenged_id\}/,
   'メンション受付の応答にも内部IDを表示しない');
 assert.doesNotMatch(intakeSource, /正式受付済み: \$\{error\.accepted\.resultType\} \$\{error\.accepted\.resultId\}/,
@@ -1838,7 +1838,7 @@ assert.equal(
   'ban',
   'canonicalJsonの出力は常にJSONとして読み戻せる');
 
-const governanceLlmSource = readFileSync(new URL('../src/governance/llm.js', import.meta.url), 'utf8');
+const governanceLlmSource = readFileSync(new URL('../src/governance/llm.ts', import.meta.url), 'utf8');
 assert.match(governanceLlmSource, /reasoning: \{ enabled: thinking === 'enabled' \}/,
   '構造化草案は共通接続の推論設定を明示的に制御する');
 assert.match(readFileSync(new URL('../src/ai/runtime.ts', import.meta.url), 'utf8'), /response was empty or invalid/,
@@ -1851,7 +1851,7 @@ assert.match(governanceLlmSource, /Investigate before you conclude/,
   '席には結論より先に調べさせる');
 assert.match(governanceLlmSource, /Every offense element needs direct cited evidence/,
   '司法事前審査は成立法の全構成要件に直接証拠を要求する');
-const serviceSource = readFileSync(new URL('../src/governance/service.js', import.meta.url), 'utf8');
+const serviceSource = readFileSync(new URL('../src/governance/service.ts', import.meta.url), 'utf8');
 assert.match(parliamentSource, /createAgendaPost/,
   '国会が自分で立てた議題も公開スレとして討論に開く');
 assert.doesNotMatch(serviceSource, /`(?:法案|改憲案) L-\$\{proposal\.id\}|`事件 C-\$\{caseRecord\.id\}|ロールID:/,

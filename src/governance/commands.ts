@@ -7,7 +7,11 @@ import {
   ModalBuilder,
   SlashCommandBuilder,
   TextInputBuilder,
-  TextInputStyle
+  TextInputStyle,
+  type ButtonInteraction,
+  type ChatInputCommandInteraction,
+  type Guild,
+  type InteractionReplyOptions
 } from 'discord.js';
 import { isGovernanceOperator, loadBootstrapDocuments } from './config.js';
 import {
@@ -23,6 +27,7 @@ import {
   updateGovernanceSetupSession
 } from './db.js';
 import {
+  actingMember,
   createGovernanceSurfaces,
   governancePermissionReport,
   postAuthorityChange,
@@ -44,12 +49,36 @@ import {
 import { handleGovernanceIntakeComponent } from './intake.js';
 import { syncLawSite } from './lawsite.js';
 import { ensureGovernanceUx, handleGovernanceUxInteraction, renderGovernanceOperationsPanel } from './ux.js';
+import {
+  errorMessage,
+  isCaseRow,
+  isConstitutionRow,
+  isGovernanceGuildRow,
+  isRecord,
+  isSanctionRow,
+  isSetupSessionRow,
+  isString,
+  isUnknown,
+  narrow,
+  narrowList,
+  narrowRequired,
+  requireValue,
+  shape,
+  type GovernanceCommand,
+  type GovernanceComponentInteraction,
+  type GovernancePermissionReport,
+  type SetupSessionRow
+} from './types-service.js';
 
 const EPHEMERAL = MessageFlags.Ephemeral;
 const SETUP_TTL_MS = 15 * 60_000;
+const VOTE_LABELS: Record<string, string> = { yes: '賛成', no: '反対', abstain: '棄権' };
 
-function reviewListPayload(guildId, userId, offset = 0) {
-  const sanctions = listContestableSanctions(guildId, userId);
+const governanceGuild = (guildId: unknown) => narrow(getGovernanceGuild(guildId), isGovernanceGuildRow, 'governance guild');
+const setupSession = (value: unknown) => narrow(value, isSetupSessionRow, 'setup session');
+
+function reviewListPayload(guildId: string, userId: string, offset = 0): InteractionReplyOptions & { flags: typeof EPHEMERAL } {
+  const sanctions = narrowList(listContestableSanctions(guildId, userId), isSanctionRow, 'sanction');
   const pageSize = 4;
   const start = Math.max(0, Math.min(Number(offset) || 0, Math.max(0, sanctions.length - 1)));
   const page = sanctions.slice(start, start + pageSize);
@@ -57,16 +86,15 @@ function reviewListPayload(guildId, userId, offset = 0) {
     return { content: 'いま争える即時処分はありません。', components: [], flags: EPHEMERAL };
   }
   const lines = page.map((sanction, index) => {
-    const caseRecord = getCase(sanction.case_id);
+    const caseRecord = narrow(getCase(sanction.case_id), isCaseRow, 'case');
     const type = sanction.type === 'warning' ? '警告' : sanction.type === 'restriction' ? '機能制限' : 'タイムアウト';
     return `${index + 1}. ${type}: ${String(caseRecord?.summary ?? '理由は裁判所を参照').replace(/\s+/g, ' ').slice(0, 180)}`;
   });
-  const rows = page.map((sanction, index) => {
-    const row = contestButtons(guildId, sanction.id)[0];
-    row.components[0].setLabel(`${index + 1}の審理を求める`);
+  const rows = page.flatMap((sanction, index) => contestButtons(guildId, sanction.id).slice(0, 1).map((row) => {
+    row.components[0]?.setLabel(`${index + 1}の審理を求める`);
     return row;
-  });
-  const navigation = new ActionRowBuilder();
+  }));
+  const navigation = new ActionRowBuilder<ButtonBuilder>();
   if (start > 0) {
     navigation.addComponents(new ButtonBuilder().setCustomId(`gov:contest_list:${Math.max(0, start - pageSize)}`)
       .setLabel('前へ').setStyle(ButtonStyle.Secondary));
@@ -83,31 +111,45 @@ function reviewListPayload(guildId, userId, offset = 0) {
   };
 }
 
-function requireGuild(interaction) {
+function requireGuild(interaction: { guildId: string | null; guild: Guild | null }): Guild {
   if (!interaction.guildId || !interaction.guild) throw new Error('サーバー内でのみ使えます。');
+  return interaction.guild;
 }
 
-function requireOperator(interaction) {
+function requireOperator(interaction: { member: unknown }): void {
   if (!isGovernanceOperator(interaction.member)) {
     throw new Error('この操作はサーバーownerまたは設定済み運営者だけが実行できます。');
   }
 }
 
-function setupHashes(documents) {
-  return { constitutionHash: sha256(documents.constitution), policyHash: policyHash({ policy: documents.policy, laws: documents.laws ?? [] }) };
+// config.js が読む初期憲法・初期法律。プレビューの照合に本文のハッシュを使う。
+const isBootstrapDocuments = shape({ constitution: isString, policy: isUnknown, laws: isUnknown });
+
+function bootstrapDocuments(serverName: string) {
+  return narrowRequired(loadBootstrapDocuments({ serverName }), isBootstrapDocuments, 'bootstrap documents');
 }
 
-function setupBlockingPermissions(report) {
+function setupHashes(documents: { constitution: string; policy?: unknown; laws?: unknown }): { constitutionHash: string; policyHash: string } {
+  return { constitutionHash: sha256(documents.constitution), policyHash: String(policyHash({ policy: documents.policy, laws: documents.laws ?? [] })) };
+}
+
+function setupBlockingPermissions(report: GovernancePermissionReport): string[] {
   const required = new Set(['ManageChannels', 'ManageRoles', 'ManageThreads', 'ManageMessages']);
   return report.missing.filter((name) => required.has(name));
 }
 
-function setupPreviewPayload(interaction, session, documents, report, { resumed = false } = {}) {
+function setupPreviewPayload(
+  guild: Guild,
+  session: SetupSessionRow,
+  documents: { constitution: string; laws?: unknown },
+  report: GovernancePermissionReport,
+  { resumed = false }: { resumed?: boolean } = {}
+): InteractionReplyOptions {
   const blocking = setupBlockingPermissions(report);
   const missing = report.missing.length ? report.missing.join('、') : 'なし';
   return {
     content: [
-      `# ${interaction.guild.name} 統治機能の導入確認`,
+      `# ${guild.name} 統治機能の導入確認`,
       '',
       resumed ? '途中まで作成された導入処理を、安全に続きから再開します。' : 'まだサーバーには変更を加えていません。',
       '初期憲法と統治組織手続法の全文を添付しています。内容を確認してから確定してください。',
@@ -121,7 +163,7 @@ function setupPreviewPayload(interaction, session, documents, report, { resumed 
       { attachment: Buffer.from(documents.constitution), name: 'initial-constitution.md' },
       { attachment: Buffer.from(`${JSON.stringify(documents.laws, null, 2)}\n`), name: 'initial-laws.json' }
     ],
-    components: blocking.length ? [] : [new ActionRowBuilder().addComponents(
+    components: blocking.length ? [] : [new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId(`gov:setup:${session.id}:confirm`)
         .setLabel(resumed ? '導入を再開' : 'この憲法・法律で導入')
@@ -132,54 +174,55 @@ function setupPreviewPayload(interaction, session, documents, report, { resumed 
   };
 }
 
-async function openGovernance(interaction) {
-  requireGuild(interaction);
+async function openGovernance(interaction: ChatInputCommandInteraction): Promise<void> {
+  const guild = requireGuild(interaction);
   requireOperator(interaction);
-  const governance = getGovernanceGuild(interaction.guildId);
+  const governance = governanceGuild(guild.id);
   if (governance) {
     await interaction.deferReply({ flags: EPHEMERAL });
-    const ux = await ensureGovernanceUx(interaction.guild, governance);
-    await interaction.editReply(await renderGovernanceOperationsPanel(interaction.guild, ux.governance));
+    const ux = await ensureGovernanceUx(guild, governance);
+    await interaction.editReply(await renderGovernanceOperationsPanel(guild, ux.governance));
     return;
   }
 
-  const documents = loadBootstrapDocuments({ serverName: interaction.guild.name });
+  const documents = bootstrapDocuments(guild.name);
   const hashes = setupHashes(documents);
-  let session = getResumableGovernanceSetup(interaction.guildId);
+  let session = setupSession(getResumableGovernanceSetup(guild.id));
   const canResume = session
     && session.constitution_hash === hashes.constitutionHash
     && session.policy_hash === hashes.policyHash;
-  if (canResume) {
-    session = updateGovernanceSetupSession(session.id, {
+  if (session && canResume) {
+    session = setupSession(updateGovernanceSetupSession(session.id, {
       status: 'preview',
       requested_by: interaction.user.id,
       expires_at: Date.now() + SETUP_TTL_MS,
       last_error: session.last_error
-    });
+    }));
   } else {
-    session = createGovernanceSetupSession({
-      guildId: interaction.guildId,
+    session = setupSession(createGovernanceSetupSession({
+      guildId: guild.id,
       requestedBy: interaction.user.id,
       constitutionHash: hashes.constitutionHash,
       policyHash: hashes.policyHash,
       expiresAt: Date.now() + SETUP_TTL_MS
-    });
+    }));
   }
+  const current = requireValue(session, '導入確認を作成できませんでした。');
   await interaction.reply(setupPreviewPayload(
-    interaction,
-    session,
+    guild,
+    current,
     documents,
-    governancePermissionReport(interaction.guild),
-    { resumed: Boolean(canResume && Object.keys(session.resources).length) }
+    governancePermissionReport(guild),
+    { resumed: Boolean(canResume && Object.keys(current.resources).length) }
   ));
 }
 
-async function executeSetup(interaction, sessionId) {
-  requireGuild(interaction);
+async function executeSetup(interaction: ButtonInteraction, sessionId: string): Promise<void> {
+  const guild = requireGuild(interaction);
   requireOperator(interaction);
-  const claimed = claimGovernanceSetupSession(sessionId, interaction.user.id);
+  const claimed = setupSession(claimGovernanceSetupSession(sessionId, interaction.user.id));
   if (!claimed) throw new Error('この導入確認は期限切れ、処理済み、または別の運営者が作成したものです。');
-  const documents = loadBootstrapDocuments({ serverName: interaction.guild.name });
+  const documents = bootstrapDocuments(guild.name);
   const hashes = setupHashes(documents);
   if (claimed.constitution_hash !== hashes.constitutionHash || claimed.policy_hash !== hashes.policyHash) {
     updateGovernanceSetupSession(claimed.id, { status: 'failed', last_error: 'preview hashes changed' });
@@ -192,14 +235,14 @@ async function executeSetup(interaction, sessionId) {
     attachments: []
   });
   try {
-    const surfaces = await createGovernanceSurfaces(interaction.guild, {
+    const surfaces = await createGovernanceSurfaces(guild, {
       resources: claimed.resources,
       onProgress: (resources) => updateGovernanceSetupSession(claimed.id, { resources })
     });
-    let result = getGovernanceGuild(interaction.guildId)
-      ? { guild: getGovernanceGuild(interaction.guildId), constitution: null }
+    const result: unknown = governanceGuild(guild.id)
+      ? { guild: governanceGuild(guild.id), constitution: null }
       : bootstrapGovernanceGuild({
-        guildId: interaction.guildId,
+        guildId: guild.id,
         enactedBy: interaction.user.id,
         trustedRoleId: '',
         enforcementMode: 'shadow',
@@ -210,23 +253,23 @@ async function executeSetup(interaction, sessionId) {
       });
     if (surfaces.legacyGuideChannelId || surfaces.legacyGazetteChannelId) {
       recordGovernanceSurfaceMigration({
-        guildId: interaction.guildId,
+        guildId: guild.id,
         legacyGuideChannelId: surfaces.legacyGuideChannelId,
         legacyGazetteChannelId: surfaces.legacyGazetteChannelId,
         detail: { source: 'resumed-setup' }
       });
     }
-    const warnings = [];
-    const backfilled = await backfillGovernanceActivity(interaction.guild).catch((error) => {
-      warnings.push(`活動履歴の初回取込み: ${error.message}`);
+    const warnings: string[] = [];
+    const backfilled = await backfillGovernanceActivity(guild).catch((error: unknown) => {
+      warnings.push(`活動履歴の初回取込み: ${errorMessage(error)}`);
       return 0;
     });
-    const constitution = result.constitution;
-    syncLawSite(interaction.guild, { verifyExisting: true });
-    const ux = await ensureGovernanceUx(interaction.guild, getGovernanceGuild(interaction.guildId));
+    const constitution = narrow(isRecord(result) ? result['constitution'] : null, isConstitutionRow, 'constitution');
+    syncLawSite(guild, { verifyExisting: true });
+    const ux = await ensureGovernanceUx(guild, governanceGuild(guild.id));
     if (constitution) {
-      await postAuthorityChange(interaction.guild, ux.governance, '統治機能を開始', `初期憲法 v${constitution.version} を公開しました。`)
-        .catch((error) => warnings.push(`運営変更の掲載: ${error.message}`));
+      await postAuthorityChange(guild, ux.governance, '統治機能を開始', `初期憲法 v${constitution.version} を公開しました。`)
+        .catch((error: unknown) => warnings.push(`運営変更の掲載: ${errorMessage(error)}`));
     }
     updateGovernanceSetupSession(claimed.id, { status: 'completed', last_error: null });
     await interaction.editReply([
@@ -236,12 +279,12 @@ async function executeSetup(interaction, sessionId) {
       warnings.length ? `注意: ${warnings.join(' / ')}` : null
     ].filter(Boolean).join('\n'));
   } catch (error) {
-    updateGovernanceSetupSession(claimed.id, { status: 'failed', last_error: String(error?.message ?? error).slice(0, 500) });
+    updateGovernanceSetupSession(claimed.id, { status: 'failed', last_error: errorMessage(error).slice(0, 500) });
     throw error;
   }
 }
 
-const governanceCommand = {
+const governanceCommand: GovernanceCommand = {
   data: new SlashCommandBuilder()
     .setName('governance')
     .setDescription('統治機能を導入または管理します')
@@ -249,15 +292,15 @@ const governanceCommand = {
   execute: openGovernance
 };
 
-function safeCommandError(error) {
-  const message = String(error?.message ?? error);
+function safeCommandError(error: unknown): string {
+  const message = errorMessage(error);
   if (/Governance model HTTP|Governance AI is busy|fetch failed|JSON|SQLITE|DiscordAPIError/i.test(message)) {
     return 'AI・Discord・DBの一時エラーです。作成済みの案件は自動再試行されます。`/governance` の「診断・復旧」を確認してください。';
   }
   return message.slice(0, 500);
 }
 
-function withGovernanceErrors(command) {
+function withGovernanceErrors(command: GovernanceCommand): GovernanceCommand {
   return {
     ...command,
     async execute(interaction) {
@@ -276,14 +319,20 @@ function withGovernanceErrors(command) {
 
 export const governanceCommands = [governanceCommand].map(withGovernanceErrors);
 
-export async function handleGovernanceComponent(interaction) {
+/** custom_id に埋めた数値の ID。正の整数でなければ壊れた操作として扱う。 */
+function positiveId(value: unknown): number | null {
+  const id = Number(value);
+  return Number.isInteger(id) && id >= 1 ? id : null;
+}
+
+export async function handleGovernanceComponent(interaction: GovernanceComponentInteraction): Promise<boolean> {
   const customId = interaction.customId ?? '';
   if (!customId.startsWith('gov:')) return false;
   try {
     if (customId.startsWith('gov:contest_list:') && interaction.isButton()) {
-      requireGuild(interaction);
+      const guild = requireGuild(interaction);
       const offset = Number(customId.split(':')[2]);
-      const payload = reviewListPayload(interaction.guildId, interaction.user.id, offset);
+      const payload = reviewListPayload(guild.id, interaction.user.id, offset);
       if (interaction.message?.flags?.has?.(EPHEMERAL)) {
         const { flags: _flags, ...update } = payload;
         await interaction.update(update);
@@ -293,36 +342,45 @@ export async function handleGovernanceComponent(interaction) {
     }
     if (customId.startsWith('gov:contest:') && interaction.isButton()) {
       const [, , guildId, rawSanctionId] = customId.split(':');
+      // 処分通知は DM でも届くので対象サーバーを custom_id に持つ。サーバー内で押されたなら
+      // そのサーバーの処分だけを扱い、別サーバーへ手続を起こさない。
+      if (!guildId || (interaction.inGuild() && interaction.guildId !== guildId)) throw new Error('対象サーバーを確認できません。');
       const guild = interaction.client.guilds.cache.get(guildId)
         ?? await interaction.client.guilds.fetch(guildId).catch(() => null);
       if (!guild) throw new Error('対象サーバーを確認できません。');
       const member = await guild.members.fetch(interaction.user.id).catch(() => null);
       if (!member) throw new Error('対象サーバーのメンバーではありません。');
-      await interaction.deferReply(interaction.inGuild?.() ? { flags: EPHEMERAL } : {});
-      const result = await requestTrial(guild, member, Number(rawSanctionId));
-      await interaction.editReply(`裁判所の審理を始めました。期限: <t:${Math.floor(result.defense_until / 1000)}:F>\n[事件記録を開く](https://discord.com/channels/${guild.id}/${result.public_thread_id})`);
+      const sanctionId = positiveId(rawSanctionId);
+      if (sanctionId === null) throw new Error('処分が見つかりません。');
+      await interaction.deferReply(interaction.inGuild() ? { flags: EPHEMERAL } : {});
+      const result = await requestTrial(guild, member, sanctionId);
+      await interaction.editReply(`裁判所の審理を始めました。期限: <t:${Math.floor(Number(result.defense_until) / 1000)}:F>\n[事件記録を開く](https://discord.com/channels/${guild.id}/${String(result.public_thread_id)})`);
       return true;
     }
     if (customId.startsWith('gov:court_answer:') && interaction.isModalSubmit()) {
-      const caseId = Number(customId.split(':')[2]);
-      const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
+      const guild = requireGuild(interaction);
+      const caseId = positiveId(customId.split(':')[2]);
+      if (caseId === null) throw new Error('案件IDが壊れています。');
+      const member = await actingMember(interaction, guild);
       await interaction.deferReply({ flags: EPHEMERAL });
-      await submitCaseAnswer(interaction.guild, member, caseId, interaction.fields.getTextInputValue('answer'));
+      await submitCaseAnswer(guild, member, caseId, interaction.fields.getTextInputValue('answer'));
       await interaction.editReply('回答を裁判記録へ提出しました。追記するか、事件投稿の「回答完了」を押してください。');
       return true;
     }
     if (customId.startsWith('gov:court_appeal:') && interaction.isModalSubmit()) {
-      const caseId = Number(customId.split(':')[2]);
-      const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
+      const guild = requireGuild(interaction);
+      const caseId = positiveId(customId.split(':')[2]);
+      if (caseId === null) throw new Error('案件IDが壊れています。');
+      const member = await actingMember(interaction, guild);
       await interaction.deferReply({ flags: EPHEMERAL });
-      await appealCase(interaction.guild, member, caseId, interaction.fields.getTextInputValue('grounds'));
+      await appealCase(guild, member, caseId, interaction.fields.getTextInputValue('grounds'));
       await interaction.editReply('上訴を受理しました。回答を追記し、終わったら「回答完了」を押してください。');
       return true;
     }
     if (customId.startsWith('gov:admin')) return await handleGovernanceUxInteraction(interaction);
     if (interaction.isButton() && customId.startsWith('gov:setup:')) {
       const [, , sessionId, action] = customId.split(':');
-      const session = getGovernanceSetupSession(sessionId);
+      const session = setupSession(getGovernanceSetupSession(sessionId));
       if (!session || session.guild_id !== interaction.guildId || session.requested_by !== interaction.user.id) {
         throw new Error('この導入確認は使用できません。');
       }
@@ -339,14 +397,15 @@ export async function handleGovernanceComponent(interaction) {
     }
     if (!interaction.isButton()) return false;
     const [, action, rawId, value] = customId.split(':');
-    const id = Number(rawId);
-    if (!Number.isInteger(id) || id < 1) throw new Error('案件IDが壊れています。');
+    const id = positiveId(rawId);
+    if (id === null) throw new Error('案件IDが壊れています。');
     if (action === 'intake') return await handleGovernanceIntakeComponent(interaction, id, value);
+    const guild = requireGuild(interaction);
     if (action === 'court') {
-      const member = interaction.member ?? await interaction.guild.members.fetch(interaction.user.id);
+      const member = await actingMember(interaction, guild);
       if (value === 'answer') {
         const modal = new ModalBuilder().setCustomId(`gov:court_answer:${id}`).setTitle('裁判への回答')
-          .addComponents(new ActionRowBuilder().addComponents(
+          .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
             new TextInputBuilder().setCustomId('answer').setLabel('説明・反論').setStyle(TextInputStyle.Paragraph)
               .setRequired(true).setMaxLength(4000)
           ));
@@ -355,7 +414,7 @@ export async function handleGovernanceComponent(interaction) {
       }
       if (value === 'appeal') {
         const modal = new ModalBuilder().setCustomId(`gov:court_appeal:${id}`).setTitle('上訴')
-          .addComponents(new ActionRowBuilder().addComponents(
+          .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
             new TextInputBuilder().setCustomId('grounds').setLabel('判決を見直す理由').setStyle(TextInputStyle.Paragraph)
               .setRequired(true).setMaxLength(4000)
           ));
@@ -371,41 +430,41 @@ export async function handleGovernanceComponent(interaction) {
       }
       if (value === 'withdraw') {
         await interaction.deferReply({ flags: EPHEMERAL });
-        await withdrawContest(interaction.guild, member, id);
+        await withdrawContest(guild, member, id);
         await interaction.editReply('申立ての取下げを記録しました。処分は法定手続に従って扱います。');
         return true;
       }
       if (value === 'complete') {
         await interaction.deferReply({ flags: EPHEMERAL });
-        await completeCaseResponse(interaction.guild, member, id);
+        await completeCaseResponse(guild, member, id);
         await interaction.editReply('回答を締め切り、判定を開始しました。');
         return true;
       }
     }
     await interaction.deferReply({ flags: EPHEMERAL });
     if (action === 'veto') {
-      const result = await exerciseHumanVeto(interaction, value, id);
-      await ensureGovernanceUx(interaction.guild, getGovernanceGuild(interaction.guildId));
+      const result = await exerciseHumanVeto(interaction, String(value), id);
+      await ensureGovernanceUx(guild, governanceGuild(guild.id));
       await interaction.editReply(`拒否権の行使を記録しました（${result.count}人）。${result.vetoed ? '成立・執行を取りやめます。' : '法律で定める必要人数への到達を待ちます。'}`);
       return true;
     }
     if (action === 'manual') {
       const [requestKey, result] = String(value).split('-');
-      await reportManualExecution(interaction.guild, interaction.user.id, { sanctionId: id, requestKey, result });
-      await ensureGovernanceUx(interaction.guild, getGovernanceGuild(interaction.guildId));
+      await reportManualExecution(guild, interaction.user.id, { sanctionId: id, requestKey, result });
+      await ensureGovernanceUx(guild, governanceGuild(guild.id));
       await interaction.editReply('管理者による対応完了を記録しました。');
       return true;
     }
     if (action === 'vote') {
-      await castAndPublishVote(interaction, id, value);
-      await ensureGovernanceUx(interaction.guild, getGovernanceGuild(interaction.guildId));
-      const label = { yes: '賛成', no: '反対', abstain: '棄権' }[value] ?? value;
+      await castAndPublishVote(interaction, id, String(value));
+      await ensureGovernanceUx(guild, governanceGuild(guild.id));
+      const label = VOTE_LABELS[String(value)] ?? value;
       await interaction.editReply(`「${label}」で記名投票しました。`);
       return true;
     }
     if (action === 'approve') {
-      const result = await approveCase(interaction, id, value);
-      await ensureGovernanceUx(interaction.guild, getGovernanceGuild(interaction.guildId));
+      const result = await approveCase(interaction, id, String(value));
+      await ensureGovernanceUx(guild, governanceGuild(guild.id));
       const label = value === 'approve' ? '執行を承認' : '承認しない';
       await interaction.editReply(`「${label}」を記録しました（承認 ${result.approvals}/${result.required}）。`);
       return true;
@@ -415,10 +474,10 @@ export async function handleGovernanceComponent(interaction) {
   } catch (error) {
     console.error('Governance component failed:', error);
     const content = `実行できません: ${safeCommandError(error)}`;
-    const flags = interaction.inGuild?.() ? { flags: EPHEMERAL } : {};
+    const notice: InteractionReplyOptions = interaction.inGuild?.() ? { content, flags: EPHEMERAL } : { content };
     if (interaction.deferred) await interaction.editReply({ content }).catch(() => {});
-    else if (interaction.replied) await interaction.followUp({ content, ...flags }).catch(() => {});
-    else await interaction.reply({ content, ...flags }).catch(() => {});
+    else if (interaction.replied) await interaction.followUp(notice).catch(() => {});
+    else await interaction.reply(notice).catch(() => {});
     return true;
   }
 }

@@ -197,6 +197,20 @@ try {
     await assert.rejects(runRead(ctx3, { channel: 'x'.repeat(50_000) }), /見つかりませんでした/);
   });
 
+  await check('a governance button pressed in one guild cannot act on another guild named in its custom_id', async () => {
+    const { handleGovernanceComponent } = await import('../src/governance/commands.js');
+    const looked = [];
+    const replies = [];
+    const interaction = {
+      customId: 'gov:contest:guild-b:1', guildId: 'guild-a', user: { id: 'shared-user' },
+      isButton: () => true, isModalSubmit: () => false, inGuild: () => true, deferred: false, replied: false,
+      client: { guilds: { cache: new Map(), fetch: async (id) => { looked.push(id); return null; } } },
+      reply: async (payload) => { replies.push(payload.content); }
+    };
+    assert.equal(await handleGovernanceComponent(interaction), true);
+    assert.deepEqual(looked, [], 'the foreign guild is never resolved');
+    assert.match(replies[0], /対象サーバーを確認できません/);
+  });
   assert.deepEqual(failures, [], 'server information isolation regressions');
   console.log('check-guild-isolation: ok');
   // archive の検索と返事 (正規表現の時間切れ・メンション・公開の返事に出す範囲) は別の DB で検査する
