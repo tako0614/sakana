@@ -10,6 +10,7 @@ import {
   countChildren, episodeTimeline, episodesFor, getEpisode, getNode, linkedPages, listChildren, loadPublicChannels,
   memoryDb, nameOf, parentOf, searchEpisodes, searchNodes, topLevels, type MemoryNode
 } from './store.js';
+import { siteOrigin, siteUrl, type SiteTarget } from './site.js';
 import { errorCode, errorMessage, type QuoteFilter } from './types.js';
 
 // /memory explore: 記憶の本を Discord の中でたどる画面。本人にだけ見える。
@@ -110,6 +111,12 @@ const button = (customId: string, label: string, { disabled = false, style = But
   new ButtonBuilder().setCustomId(customId).setLabel(label).setStyle(style).setDisabled(disabled);
 const buttonRow = (...buttons: ButtonBuilder[]): ButtonRow => new ActionRowBuilder<ButtonBuilder>().addComponents(buttons);
 
+/** サイトで同じページを開くリンクボタン。サイトの URL が設定されていなければ null (ボタンを出さない)。 */
+function siteButton(target: SiteTarget): ButtonBuilder | null {
+  const origin = siteOrigin();
+  return origin ? new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('🌐 サイトで開く').setURL(siteUrl(origin, target)) : null;
+}
+
 /** 本人だけの画面には「みんなに見せる」、共有した画面には「自分で開く」。 */
 const shareButton = (target: string, shared: boolean): ButtonBuilder => shared
   ? button(`${PREFIX}:mine:${target}`, '🔎 自分で開く')
@@ -207,6 +214,8 @@ export function pageView(guildId: string, node: MemoryNode, { offset = 0, shared
   const tools = [button(`${PREFIX}:s`, '🔍 探す', { style: ButtonStyle.Primary })];
   if (episodes.length) tools.push(button(`${PREFIX}:t:${node.id}:0`, '🕒 年表'));
   tools.push(shareButton(isRoot ? 'root' : `n:${node.id}:${offset}`, shared));
+  const site = siteButton(isRoot ? { kind: 'home' } : { kind: 'page', path: node.path });
+  if (site) tools.push(site);
   components.push(buttonRow(...tools));
   return { content: '', embeds: [embed], components };
 }
@@ -231,7 +240,8 @@ export function episodeView(guildId: string, id: number,
     ...(back ? [button(`${PREFIX}:n:${back.id}`, clip(`← ${nameOf(back.path) || '根'}`, 80))] : []),
     button(`${PREFIX}:root`, '🏠 根'),
     button(`${PREFIX}:s`, '🔍 探す', { style: ButtonStyle.Primary }),
-    ...(episode ? [shareButton(`e:${id}:${fromId}`, shared)] : [])
+    ...(episode ? [shareButton(`e:${id}:${fromId}`, shared)] : []),
+    ...(episode ? [siteButton({ kind: 'episode', id })].filter((entry): entry is ButtonBuilder => entry !== null) : [])
   );
   if (!episode) return { content: `出来事 e${id} はありません。`, embeds: [], components: [navRow()] };
 

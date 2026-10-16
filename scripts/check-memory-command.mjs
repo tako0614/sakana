@@ -155,6 +155,63 @@ const search = interaction({ sub: 'search', admin: false, options: { query: '統
 await memoryCommand.execute(search);
 assert.match(embedText(search.calls[1][1]), /統治機能を作った/);
 
+// url: サイトの URL を、チャンネルにそのまま出す (本人だけにしない)。存在しないものは本人にだけ断る
+{
+  const savedEnv = { site: process.env.GOVERNANCE_LAW_SITE_URL, memory: process.env.MEMORY_SITE_PUBLIC_URL };
+  delete process.env.MEMORY_SITE_PUBLIC_URL;
+  delete process.env.GOVERNANCE_LAW_SITE_URL;
+  const unset = interaction({ sub: 'url', admin: false });
+  await memoryCommand.execute(unset);
+  assert.equal(unset.calls[0][1].flags, MessageFlags.Ephemeral, 'without a site URL the refusal is private');
+  assert.match(unset.calls[0][1].content, /まだ設定されていません/);
+
+  process.env.GOVERNANCE_LAW_SITE_URL = 'http://evil.example';
+  const plain = interaction({ sub: 'url', admin: false });
+  await memoryCommand.execute(plain);
+  assert.equal(plain.calls[0][1].flags, MessageFlags.Ephemeral, 'a plain http site is not used');
+
+  process.env.GOVERNANCE_LAW_SITE_URL = 'https://laws.example.test/';
+  const home = interaction({ sub: 'url', admin: false });
+  await memoryCommand.execute(home);
+  assert.deepEqual(home.calls.map((entry) => entry[0]), ['reply'], 'anyone can ask, and it answers at once');
+  assert.equal(home.calls[0][1].flags, undefined, 'the answer is public so it can be shared');
+  assert.match(home.calls[0][1].content, /<https:\/\/laws\.example\.test\/wiki>/, 'wrapped in <> so no login-page preview is unfurled');
+  assert.match(home.calls[0][1].content, /メンバーだけ読めます/);
+  assert.deepEqual(home.calls[0][1].allowedMentions, { parse: [] });
+
+  const page = interaction({ sub: 'url', admin: false, options: { path: '/people/たこ/' } });
+  await memoryCommand.execute(page);
+  assert.match(page.calls[0][1].content, /<https:\/\/laws\.example\.test\/wiki\/people\/%E3%81%9F%E3%81%93>/, 'a page link encodes each part');
+  assert.match(page.calls[0][1].content, /people\/たこ — sakana の作者/);
+  const missing = interaction({ sub: 'url', admin: false, options: { path: 'people/いない' } });
+  await memoryCommand.execute(missing);
+  assert.equal(missing.calls[0][1].flags, MessageFlags.Ephemeral, 'an unknown page is refused privately');
+  const byEpisode = interaction({ sub: 'url', admin: false, options: { id: `E${episode}` } });
+  await memoryCommand.execute(byEpisode);
+  assert.match(byEpisode.calls[0][1].content, new RegExp(`<https://laws\\.example\\.test/e/${episode}>`), 'an episode link');
+  assert.match(byEpisode.calls[0][1].content, /統治機能を作った/);
+  for (const bad of ['e99999', 'abc', '1; DROP']) {
+    const refused = interaction({ sub: 'url', admin: false, options: { id: bad } });
+    await memoryCommand.execute(refused);
+    assert.equal(refused.calls[0][1].flags, MessageFlags.Ephemeral, `an unknown episode (${bad}) is refused privately`);
+  }
+  const mentions = interaction({ sub: 'url', admin: false, options: { path: '@everyone <@&1>' } });
+  await memoryCommand.execute(mentions);
+  assert.equal(mentions.calls[0][1].flags, MessageFlags.Ephemeral, 'a made-up path is refused, and never echoed with a ping');
+  assert.deepEqual(mentions.calls[0][1].allowedMentions, { parse: [] });
+
+  process.env.MEMORY_SITE_PUBLIC_URL = 'https://wiki.example.test';
+  const override = interaction({ sub: 'url', admin: false });
+  await memoryCommand.execute(override);
+  assert.match(override.calls[0][1].content, /<https:\/\/wiki\.example\.test\/wiki>/, 'MEMORY_SITE_PUBLIC_URL wins over the law site URL');
+  delete process.env.MEMORY_SITE_PUBLIC_URL;
+  // explore のリンクボタンは、この URL で作られる (後の explore の検査へ)
+  globalThis.__restoreSiteEnv = () => {
+    if (savedEnv.site === undefined) delete process.env.GOVERNANCE_LAW_SITE_URL; else process.env.GOVERNANCE_LAW_SITE_URL = savedEnv.site;
+    if (savedEnv.memory === undefined) delete process.env.MEMORY_SITE_PUBLIC_URL; else process.env.MEMORY_SITE_PUBLIC_URL = savedEnv.memory;
+  };
+}
+
 // explore: メニューでたどる。部品は Discord の制限内で組み立てられる
 const { handleMemoryComponent } = await import('../src/memory/explore.js');
 const explore = interaction({ sub: 'explore', admin: false, options: { path: '' } });
@@ -193,7 +250,7 @@ const click = (fields) => {
 // 選択肢は25件まで・ID は100字まで・embed は合計6000字まで
 const checkLimits = (view, label) => {
   const all = view.components.flatMap((row) => row.components);
-  const ids = all.map((c) => c.custom_id);
+  const ids = all.map((c) => c.custom_id).filter(Boolean);   // リンクボタンは custom_id を持たない
   assert.equal(new Set(ids).size, ids.length, `${label}: component ids must be unique within a message: ${ids.join(',')}`);
   for (const id of ids) assert.ok(id.length <= 100, `${label}: custom id too long: ${id}`);
   for (const menu of all.filter((c) => c.type === 3)) {
@@ -208,7 +265,7 @@ const checkLimits = (view, label) => {
   }
   assert.ok(view.components.length <= 5, `${label}: at most 5 rows`);
 };
-const buttonsOf = (view) => view.components.flatMap((row) => row.components).filter((c) => c.type === 2);
+const buttonsOf = (view) => view.components.flatMap((row) => row.components).filter((c) => c.type === 2 && c.custom_id);   // リンクボタンは別 (linkButtons)
 const people = click({ customId: 'memx:open', values: [peopleOption.value] });
 assert.equal(await handleMemoryComponent(people), true);
 const peopleJson = json(people.updates[0]);
@@ -222,6 +279,10 @@ assert.match(takoJson.embeds[0].description, /sakana bot を作っている/);
 // 本文の [[リンク]] は太字の名前に、[e12] は消して読みやすく
 assert.doesNotMatch(takoJson.embeds[0].description, /\[\[|\[e\d+\]/, 'links and citations are rendered for people');
 assert.match(takoJson.embeds[0].author.name, /記憶の本 › people › たこ/, 'a page shows where it is');
+const linkButtons = (view) => view.components.flatMap((row) => row.components).filter((c) => c.type === 2 && c.style === 5);
+assert.deepEqual(linkButtons(takoJson).map((b) => b.url), ['https://laws.example.test/wiki/people/%E3%81%9F%E3%81%93'], 'a page links to the same page on the site');
+assert.deepEqual(linkButtons(rootJson).map((b) => b.url), ['https://laws.example.test/wiki'], 'the root links to the site home');
+assert.ok(linkButtons(takoJson).every((b) => !b.custom_id && /サイトで開く/.test(b.label)));
 assert.ok(buttonsOf(takoJson).some((b) => b.custom_id === `memx:n:${peopleOption.value.split(':')[1]}`), 'up goes to the parent');
 const episodeOption = takoJson.components.flatMap((row) => row.components).filter((c) => c.type === 3)
   .flatMap((c) => c.options).find((o) => o.value.startsWith('e:'));
@@ -230,6 +291,7 @@ const openEpisode = click({ customId: 'memx:open', values: [episodeOption.value]
 await handleMemoryComponent(openEpisode);
 const episodeJson = json(openEpisode.updates[0]);
 checkLimits(episodeJson, 'episode');
+assert.deepEqual(linkButtons(episodeJson).map((b) => b.url), [`https://laws.example.test/e/${store.getEpisode(GUILD, Number(episodeOption.value.split(':')[1])).id}`], 'an episode links to its page on the site');
 assert.match(episodeJson.embeds[0].description, /discord\.com\/channels/, 'episode view links its sources');
 // 開いたページへ戻れる
 const takoId = takoOption.value.split(':')[1];
@@ -405,6 +467,7 @@ for (const offset of ['-5', '1e400', '99999999999999999999']) {
   assert.match(json(odd.updates[0]).embeds[0].title, /たこ/, `offset ${offset} still opens the page`);
 }
 
+globalThis.__restoreSiteEnv?.();
 store.resetTree(GUILD);
 archive.prepare('DELETE FROM messages WHERE guild_id = ?').run(GUILD);
-console.log('memory command ok (共有は普通のメッセージ・誰でも操作・自分で開く・NSFW の出来事は NSFW でだけ / status は管理者・先に受付・割合と見込みと費用 / pause で止まる / include・exclude / category / explore でたどる・年表・探す / 誰でも開ける・根拠にリンク / ロール限定チャンネルの原文は見られる人にだけ・共有はそのチャンネルか @everyone / NSFW の原文は NSFW にだけ共有 / agent は channelScope で絞る / 返事は通知しない)');
+console.log('memory command ok (url をチャンネルに出す・サイトで開くボタン / 共有は普通のメッセージ・誰でも操作・自分で開く・NSFW の出来事は NSFW でだけ / status は管理者・先に受付・割合と見込みと費用 / pause で止まる / include・exclude / category / explore でたどる・年表・探す / 誰でも開ける・根拠にリンク / ロール限定チャンネルの原文は見られる人にだけ・共有はそのチャンネルか @everyone / NSFW の原文は NSFW にだけ共有 / agent は channelScope で絞る / 返事は通知しない)');

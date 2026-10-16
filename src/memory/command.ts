@@ -12,6 +12,7 @@ import {
   OTHERS, addTopLevel, includeChannel, includedChannels, listChildren, memoryDb, moveSubtree, normalizePath, removeIncluded,
   removeTopLevel, topLevels
 } from './store.js';
+import { parseEpisodeId, siteOrigin, siteUrl, type SiteTarget } from './site.js';
 import { hasMemory, runMemoryTool, type MemoryRefTable } from './tool.js';
 import { errorMessage } from './types.js';
 
@@ -83,6 +84,44 @@ function sourceLinks(guildId: string, refs: { entries: { channelId: string; mess
     .join(' ');
 }
 
+/** /memory url: サイトのトップ・ページ・出来事の URL を、チャンネルにそのまま出す。存在しないものは本人にだけ断る。 */
+async function replyWithSiteUrl(interaction: ChatInputCommandInteraction, guildId: string): Promise<void> {
+  const refuse = (content: string) => interaction.reply({ content, flags: MessageFlags.Ephemeral, allowedMentions: NO_PINGS });
+  const origin = siteOrigin();
+  if (!origin) {
+    await refuse('記憶の本のサイトはまだ設定されていません (MEMORY_SITE_PUBLIC_URL または GOVERNANCE_LAW_SITE_URL)。');
+    return;
+  }
+  const { getEpisode, getNode } = await import('./store.js');
+  const idText = interaction.options.getString('id');
+  const pathText = (interaction.options.getString('path') ?? '').replace(/^\/+|\/+$/g, '').trim();
+  let target: SiteTarget = { kind: 'home' };
+  let label = '記憶の本';
+  if (idText) {
+    const id = parseEpisodeId(idText);
+    const episode = id === null ? null : getEpisode(guildId, id);
+    if (id === null || !episode) {
+      await refuse(`出来事 ${idText.slice(0, 20)} は記憶の本にありません。`);
+      return;
+    }
+    target = { kind: 'episode', id };
+    label = `出来事 e${id}: ${episode.title}`;
+  } else if (pathText) {
+    const node = getNode(guildId, pathText);
+    if (!node) {
+      await refuse(`ページ「${pathText.slice(0, 60)}」は記憶の本にありません。`);
+      return;
+    }
+    target = { kind: 'page', path: node.path };
+    label = `${node.path}${node.summary ? ` — ${node.summary}` : ''}`;
+  }
+  // <> で囲むと、ログインが要るページのプレビュー (「ログインしてください」の画面) が展開されない
+  await interaction.reply({
+    content: `📖 **${label.slice(0, 200)}**\n<${siteUrl(origin, target)}>\n-# このサーバーのメンバーだけ読めます (Discord でログインします)`,
+    allowedMentions: NO_PINGS
+  });
+}
+
 export const memoryCommand = {
   data: new SlashCommandBuilder()
     .setName('memory')
@@ -95,6 +134,9 @@ export const memoryCommand = {
       .addStringOption((option) => option.setName('query').setDescription('探す語').setRequired(true)))
     .addSubcommand((sub) => sub.setName('episode').setDescription('出来事と根拠の発言を開く')
       .addStringOption((option) => option.setName('id').setDescription('出来事の番号。例: e12').setRequired(true)))
+    .addSubcommand((sub) => sub.setName('url').setDescription('記憶の本のサイトの URL を出す (サーバーのメンバーだけ読める)')
+      .addStringOption((option) => option.setName('path').setDescription('開くページ。例: people/たこ。空ならトップ'))
+      .addStringOption((option) => option.setName('id').setDescription('開く出来事の番号。例: e12')))
     .addSubcommand((sub) => sub.setName('status').setDescription('読み込みの進み具合と費用 (管理者)'))
     .addSubcommand((sub) => sub.setName('pause').setDescription('読み込みを一時停止する (管理者)'))
     .addSubcommand((sub) => sub.setName('resume').setDescription('読み込みを再開する (管理者)'))
@@ -124,6 +166,11 @@ export const memoryCommand = {
         await interaction.reply({ content: 'この操作は「サーバー管理」権限を持つ人か `ARCHIVE_ADMIN_USERS` の人だけが使えます。', flags: MessageFlags.Ephemeral });
         return;
       }
+    }
+    // URL はみんなに見せるための返事なので、本人だけにはしない (サイトはログインが要るので URL が見えても読めない)
+    if (sub === 'url') {
+      await replyWithSiteUrl(interaction, guildId);
+      return;
     }
     // 本人だけの返事でも利用者の入力を含むので、誰にも通知しない
     const edit = (options: string | InteractionEditReplyOptions): Promise<unknown> =>
