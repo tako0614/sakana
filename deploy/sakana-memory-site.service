@@ -1,0 +1,20 @@
+[Unit]
+Description=Push the memory book to the wiki site (Worker + D1; only what changed)
+After=network-online.target sakana-memory.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# .env の MEMORY_SITE_URL / MEMORY_SITE_TOKEN (無ければ GOVERNANCE_LAW_API_URL / GOVERNANCE_LAW_API_TOKEN) と
+# MEMORY_TREE_GUILD が揃っていなければ何も送らずに終わる。記憶 DB は読むだけ (builder とぶつからない)。
+# リリースを切り替えるときは sakana.service と同じく drop-in (90-release.conf) で ExecStart を差し替える:
+#   ExecStart=/usr/bin/node --import /root/sakana/releases/<ts>/node_modules/tsx/dist/loader.mjs /root/sakana/releases/<ts>/scripts/memory-site-sync.ts
+WorkingDirectory=/root/sakana
+ExecStart=/usr/bin/node --import tsx scripts/memory-site-sync.ts
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sakana-memory-site

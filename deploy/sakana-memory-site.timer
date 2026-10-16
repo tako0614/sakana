@@ -1,0 +1,10 @@
+[Unit]
+Description=Push the memory book to the wiki site every 10 minutes
+
+[Timer]
+OnBootSec=15min
+OnUnitInactiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

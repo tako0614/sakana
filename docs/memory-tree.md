@@ -134,3 +134,16 @@ node scripts/memory-tree.mjs settle   --guild ID   # 結果の返らなかった
 provider の当たり外れ: OpenRouter は同じモデルを複数の provider に回す。2026-10-15 には glm-5.3-flash の一部の provider が、3万トークン読ませても空の JSON だけを返したり、出力の上限まで暴走したりした。builder は長い区切り (`MEMORY_TREE_EMPTY_CHARS`、既定 4000 字) で出来事も知識も空なら読めていないとみなし、すぐ送り直す (2回まで)。provider を外すのは、直近1時間に3回以上・4回に1回以上壊れた出力を返したときだけで、外すのは1時間 (2026-10-16、1回の暴走で外していたら、いちばん安くまともな StreamLake まで外れて読み込みが止まりかけた。出力の暴走はどの provider でも時々起きる)。最初から外したい provider は `MEMORY_TREE_IGNORE_PROVIDERS` に書く。OpenRouter の「安い順」は主に入力の単価で並べるので、入力3万・出力4千トークンほどの区切りでは出力の高い provider (Reka は出力 $1.6/M、1回 $0.0094) が選ばれやすい。`MEMORY_TREE_MAX_PRICE=0.1,0.3` (入力,出力) で上限を付けると、StreamLake (1回 $0.0017) などに寄る。
 
 `--guild` を省くと `MEMORY_TREE_GUILD` を使う。builder は同時に1つだけ動く (ロック)。本番では `deploy/sakana-memory.service` を `deploy/sakana-memory.timer` で起動する。溜まっている分は読み切るまで続け、読み終えたら15分おきに起動して新着を読む。会話が1時間止まるか、新着が 6,000 字溜まったチャンネルから読むので、日々の会話はその日のうちに入る。モデルを決める前に `try --model` で同じ区切りを候補ごとに読ませ、出来事の切り方・知識の書き方・捨てられた数を比べる。
+
+## サイト (wiki)
+
+記憶の本は Discord の中 (`/memory explore`) のほかに、法令集と同じ Cloudflare Worker (`worker/`) の `/wiki` で、
+wiki として読めます (Discord ログインでサーバーのメンバーだけ)。ページは記事、出来事は年表と出来事のページ、
+本文の `[[リンク]]` は wiki のリンク、`[e12]` は脚注の番号 (その出来事のページへ直接飛ぶ) になります。
+
+- 送り方: `scripts/memory-site-sync.ts` (systemd `sakana-memory-site.timer`、10分おき) が memory.sqlite を読み、
+  サイトの D1 が持つ行の `content_hash` と比べて、変わった行だけを `/v1/memory/batch` へ送ります。
+  bot で消えたページ・出来事は `/v1/memory/prune` で消します。
+- 引用の原文は、全員に見えるチャンネルのものだけ送ります (`/memory include` のチャンネル・NSFW の名前のチャンネル・
+  消された発言は送らない。送らなかった件数だけ送り、サイトに「載せていない」と出す)。
+- 手順・URL・配備は `worker/README.md`。
