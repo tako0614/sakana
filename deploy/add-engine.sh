@@ -40,7 +40,7 @@ sleep 10
 systemctl is-active sakana
 
 echo "== 5. Discord のコマンド登録を更新する (/model の選択肢は登録データに焼き付く)"
-node scripts/deploy-commands.js
+npx tsx scripts/deploy-commands.ts
 node scripts/list-commands.js | grep -A2 '^/model$'
 
 echo

@@ -11,28 +11,49 @@ import {
   SlashCommandBuilder
 } from 'discord.js';
 
-import { ENDPOINTS, endpointFor, isSelfHosted, status } from './client.js';
+import type { Command } from '../commands.js';
+import {
+  ENDPOINTS, MimicError, endpointFor, isSelfHosted, publicUrl, releaseSlot, status, tryAcquireSlot,
+  type HealthStatus
+} from './client.js';
 import { impersonate } from './impersonate.js';
 import { clearPersona, forgetPersona, personaCounts, personaFor, setPersona } from './persona.js';
-import { DEFAULT_ENGINE, ENGINES, engineCounts, engineFor, setEngine } from './prefs.js';
+import { DEFAULT_ENGINE, ENGINES, engineCounts, engineFor, engineInfo, setEngine } from './prefs.js';
 import { labelledSpeakers } from './plain.js';
 import { hasOptedOut, learnedSpeakers, optIn, optOut } from './speakers.js';
 
-async function overview(userId, guildId) {
+/** 候補に出す人。labels.json (ft 系) と speakers.json (evex-1) のどちらからでも来る。 */
+interface SpeakerChoice {
+  userId: string;
+  name?: string;
+  count?: number;
+}
+
+// 候補は載っているモデルに合わせる (labels.json があればそちら)
+const speakerPool = (): SpeakerChoice[] => (labelledSpeakers().length ? labelledSpeakers() : learnedSpeakers());
+
+// /health の申告は形を保証しないので、表示に使う前に確かめる
+const epochText = (value: unknown): string => (value === null || value === undefined ? '?' : String(value));
+const lossText = (value: unknown): string => (typeof value === 'number' ? value.toFixed(4) : '?');
+
+/** エンジンの表示名。engineFor が返すものは必ず ENGINES にある。 */
+const labelOf = (engine: string): string => engineInfo(engine)?.label ?? engine;
+
+async function overview(userId: string, guildId: string | null): Promise<EmbedBuilder> {
   const current = engineFor(userId, guildId);
   const counts = new Map(engineCounts(guildId).map((row) => [row.engine, row.users]));
 
   // 自作モデルは世代ごとに別プロセス。立っていないものを選ばせないよう、
   // それぞれの状態を見る
-  const selfHosted = Object.keys(ENDPOINTS).filter((key) => ENGINES[key]);
+  const selfHosted = Object.keys(ENDPOINTS).filter((key) => engineInfo(key) !== null);
   const health = new Map(await Promise.all(
-    selfHosted.map(async (key) => [key, await status(key)])
+    selfHosted.map(async (key): Promise<[string, HealthStatus]> => [key, await status(key)])
   ));
 
   const embed = new EmbedBuilder()
     .setColor('#2b2d31')
     .setTitle('🧠 使うモデル')
-    .setDescription(`いまのあなた: **${ENGINES[current].label}**`);
+    .setDescription(`いまのあなた: **${labelOf(current)}**`);
 
   // **1 エンジン 1 フィールドにまとめる。**説明と状態を別々に足していたら、
   // 世代が増えたとき 2 倍の速さで埋め込みの上限 (25 フィールド) に当たって
@@ -40,7 +61,7 @@ async function overview(userId, guildId) {
   const selfHostedKeys = new Set(selfHosted);
 
   for (const [key, info] of Object.entries(ENGINES)) {
-    const marks = [];
+    const marks: string[] = [];
     if (key === current) marks.push('← あなた');
     if (key === DEFAULT_ENGINE) marks.push('既定');
 
@@ -49,10 +70,10 @@ async function overview(userId, guildId) {
 
     const lines = [info.summary];
     if (selfHostedKeys.has(key)) {
-      const state = health.get(key) ?? { up: false };
+      const state: HealthStatus = health.get(key) ?? { up: false };
       lines.push(state.up
-        ? `起動中 (epoch ${state.epoch ?? '?'} / val ${state.val_loss?.toFixed?.(4) ?? '?'})`
-        : `**停止中** (${endpointFor(key).url})。選んでも答えられません`);
+        ? `起動中 (epoch ${epochText(state.epoch)} / val ${lossText(state.val_loss)})`
+        : `**停止中** (${publicUrl(endpointFor(key).url)})。選んでも答えられません`);
     }
 
     embed.addFields({ name: `${info.label}${marks.length ? ` (${marks.join(' / ')})` : ''}`,
@@ -75,7 +96,7 @@ async function overview(userId, guildId) {
   return embed;
 }
 
-export const mimicCommands = [
+export const mimicCommands: Command[] = [
   {
     data: new SlashCommandBuilder()
       .setName('model')
@@ -101,7 +122,10 @@ export const mimicCommands = [
         return;
       }
 
-      if (!ENGINES[engine]) {
+      // 選択肢は登録時に固定されるが、届いた値は名簿で検め直す
+      // (`ENGINES[engine]` だと `toString` のような継承プロパティが通る)
+      const chosen = engineInfo(engine);
+      if (!chosen) {
         await interaction.reply({
           content: `そのモデルは選べません: ${engine}`,
           flags: MessageFlags.Ephemeral
@@ -117,7 +141,7 @@ export const mimicCommands = [
         if (!health.up) {
           await interaction.reply({
             content: [
-              `**${ENGINES[engine].label}** はまだ動いていません (${endpointFor(engine).url})。`,
+              `**${chosen.label}** はまだ動いていません (${publicUrl(endpointFor(engine).url)})。`,
               '推論プロセスが立っていないので、選んでも答えられません。'
             ].join('\n'),
             flags: MessageFlags.Ephemeral
@@ -129,7 +153,7 @@ export const mimicCommands = [
       setEngine(interaction.user.id, engine, interaction.guildId);
 
       await interaction.reply({
-        content: `あなたの分を **${ENGINES[engine].label}** にしました。他の人には影響しません。`,
+        content: `あなたの分を **${chosen.label}** にしました。他の人には影響しません。`,
         embeds: [await overview(interaction.user.id, interaction.guildId)],
         flags: MessageFlags.Ephemeral
       });
@@ -158,7 +182,7 @@ export const mimicCommands = [
 
       // 候補は載っているモデルに合わせる。evex-1 は 48 人、evex-ft-1 は 147 人。
       // 学習していない人を候補に出すと、選んだ人だけ浅い返答になって理由が分からない
-      const pool = labelledSpeakers().length ? labelledSpeakers() : learnedSpeakers();
+      const pool = speakerPool();
       const found = pool
         .filter((row) => !hasOptedOut(row.userId))
         .filter((row) => !typed || (row.name ?? '').toLowerCase().includes(typed))
@@ -193,46 +217,60 @@ export const mimicCommands = [
         return;
       }
 
-      // CPU 推論で数秒かかる。黙っていると落ちたように見える
-      await interaction.deferReply();
+      // 返答と同じ推論の枠を使う。/mimic だけ数えずにいたので、連打すると推論が積み上がり、
+      // その間は全員の返答が詰まった
+      if (!tryAcquireSlot()) {
+        await interaction.reply({
+          content: 'いま別の生成を回しています。少し待ってからもう一度呼んでください。',
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
 
       try {
-        // その人が選んでいる世代で生成する。deepseek のままだと自作モデルが
-        // 使われないので、既定は evex に落とす
-        const chosen = engineFor(interaction.user.id, interaction.guildId);
-        const engine = isSelfHosted(chosen) ? chosen : 'evex';
-        const { text, how } = await impersonate(targetId, {
-          guildId: interaction.guildId,
-          channelScope: { mode: 'include', ids: [interaction.channelId] },
-          topic,
-          channelId: interaction.channelId,
-          askerId: interaction.user.id,
-          engine
-        });
+        // CPU 推論で数秒かかる。黙っていると落ちたように見える
+        await interaction.deferReply();
 
-        if (!text) {
-          await interaction.editReply(how === 'empty'
-            ? 'この人の発言が足りず、真似る材料がありません。'
-            : '何も出てきませんでした。もう一度呼ぶと違うものが出ます。');
-          return;
+        try {
+          // その人が選んでいる世代で生成する。deepseek のままだと自作モデルが
+          // 使われないので、既定は evex に落とす
+          const chosen = engineFor(interaction.user.id, interaction.guildId);
+          const engine = isSelfHosted(chosen) ? chosen : 'evex';
+          const { text, how } = await impersonate(targetId, {
+            guildId: interaction.guildId,
+            channelScope: { mode: 'include', ids: [interaction.channelId] },
+            topic,
+            channelId: interaction.channelId,
+            askerId: interaction.user.id,
+            engine
+          });
+
+          if (!text) {
+            await interaction.editReply(how === 'empty'
+              ? 'この人の発言が足りず、真似る材料がありません。'
+              : '何も出てきませんでした。もう一度呼ぶと違うものが出ます。');
+            return;
+          }
+
+          const pool = speakerPool();
+          const name = pool.find((row) => row.userId === targetId)?.name;
+          // どちらの手で作ったかを出す。深さが違うので、読む側の期待を合わせておく
+          const source = (how === 'token' || how === 'label')
+            ? '学習済みの口調'
+            : '直近の発言から真似';
+
+          await interaction.editReply({
+            content: `${text}\n-# ${endpointFor(engine).label} が ${name ?? 'この人'} として書いたもの (${source})`,
+            allowedMentions: { parse: [], repliedUser: false }
+          });
+        } catch (error) {
+          console.error('mimic failed:', error);
+          await interaction.editReply(error instanceof MimicError && error.down
+            ? 'Evex の推論プロセスが起動していません。'
+            : `失敗しました: ${error instanceof Error ? error.message : '不明なエラー'}`);
         }
-
-        const pool = labelledSpeakers().length ? labelledSpeakers() : learnedSpeakers();
-        const name = pool.find((row) => row.userId === targetId)?.name;
-        // どちらの手で作ったかを出す。深さが違うので、読む側の期待を合わせておく
-        const source = (how === 'token' || how === 'label')
-          ? '学習済みの口調'
-          : '直近の発言から真似';
-
-        await interaction.editReply({
-          content: `${text}\n-# ${endpointFor(engine).label} が ${name ?? 'この人'} として書いたもの (${source})`,
-          allowedMentions: { parse: [], repliedUser: false }
-        });
-      } catch (error) {
-        console.error('mimic failed:', error);
-        await interaction.editReply(error?.down
-          ? 'Evex の推論プロセスが起動していません。'
-          : `失敗しました: ${error?.message ?? '不明なエラー'}`);
+      } finally {
+        releaseSlot();
       }
     }
   },
@@ -256,7 +294,7 @@ export const mimicCommands = [
 
     async autocomplete(interaction) {
       const typed = (interaction.options.getFocused() ?? '').toLowerCase();
-      const pool = labelledSpeakers().length ? labelledSpeakers() : learnedSpeakers();
+      const pool = speakerPool();
       const found = pool
         .filter((row) => !hasOptedOut(row.userId))
         .filter((row) => !typed || (row.name ?? '').toLowerCase().includes(typed))
@@ -271,8 +309,8 @@ export const mimicCommands = [
     async execute(interaction) {
       const who = interaction.options.getString('who');
       const off = interaction.options.getBoolean('off');
-      const pool = () => (labelledSpeakers().length ? labelledSpeakers() : learnedSpeakers());
-      const nameOf = (id) => pool().find((row) => row.userId === id)?.name ?? id;
+      const pool = speakerPool;
+      const nameOf = (id: string): string => pool().find((row) => row.userId === id)?.name ?? id;
 
       if (off) {
         const changed = clearPersona(interaction.user.id, interaction.guildId);
@@ -333,7 +371,7 @@ export const mimicCommands = [
           `あなたの分を **${nameOf(targetId)} として** にしました。他の人には影響しません。`,
           isSelfHosted(engine)
             ? 'メンションすると、その口調で1発言返します。'
-            : `いまのあなたは **${ENGINES[engine].label}** なので効きません。\`/model\` で自作モデルに変えてください。`
+            : `いまのあなたは **${labelOf(engine)}** なので効きません。\`/model\` で自作モデルに変えてください。`
         ].join('\n'),
         flags: MessageFlags.Ephemeral
       });

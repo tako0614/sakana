@@ -49,6 +49,9 @@ try {
     assert.match(JSON.stringify(output), /LOCAL_PUBLIC_SENTINEL/);
     assert.doesNotMatch(JSON.stringify(output), /FOREIGN_SENTINEL|PRIVATE_SENTINEL/);
     assert.deepEqual(exampleTurns('shared-user'), [], 'no unscoped history retrieval');
+    // buildSearch adds no channel filter for an empty id list; an empty include must not mean "every channel"
+    assert.deepEqual(exampleTurns('shared-user', { guildId: 'guild-a', channelScope: { mode: 'include', ids: [] } }), [],
+      'an empty include scope must not read every channel');
   });
   await check('model and persona preferences stay in one guild', () => {
     setEngine('shared-user', 'evex', 'guild-a');

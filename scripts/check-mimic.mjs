@@ -534,3 +534,65 @@ try {
 
   console.log('unusable ok (添付・URL・@名前 だけは引き直す / 本文があれば通す)');
 }
+
+// --- 推論サーバーへの送り方と、受け取った値の検め直し ---
+//
+// 合言葉は MIMIC_SERVER_TOKEN があるときだけ送る (server.py はループバック以外で
+// 待ち受けるならそれを必須にする)。/mimic と返答は推論の枠を共有する。
+{
+  const {
+    endpointFor, generate, mimicConfig, publicUrl, releaseSlot, status, tryAcquireSlot
+  } = await import('../src/mimic/client.js');
+  const { engineInfo } = await import('../src/mimic/prefs.js');
+
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url, init = {}) => {
+    seen.push({ url: String(url), headers: { ...(init.headers ?? {}) } });
+    return new Response(JSON.stringify({ text: 'ok', roles: ['<|a|>'] }), { status: 200 });
+  };
+  const savedToken = process.env.MIMIC_SERVER_TOKEN;
+  try {
+    delete process.env.MIMIC_SERVER_TOKEN;
+    await generate({ prompt: 'x' });
+    await status();
+    if (seen.some((call) => 'authorization' in call.headers)) fail('合言葉が無いのに Authorization を送っている');
+
+    process.env.MIMIC_SERVER_TOKEN = 'check-token';
+    seen.length = 0;
+    const result = await generate({ prompt: 'x' });
+    const health = await status();
+    if (result.text !== 'ok' || !health.up) fail('generate / status の返りが読めていない');
+    if (seen.length !== 2 || seen.some((call) => call.headers.authorization !== 'Bearer check-token')) {
+      fail(`合言葉を Bearer で送っていない: ${JSON.stringify(seen.map((call) => call.headers.authorization))}`);
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedToken === undefined) delete process.env.MIMIC_SERVER_TOKEN;
+    else process.env.MIMIC_SERVER_TOKEN = savedToken;
+  }
+
+  // 推論の枠は1つ。取ったら次は断られ、返せばまた取れる
+  if (!tryAcquireSlot()) fail('空いている枠が取れない');
+  try {
+    if (tryAcquireSlot()) fail('推論の枠が2つ取れてしまう (/mimic と返答で共有していない)');
+  } finally {
+    releaseSlot();
+  }
+  if (!tryAcquireSlot()) fail('返した枠がまた取れない');
+  releaseSlot();
+
+  // 継承プロパティの名前はエンジンでも接続先でもない
+  for (const key of ['toString', 'constructor', '__proto__', 'hasOwnProperty']) {
+    if (engineInfo(key)) fail(`${key} をエンジンとして受け付けている`);
+    if (setEngine(USER, key, TEST_GUILD)) fail(`${key} を選べてしまう`);
+    if (endpointFor(key) !== mimicConfig) fail(`${key} を接続先として引いている`);
+  }
+  clear();
+
+  // 表示に出す接続先から利用者名・パスワードを落とす。無ければそのまま
+  if (publicUrl('http://127.0.0.1:8765') !== 'http://127.0.0.1:8765') fail('普通の URL を書き換えている');
+  if (publicUrl('http://user:pass@10.0.0.5:8765').includes('pass')) fail('URL の資格情報を表示している');
+
+  console.log('client ok (合言葉は設定時だけ Bearer で送る / 推論の枠は1つ / 継承プロパティは名簿に無い)');
+}

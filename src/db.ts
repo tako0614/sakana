@@ -31,7 +31,39 @@ db.exec(`
   )
 `);
 
-export function addTextXP(guildId, userId, amount) {
+/** ランキングの1行。 */
+export interface XpRow {
+  id: string;
+  xp: number;
+}
+
+/** その人の順位。XP が無ければ順位は '-'。 */
+export interface UserRank {
+  rank: number | '-';
+  xp: number;
+}
+
+// --- 行の形を確かめる (DB の中身は型を保証しない) ---
+
+function isXpRow(row: unknown): row is XpRow {
+  return typeof row === 'object' && row !== null
+    && 'id' in row && typeof row.id === 'string'
+    && 'xp' in row && typeof row.xp === 'number';
+}
+
+/** SUM(amount) の行。対象が無ければ xp は null。 */
+function totalOf(row: unknown): number | null {
+  if (typeof row !== 'object' || row === null || !('xp' in row)) return null;
+  return typeof row.xp === 'number' ? row.xp : null;
+}
+
+/** COUNT(*) の行。 */
+function countOf(row: unknown): number {
+  if (typeof row !== 'object' || row === null || !('count' in row)) return 0;
+  return typeof row.count === 'number' ? row.count : 0;
+}
+
+export function addTextXP(guildId: string, userId: string, amount: number): void {
   // 累計データを更新
   db.prepare(`
     INSERT INTO guild_users (guild_id, user_id, xp_text, xp_voice)
@@ -43,7 +75,7 @@ export function addTextXP(guildId, userId, amount) {
   db.prepare(`INSERT INTO xp_log (guild_id, user_id, type, amount) VALUES (?, ?, 'text', ?)`).run(guildId, userId, amount);
 }
 
-export function addVoiceXP(guildId, userId, amount) {
+export function addVoiceXP(guildId: string, userId: string, amount: number): void {
   // 累計データを更新
   db.prepare(`
     INSERT INTO guild_users (guild_id, user_id, xp_text, xp_voice)
@@ -55,40 +87,42 @@ export function addVoiceXP(guildId, userId, amount) {
   db.prepare(`INSERT INTO xp_log (guild_id, user_id, type, amount) VALUES (?, ?, 'voice', ?)`).run(guildId, userId, amount);
 }
 
-// 動的に期間を指定してランキングを取得する関数
-export function getTopXP(guildId, type, period = 'all', limit = 5) {
-  let timeFilter = '';
+// 期間の絞り込み。SQL に直接埋めるので、決め打ちの4通り以外は全期間にする
+function timeFilterOf(period: string): string {
   // period により取得するレコードの期間を絞る (過去24時間、過去7日間、過去30日間)
-  if (period === 'day') timeFilter = "AND created_at >= datetime('now', '-1 day')";
-  if (period === 'week') timeFilter = "AND created_at >= datetime('now', '-7 days')";
-  if (period === 'month') timeFilter = "AND created_at >= datetime('now', '-30 days')";
-
-  return db.prepare(`
-    SELECT user_id as id, SUM(amount) as xp 
-    FROM xp_log 
-    WHERE guild_id = ? AND type = ? ${timeFilter}
-    GROUP BY user_id 
-    HAVING xp > 0
-    ORDER BY xp DESC 
-    LIMIT ?
-  `).all(guildId, type, limit);
+  if (period === 'day') return "AND created_at >= datetime('now', '-1 day')";
+  if (period === 'week') return "AND created_at >= datetime('now', '-7 days')";
+  if (period === 'month') return "AND created_at >= datetime('now', '-30 days')";
+  return '';
 }
 
-export function getUserRank(guildId, userId, type, period = 'all') {
-  let timeFilter = '';
-  if (period === 'day') timeFilter = "AND created_at >= datetime('now', '-1 day')";
-  if (period === 'week') timeFilter = "AND created_at >= datetime('now', '-7 days')";
-  if (period === 'month') timeFilter = "AND created_at >= datetime('now', '-30 days')";
+// 動的に期間を指定してランキングを取得する関数
+export function getTopXP(guildId: string, type: string, period: string = 'all', limit = 5): XpRow[] {
+  const timeFilter = timeFilterOf(period);
 
-  const userTotal = db.prepare(`SELECT SUM(amount) as xp FROM xp_log WHERE guild_id = ? AND user_id = ? AND type = ? ${timeFilter}`).get(guildId, userId, type)?.xp || 0;
+  return db.prepare(`
+    SELECT user_id as id, SUM(amount) as xp
+    FROM xp_log
+    WHERE guild_id = ? AND type = ? ${timeFilter}
+    GROUP BY user_id
+    HAVING xp > 0
+    ORDER BY xp DESC
+    LIMIT ?
+  `).all(guildId, type, limit).filter(isXpRow);
+}
+
+export function getUserRank(guildId: string, userId: string, type: string, period: string = 'all'): UserRank {
+  const timeFilter = timeFilterOf(period);
+
+  const userTotal = totalOf(db.prepare(`SELECT SUM(amount) as xp FROM xp_log WHERE guild_id = ? AND user_id = ? AND type = ? ${timeFilter}`).get(guildId, userId, type)) || 0;
 
   if (userTotal === 0) return { rank: '-', xp: 0 };
 
-  const rank = db.prepare(`
+  const rank = countOf(db.prepare(`
     SELECT COUNT(*) as count FROM (
       SELECT SUM(amount) as total_xp FROM xp_log WHERE guild_id = ? AND type = ? ${timeFilter} GROUP BY user_id
     ) WHERE total_xp > ?
-  `).get(guildId, type, userTotal).count + 1;
+  `).get(guildId, type, userTotal)) + 1;
 
   return { rank, xp: userTotal };
 }

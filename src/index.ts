@@ -5,13 +5,19 @@ import {
   GatewayIntentBits,
   EmbedBuilder,
   MessageFlags,
-  Partials
+  Partials,
+  type GuildMember,
+  type Interaction,
+  type InteractionReplyOptions,
+  type Message,
+  type PartialMessage,
+  type VoiceState
 } from 'discord.js';
 import cron from 'node-cron';
 import { commandMap } from './commands.js';
 import { enforceGuildAllowlist, isAllowedGuild } from './guilds.js';
 import { handleEmotionRequest, isEmotionRequest } from './emotion.js';
-import { addTextXP, addVoiceXP, getTopXP } from './db.js';
+import { addTextXP, addVoiceXP, getTopXP, type XpRow } from './db.js';
 import { handleArchiveComponent } from './archive/commands.js';
 import { handleMemoryComponent } from './memory/explore.js';
 import { setVisibilityClient } from './archive/visibility.js';
@@ -80,12 +86,16 @@ const client = new Client({
     GatewayIntentBits.GuildMessageReactions
   ],
   // 編集/削除/リアクションはキャッシュに無いメッセージにも届くので partial を有効にする
-  partials: [Partials.Message, Partials.Channel, Partials.Reaction]
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction],
+  // **既定では誰も呼ばない。**利用者やモデルの書いた文をそのまま流す経路が多く、
+  // 何も指定しないと本文の @everyone / @here / ロールがそのまま通知になる。
+  // 返信も相手を呼ばない。呼びたい送信は、その送信で allowedMentions を明示する
+  allowedMentions: { parse: [], repliedUser: false }
 });
 
 let shuttingDown = false;
 
-async function shutdown(signal) {
+async function shutdown(signal: NodeJS.Signals): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`${signal} received. Closing the Discord connection.`);
@@ -131,14 +141,14 @@ client.on(Events.ShardReconnecting, () => {
 
 // 再接続 (resume ではなく再 identify) のあとは取りこぼしを取りに行く
 client.on(Events.ShardReady, () => {
-  catchupAllGuilds(client).catch((error) => {
+  catchupAllGuilds(client).catch((error: unknown) => {
     console.error('Catch-up after reconnect failed:', error);
   });
 });
 
 // 招待された瞬間に退出する。許可外のサーバーには何も残さない。
 client.on(Events.GuildCreate, (guild) => {
-  enforceGuildAllowlist(guild.client).catch((error) => {
+  enforceGuildAllowlist(guild.client).catch((error: unknown) => {
     console.error('Failed to enforce the guild allowlist:', error);
   });
 });
@@ -155,13 +165,13 @@ client.once(Events.ClientReady, (readyClient) => {
   );
 
   // 許可していないサーバーに入っていたら出る
-  enforceGuildAllowlist(readyClient).catch((error) => {
+  enforceGuildAllowlist(readyClient).catch((error: unknown) => {
     console.error('Failed to enforce the guild allowlist:', error);
   });
 
   // 前回落ちたときに消し損ねた「thinking」を片付ける。
   // 残すとチャンネルに経過表示が出たまま積み上がる。
-  sweepStaleIndicators(readyClient).catch((error) => {
+  sweepStaleIndicators(readyClient).catch((error: unknown) => {
     console.error('Failed to clean up leftover thinking indicators:', error);
   });
 
@@ -172,7 +182,7 @@ client.once(Events.ClientReady, (readyClient) => {
   // on-write にすると 1GiB の Python を24時間常駐させ、MessageCreate の
   // ホットパスに往復を足すことになるので、まとめて夜にやる。
   cron.schedule(embedConfig.sweepCron, () => {
-    sweepEnabledGuilds(readyClient).catch((error) => {
+    sweepEnabledGuilds(readyClient).catch((error: unknown) => {
       console.error('Embed sweep failed:', error);
     });
   });
@@ -180,12 +190,12 @@ client.once(Events.ClientReady, (readyClient) => {
   // 落ちていた間に流れたメッセージを取りに行く。
   // live indexing は追いつくまで区間を伸ばさないので、ここで埋めないと
   // 停止していた期間が穴のまま残る。時間がかかるので待たない。
-  catchupAllGuilds(readyClient).catch((error) => {
+  catchupAllGuilds(readyClient).catch((error: unknown) => {
     console.error('Catch-up failed:', error);
   });
 
   if (governanceConfig.enabled) {
-    const run = () => runGovernanceScheduler(readyClient).catch((error) => {
+    const run = () => runGovernanceScheduler(readyClient).catch((error: unknown) => {
       console.error('Governance scheduler failed:', error);
     });
     run();
@@ -202,7 +212,9 @@ client.once(Events.ClientReady, (readyClient) => {
       }
 
       const channel = await client.channels.fetch(leaderboardChannelId).catch(() => null);
-      if (!channel || !channel.isTextBased()) return;
+      // サーバーのチャンネルだけ。許可外のサーバーには出さない
+      if (!channel || !channel.isTextBased() || channel.isDMBased()) return;
+      if (!isAllowedGuild(channel.guildId)) return;
 
       const guildId = channel.guildId;
 
@@ -210,7 +222,7 @@ client.once(Events.ClientReady, (readyClient) => {
       const topText = getTopXP(guildId, 'text', 'day', 5);
       const topVoice = getTopXP(guildId, 'voice', 'day', 5);
 
-      const formatTopList = (list) => {
+      const formatTopList = (list: XpRow[]): string => {
         if (list.length === 0) return '該当なし';
         return list.map((user, i) => `#${i + 1} | <@${user.id}> XP: \`${user.xp}\``).join('\n');
       };
@@ -246,7 +258,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
   }
 });
 
-async function handleGuildMemberAdd(member) {
+async function handleGuildMemberAdd(member: GuildMember): Promise<void> {
   const targetGuildId = '1255359848644608035';
   const targetChannelId = '1487488490697658408';
 
@@ -254,15 +266,19 @@ async function handleGuildMemberAdd(member) {
     const channel = await member.guild.channels.fetch(targetChannelId).catch(() => null);
     if (channel && channel.isTextBased()) {
       await channel
-        .send(`<@${member.id}> さん\nEvex Developersへようこそ！\nここで自己紹介してって言ってほしいかも\nhttps://discord.com/channels/1255359848644608035/1445478071221223515`)
-        .catch((error) => {
+        .send({
+          content: `<@${member.id}> さん\nEvex Developersへようこそ！\nここで自己紹介してって言ってほしいかも\nhttps://discord.com/channels/1255359848644608035/1445478071221223515`,
+          // 既定では誰も呼ばないので、入ってきた本人だけ呼ぶ
+          allowedMentions: { users: [member.id] }
+        })
+        .catch((error: unknown) => {
           console.error('Failed to send welcome message:', error);
         });
     }
   }
 }
 
-const textCooldowns = new Map(); // guildId-userId -> timestamp
+const textCooldowns = new Map<string, number>(); // guildId-userId -> timestamp
 
 client.on(Events.MessageCreate, async (message) => {
   try {
@@ -272,9 +288,9 @@ client.on(Events.MessageCreate, async (message) => {
   }
 });
 
-async function handleMessageCreate(message) {
+async function handleMessageCreate(message: Message): Promise<void> {
   // 許可外のサーバーでは記録も応答もしない (退出が効くまでの間も含めて)
-  if (!message.guildId || !isAllowedGuild(message.guildId)) {
+  if (!message.inGuild() || !isAllowedGuild(message.guildId)) {
     return;
   }
 
@@ -287,7 +303,7 @@ async function handleMessageCreate(message) {
     // 統治面の公式投稿はrecordGovernanceMessage側で除外し、botを自動処罰の対象にはしない。
     if (governanceConfig.enabled) {
       recordGovernanceMessage(message);
-      if (message.author.id !== client.user.id && await handleGovernanceMention(message)) return;
+      if (message.author.id !== message.client.user.id && await handleGovernanceMention(message)) return;
     }
     return;
   }
@@ -301,7 +317,7 @@ async function handleMessageCreate(message) {
     if (courtResult === 'blocked') return;
     const activityRecorded = recordGovernanceMessage(message);
     if (activityRecorded) {
-      await detectAutomaticEnforcement(message).catch((error) => {
+      await detectAutomaticEnforcement(message).catch((error: unknown) => {
         console.error('Automatic governance enforcement failed:', error);
       });
     }
@@ -393,9 +409,9 @@ client.on(Events.MessageBulkDelete, (messages) => {
   }
 });
 
-async function handleReactionChange(reaction) {
+async function handleReactionChange(reaction: { message: Message | PartialMessage }): Promise<void> {
   try {
-    if (!isAllowedGuild(reaction.message?.guildId)) return;
+    if (!isAllowedGuild(reaction.message.guildId)) return;
     const message = reaction.message.partial ? await reaction.message.fetch() : reaction.message;
     await syncLiveReactions(message);
   } catch (error) {
@@ -405,6 +421,8 @@ async function handleReactionChange(reaction) {
 
 client.on(Events.MessageReactionAdd, async (reaction, user) => {
   try {
+    // 許可外のサーバーでは制裁も含めて何もしない (他のイベントと同じ門)
+    if (!isAllowedGuild(reaction.message.guildId)) return;
     if (governanceConfig.enabled && await enforceReactionRestrictions(reaction, user)) return;
     await handleReactionChange(reaction);
   } catch (error) {
@@ -416,10 +434,12 @@ client.on(Events.MessageReactionRemoveEmoji, (reaction) => handleReactionChange(
 client.on(Events.MessageReactionRemoveAll, (message) => handleReactionChange({ message }));
 
 // 通話の入退室時間を記録するMap
-const voiceSessions = new Map(); // guildId-userId -> timestamp
+const voiceSessions = new Map<string, number>(); // guildId-userId -> timestamp
 
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   try {
+    // 許可外のサーバーでは制裁も含めて何もしない (他のイベントと同じ門)
+    if (!isAllowedGuild(newState.guild.id)) return;
     if (governanceConfig.enabled && await enforceVoiceRestrictions(oldState, newState)) return;
     handleVoiceStateUpdate(oldState, newState);
   } catch (error) {
@@ -427,7 +447,7 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   }
 });
 
-function handleVoiceStateUpdate(oldState, newState) {
+function handleVoiceStateUpdate(oldState: VoiceState, newState: VoiceState): void {
   const memberId = newState.member?.id;
   const guildId = newState.guild?.id || oldState.guild?.id;
   if (!memberId || !guildId || newState.member?.user.bot) return;
@@ -469,7 +489,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-async function handleInteractionCreate(interaction) {
+async function handleInteractionCreate(interaction: Interaction): Promise<void> {
   if (!isAllowedGuild(interaction.guildId)) {
     if (interaction.isRepliable()) {
       await interaction.reply({
@@ -528,7 +548,7 @@ async function handleInteractionCreate(interaction) {
   } catch (error) {
     console.error(`Failed to run /${interaction.commandName}:`, error);
 
-    const response = {
+    const response: InteractionReplyOptions = {
       content: 'コマンド実行中にエラーが発生しました。',
       flags: MessageFlags.Ephemeral
     };
@@ -547,28 +567,28 @@ async function handleInteractionCreate(interaction) {
 
 client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
   if (!governanceConfig.enabled || !isAllowedGuild(newMember.guild.id)) return;
-  onTrustedRoleChange(oldMember, newMember).catch((error) => {
+  onTrustedRoleChange(oldMember, newMember).catch((error: unknown) => {
     console.error('Failed to audit trusted role change:', error);
   });
 });
 
 client.on(Events.ChannelCreate, (channel) => {
   if (!governanceConfig.enabled || !isAllowedGuild(channel.guildId)) return;
-  onGuildChannelCreate(channel).catch((error) => {
+  onGuildChannelCreate(channel).catch((error: unknown) => {
     console.error('Failed to sync governance channel permissions:', error);
   });
 });
 
 client.on(Events.GuildRoleDelete, (role) => {
   if (!governanceConfig.enabled || !isAllowedGuild(role.guild.id)) return;
-  onGuildRoleDelete(role).catch((error) => {
+  onGuildRoleDelete(role).catch((error: unknown) => {
     console.error('Failed to fail-close after trusted role deletion:', error);
   });
 });
 
 client.on(Events.ThreadCreate, (thread) => {
   if (!governanceConfig.enabled || !isAllowedGuild(thread.guildId)) return;
-  enforceThreadRestrictions(thread).catch((error) => {
+  enforceThreadRestrictions(thread).catch((error: unknown) => {
     console.error('Failed to enforce thread restriction:', error);
   });
 });

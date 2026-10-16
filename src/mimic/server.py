@@ -6,18 +6,24 @@ bot と同じプロセスで回さないのは、CPU 推論がイベントルー
 REST が全部落ちるから。別プロセスなら推論が固まっても bot は生きている。
 
 FastAPI は入れない。要るのは POST 1本と health なので標準ライブラリで足りる。
+
+ループバック以外 (--host 0.0.0.0 など) で待ち受けるときは MIMIC_SERVER_TOKEN が
+必須で、全ての要求に `Authorization: Bearer <合言葉>` を求める。本文は 1MiB まで
+(http_guard.py)。既定の 127.0.0.1 / 合言葉なしの動きは変わらない。
 """
 
 import argparse
-import json
 import os
 import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-import sentencepiece as spm
-import torch
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from http_guard import GuardedHandler, bind_error  # noqa: E402
+
+import sentencepiece as spm  # noqa: E402
+import torch  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "llm"))
 from model import Config, MicroLM  # noqa: E402
@@ -32,6 +38,14 @@ parser.add_argument("--port", type=int, default=8765)
 parser.add_argument("--threads", type=int, default=int(os.environ.get("MIMIC_THREADS", 4)))
 parser.add_argument("--max-new-cap", type=int, default=300)
 args = parser.parse_args()
+
+# 合言葉。**値は表示しない。**ループバック以外で待ち受けるなら必須にする —
+# 認証の無い推論口が外から届くと、誰でも CPU を張り付かせられる。
+# モデルを読む前に断る (読み込みに時間がかかるので、設定ミスは先に知らせる)
+TOKEN = os.environ.get("MIMIC_SERVER_TOKEN") or None
+problem = bind_error(args.host, TOKEN)
+if problem:
+    raise SystemExit(problem)
 
 torch.set_num_threads(args.threads)
 torch.set_grad_enabled(False)
@@ -159,33 +173,28 @@ def run(prompt, max_new_tokens, temperature, top_k, ban, min_new_tokens):
     return sp.decode(out[0].tolist())
 
 
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def _send(self, code, payload):
-        body = json.dumps(payload, ensure_ascii=False).encode("utf8")
-        self.send_response(code)
-        self.send_header("content-type", "application/json; charset=utf-8")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+class Handler(GuardedHandler):
+    token = TOKEN
 
     def do_GET(self):
+        if not self._authorized():
+            return
         if self.path != "/health":
             self._send(404, {"error": "not found"})
             return
         self._send(200, INFO)
 
     def do_POST(self):
+        if not self._authorized():
+            return
         if self.path != "/generate":
-            self._send(404, {"error": "not found"})
+            # 本文を読まずに返すので接続ごと閉じる
+            self._send(404, {"error": "not found"}, close=True)
             return
 
-        try:
-            length = int(self.headers.get("content-length") or 0)
-            payload = json.loads(self.rfile.read(length) or b"{}")
-        except (ValueError, json.JSONDecodeError) as error:
-            self._send(400, {"error": f"bad request: {error}"})
+        # 上限 (1MiB) を超える本文は読む前に 413 で断る
+        payload = self._read_json()
+        if payload is None:
             return
 
         prompt = payload.get("prompt") or ""
@@ -214,13 +223,10 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send(200, {"text": text, **INFO})
 
-    def log_message(self, fmt, *fmt_args):
-        # 1 リクエストごとの行は要らない。エラーは _send 側で返している
-        pass
-
 
 print(f"ckpt {args.ckpt} (epoch {INFO['epoch']} / val {INFO['val_loss']})")
 print(f"パラメータ {INFO['params']:,} / threads {args.threads}")
-print(f"listening on http://{args.host}:{args.port}", flush=True)
+print(f"listening on http://{args.host}:{args.port}"
+      f"{' (合言葉あり)' if TOKEN else ''}", flush=True)
 
 ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()

@@ -1,3 +1,5 @@
+import type { Client } from 'discord.js';
+
 // 動かすサーバーを絞る。
 //
 // 招待されただけで過去ログ検索も外付けブラウザも使えてしまうので、
@@ -11,7 +13,7 @@
 // 素の clone がいきなり開放状態にならないよう、既定を持たせておく。
 const DEFAULT_ALLOWED = ['1255359848644608035'];
 
-function parseList(value, fallback) {
+function parseList(value: string | undefined, fallback: string[]): string[] {
   if (value === undefined) return fallback;
   return String(value).split(/[\s,]+/).filter(Boolean);
 }
@@ -22,13 +24,13 @@ const leaveEnabled = !['0', 'false', 'no', 'off']
   .includes(String(process.env.ALLOWED_GUILDS_LEAVE ?? '').toLowerCase());
 
 /** 機能を動かしてよいサーバーか。リストが空なら制限しない。 */
-export function isAllowedGuild(guildId) {
+export function isAllowedGuild(guildId: unknown): boolean {
   if (allowedGuilds.length === 0) return true;
   return Boolean(guildId) && allowedGuilds.includes(String(guildId));
 }
 
 /** 起動時と参加時に呼ぶ。許可外のサーバーから退出する。 */
-export async function enforceGuildAllowlist(client) {
+export async function enforceGuildAllowlist(client: Client): Promise<void> {
   if (allowedGuilds.length === 0) {
     console.warn('ALLOWED_GUILDS is empty. Running in every guild without restriction.');
     return;
