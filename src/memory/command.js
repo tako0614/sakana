@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { EmbedBuilder, MessageFlags, SlashCommandBuilder } from 'discord.js';
 import { canManageIndex } from '../archive/permissions.js';
 import { pausedBy, setPaused, treeConfig } from './build.js';
-import { rootView, viewFor } from './explore.js';
+import { fitShared, rootView, viewFor } from './explore.js';
 import { snapshotPublicChannels } from './snapshot.js';
 import { memoryStatus } from './status.js';
 import {
@@ -183,7 +183,8 @@ export const memoryCommand = {
         const path = (interaction.options.getString('path') ?? '').replace(/^\/+|\/+$/g, '').trim();
         const { getNode } = await import('./store.js');
         const node = path ? getNode(guildId, path) : null;
-        await interaction.editReply(node ? viewFor(guildId, `n:${node.id}`) : rootView(guildId));
+        // 最初の画面は新しいメッセージなので大きさの上限に収める (書き換えは上限が緩い)
+        await interaction.editReply(fitShared(node ? viewFor(guildId, `n:${node.id}`) : rootView(guildId)));
         return;
       }
       const refs = { entries: [], add(entry) { this.entries.push(entry); return this.entries.length; } };

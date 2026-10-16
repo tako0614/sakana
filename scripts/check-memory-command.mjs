@@ -276,6 +276,25 @@ const mine = click({ customId: mineId, allowReply: true, message: sharedMessage 
 await handleMemoryComponent(mine);
 assert.equal(mine.replies[0].flags, MessageFlags.Ephemeral, 'opening privately is only for the clicker');
 assert.ok(buttonsOf(json(mine.replies[0])).some((b) => b.custom_id.startsWith('memx:share:')));
+// 共有する画面は合計の大きさに収める (大きいページで 40005 Message size exceeds maximum allowed になった)。
+// 本人だけの画面は削らない
+// (本番の あかり のページ: 本文 3800 字 + 出来事のメニュー 25 件の説明 100 字ずつ で 18KB)
+const { SHARED_BYTES, fitShared } = await import('../src/memory/explore.js');
+const { ActionRowBuilder, EmbedBuilder, StringSelectMenuBuilder } = await import('discord.js');
+const bytesOf = (view) => Buffer.byteLength(JSON.stringify(json(view)));
+const bigView = () => ({
+  content: '-# 共有',
+  embeds: [new EmbedBuilder().setTitle('あかり').setDescription('猫語で話す bot 開発者。'.repeat(320).slice(0, 3800))],
+  components: [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('memx:open:episodes').setPlaceholder('出来事')
+    .addOptions(Array.from({ length: 25 }, (_, i) => ({ label: `出来事${i} `.repeat(8).slice(0, 100), value: `e:${i}:1`, description: 'あ'.repeat(100) }))))]
+});
+assert.ok(bytesOf(bigView()) > SHARED_BYTES, `the sample is over the limit (${bytesOf(bigView())} bytes)`);
+const fitted = fitShared(bigView());
+assert.ok(bytesOf(fitted) <= SHARED_BYTES, `a shared view fits (${bytesOf(fitted)} bytes)`);
+assert.match(json(fitted).embeds[0].description, /^猫語で話す bot 開発者。/, 'the shared view still shows the page');
+assert.ok(json(fitted).components[0].components[0].options.length >= 5, 'and keeps a menu');
+checkLimits(json(fitted), 'big shared');
+
 // NSFW チャンネルの出来事は NSFW でないチャンネルに共有しない
 const episodeShare = buttonsOf(episodeJson).find((b) => b.custom_id.startsWith('memx:share:')).custom_id;
 const episodeChannel = store.getEpisode(GUILD, Number(episodeShare.split(':')[3])).channel_id;

@@ -286,6 +286,11 @@ export function rootView(guildId, { shared = false } = {}) {
 
 /** `root` / `n:12[:offset]` / `e:34[:from]` / `t:12[:offset]` を画面にする。shared は共有したメッセージの中か。 */
 export function viewFor(guildId, target, { shared = false } = {}) {
+  const view = buildView(guildId, target, { shared });
+  return shared ? fitShared(view) : view;
+}
+
+function buildView(guildId, target, { shared }) {
   if (target === 'root') return rootView(guildId, { shared });
   const [kind, id, extra] = String(target).split(':');
   if (kind === 'e') return episodeView(guildId, Number(id), { fromId: Number(extra) || 0, shared });
@@ -293,6 +298,37 @@ export function viewFor(guildId, target, { shared = false } = {}) {
   if (!node) return rootView(guildId, { shared });
   if (kind === 't') return timelineView(guildId, node, { offset: Number(extra) || 0, shared });
   return pageView(guildId, node, { offset: Number(extra) || 0, shared });
+}
+
+// 新しいメッセージ (共有・自分で開く・/memory explore の最初の画面) は、embed とメニューを合わせた大きさにも上限がある。日本語は1文字3バイトなので、
+// 大きいページ (あかり: メニュー 9.6KB + embed 8.3KB) で 40005 Message size exceeds maximum allowed になった
+// (同じ大きさでも、本人だけの画面の書き換えは通る)。共有する画面だけ、収まるまで削る
+export const SHARED_BYTES = 12000;
+const viewBytes = (view) => Buffer.byteLength(JSON.stringify({
+  content: view.content, embeds: view.embeds.map((embed) => embed.toJSON()), components: view.components.map((row) => row.toJSON())
+}));
+
+export function fitShared(view) {
+  const menus = view.components.flatMap((row) => row.components).filter((part) => part instanceof StringSelectMenuBuilder);
+  const trimMenus = (count, length) => {
+    for (const menu of menus) {
+      menu.setOptions(menu.options.slice(0, count).map((option) => {
+        const data = { ...option.data, description: length ? clip(option.data.description, length) : undefined };
+        if (!data.description) delete data.description;
+        return data;
+      }));
+    }
+  };
+  trimMenus(15, 40);
+  const embed = view.embeds[0];
+  // 本文を削り、それでも収まらなければメニューの説明を消して数を減らす
+  for (let round = 0; viewBytes(view) > SHARED_BYTES && round < 12; round += 1) {
+    const description = embed?.data.description ?? '';
+    if (embed && description.length > 600) embed.setDescription(clip(description, Math.floor(description.length * 0.75)));
+    else if (round < 10) trimMenus(10, 0);
+    else trimMenus(5, 0);
+  }
+  return view;
 }
 
 /**
@@ -341,7 +377,8 @@ export async function handleMemoryComponent(interaction) {
     // 探す: ボタンで入力欄を出し、送られたら結果の画面に差し替える (入力欄は最初の返事でしか出せない)
     if (action === 's') { await interaction.showModal(searchModal()); return true; }
     if (action === 'q' && interaction.isModalSubmit?.()) {
-      await update(keep(searchView(interaction.guildId, interaction.fields.getTextInputValue('query').trim())));
+      const view = searchView(interaction.guildId, interaction.fields.getTextInputValue('query').trim());
+      await update(keep(shared ? fitShared(view) : view));
       return true;
     }
     if (action === 'share') {
@@ -356,7 +393,8 @@ export async function handleMemoryComponent(interaction) {
       return true;
     }
     if (action === 'mine') {
-      await reply(viewFor(interaction.guildId, rest.join(':') || 'root'), { ephemeral: true });
+      // 本人だけでも新しいメッセージなので大きさの上限に収める
+      await reply(fitShared(viewFor(interaction.guildId, rest.join(':') || 'root')), { ephemeral: true });
       return true;
     }
     const target = interaction.isStringSelectMenu?.() ? interaction.values[0]
