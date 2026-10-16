@@ -1991,7 +1991,7 @@ export async function buildToolset(ctx: AgentContext): Promise<Toolset> {
   if (memoryAvailable) {
     entries.push({
       definition: memoryDefinition,
-      handler: (args) => String(runMemoryTool({ guildId: ctx.guild.id, refs: ctx.refs }, args))
+      handler: (args) => String(runMemoryTool({ guildId: ctx.guild.id, refs: ctx.refs, channelScope: ctx.channelScope }, args))
     });
   }
   if (browserAvailable) {
