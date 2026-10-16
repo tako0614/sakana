@@ -322,21 +322,33 @@ export async function handleMemoryComponent(interaction) {
   if (!customId.startsWith(`${PREFIX}:`)) return false;
   const [, action, ...rest] = customId.split(':');
   const shared = sharedIn(interaction);
-  // 共有したメッセージは書き換えても「誰が共有したか」の一行を残す
-  const keep = (view) => (shared ? { ...view, content: interaction.message.content ?? '' } : view);
+  // 共有したメッセージは書き換えても「誰が共有したか」の一行を残し、最後に操作した人を足す
+  // (誰でも操作できるので、他の人が押すと見ていた画面が急に変わる。誰が変えたか分かるように)
+  const keep = (view) => (shared ? {
+    ...view,
+    content: `${String(interaction.message.content ?? '').replace(/ · 最後に操作: <@!?[^>]+>$/, '')} · 最後に操作: ${interaction.user}`,
+    allowedMentions: { parse: [] }
+  } : view);
+  // 先に受け付けだけを返し、画面はそのあと書き換える。Discord は3秒以内に返事が無い操作を
+  // 「失敗しました」にする (受け付けの後の書き換えは15分まで効く)
+  const update = async (view) => { await interaction.deferUpdate(); await interaction.editReply(view); };
+  const reply = async (view, { ephemeral = false } = {}) => {
+    await interaction.deferReply(ephemeral ? { flags: MessageFlags.Ephemeral } : {});
+    await interaction.editReply(view);
+  };
   try {
     if (action === 'noop') { await interaction.deferUpdate(); return true; }
-    // 探す: ボタンで入力欄を出し、送られたら結果の画面に差し替える
+    // 探す: ボタンで入力欄を出し、送られたら結果の画面に差し替える (入力欄は最初の返事でしか出せない)
     if (action === 's') { await interaction.showModal(searchModal()); return true; }
     if (action === 'q' && interaction.isModalSubmit?.()) {
-      await interaction.update(keep(searchView(interaction.guildId, interaction.fields.getTextInputValue('query').trim())));
+      await update(keep(searchView(interaction.guildId, interaction.fields.getTextInputValue('query').trim())));
       return true;
     }
     if (action === 'share') {
       const target = rest.join(':') || 'root';
       const refusal = shareRefusal(interaction, target);
       if (refusal) { await interaction.reply({ content: refusal, flags: MessageFlags.Ephemeral }); return true; }
-      await interaction.reply({
+      await reply({
         ...viewFor(interaction.guildId, target, { shared: true }),
         content: `-# 📖 ${interaction.user} が記憶の本を共有しました · ボタンは誰でも操作できます (全員の画面が変わります)`,
         allowedMentions: { parse: [] }
@@ -344,15 +356,24 @@ export async function handleMemoryComponent(interaction) {
       return true;
     }
     if (action === 'mine') {
-      await interaction.reply({ ...viewFor(interaction.guildId, rest.join(':') || 'root'), flags: MessageFlags.Ephemeral });
+      await reply(viewFor(interaction.guildId, rest.join(':') || 'root'), { ephemeral: true });
       return true;
     }
     const target = interaction.isStringSelectMenu?.() ? interaction.values[0]
       : action === 'root' ? 'root' : [action, ...rest].join(':');
-    await interaction.update(keep(viewFor(interaction.guildId, target, { shared })));
+    await update(keep(viewFor(interaction.guildId, target, { shared })));
   } catch (error) {
-    console.error('memory explore failed:', error);
-    await interaction.reply({ content: `開けませんでした: ${clip(error.message, 150)}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+    // どの操作が、操作から何ミリ秒で落ちたかを残す。1秒以内の Unknown interaction (10062) は
+    // 時間切れではなく、同じ bot のトークンで動いている別のプロセスが先に返事したことを疑う
+    const ageMs = Date.now() - (interaction.createdTimestamp ?? Date.now());
+    console.error(`memory explore failed: ${customId}${interaction.values ? ` = ${interaction.values[0]}` : ''} by ${interaction.user?.id}`
+      + ` on ${interaction.message?.id ?? '-'} (${shared ? 'shared' : 'private'}) after ${ageMs}ms:`,
+      error?.code ?? '', error?.message ?? error);
+    if (error?.code === 10062 && ageMs < 2500) {
+      console.error('memory explore: Discord did not know this interaction within 2.5s; another process may be answering with the same bot token');
+    }
+    const notice = { content: `開けませんでした: ${clip(error.message, 150)}`, flags: MessageFlags.Ephemeral };
+    await (interaction.deferred || interaction.replied ? interaction.followUp(notice) : interaction.reply(notice)).catch(() => {});
   }
   return true;
 }

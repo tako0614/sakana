@@ -152,15 +152,29 @@ const menu = rootJson.components.find((row) => row.components[0].type === 3).com
 const peopleOption = menu.options.find((option) => /people/.test(option.label));
 assert.ok(peopleOption, 'the root menu lists top-level pages');
 
+// 返事は「先に受け付け (deferUpdate / deferReply) → 書き換え (editReply)」の順で来ること
+// (3秒の制限があるので、画面を作る前に受け付けを返す)
 const click = (fields) => {
   const updates = [];
   const modals = [];
   const replies = [];
+  let pending = null;
+  const user = fields.user ?? { id: 'u1', toString: () => '<@u1>' };
   return { updates, modals, replies, guildId: GUILD, isButton: () => !fields.values && !fields.fields, isStringSelectMenu: () => Boolean(fields.values),
-    isModalSubmit: () => Boolean(fields.fields), user: { id: 'u1', toString: () => '<@u1>' },
-    update: async (view) => { updates.push(view); },
+    isModalSubmit: () => Boolean(fields.fields), createdTimestamp: Date.now(),
+    update: async () => { throw new Error('acknowledge first (deferUpdate), then editReply'); },
+    deferUpdate: async () => { pending = { kind: 'update' }; },
+    deferReply: async (options = {}) => {
+      if (!fields.allowReply) throw new Error('should update in place');
+      pending = { kind: 'reply', flags: options.flags };
+    },
+    editReply: async (view) => {
+      if (!pending) throw new Error('editReply before acknowledging');
+      if (pending.kind === 'update') updates.push(view); else replies.push({ ...view, flags: pending.flags });
+    },
     reply: async (view) => { if (!fields.allowReply) throw new Error('should update in place'); replies.push(view); },
-    showModal: async (modal) => { modals.push(modal); }, deferUpdate: async () => {}, ...fields };
+    followUp: async (view) => { replies.push(view); },
+    showModal: async (modal) => { modals.push(modal); }, ...fields, user };
 };
 // Discord の制限: 部品の ID は1つのメッセージで重複しない・選択肢の値は1つのメニューで重複しない・
 // 選択肢は25件まで・ID は100字まで・embed は合計6000字まで
@@ -253,9 +267,13 @@ const mineId = buttonsOf(sharedJson).find((b) => b.custom_id.startsWith('memx:mi
 assert.ok(mineId && !buttonsOf(sharedJson).some((b) => b.custom_id.startsWith('memx:share:')), 'a shared view offers to open it privately instead');
 // 共有したメッセージでの操作はそのメッセージを書き換え、共有した人の一行を残す
 const sharedMessage = { content: share.replies[0].content, flags: { has: () => false } };
-const together = click({ customId: 'memx:root', message: sharedMessage });
+const together = click({ customId: 'memx:root', message: sharedMessage, user: { id: 'u2', toString: () => '<@u2>' } });
 await handleMemoryComponent(together);
-assert.equal(together.updates[0].content, sharedMessage.content, 'navigating a shared view keeps who shared it');
+assert.equal(together.updates[0].content, `${sharedMessage.content} · 最後に操作: <@u2>`, 'navigating a shared view keeps who shared it and shows who moved it');
+const again = click({ customId: 'memx:root', message: { ...sharedMessage, content: together.updates[0].content } });
+await handleMemoryComponent(again);
+assert.equal(again.updates[0].content, `${sharedMessage.content} · 最後に操作: <@u1>`, 'only the latest operator is shown');
+assert.deepEqual(again.updates[0].allowedMentions, { parse: [] }, 'naming the operator does not ping');
 assert.ok(buttonsOf(json(together.updates[0])).some((b) => b.custom_id.startsWith('memx:mine:')), 'it stays a shared view');
 const mine = click({ customId: mineId, allowReply: true, message: sharedMessage });
 await handleMemoryComponent(mine);
