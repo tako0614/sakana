@@ -334,6 +334,10 @@ if (db.getCase(serious.id).workflow_handler === 'appeal_window') {
 assert.equal(db.getCase(serious.id).workflow_handler,'human_approval');
 assert.equal(db.getCaseSanction(serious.id).required_approvals,2);
 assert.throws(()=>db.setCaseApproval(serious.id,'reporter','approve'),/資格/,'当事者は承認者になれない');
+db.activateRestriction({sanctionId:990101,guildId:GUILD_ID,userId:'reviewer-1',definitionId:0,
+  profile:{code:'NO_VOTING',rules:[{primitive:'block_voting',enabled:true}]},startedAt:Date.now(),endsAt:Date.now()+3_600_000});
+assert.throws(()=>db.setCaseApproval(serious.id,'reviewer-1','approve'),/投票権/,'投票権の停止中は執行を承認できない');
+db.deactivateRestrictionForSanction(990101);
 const reviewInteraction=(id)=>({guild,guildId:GUILD_ID,user:{id},member:{id,user:{bot:false},roles:{cache:new Map([['trusted',true]])}}});
 await approveCase(reviewInteraction('reviewer-1'),serious.id,'approve');
 assert.equal(db.getCase(serious.id).workflow_handler,'human_approval','1人では執行しない');

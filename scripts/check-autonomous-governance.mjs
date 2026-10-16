@@ -285,10 +285,37 @@ await advanceProposal(guild,db.getProposal(vetoProposal.id));
 assert.equal(db.getProposal(vetoProposal.id).workflow_handler,'public_vote','全員賛成でも拒否期間を短縮しない');
 assert.throws(()=>db.castHumanVeto('proposal',vetoProposal.id,'voter-1'),/資格/);
 realMembers.get('voter-2').permissions={has:()=>false};
+// 投票権を制裁で止められた人は、拒否権の指定を受けていても行使できない。
+db.activateRestriction({sanctionId:990002,guildId:GUILD_ID,userId:'voter-2',definitionId:0,
+  profile:{code:'NO_VOTING',rules:[{primitive:'block_voting',enabled:true}]},startedAt:Date.now(),endsAt:Date.now()+3_600_000});
+assert.throws(()=>db.castHumanVeto('proposal',vetoProposal.id,'voter-2'),/投票権/,'投票権の停止中は拒否権も行使できない');
+db.deactivateRestrictionForSanction(990002);
 const {exerciseHumanVeto}=await import('../src/governance/service.js');
 await assert.rejects(()=>exerciseHumanVeto({guildId:'other',guild,user:{id:'voter-2'}},'proposal',vetoProposal.id),/導入|初期化|サーバー/);
 await exerciseHumanVeto({guildId:GUILD_ID,guild,user:{id:'voter-2'}},'proposal',vetoProposal.id);
 assert.equal(db.getProposal(vetoProposal.id).status,'rejected','開始時に指定された管理者の拒否権で否決する');
 assert.equal(db.proposalVoteSummary(vetoProposal.id).vetoCount,1);
 assert.throws(()=>db.castHumanVeto('proposal',vetoProposal.id,'voter-2'),/期間/);
+
+// 制裁で請願を止められた人の議会スレは、その間は議題にしない (議会Forumを制裁の抜け道にしない)。
+const restrictedThread=fakeThread('restricted-petition','請願を止められた人の議題',{id:'restricted-member',bot:false});
+db.activateRestriction({sanctionId:990001,guildId:GUILD_ID,userId:'restricted-member',definitionId:0,
+  profile:{code:'NO_PETITION',rules:[{primitive:'block_petitions',enabled:true}]},startedAt:Date.now(),endsAt:Date.now()+3_600_000});
+await runParliamentSession(guild,db.getGovernanceGuild(GUILD_ID),Date.now(),{manual:true});
+assert.equal(db.getProposalByForumThread(restrictedThread.id),null,'請願を止められた人のスレは議題にしない');
+db.deactivateRestrictionForSanction(990001);
+restrictedThread.archived=true;
+
+// 改正対象は議題のサーバーの法律に限る。保存した判断が他サーバーの法律を指していても起草へ渡さない。
+db.bootstrapGovernanceGuild({guildId:'g-parliament-other',enactedBy:'owner',trustedRoleId:'',enforcementMode:'shadow',
+  constitution,policy,laws:foundingLaws,appealRoleId:'appeal-role',categoryId:'category-other',parliamentForumId:'parliament-other',
+  courtForumId:'court-other',courtChatChannelId:'court-other',procedureChannelId:'procedure-other'});
+const otherLaw=db.listLaws('g-parliament-other')[0];
+const crossTarget=db.createProposal({guildId:GUILD_ID,constitutionId:db.getActiveConstitution(GUILD_ID).id,source:'test',
+  title:'他サーバーの法律の改正',summary:'test',status:'agenda'});
+db.transitionWorkflowInstance({subjectType:'proposal',subjectId:crossTarget.id,toState:'draft',
+  context:{decision:{decision:'legislate',relation:'amend_law',targetId:String(otherLaw.id),instruction:'この法律を改正する。'}}});
+const draftsBeforeCross=draftCount;
+await assert.rejects(()=>advanceLegislation(guild,db.getProposal(crossTarget.id)),/改正対象の現行法がありません/);
+assert.equal(draftCount,draftsBeforeCross,'他サーバーの法令本文を起草AIへ渡さない');
 console.log('check-autonomous-governance: ok (public votes and independent human veto)');

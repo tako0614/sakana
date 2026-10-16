@@ -1,14 +1,59 @@
 import { legalDuration, validateLegalProcedure } from './legal-system.js';
+import type { LegalProcedure, ProcedureState, WorkflowContext } from './types.js';
 
-export const procedureVisits = (context, state) => Number(context.visits?.[state] ?? 0);
-export const procedureExhausted = (definition, context, state) => definition.config.maximumVisits !== undefined
+export const procedureVisits = (context: WorkflowContext, state: string): number => Number(context.visits?.[state] ?? 0);
+export const procedureExhausted = (definition: ProcedureState, context: WorkflowContext, state: string): boolean => definition.config.maximumVisits !== undefined
   && procedureVisits(context, state) >= definition.config.maximumVisits;
-export const recordProcedureVisit = (context, state) => ({ ...context,
+export const recordProcedureVisit = (context: WorkflowContext, state: string): WorkflowContext => ({ ...context,
   visits: { ...context.visits, [state]: procedureVisits(context, state) + 1 } });
+
+export interface ProcedureOperationInput {
+  state: string;
+  definition: ProcedureState;
+  context: WorkflowContext;
+  key: string;
+}
+
+/** 操作の結果。outcome は state の on に宣言された結果だけを受け付ける。 */
+export interface ProcedureOperationResult {
+  restart?: boolean;
+  suspended?: boolean;
+  outcome?: string;
+  context?: WorkflowContext;
+  wakeAt?: number | null;
+}
+
+export type ProcedureOperation = (input: ProcedureOperationInput) => Promise<ProcedureOperationResult | null | undefined>;
+
+export interface ProcedurePersistPatch {
+  state: string;
+  context: WorkflowContext;
+  wakeAt: number | null;
+  completed?: boolean;
+  event?: string;
+  previousState?: string;
+  operationKey?: string;
+}
+
+export interface RunLegalProcedureInput {
+  procedure: LegalProcedure;
+  state: string;
+  context?: WorkflowContext;
+  wakeAt?: number | null;
+  now?: number;
+  operations: Partial<Record<string, ProcedureOperation>>;
+  persist: (patch: ProcedurePersistPatch) => unknown;
+  identity: string;
+  maximumOperations?: number;
+}
+
+export type RunLegalProcedureResult =
+  | { restarted: true }
+  | { restarted?: undefined; state: string; context: WorkflowContext; wakeAt?: number | null; completed: boolean };
 
 // This executor knows operations, persistence and declared transitions, not institutions
 // or political outcomes. A failed operation retains its identity for durable retry.
-export async function runLegalProcedure({ procedure, state, context = {}, wakeAt = null, now = Date.now(), operations, persist, identity, maximumOperations = 100 }) {
+export async function runLegalProcedure({ procedure, state, context = {}, wakeAt = null, now = Date.now(), operations, persist, identity, maximumOperations = 100 }: RunLegalProcedureInput): Promise<RunLegalProcedureResult> {
   validateLegalProcedure(procedure);
   context = structuredClone(context);
   for (let step = 0; step < maximumOperations; step += 1) {
@@ -22,7 +67,10 @@ export async function runLegalProcedure({ procedure, state, context = {}, wakeAt
     const visits = procedureVisits(context, state);
     if (procedureExhausted(definition, context, state)) {
       context.exhausted = { state, visits, reason: '法律で定められた試行回数に達しました。' };
-      state = definition.on.exhausted;
+      // 試行回数を定める state には終端の exhausted が必ずある (validateLegalProcedure)。
+      const exhausted = definition.on.exhausted;
+      if (exhausted === undefined) throw new Error(`unknown persisted legal state: ${String(exhausted)}`);
+      state = exhausted;
       await persist({ state, context, wakeAt: null, event: 'exhausted' });
       continue;
     }
@@ -32,8 +80,9 @@ export async function runLegalProcedure({ procedure, state, context = {}, wakeAt
         await persist({ state, context, wakeAt, event: 'waiting' });
         return { state, context, wakeAt, completed: false };
       }
-      state = definition.on.expired;
-      if (!state) throw new Error('legal wait has no expired outcome');
+      const expired = definition.on.expired;
+      if (!expired) throw new Error('legal wait has no expired outcome');
+      state = expired;
       wakeAt = null;
       await persist({ state, context, wakeAt, event: 'expired' });
       continue;
@@ -51,13 +100,15 @@ export async function runLegalProcedure({ procedure, state, context = {}, wakeAt
       await persist({ state, context, wakeAt: result.wakeAt ?? null, event: 'waiting' });
       return { state, context, wakeAt: result.wakeAt ?? null, completed: false };
     }
-    if (!result || !Object.hasOwn(definition.on, result.outcome)) throw new Error(`undeclared legal outcome: ${state}.${result?.outcome}`);
+    const outcome = result?.outcome;
+    const next = typeof outcome === 'string' && Object.hasOwn(definition.on, outcome) ? definition.on[outcome] : undefined;
+    if (!result || outcome === undefined || next === undefined) throw new Error(`undeclared legal outcome: ${state}.${String(outcome)}`);
     context = recordProcedureVisit({ ...context, ...(result.context ?? {}) }, state);
     delete context.pending;
     const previousState = state;
-    state = definition.on[result.outcome];
+    state = next;
     wakeAt = result.wakeAt ?? null;
-    await persist({ state, context, wakeAt, event: result.outcome, previousState, operationKey: key });
+    await persist({ state, context, wakeAt, event: outcome, previousState, operationKey: key });
   }
   // A runtime resource boundary is never a political rejection or a judgment.
   throw new Error('legal procedure yielded at the runtime operation limit; saved work will resume');

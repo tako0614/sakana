@@ -62,6 +62,9 @@ assert.equal(parseOperationalSetting('investigation_case_limit', '11').ok, false
   '一度に事件化する件数は運営者でも安全上限を超えられない');
 assert.equal(parseOperationalSetting('investigation_guild_limit', '501').ok, false,
   'サーバー全体のAI調査件数は安全上限を超えられない');
+for (const key of ['__proto__', 'constructor', 'toString']) {
+  assert.equal(parseOperationalSetting(key, '1').ok, false, 'prototype の名前を運用設定として保存しない');
+}
 policyModule.validateConstitutionPolicy(policy);
 assert.equal(policy.schemaVersion, 2);
 assert.deepEqual(policyModule.policeProcedure(policy), policy.judiciary.policeProcedure);
@@ -1001,6 +1004,12 @@ assert.match(publicApprovalMessages[0], /表示対象のアカウント が執�
   '執行承認者と選択を事件投稿へ公開し、無効な内部IDは表示しない');
 assert.match(publicApprovalMessages[1], /執行を拒否しました \(変更前: 承認\)。承認 0\/2/,
   '執行承認の選択変更も事件投稿へ公開する');
+for (const party of ['approval-reporter', 'approval-accused']) {
+  assert.throws(() => governanceDb.setCaseApproval(approvalCase.id, party, 'approve'), /被告・通報者/,
+    '当事者はDBの層でも自分の事件の執行を承認できない');
+}
+assert.throws(() => governanceDb.setOperationalSetting('g2', '__proto__', 1, 'op'), /変更できない設定/,
+  '既定値を持たない名前を運用設定としてDBへ書かない');
 governanceDb.updateCase(approvalCase.id, { status: 'closed' });
 
 const finalBanCase = governanceDb.createCase({
@@ -1800,12 +1809,12 @@ assert.doesNotMatch(intakeSource, /正式受付済み: \$\{error\.accepted\.resu
   '自動再試行中の受付にも内部IDを表示しない');
 assert.doesNotMatch(intakeSource, /legislature/,
   '立法の入口はmentionではなく議会Forumへの投稿だけになった');
-const parliamentSource = readFileSync(new URL('../src/governance/parliament.js', import.meta.url), 'utf8');
+const parliamentSource = readFileSync(new URL('../src/governance/parliament.ts', import.meta.url), 'utf8');
 assert.match(parliamentSource, /adoptMemberThreads/,
   '国会は議会Forumの人間のスレをそのまま議題として取り込む');
 assert.match(parliamentSource, /discoverWeeklyIssues/,
   '公開ログから見つけた議題も人間の提案と同じ経路で審議する');
-assert.match(readFileSync(new URL('../src/governance/legislation.js', import.meta.url), 'utf8'), /runConstitutionalPanel/,
+assert.match(readFileSync(new URL('../src/governance/legislation.ts', import.meta.url), 'utf8'), /runConstitutionalPanel/,
   '事前違憲審査の段階を廃止しても、憲法適合は国会の中で必ず確認する');
 assert.match(intakeSource, /screenJudicialMention/,
   '@裁判は人間の法選択フォームではなく独立AI席の成立法照合から開始する');
@@ -1865,7 +1874,7 @@ assert.equal(classifyLegacyGazetteContent('現行法はありません。').kind
 assert.equal(classifyLegacyGazetteContent('行政行為はありません。').kind, 'empty');
 assert.equal(classifyLegacyGazetteContent('# 分類不能な記録\n本文').kind, 'unknown',
   '分類できない旧官報投稿は推測で削除しない');
-const surfaceMigrationSource = readFileSync(new URL('../src/governance/surface-migration.js', import.meta.url), 'utf8');
+const surfaceMigrationSource = readFileSync(new URL('../src/governance/surface-migration.ts', import.meta.url), 'utf8');
 assert.match(surfaceMigrationSource, /entry\.message\.author\.id !== guild\.client\.user\.id/,
   '人間が書いた旧官報を自動削除しない');
 assert.match(surfaceMigrationSource, /attachment\.size > 5_000_000/,

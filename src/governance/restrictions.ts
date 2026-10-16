@@ -1,34 +1,51 @@
+import type {
+  AnyThreadChannel,
+  Message,
+  MessageReaction,
+  PartialMessage,
+  PartialMessageReaction,
+  PartialUser,
+  User,
+  VoiceState
+} from 'discord.js';
 import {
   activeDetentions,
   activeRestrictions,
   getCaseByPublicThread,
   recordRestrictionUsage,
+  restrictionRules,
   restrictionUsageCount,
   restrictionUsageWindow,
   writeAudit
 } from './db.js';
+import type { ActiveRestriction } from './types.js';
 
 const LINK_RE = /https?:\/\/|www\.|discord(?:app)?\.com\/invite\/|discord\.gg\//i;
 
-function rules(restriction, primitive) {
-  return (restriction.profile?.rules ?? []).filter((rule) => rule.primitive === primitive);
+
+export function hasRestriction(guildId: string, userId: string, primitive: string, now = Date.now()): boolean {
+  return activeRestrictions(guildId, userId, now).some((restriction) => restrictionRules(restriction, primitive).length > 0);
 }
 
-export function hasRestriction(guildId, userId, primitive, now = Date.now()) {
-  return activeRestrictions(guildId, userId, now).some((restriction) => rules(restriction, primitive).length > 0);
-}
-
-export function isDetained(guildId, userId, now = Date.now()) {
+export function isDetained(guildId: string, userId: string, now = Date.now()): boolean {
   return activeDetentions(guildId, userId, now).length > 0;
 }
 
-export function governanceActionAllowed(guildId, userId, action, now = Date.now()) {
+export function governanceActionAllowed(guildId: string, userId: string, action: string, now = Date.now()): boolean {
   if (isDetained(guildId, userId, now)) return false;
   const primitive = action === 'vote' ? 'block_voting' : 'block_petitions';
   return !hasRestriction(guildId, userId, primitive, now);
 }
 
-export function reserveRestrictedAgentCall(guildId, userId, eventId, now = Date.now()) {
+export interface RestrictedCallReservation {
+  ok: boolean;
+  used?: number;
+  limit?: number;
+  retryAt?: number;
+  reason?: string;
+}
+
+export function reserveRestrictedAgentCall(guildId: string, userId: string, eventId: string, now = Date.now()): RestrictedCallReservation {
   const detentions = activeDetentions(guildId, userId, now);
   if (detentions.length > 0) {
     return {
@@ -41,57 +58,59 @@ export function reserveRestrictedAgentCall(guildId, userId, eventId, now = Date.
   }
   const restrictions = activeRestrictions(guildId, userId, now);
   for (const restriction of restrictions) {
-    for (const rule of rules(restriction, 'agent_calls_per_window')) {
-      const since = now - rule.windowSeconds * 1000;
+    for (const rule of restrictionRules(restriction, 'agent_calls_per_window')) {
+      const windowMs = Number(rule.windowSeconds) * 1000;
+      const maximum = Number(rule.maximum);
+      const since = now - windowMs;
       const usage = restrictionUsageWindow(restriction.id, 'agent_call', since);
-      if (usage.count >= rule.maximum) {
+      if (usage.count >= maximum) {
         return {
           ok: false,
           used: usage.count,
-          limit: rule.maximum,
-          retryAt: (usage.oldest ?? now) + rule.windowSeconds * 1000
+          limit: maximum,
+          retryAt: (usage.oldest ?? now) + windowMs
         };
       }
     }
   }
   for (const restriction of restrictions) {
-    if (rules(restriction, 'agent_calls_per_window').length > 0) {
+    if (restrictionRules(restriction, 'agent_calls_per_window').length > 0) {
       recordRestrictionUsage(restriction.id, 'agent_call', eventId);
     }
   }
   return { ok: true };
 }
 
-function blockedMessageReason(message, restriction, now) {
-  if (rules(restriction, 'block_links').length > 0 && LINK_RE.test(message.content ?? '')) return 'リンク投稿が制限されています';
-  if (rules(restriction, 'block_attachments').length > 0 && message.attachments?.size > 0) return '添付投稿が制限されています';
-  if (rules(restriction, 'block_mentions').length > 0
+function blockedMessageReason(message: Message, restriction: ActiveRestriction, now: number): string | null {
+  if (restrictionRules(restriction, 'block_links').length > 0 && LINK_RE.test(message.content ?? '')) return 'リンク投稿が制限されています';
+  if (restrictionRules(restriction, 'block_attachments').length > 0 && (message.attachments?.size ?? 0) > 0) return '添付投稿が制限されています';
+  if (restrictionRules(restriction, 'block_mentions').length > 0
     && ((message.mentions?.users?.size ?? 0) > 0
       || (message.mentions?.roles?.size ?? 0) > 0
       || (message.mentions?.channels?.size ?? 0) > 0
       || message.mentions?.everyone)) {
     return 'メンションが制限されています';
   }
-  for (const rule of rules(restriction, 'messages_per_window')) {
-    const since = now - rule.windowSeconds * 1000;
+  for (const rule of restrictionRules(restriction, 'messages_per_window')) {
+    const since = now - Number(rule.windowSeconds) * 1000;
     const used = restrictionUsageCount(restriction.id, 'message', since);
-    if (used >= rule.maximum) return `${rule.windowSeconds}秒あたり${rule.maximum}件の発言上限です`;
+    if (used >= Number(rule.maximum)) return `${String(rule.windowSeconds)}秒あたり${String(rule.maximum)}件の発言上限です`;
   }
   return null;
 }
 
-export async function enforceMessageRestrictions(message) {
+export async function enforceMessageRestrictions(message: Message | null | undefined): Promise<boolean> {
   if (!message?.guildId || message.author?.bot) return false;
   const now = Date.now();
   const courtCase = message.channel?.isThread?.() ? getCaseByPublicThread(message.channelId) : null;
   const detentions = activeDetentions(message.guildId, message.author.id, now);
-  if (detentions.length > 0) {
+  const [protection] = detentions;
+  if (protection) {
     // 拘留中でも、自分の事件の記録では必ず反論できる。第十条3。
     const ownOpenCase = courtCase
       && courtCase.accused_id === message.author.id
       && detentions.some((entry) => entry.case_id === courtCase.id);
     if (!ownOpenCase) {
-      const protection = detentions[0];
       const reason = '拘留中は自分の事件記録だけに発言できます';
       const deleted = await message.delete().then(() => true).catch(() => false);
       writeAudit({
@@ -144,15 +163,18 @@ export async function enforceMessageRestrictions(message) {
     return true;
   }
   for (const restriction of restrictions) {
-    if (rules(restriction, 'messages_per_window').length > 0) {
+    if (restrictionRules(restriction, 'messages_per_window').length > 0) {
       recordRestrictionUsage(restriction.id, 'message', message.id);
     }
   }
   return false;
 }
 
-export async function enforceReactionRestrictions(reaction, user) {
-  if (!reaction?.message?.guildId || user?.bot) return false;
+export async function enforceReactionRestrictions(
+  reaction: (MessageReaction | PartialMessageReaction) & { message: Message | PartialMessage } | null | undefined,
+  user: User | PartialUser | null | undefined
+): Promise<boolean> {
+  if (!reaction?.message?.guildId || !user || user.bot) return false;
   if (!isDetained(reaction.message.guildId, user.id)
     && !hasRestriction(reaction.message.guildId, user.id, 'block_reactions')) return false;
   const removed = await reaction.users.remove(user.id).then(() => true).catch(() => false);
@@ -167,7 +189,7 @@ export async function enforceReactionRestrictions(reaction, user) {
   return removed;
 }
 
-export async function enforceVoiceRestrictions(_oldState, newState) {
+export async function enforceVoiceRestrictions(_oldState: VoiceState | null | undefined, newState: VoiceState | null | undefined): Promise<boolean> {
   if (!newState?.guild?.id || !newState.member || !newState.channelId) return false;
   if (!isDetained(newState.guild.id, newState.member.id)
     && !hasRestriction(newState.guild.id, newState.member.id, 'block_voice')) return false;
@@ -184,7 +206,7 @@ export async function enforceVoiceRestrictions(_oldState, newState) {
   return disconnected;
 }
 
-export async function enforceThreadRestrictions(thread) {
+export async function enforceThreadRestrictions(thread: AnyThreadChannel | null | undefined): Promise<boolean> {
   const ownerId = thread?.ownerId;
   if (!thread?.guildId || !ownerId || (!isDetained(thread.guildId, ownerId)
     && !hasRestriction(thread.guildId, ownerId, 'block_thread_creation'))) return false;
