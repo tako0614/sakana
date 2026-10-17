@@ -3,6 +3,7 @@
 
 import type { Message } from 'discord.js';
 import { TZ_OFFSET_HOURS } from '../archive/query.js';
+import type { JsonRecord } from '../ai/types.js';
 import type { MessageRow } from '../archive/types.js';
 import { archiveStructure, discordStructure, discordExtraText, messageEnvelope } from '../conversation/message.js';
 import {
@@ -373,6 +374,75 @@ export interface FormatOptions {
   selfId?: string | null | undefined;
 }
 
+const nonEmpty = (value: unknown): boolean => Array.isArray(value) ? value.length > 0 : value !== null && value !== undefined && value !== '';
+
+/**
+ * messageEnvelope の既定値・重複を省いた、モデルに見せる形。
+ *
+ * 1件ごとに schema・location (どれも同じ guild / channel)・author.webhookId=null・
+ * body.characters・空の supplemental / mentions / embeds …・reactions.meaning・state.observedAt が並んで、
+ * 本文 70 文字の発言が 1,100 文字の JSON になっていた (30 件で 約 1.1 万トークン、中身は 700 トークン)。
+ * 省いた欄は既定値 (返信ではない・本文は完結・削除でも固定でもない・添付も埋め込みも無い)。
+ * messageEnvelope 自体は統治・調査も使うので触らず、ここで間引くだけ。
+ */
+export function slimEnvelope(envelope: JsonRecord, { showChannel = false }: { showChannel?: boolean } = {}): JsonRecord {
+  const out: JsonRecord = { id: envelope.id };
+
+  // 場所: チャンネルをまたぐ検索結果だけ。スレッドのときは、それが分かる最小限
+  const location = isRecord(envelope.location) ? envelope.location : {};
+  const thread = isRecord(location.thread) && location.thread.id ? { id: location.thread.id, name: location.thread.name ?? null, parentChannelId: location.thread.parentChannelId ?? null } : null;
+  if (showChannel) out.location = { channelId: location.channelId, ...(location.channelName ? { channelName: location.channelName } : {}), ...(thread ? { thread } : {}) };
+  else if (thread) out.location = { thread };
+
+  const author = isRecord(envelope.author) ? envelope.author : {};
+  out.author = {
+    id: author.id, name: author.name,
+    ...(author.bot ? { bot: true } : {}),
+    ...(author.webhookId ? { webhookId: author.webhookId } : {}),
+    ...(author.identity && author.identity !== 'participant' ? { identity: author.identity } : {})
+  };
+
+  const body = isRecord(envelope.body) ? envelope.body : {};
+  out.body = { text: body.text, ...(body.complete === false ? { complete: false, characters: body.characters } : {}) };
+
+  const supplemental = isRecord(envelope.supplemental) ? envelope.supplemental : {};
+  if (nonEmpty(supplemental.text)) {
+    out.supplemental = { text: supplemental.text, attribution: supplemental.attribution, ...(supplemental.complete === false ? { complete: false, characters: supplemental.characters } : {}) };
+  }
+
+  // 返信の関係。返信でも転送でもなく、先も無いなら省く (=返信ではない)
+  const reference = isRecord(envelope.reference) ? envelope.reference : {};
+  const plain = (reference.kind === 'none' || reference.kind === 'unknown') && !reference.messageId;
+  if (!plain) {
+    out.reference = {
+      kind: reference.kind, messageId: reference.messageId, availability: reference.availability,
+      ...(reference.ref ? { ref: reference.ref } : {}),
+      ...(reference.authorId ? { authorId: reference.authorId } : {}),
+      ...(reference.channelId && (showChannel || reference.channelId !== location.channelId) ? { channelId: reference.channelId } : {})
+    };
+  }
+  if (envelope.replyChain) out.replyChain = envelope.replyChain;
+
+  const state = isRecord(envelope.state) ? envelope.state : {};
+  out.state = {
+    createdAt: state.createdAt,
+    ...(state.editedAt ? { editedAt: state.editedAt } : {}),
+    ...(state.deleted ? { deleted: true } : {}),
+    ...(state.pinned ? { pinned: true } : {}),
+    ...(state.messageType ? { messageType: state.messageType } : {}),
+    // 古いアーカイブ (構造を残していない発言) は、返信の有無が確かめられないと伝える
+    ...(state.metadata && state.metadata !== 'observed' ? { metadata: state.metadata } : {})
+  };
+
+  for (const key of ['mentions', 'forwarded', 'attachments', 'embeds', 'stickers'] as const) {
+    if (nonEmpty(envelope[key])) out[key] = envelope[key];
+  }
+  const reactions = isRecord(envelope.reactions) ? envelope.reactions.total : null;
+  if (typeof reactions === 'number' && reactions > 0) out.reactions = reactions;
+  if (envelope.contextNote) out.contextNote = envelope.contextNote;
+  return out;
+}
+
 /**
  * メッセージ列を1行1件の構造化JSONで書き出す。本文の改行はJSON内に保つ。
  */
@@ -387,11 +457,9 @@ export function formatMessages(
     const envelope = messageEnvelope(message, {
       lookup: (id) => refs?.byMessageId.get(id), selfId: selfId ?? null, bodyChars
     });
-    // location は messageEnvelope が必ず作るオブジェクト。型は JsonRecord の unknown なので確かめて触る
-    if (!showChannel && isRecord(envelope.location)) delete envelope.location.channelName;
     const note = tailOf?.(message);
     if (note) envelope.contextNote = note;
-    return `${ref ? `${ref}) ` : ''}${JSON.stringify(envelope)}`;
+    return `${ref ? `${ref}) ` : ''}${JSON.stringify(slimEnvelope(envelope, { showChannel }))}`;
   }).join('\n');
 }
 

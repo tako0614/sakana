@@ -74,7 +74,7 @@ export function buildSystemPrompt(ctx: PromptContext, toolset: ToolAvailability)
     '- チャンネルでは複数の話題が同時に流れている。答えるのは1つだけ。',
     '  「いま答えるべき話」があるならそれだけが本題。「参考」の側は誰が何を話しているかの',
     '  背景で、答えの材料にしない。混ぜて1つの答えにしない。',
-    '  各行は discord.message.v1。reference.kind=reply だけが返信。reference.ref/messageId が宛先で、時系列・メンション・転送は返信ではない。',
+    '  各行は発言1件の JSON で、省かれた欄は既定値 (返信ではない・本文は完結・添付も埋め込みも無い)。reference.kind=reply だけが返信。reference.ref/messageId が宛先で、時系列・メンション・転送は返信ではない。',
     '  reference.availability が not_fetched / unavailable / deleted の場合、返信先の発言内容や意図を推定で補わない。',
     '  body.complete=false は抜粋。forwarded / embeds / 添付の内容は送信者自身の発言とは限らない。thread と channel の境界も守る。',
     '  supplemental はカード・添付・引用の補足。',
