@@ -90,14 +90,13 @@ export function recallParts(guildId: string,
   const pages = [...scores].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([path]) => path);
   if (pages.length === 0 && episodeHits.length === 0) return { text: '', paths: new Set(), episodeIds: new Set() };
 
-  const lines = ['思い出したこと (記憶から。詳しくは memory ツールで path / episode を開く):'];
+  const lines = ['思い出したこと (記憶の見出しだけ。中身は memory ツールで path / episode を開いて読む):'];
   const shown = new Set<number>();
   for (const path of pages) {
     const node = getNode(guildId, path);
     if (!node) continue;
-    lines.push(`- [[${path}]] ${node.summary || ''}`.trimEnd());
-    const head = (node.body || node.pending).split('\n').filter(Boolean).slice(0, 3).join(' ').slice(0, 220);
-    if (head) lines.push(`  ${head}`);
+    // 見出しだけ。中身 (説明・本文) は入れない: 読みたければ memory ツールで path / episode を開く
+    lines.push(`- [[${path}]]`);
     const episodes = episodesFor(guildId, path, 2).filter((episode) => !shown.has(episode.id));
     for (const episode of episodes) {
       shown.add(episode.id);
@@ -128,7 +127,7 @@ const MEANING_HEAD = '- 意味が近い記憶 (言葉は一致しないが、話
 export function meaningLines(meaning: Meaning | null): string[] {
   if (!meaning) return [];
   return [
-    ...meaning.nodes.map((node) => `  [[${node.path}]] ${node.summary || ''}`.trimEnd()),
+    ...meaning.nodes.map((node) => `  [[${node.path}]]`),
     ...meaning.episodes.map((episode) => `  e${episode.id} ${date(episode.atMs)}${episode.kind ? ` [${episode.kind}]` : ''} ${episode.title}`)
   ];
 }
@@ -142,7 +141,7 @@ export async function recallWithMeaning(guildId: string,
   const parts = recallParts(guildId, { request, context, maxChars: 1800 });
   const lines = meaningLines(await meaningOf(guildId, request, { excludePaths: parts.paths, excludeEpisodes: parts.episodeIds, timeoutMs }));
   if (lines.length === 0) return parts;
-  const head = parts.text || '思い出したこと (記憶から。詳しくは memory ツールで path / episode を開く):';
+  const head = parts.text || '思い出したこと (記憶の見出しだけ。中身は memory ツールで path / episode を開いて読む):';
   const text = [head, MEANING_HEAD, ...lines].join('\n');
   for (const line of lines) {
     const page = /^ {2}\[\[([^\]]+)\]\]/.exec(line)?.[1];
@@ -170,7 +169,7 @@ export function meaningReader(guildId: string, seed: { request: string; shown?: 
     if (lines.length === 0 || !meaning) return null;
     for (const node of meaning.nodes) paths.add(node.path);
     for (const episode of meaning.episodes) episodeIds.add(episode.id);
-    return { text: ['調べている内容に近い記憶 (まだ出していないもの。詳しくは memory ツールで path / episode を開く):', ...lines].join('\n') };
+    return { text: ['調べている内容に近い記憶 (見出しだけ。まだ出していないもの。中身は memory ツールで path / episode を開いて読む):', ...lines].join('\n') };
   };
 }
 

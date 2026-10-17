@@ -231,17 +231,29 @@ export function nearest(guildId: string, kind: Kind, query: Float32Array, { limi
  * 質問文をベクトルにする。timeoutMs で見切る (null)。モデルが眠っていたら起こしておく。
  * 見切った後も読み込みは裏で続くので、次の往復には間に合う。
  */
+// モデルがまだ起きていないとき、1度見切ったら少しのあいだは待たずに諦める
+// (往復のたびに数秒ずつ待たせない。読み込みは prewarm で裏に進んでいる)。
+let coldUntil = 0;
+const COLD_SKIP_MS = 30_000;
+
 export async function embedQuery(text: string, { timeoutMs = 3000 }: { timeoutMs?: number } = {}): Promise<Float32Array | null> {
   const clean = text.replace(/\s+/g, ' ').trim().slice(0, 1200);
   if (!clean || !embedConfig.enabled || isDisabled()) return null;
-  if (embedder === defaultEmbed && workerInfo() === null) prewarm();
+  const real = embedder === defaultEmbed;
+  const cold = real && workerInfo() === null;
+  if (cold) {
+    prewarm();
+    if (Date.now() < coldUntil) return null;
+  }
   const work = embedder([clean], 'query').then((reply) => decode(reply.vectors[0] ?? '', reply.dim), () => null);
   let timer: NodeJS.Timeout | undefined;
-  const limit = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); });
+  let timedOut = false;
+  const limit = new Promise<null>((resolve) => { timer = setTimeout(() => { timedOut = true; resolve(null); }, timeoutMs); });
   try {
     return await Promise.race([work, limit]);
   } finally {
     clearTimeout(timer);
+    if (cold && timedOut) coldUntil = Date.now() + COLD_SKIP_MS;
   }
 }
 
@@ -249,10 +261,12 @@ export interface MeaningNode { path: string; summary: string; score: number }
 export interface MeaningEpisode { id: number; kind: string; title: string; atMs: number; score: number }
 export interface Meaning { nodes: MeaningNode[]; episodes: MeaningEpisode[] }
 
-// 1位からこれ以上離れたものは捨てる。e5 は無関係な文どうしでも高い値が出る (0.7〜0.8) ので、絶対値では切れず、
-// 順位と1位との差でしか絞れない。floor は絶対値の下限 (ほぼ何も似ていない質問で、1位をそのまま出さないため)。
-const gap = Number(process.env.MEMORY_RECALL_GAP ?? 0.04);
-const floor = Number(process.env.MEMORY_RECALL_FLOOR ?? 0.8);
+// 1位からこれ以上離れたものは捨てる。e5 は無関係な文どうしでも高い値が出るので、順位と1位との差でも絞る。
+// 本番の実データで測った (2026-10-17、ページ 4,242 件・出来事 11,917 件): 関係のある質問の1位は 0.87〜0.91、
+// 関係のない質問 (天気・おなかすいた・ころすよ) は 0.80〜0.84、抽象的な雑談は 0.85〜0.86。
+// 下限 0.85 で「何も似ていない質問」は何も出さない。上位は 0.01〜0.02 差で団子になるので、差は 0.02。
+const gap = Number(process.env.MEMORY_RECALL_GAP ?? 0.02);
+const floor = Number(process.env.MEMORY_RECALL_FLOOR ?? 0.85);
 
 /** 文に意味が近いページと出来事。ベクトルが無い・間に合わない・近いものが無ければ null。 */
 export async function meaningOf(guildId: string, text: string,
