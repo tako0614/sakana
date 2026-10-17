@@ -10,7 +10,7 @@ import {
   countChildren, episodeTimeline, episodesFor, getEpisode, getNode, linkedPages, listChildren, loadPublicChannels,
   memoryDb, nameOf, parentOf, searchEpisodes, searchNodes, topLevels, type MemoryNode
 } from './store.js';
-import { siteOriginFor, siteUrl, type SiteTarget } from './site.js';
+import { replyWithSiteLink, siteConfigFor, type SiteTarget } from './site.js';
 import { errorCode, errorMessage, type QuoteFilter } from './types.js';
 
 // /memory explore: 記憶の本を Discord の中でたどる画面。本人にだけ見える。
@@ -111,10 +111,29 @@ const button = (customId: string, label: string, { disabled = false, style = But
   new ButtonBuilder().setCustomId(customId).setLabel(label).setStyle(style).setDisabled(disabled);
 const buttonRow = (...buttons: ButtonBuilder[]): ButtonRow => new ActionRowBuilder<ButtonBuilder>().addComponents(buttons);
 
-/** サイトで同じページを開くリンクボタン。サイトの URL が設定されていなければ null (ボタンを出さない)。 */
-function siteButton(guildId: string, target: SiteTarget): ButtonBuilder | null {
-  const origin = siteOriginFor(guildId);
-  return origin ? new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('🌐 サイトで開く').setURL(siteUrl(origin, target)) : null;
+/**
+ * 「サイトで開く」ボタン。押した人にだけ、その人専用のログインリンクを返す (共有した画面でも、リンクは押した人のもの)。
+ * サイトの設定が無い・別のサーバーなら null (ボタンを出さない)。target は画面と同じ表し方 (root / n:<ページ> / e:<出来事>)。
+ */
+function siteButton(guildId: string, target: string): ButtonBuilder | null {
+  return siteConfigFor(guildId) ? button(`${PREFIX}:site:${target}`, '🌐 サイトで開く') : null;
+}
+
+/** 画面の target を、サイトの行き先にする。存在しなければ null。 */
+function siteTargetFor(guildId: string, target: string): { target: SiteTarget; label: string } | null {
+  const [kind, rawId] = target.split(':');
+  if (target === 'root') return { target: { kind: 'home' }, label: '記憶の本' };
+  const id = Number(rawId);
+  if (!Number.isSafeInteger(id) || id < 0) return null;
+  if (kind === 'n') {
+    const node = nodeById(guildId, id);
+    return node ? { target: node.path ? { kind: 'page', path: node.path } : { kind: 'home' }, label: node.path || '記憶の本' } : null;
+  }
+  if (kind === 'e') {
+    const episode = getEpisode(guildId, id);
+    return episode ? { target: { kind: 'episode', id }, label: `出来事 e${id}: ${episode.title}` } : null;
+  }
+  return null;
 }
 
 /** 本人だけの画面には「みんなに見せる」、共有した画面には「自分で開く」。 */
@@ -214,7 +233,7 @@ export function pageView(guildId: string, node: MemoryNode, { offset = 0, shared
   const tools = [button(`${PREFIX}:s`, '🔍 探す', { style: ButtonStyle.Primary })];
   if (episodes.length) tools.push(button(`${PREFIX}:t:${node.id}:0`, '🕒 年表'));
   tools.push(shareButton(isRoot ? 'root' : `n:${node.id}:${offset}`, shared));
-  const site = siteButton(guildId, isRoot ? { kind: 'home' } : { kind: 'page', path: node.path });
+  const site = siteButton(guildId, isRoot ? 'root' : `n:${node.id}`);
   if (site) tools.push(site);
   components.push(buttonRow(...tools));
   return { content: '', embeds: [embed], components };
@@ -241,7 +260,7 @@ export function episodeView(guildId: string, id: number,
     button(`${PREFIX}:root`, '🏠 根'),
     button(`${PREFIX}:s`, '🔍 探す', { style: ButtonStyle.Primary }),
     ...(episode ? [shareButton(`e:${id}:${fromId}`, shared)] : []),
-    ...(episode ? [siteButton(guildId, { kind: 'episode', id })].filter((entry): entry is ButtonBuilder => entry !== null) : [])
+    ...(episode ? [siteButton(guildId, `e:${id}`)].filter((entry): entry is ButtonBuilder => entry !== null) : [])
   );
   if (!episode) return { content: `出来事 e${id} はありません。`, embeds: [], components: [navRow()] };
 
@@ -512,6 +531,17 @@ export async function handleMemoryComponent(interaction: MemoryInteraction): Pro
         content: `-# 📖 ${interaction.user} が記憶の本を共有しました · ボタンは誰でも操作できます (全員の画面が変わります)`,
         allowedMentions: { parse: [] }
       });
+      return true;
+    }
+    if (action === 'site') {
+      // 共有した画面でも、リンクは押した人専用 (その人にだけ返す)
+      const config = siteConfigFor(guildId);
+      const destination = config ? siteTargetFor(guildId, rest.join(':') || 'root') : null;
+      if (!config || !destination) {
+        await interaction.reply({ content: 'このページはサイトにありません。', flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+        return true;
+      }
+      await replyWithSiteLink(interaction, config, destination.target, destination.label);
       return true;
     }
     if (action === 'mine') {

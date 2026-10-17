@@ -16,6 +16,7 @@ const { html, esc, raw } = await import('../worker/src/wiki/html.ts');
 const { renderMarkdown, scanReferences, highlightSnippet, plainText } = await import('../worker/src/wiki/markdown.ts');
 const { handleIngest, parseNode, parseEpisode } = await import('../worker/src/wiki/ingest.ts');
 const auth = await import('../worker/src/wiki/auth.ts');
+const botSite = await import('../src/memory/site.ts');
 const { handleWiki } = await import('../worker/src/wiki/router.ts');
 const store = await import('../worker/src/wiki/store.ts');
 
@@ -260,6 +261,58 @@ const deps = {
   assert.equal(await handleWiki(new Request('https://wiki.test/law/1'), authEnv, deps), null, 'law pages are not handled here');
   assert.equal(await handleWiki(new Request('https://wiki.test/'), authEnv, deps), null);
   assert.equal((await handleWiki(new Request('https://wiki.test/wiki', { method: 'POST' }), env, deps)).status, 405);
+
+  // ---- bot のログインリンク (Discord の OAuth アプリが無くても入れる) ----
+  {
+    const LINK_SECRET = 'link-secret-0123456789abcdef';
+    const linkEnv = { ...env, MEMORY_ACCESS: 'members', SESSION_SECRET, MEMORY_LINK_SECRET: LINK_SECRET };   // OAuth の設定は無い
+    const config = { origin: 'https://wiki.test', secret: LINK_SECRET, guildId: GUILD };
+    const user = { id: '42', name: 'たこ', avatar: 'abc' };
+    const make = (target = { kind: 'page', path: 'people/たこ' }, at = NOW, cfg = config) => botSite.siteLoginUrl(cfg, user, target, at);
+    const open = (url, e = linkEnv, cookie = '') => handleWiki(new Request(url, { headers: cookie ? { cookie } : {} }), e, deps);
+
+    const gate = await open('https://wiki.test/wiki');
+    assert.equal(gate.status, 401, 'without a session the book stays closed');
+    const gateText = await gate.text();
+    assert.match(gateText, /\/memory url/, 'the login page tells members how to get in');
+    assert.ok(!gateText.includes('Discord でログイン'), 'and offers no OAuth button when OAuth is not set up');
+    assert.equal((await open('https://wiki.test/wiki', { ...linkEnv, MEMORY_LINK_SECRET: undefined })).status, 503, 'with no way to log in at all the book is closed');
+
+    const link = make();
+    const entered = await open(link);
+    assert.equal(entered.status, 302, await entered.clone().text());
+    assert.equal(entered.headers.get('location'), '/wiki/people/%E3%81%9F%E3%81%93', 'goes to the page the link was made for');
+    const cookie = entered.headers.get('set-cookie').split(';')[0];
+    assert.match(entered.headers.get('set-cookie'), /HttpOnly; SameSite=Lax; Secure/);
+    assert.equal(entered.headers.get('referrer-policy'), 'no-referrer', 'the one-time token is not leaked in a Referer');
+    const inside = await open('https://wiki.test/wiki', linkEnv, cookie);
+    assert.equal(inside.status, 200);
+    assert.match(await inside.text(), /<span class="uname">たこ<\/span>/, 'the session knows who came in');
+
+    const again = await open(link);
+    assert.equal(again.status, 400, 'a link works once');
+    assert.match(await again.text(), /もう使われています/);
+    assert.equal((await open(make(undefined, NOW - 11 * 60_000))).status, 400, 'an expired link does not work');
+    assert.equal((await open(make(undefined, NOW + 5 * 60_000))).status, 400, 'a link from the future does not work');
+    assert.equal((await open(make(undefined, NOW, { ...config, guildId: '999' }))).status, 400, 'a link for another server does not work');
+    assert.equal((await open(make(undefined, NOW, { ...config, secret: 'a-different-secret-0123456789' }))).status, 400, 'a link signed with another key does not work');
+    const tampered = new URL(make());
+    const [payload, signature] = tampered.searchParams.get('t').split('.');
+    const forged = Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(payload, 'base64url').toString()), uid: '1' })).toString('base64url');
+    tampered.searchParams.set('t', `${forged}.${signature}`);
+    assert.equal((await open(tampered)).status, 400, 'a changed payload does not verify');
+    assert.equal((await open('https://wiki.test/auth/link')).status, 400, 'no token');
+    assert.equal((await open(make(), { ...linkEnv, MEMORY_LINK_SECRET: undefined })).status, 503, 'links are refused when the Worker has no key');
+
+    const evil = new URL(make());
+    evil.searchParams.set('next', '//evil.example');
+    assert.equal((await open(evil)).headers.get('location'), '/wiki', 'an off-site next is ignored');
+    assert.equal(db.raw.prepare("SELECT COUNT(*) n FROM memory_meta WHERE guild_id = '~link'").get().n >= 1, true, 'used links are remembered');
+    // 期限を過ぎた記録は、次のリンクを開いたときに掃除される
+    db.raw.prepare("INSERT INTO memory_meta (guild_id, key, value) VALUES ('~link', 'old-one-0123456789', ?)").run(String(Math.floor(NOW / 1000) - 3600));
+    await open(make());
+    assert.equal(db.raw.prepare("SELECT COUNT(*) n FROM memory_meta WHERE key = 'old-one-0123456789'").get().n, 0, 'expired records are swept');
+  }
 
   // ---- 画面 ----
   const page = async (path, e = env) => {

@@ -1,8 +1,11 @@
 import type { Env, Session } from './types.ts';
 
-// 記憶の本を読めるのは、このサーバーのメンバーだけにする。
-//   Discord OAuth2 (identify + guilds) でログイン → サーバーに入っているかを確かめる → 署名つき cookie を渡す。
-// アクセストークンはその場で使い捨てて保存しない。メッセージやフレンドの権限は求めない。
+// 記憶の本を読めるのは、このサーバーのメンバーだけにする。入り方は2つ:
+//   1. bot のログインリンク (既定): メンバーが Discord で /memory url を使うと、bot が (そのサーバーのメンバーだと
+//      分かっているので) 10分だけ有効な1回限りのリンクを本人にだけ返す。サイトは署名を確かめて cookie を渡す。
+//      Discord 側の設定 (OAuth アプリ・Client Secret) が要らない。
+//   2. Discord OAuth2 (identify + guilds): 設定してあれば「Discord でログイン」ボタンも出す。
+// どちらも署名つきの session cookie を渡す。OAuth のアクセストークンはその場で使い捨てて保存しない。
 
 const SESSION_COOKIE = 'sk_session';
 const STATE_COOKIE = 'sk_state';
@@ -92,9 +95,19 @@ function setCookie(url: URL, name: string, value: string, options: { maxAge: num
 export const memoryGuild = (env: Env): string => (env.MEMORY_GUILD_ID ?? env.DEFAULT_GUILD_ID ?? '').trim();
 export const isPublicAccess = (env: Env): boolean => env.MEMORY_ACCESS === 'public';
 
+/** cookie を発行・確認できる (どの入り方にも必要) */
+export const sessionConfigured = (env: Env): boolean => Boolean(env.SESSION_SECRET && memoryGuild(env));
+
+/** Discord OAuth でログインできる */
 export function authConfigured(env: Env): boolean {
-  return Boolean(env.DISCORD_CLIENT_ID && env.DISCORD_CLIENT_SECRET && env.SESSION_SECRET && memoryGuild(env));
+  return Boolean(env.DISCORD_CLIENT_ID && env.DISCORD_CLIENT_SECRET) && sessionConfigured(env);
 }
+
+/** bot のログインリンクで入れる */
+export const linkConfigured = (env: Env): boolean => Boolean(env.MEMORY_LINK_SECRET) && sessionConfigured(env);
+
+/** 入る手段が1つでもある (無ければ wiki は閉じたまま) */
+export const loginAvailable = (env: Env): boolean => authConfigured(env) || linkConfigured(env);
 
 /** ログイン後に戻る先。同じサイトの中の絶対パスだけ (//evil.example や \ を弾く)。 */
 export function safeNext(next: string | null | undefined): string {
@@ -224,6 +237,67 @@ function decodeURIComponentSafe(value: string): string {
   } catch {
     return '';
   }
+}
+
+// ---- bot のログインリンク -------------------------------------------------------
+
+const LINK_PREFIX = 'sakana-memory-link.v1';
+const LINK_JTI = '~link';
+
+export interface LinkClaims {
+  g: string;
+  uid: string;
+  name: string;
+  avatar: string | null;
+  iat: number;
+  exp: number;
+  jti: string;
+}
+
+function isLinkClaims(value: unknown): value is LinkClaims {
+  if (typeof value !== 'object' || value === null) return false;
+  const c = value as Record<string, unknown>;
+  return typeof c.g === 'string' && typeof c.uid === 'string' && typeof c.name === 'string' && (c.avatar === null || typeof c.avatar === 'string')
+    && typeof c.iat === 'number' && typeof c.exp === 'number' && typeof c.jti === 'string' && c.jti.length >= 8 && c.jti.length <= 64;
+}
+
+/** 署名・サーバー・期限を確かめる。1回限りの確認 (jti) は finishLink で行う。 */
+export async function verifyLinkToken(token: string, secret: string, guild: string, now: number): Promise<LinkClaims | null> {
+  const [payload, signature] = token.split('.');
+  if (!payload || !signature) return null;
+  const signatureBytes = fromBase64Url(signature);
+  if (!signatureBytes) return null;
+  const ok = await crypto.subtle.verify('HMAC', await hmacKey(secret), signatureBytes, encoder.encode(`${LINK_PREFIX}.${payload}`));
+  if (!ok) return null;
+  const bytes = fromBase64Url(payload);
+  if (!bytes) return null;
+  try {
+    const claims: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    // 発行から 10 分以内・このサーバー宛て・未来すぎる発行時刻 (時計のずれ以上) は受け取らない
+    return isLinkClaims(claims) && claims.g === guild && claims.exp * 1000 > now && claims.iat * 1000 <= now + 60_000 && claims.exp - claims.iat <= 900 ? claims : null;
+  } catch {
+    return null;
+  }
+}
+
+/** /auth/link?t=…&next=…: bot のリンクを受け取り、1回だけ使えるようにして cookie を渡す。 */
+export async function finishLink(request: Request, env: Env, now = Date.now()): Promise<{ ok: true; response: Response } | { ok: false; reason: string; status: number }> {
+  if (!linkConfigured(env)) return { ok: false, reason: 'このサイトではログインリンクが設定されていません。', status: 503 };
+  const url = new URL(request.url);
+  const claims = await verifyLinkToken(url.searchParams.get('t') ?? '', env.MEMORY_LINK_SECRET ?? '', memoryGuild(env), now);
+  if (!claims) return { ok: false, reason: 'このリンクは使えません (期限切れか、別のサーバーのものです)。Discord でもう一度 /memory url を使ってください。', status: 400 };
+  // 1回限り: 使った jti を D1 に残し、同じリンクの2回目は断る。古い記録 (期限の2倍を過ぎたもの) はここで掃除する
+  const [, inserted] = await env.LAWS.batch([
+    env.LAWS.prepare('DELETE FROM memory_meta WHERE guild_id = ?1 AND CAST(value AS INTEGER) < ?2').bind(LINK_JTI, Math.floor(now / 1000) - 1800),
+    env.LAWS.prepare('INSERT OR IGNORE INTO memory_meta (guild_id, key, value) VALUES (?1, ?2, ?3)').bind(LINK_JTI, claims.jti, String(claims.exp))
+  ]);
+  if (!inserted || (inserted.meta?.changes ?? 0) !== 1) {
+    return { ok: false, reason: 'このリンクはもう使われています。Discord でもう一度 /memory url を使ってください。', status: 400 };
+  }
+  const session: Session = { uid: claims.uid, name: claims.name.slice(0, 40), avatar: claims.avatar, exp: Math.floor(now / 1000) + SESSION_SECONDS };
+  const headers = new Headers({ location: asciiLocation(safeNext(url.searchParams.get('next'))), 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' });
+  headers.append('set-cookie', setCookie(url, SESSION_COOKIE, await signSession(session, env.SESSION_SECRET ?? ''), { maxAge: SESSION_SECONDS, path: '/' }));
+  return { ok: true, response: new Response(null, { status: 302, headers }) };
 }
 
 export function logoutResponse(request: Request): Response {

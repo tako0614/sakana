@@ -12,7 +12,7 @@ import {
   OTHERS, addTopLevel, includeChannel, includedChannels, listChildren, memoryDb, moveSubtree, normalizePath, removeIncluded,
   removeTopLevel, topLevels
 } from './store.js';
-import { parseEpisodeId, siteOriginFor, siteUrl, type SiteTarget } from './site.js';
+import { parseEpisodeId, replyWithSiteLink, siteConfigFor, type SiteTarget } from './site.js';
 import { hasMemory, runMemoryTool, type MemoryRefTable } from './tool.js';
 import { errorMessage } from './types.js';
 
@@ -84,11 +84,11 @@ function sourceLinks(guildId: string, refs: { entries: { channelId: string; mess
     .join(' ');
 }
 
-/** /memory url: サイトのトップ・ページ・出来事の URL を、チャンネルにそのまま出す。存在しないものは本人にだけ断る。 */
+/** /memory url: サイトの入り口 (その人専用のログインリンク) を、その人にだけ返す。存在しないページ・出来事も本人にだけ断る。 */
 async function replyWithSiteUrl(interaction: ChatInputCommandInteraction, guildId: string): Promise<void> {
   const refuse = (content: string) => interaction.reply({ content, flags: MessageFlags.Ephemeral, allowedMentions: NO_PINGS });
-  const origin = siteOriginFor(guildId);
-  if (!origin) {
+  const config = siteConfigFor(guildId);
+  if (!config) {
     await refuse('このサーバーの記憶の本のサイトはまだありません。');
     return;
   }
@@ -115,11 +115,7 @@ async function replyWithSiteUrl(interaction: ChatInputCommandInteraction, guildI
     target = { kind: 'page', path: node.path };
     label = `${node.path}${node.summary ? ` — ${node.summary}` : ''}`;
   }
-  // <> で囲むと、ログインが要るページのプレビュー (「ログインしてください」の画面) が展開されない
-  await interaction.reply({
-    content: `📖 **${label.slice(0, 200)}**\n<${siteUrl(origin, target)}>\n-# このサーバーのメンバーだけ読めます (Discord でログインします)`,
-    allowedMentions: NO_PINGS
-  });
+  await replyWithSiteLink(interaction, config, target, label);
 }
 
 export const memoryCommand = {
@@ -134,7 +130,7 @@ export const memoryCommand = {
       .addStringOption((option) => option.setName('query').setDescription('探す語').setRequired(true)))
     .addSubcommand((sub) => sub.setName('episode').setDescription('出来事と根拠の発言を開く')
       .addStringOption((option) => option.setName('id').setDescription('出来事の番号。例: e12').setRequired(true)))
-    .addSubcommand((sub) => sub.setName('url').setDescription('記憶の本のサイトの URL を出す (サーバーのメンバーだけ読める)')
+    .addSubcommand((sub) => sub.setName('url').setDescription('記憶の本のサイトへの入り口 (あなただけのリンク) を出す')
       .addStringOption((option) => option.setName('path').setDescription('開くページ。例: people/たこ。空ならトップ'))
       .addStringOption((option) => option.setName('id').setDescription('開く出来事の番号。例: e12')))
     .addSubcommand((sub) => sub.setName('status').setDescription('読み込みの進み具合と費用 (管理者)'))
@@ -167,7 +163,7 @@ export const memoryCommand = {
         return;
       }
     }
-    // URL はみんなに見せるための返事なので、本人だけにはしない (サイトはログインが要るので URL が見えても読めない)
+    // リンクはその人専用 (開くとその人としてログインする)。本人にだけ返す
     if (sub === 'url') {
       await replyWithSiteUrl(interaction, guildId);
       return;

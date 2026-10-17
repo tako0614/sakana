@@ -11,6 +11,8 @@ export interface Env {
   DISCORD_CLIENT_ID?: string;
   DISCORD_CLIENT_SECRET?: string;
   SESSION_SECRET?: string;
+  /** bot が発行するログインリンクの署名の鍵 (bot の MEMORY_SITE_LINK_SECRET と同じ値) */
+  MEMORY_LINK_SECRET?: string;
 }
 
 export interface NodeRow {

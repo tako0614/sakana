@@ -42,10 +42,11 @@ class Statement {
     const { statement, params } = this.prepared();
     return { success: true, meta: { changes: statement.run(...params).changes } };
   }
-  /** batch から使う: 読む文か書く文かで呼び分ける */
+  /** batch から使う: 読む文か書く文かで呼び分ける。D1 の batch と同じ形 ({ results, success, meta.changes }) で返す */
   execute(): unknown {
     const { statement, params } = this.prepared();
-    return statement.reader ? statement.all(...params) : statement.run(...params);
+    if (statement.reader) return { results: statement.all(...params), success: true, meta: {} };
+    return { results: [], success: true, meta: { changes: statement.run(...params).changes } };
   }
 }
 

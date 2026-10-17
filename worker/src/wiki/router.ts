@@ -1,4 +1,7 @@
-import { authConfigured, currentSession, defaultAuthDeps, finishLogin, isPublicAccess, loginRedirect, logoutResponse, memoryGuild, safeNext, type AuthDeps } from './auth.ts';
+import {
+  authConfigured, currentSession, defaultAuthDeps, finishLink, finishLogin, isPublicAccess, linkConfigured, loginAvailable, loginRedirect, logoutResponse, memoryGuild,
+  safeNext, type AuthDeps
+} from './auth.ts';
 import type { SafeHtml } from './html.ts';
 import { handleIngest } from './ingest.ts';
 import { layout } from './layout.ts';
@@ -62,9 +65,14 @@ export async function handleWiki(request: Request, env: Env, deps: Deps = defaul
   if (path.startsWith('/v1/memory/')) return handleIngest(request, env, deps.now());
 
   if (path.startsWith('/auth/')) {
-    if (!authConfigured(env)) return respond(messageView('ログインの設定がありません', 'このサイトではまだ Discord ログインが設定されていません。', { status: 503 }), { user: null });
-    if (path === '/auth/login') return loginRedirect(request, env, deps.auth);
     if (path === '/auth/logout') return logoutResponse(request);
+    if (path === '/auth/link') {
+      const result = await finishLink(request, env, deps.now());
+      if (result.ok) return result.response;
+      return respond(messageView('入れませんでした', result.reason, { status: result.status }), { user: null });
+    }
+    if (!authConfigured(env)) return respond(messageView('ログインの設定がありません', 'このサイトでは Discord ログインは使えません。Discord で /memory url を使うと、ログインリンクが出ます。', { status: 503 }), { user: null });
+    if (path === '/auth/login') return loginRedirect(request, env, deps.auth);
     if (path === '/auth/callback') {
       const result = await finishLogin(request, env, deps.auth);
       if (result.ok) return result.response;
@@ -84,11 +92,11 @@ export async function handleWiki(request: Request, env: Env, deps: Deps = defaul
   // gate: 公開 (MEMORY_ACCESS=public) でなければ、サーバーのメンバーとしてログインした人だけ
   let user: Session | null = null;
   if (!isPublicAccess(env)) {
-    if (!authConfigured(env)) {
-      return respond(messageView('まだ公開されていません', '記憶の本は、Discord ログインの設定が済むまで閉じています。', { status: 503 }), { user: null, lawsHref });
+    if (!loginAvailable(env)) {
+      return respond(messageView('まだ公開されていません', '記憶の本は、ログインの設定が済むまで閉じています。', { status: 503 }), { user: null, lawsHref });
     }
     user = await currentSession(request, env, deps.now());
-    if (!user) return respond(loginView(safeNext(`${url.pathname}${url.search}`), null), { user: null, lawsHref });
+    if (!user) return respond(loginView(safeNext(`${url.pathname}${url.search}`), { oauth: authConfigured(env), link: linkConfigured(env) }), { user: null, lawsHref });
   }
   const ctx = { user, lawsHref };
   const db = env.LAWS;
