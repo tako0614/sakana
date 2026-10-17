@@ -9,6 +9,7 @@
 // 使う場所で形を確かめる。結果の本文にもユーザーの発言が入るが、それは材料であって命令ではない。
 
 import type { GuildBasedChannel, Message } from 'discord.js';
+import { createCoach } from './coach.js';
 import { hasMemory, memoryToolDefinition, runMemoryToolWithMeaning } from '../memory/tool.js';
 import { db as archiveDb, getGuildState, msToSnowflake, snowflakeToMs } from '../archive/db.js';
 import { MESSAGE_CHANNEL_TYPES, canRead, isForumType, isThreadType } from '../archive/permissions.js';
@@ -29,7 +30,7 @@ import { runSemanticSearch, semanticAvailable } from './semantic.js';
 import { cdpAvailable } from './cdp.js';
 import { agentConfig } from './config.js';
 import {
-  formatMessages,
+  formatMessageLines,
   fromArchiveRow,
   fromDiscordMessage,
   fromRawMessage,
@@ -511,7 +512,8 @@ export function searchToolDefinition({ archiveAvailable, semanticAvailable }: Se
       '意味検索も同じ呼び出しの中で自動で走るので、呼び直さなくてよい。'
     ] : []),
     ...(archiveAvailable ? [
-      'mode:count は個別の発言を返さず数だけ返すので安い。by:term はその条件でよく話している話題を出す。',
+      'mode:count は個別の発言を返さず数だけ返すので安い。特定の人の件数は author に名前を渡し、query は空か絞りたい語だけにする',
+      '(人名や「文字数」を query に書くと、その語を含む発言を数えるので 0 件になる)。by:term はその条件でよく話している話題を出す。',
       'mode:posts はスレッド / フォーラムの投稿を単位にして返す (タイトルも本文も見る)。',
       '「どの投稿でその話をしているか」を知りたいときはこれ。番号を read の at に渡せば中に入れる。'
     ] : [])
@@ -906,7 +908,7 @@ async function searchViaArchive(ctx: AgentContext, args: ToolArgs, limit: number
     lines.push('(新しい順の先頭のみ。古い方を見るなら sort:old か during: で期間を指定する)');
   }
 
-  lines.push(formatMessages(messages, {
+  lines.push(formatMessageLines(messages, {
     refs: ctx.refs,
     selfId: ctx.client?.user?.id,
     showChannel: true,
@@ -1195,7 +1197,7 @@ async function searchViaDiscord(ctx: AgentContext, args: ToolArgs, limit: number
       `表示 ${messages.length} 件 ・ 検索元: Discord`
         + (sort === 'relevance' ? ' (関連度順)' : '')
         + (visible.length >= limit ? ' ・ limit ぶん埋まったのでこれで全部とは限らない' : ''),
-      formatMessages(messages, {
+      formatMessageLines(messages, {
         refs: ctx.refs,
         selfId: ctx.client?.user?.id,
         showChannel: true,
@@ -1433,7 +1435,7 @@ async function readManyChannels(
       `--- #${channel.name} (${messages.length}件) ---`,
       messages.length === 0
         ? '(発言なし)'
-        : formatMessages(messages, {
+        : formatMessageLines(messages, {
           refs: ctx.refs,
           selfId: ctx.client?.user?.id,
           showChannel: false,
@@ -1772,7 +1774,7 @@ export async function runRead(ctx: AgentContext, rawArgs: ToolArgs): Promise<str
 
   return [
     `#${channel.name} ${messages.length} 件${period}${notes.length ? ` ・ ${notes.join(' ・ ')}` : ''}`,
-    formatMessages(messages, {
+    formatMessageLines(messages, {
       refs: ctx.refs,
       selfId: ctx.client?.user?.id,
       showChannel: !sameChannel,
@@ -1858,7 +1860,7 @@ async function readReplies(ctx: AgentContext, anchorMessageId: string, args: Too
 
   return [
     `返信の連鎖 ${messages.length} 件 (起点への返信を含む${replies === 0 ? '。返信は付いていない' : ''})`,
-    formatMessages(messages, {
+    formatMessageLines(messages, {
       refs: ctx.refs,
       selfId: ctx.client?.user?.id,
       showChannel: true,
@@ -2016,6 +2018,7 @@ export async function buildToolset(ctx: AgentContext): Promise<Toolset> {
   }
 
   const definitions = entries.map((entry) => entry.definition);
+  const coach = createCoach();
   // Map で引く。モデルが渡す名前を素のオブジェクトの添字にすると、
   // `constructor` や `toString` が Object.prototype の関数に当たってしまう。
   const handlers = new Map(entries.map((entry) => [entry.definition.function.name, entry.handler] as const));
@@ -2029,15 +2032,16 @@ export async function buildToolset(ctx: AgentContext): Promise<Toolset> {
     semanticAvailable: semanticReady,
 
     async call(name: string, args: unknown): Promise<string> {
+      // 結果に、同じ呼び出しの繰り返し・空振りの連続への助言を足す (coach.ts)
       const handler = handlers.get(name);
-      if (!handler) return `そのツールはありません: ${String(name).slice(0, MAX_NAME_CHARS)}`;
+      if (!handler) return coach(name, args, `そのツールはありません: ${String(name).slice(0, MAX_NAME_CHARS)}`);
 
       try {
-        return String((await handler(isRecord(args) ? args : {})) ?? '');
+        return coach(name, args, String((await handler(isRecord(args) ? args : {})) ?? ''));
       } catch (error) {
-        if (error instanceof QueryError) return `クエリが不正です: ${error.message}`;
+        if (error instanceof QueryError) return coach(name, args, `クエリが不正です: ${error.message}`);
         console.error(`Agent tool ${name} failed:`, error);
-        return `ツールの実行に失敗しました: ${truncate(errorMessage(error), 200)}`;
+        return coach(name, args, `ツールの実行に失敗しました: ${truncate(errorMessage(error), 200)}`);
       }
     }
   };

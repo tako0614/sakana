@@ -458,6 +458,77 @@ export function formatMessages(
   }).join('\n');
 }
 
+const flat = (text: unknown): string => String(text ?? '').replace(/\s*\n\s*/g, ' ⏎ ').trim();
+const listOf = (value: unknown): JsonRecord[] => (Array.isArray(value) ? value.filter(isRecord) : []);
+
+/** envelope 1件を1行にする。省くのは既定値だけで、返信・自分の発言・補足 (発言者の言葉ではない) は残す。 */
+function lineOf(ref: number | null | undefined, envelope: JsonRecord, showChannel: boolean): string {
+  const author = isRecord(envelope.author) ? envelope.author : {};
+  const state = isRecord(envelope.state) ? envelope.state : {};
+  const body = isRecord(envelope.body) ? envelope.body : {};
+  const supplemental = isRecord(envelope.supplemental) ? envelope.supplemental : {};
+  const location = isRecord(envelope.location) ? envelope.location : {};
+  const reference = isRecord(envelope.reference) ? envelope.reference : {};
+  const thread = isRecord(location.thread) && location.thread.id ? location.thread : null;
+
+  const channel = showChannel || thread
+    ? `${showChannel ? `#${String(location.channelName ?? location.channelId ?? '?')}` : ''}${thread ? `[スレッド:${String(thread.name ?? thread.id)}]` : ''}`
+    : '';
+  const who = `${String(author.name ?? 'unknown')}${author.identity && author.identity !== 'participant' ? '(あなた)' : ''}${author.bot ? '[bot]' : ''}`;
+
+  // 返信先: 番号が分かれば ↩N。引けなかった・消えたことも言う (返信先を推測で補わせない)
+  let reply = '';
+  if (reference.kind === 'forward') reply = ' [転送]';
+  else if (reference.kind === 'thread_starter') reply = ' [スレッド開始]';
+  else if (reference.messageId) {
+    reply = reference.ref ? ` ↩${String(reference.ref)}`
+      : reference.availability === 'deleted' ? ' ↩(削除済)' : ' ↩(未取得)';
+  }
+
+  const text = flat(body.text);
+  const cut = body.complete === false ? `…(全${String(body.characters)}字)` : '';
+  let extra = '';
+  if (typeof supplemental.text === 'string' && supplemental.text.trim()) {
+    extra = ` ※補足(発言者の言葉ではない): ${flat(supplemental.text)}${supplemental.complete === false ? '…' : ''}`;
+  } else {
+    const names = listOf(envelope.attachments).map((item) => String(item.name ?? '')).filter(Boolean);
+    if (names.length) extra += ` [添付:${names.slice(0, 3).join(',')}${names.length > 3 ? ` ほか${names.length - 3}件` : ''}]`;
+    const stickers = listOf(envelope.stickers).map((item) => String(item.name ?? '')).filter(Boolean);
+    if (stickers.length) extra += ` [スタンプ:${stickers.slice(0, 2).join(',')}]`;
+  }
+  const marks = [
+    state.editedAt ? '(編集済)' : '',
+    state.deleted ? '(削除済)' : '',
+    typeof (isRecord(envelope.reactions) ? envelope.reactions.total : null) === 'number' && Number(isRecord(envelope.reactions) ? envelope.reactions.total : 0) > 0
+      ? `(反応${String(isRecord(envelope.reactions) ? envelope.reactions.total : 0)})` : ''
+  ].filter(Boolean).join('');
+
+  const head = [ref !== undefined && ref !== null ? `${ref})` : '', shortTime(state.createdAt), channel, `${who}${reply}`].filter(Boolean).join(' ');
+  const content = text || (extra ? '' : '(本文なし)');
+  return `${head}:${content ? ` ${content}` : ''}${cut}${extra}${marks ? ` ${marks}` : ''}`.trimEnd();
+}
+
+/**
+ * メッセージ列を1行1件の短い文で書き出す (道具の結果用)。
+ * `3) 08/14 14:02 #雑談 たこ ↩2: 本文` — 自分の発言は名前に (あなた)、返信は ↩N、補足は ※ 以降。
+ * 1件ずつ JSON にすると 540 文字の飾りが付いて、検索1回で 5〜19k 文字になっていた (往復のたびに送り直される)。
+ * 意味の元は formatMessages と同じ envelope で、返信先の解決・本文の切り詰め・自分の判定は変わらない。
+ */
+export function formatMessageLines(
+  messages: AgentMessage[],
+  { refs, showChannel = false, bodyChars = 300, selfId = null }: FormatOptions = {}
+): string {
+  // 返信は親より前に出ることがある。番号を先に全部振る
+  for (const message of messages) refs?.add(message);
+  return messages.map((message) => {
+    const ref = refs?.add(message);
+    const envelope = messageEnvelope(message, {
+      lookup: (id) => refs?.byMessageId.get(id), selfId: selfId ?? null, bodyChars
+    });
+    return lineOf(ref, envelope, showChannel);
+  }).join('\n');
+}
+
 /** そのテキストがコードブロックを開いたまま終わっているか。 */
 function fenceLeftOpen(text: string): boolean {
   return ((text.match(/```/g) ?? []).length % 2) === 1;

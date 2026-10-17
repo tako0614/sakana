@@ -284,6 +284,8 @@ export interface AgentResult {
   used: UsedTool[];
   runId: string;
   inputToken?: unknown;
+  /** モデルが見た材料 (依頼と道具の結果) の本文。「」の引用が実在するかの照合に使う。 */
+  observed: string;
 }
 
 /** One host-owned execution loop for chat and every institution. Providers only
@@ -358,7 +360,9 @@ export async function runAgent({ guildId, system, userContent, toolset = { defin
     // describes only provider responses observed by this function call.
     rounds: state.rounds, requests: state.requests, usage: { ...totals },
     invocation: { rounds: invocationRounds, usage: { ...invocationUsage } },
-    used: state.used, runId, ...(state.inputToken ? { inputToken: state.inputToken } : {}) });
+    used: state.used, runId, ...(state.inputToken ? { inputToken: state.inputToken } : {}),
+    observed: state.messages.filter((entry) => entry.role === 'user' || entry.role === 'tool')
+      .map((entry) => (typeof entry.content === 'string' ? entry.content : JSON.stringify(entry.content ?? ''))).join('\n') });
   const stepsUsed = (): number => Math.max(state.steps, toolset.steps ?? 0);
   const consumeRequest = ({ model }: { model?: unknown } = {}): number => {
     if (state.requests >= maximumRequests) throw Object.assign(new Error('Agent model request limit reached'), {

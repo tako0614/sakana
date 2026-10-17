@@ -28,6 +28,8 @@ import { governance, type GovernanceReservation } from './boundary.js';
 import { closeBrowserSandbox } from './browser.js';
 import { failureNotice } from './failure.js';
 import { stripAddressNarration } from './narration.js';
+import { lookupGuard } from './lookup.js';
+import { softenUnverifiedQuotes } from './quotes.js';
 import { dropRestartedAnswer } from './repeat.js';
 import { agentConfig, agentEnabled } from './config.js';
 import {
@@ -488,6 +490,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
       recall: recalled?.text ?? ''
     });
 
+    let toolUsed = false;
     const result = await runAgent({
       model,
       guildId: guild.id,
@@ -514,7 +517,9 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
       // 超えてもツールが外れるだけなので、答えはその場の材料で必ず書かれる。
       deadlineAt: Date.now() + agentConfig.deadlineMs,
       weigh: weighCost,
-      onToolCall: (name, args) => thinking.setStatus(toolLabel(name, args))
+      // 事実を聞かれたのに何も調べずに答えそうなら、答える前に1回だけ確かめさせる (lookup.ts)
+      ...(toolset.definitions.length > 0 ? { validate: lookupGuard({ request, known: (recalled?.paths.size ?? 0) > 0, usedTool: () => toolUsed }) } : {}),
+      onToolCall: (name, args) => { toolUsed = true; thinking.setStatus(toolLabel(name, args)); }
     });
 
     finalizeCall(reservation.id, {
@@ -534,7 +539,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
     // 文字列でなければ回答として使わない
     const text = typeof result.text === 'string' ? result.text.trim() : '';
     const answer = text
-      ? expandCitations(stripAddressNarration(dropRestartedAnswer(text), member.displayName), refs, {
+      ? expandCitations(softenUnverifiedQuotes(stripAddressNarration(dropRestartedAnswer(text), member.displayName), result.observed), refs, {
         label: modelLabel(model), selfId: client.user.id, episodeUrl: (id) => memoryEpisodeUrl(guild.id, id)
       })
       : 'うまく答えをまとめられませんでした。条件を絞ってもう一度聞いてください。';
