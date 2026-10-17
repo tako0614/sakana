@@ -88,6 +88,7 @@ export function browserToolDefinition(browserFull: boolean): ToolDefinition {
         properties: {
           action: { type: 'string', enum: actions, description: '実行する操作' },
           query: { type: 'string', description: 'search の検索語' },
+          why: { type: 'string', description: 'なぜ・何を知りたくて呼ぶか (1文。想起の手がかりになる)' },
           url: { type: 'string', description: 'open / new_tab で開く URL' },
           selector: { type: 'string', description: 'click / type / scroll / wait の対象 CSS セレクタ' },
           text: { type: 'string', description: 'type で入力する文字列' },

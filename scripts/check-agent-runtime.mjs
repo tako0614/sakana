@@ -234,14 +234,17 @@ try {
         rounds += 1;
         if (rounds === 1) return { choices: [{ message: { content: '', reasoning: 'さかなの過去の事件を探したい。\n\nまず検索する', tool_calls: [{ id: 'l1', function: { name: 'lookup', arguments: '{}' } }] } }] };
         if (rounds === 2) return { choices: [{ message: { content: '', reasoning_details: [{ type: 'reasoning.text', text: '結果に出た DB 削除の件を掘る' }, { type: 'reasoning.encrypted', data: 'xxxx' }], tool_calls: [{ id: 'l2', function: { name: 'lookup', arguments: '{}' } }] } }] };
-        if (rounds === 3) return { choices: [{ message: { content: '', reasoning_details: [{ type: 'reasoning.encrypted', data: 'only-encrypted' }], tool_calls: [{ id: 'l3', function: { name: 'lookup', arguments: '{}' } }] } }] };
+        if (rounds === 3) return { choices: [{ message: { content: '', reasoning_details: [{ type: 'reasoning.encrypted', data: 'only-encrypted' }], tool_calls: [{ id: 'l3', function: { name: 'lookup', arguments: JSON.stringify({ why: 'さかなの事件の続きを探す' }) } }] } }] };
+        if (rounds === 4) return { choices: [{ message: { content: '', reasoning: 'ほぼ空', tool_calls: [{ id: 'l4', function: { name: 'lookup', arguments: JSON.stringify({ why: '日付を確かめたい', query: 'x' }) } }, { id: 'l5', function: { name: 'lookup', arguments: 'not json' } }] } }] };
         return { choices: [{ message: { content: 'done' } }] };
       } };
     await runAgent(reasoningOptions);
     assert.equal(seen[0].reasoning, undefined, 'before the first model call there is no thinking yet');
     assert.equal(seen[1].reasoning, 'さかなの過去の事件を探したい。 まず検索する', 'the previous round\'s thinking text is handed to the recall');
     assert.equal(seen[2].reasoning, '結果に出た DB 削除の件を掘る', 'reasoning details with text are used; encrypted ones are skipped');
-    assert.equal(seen[3].reasoning, undefined, 'unreadable (encrypted-only) thinking is simply absent');
+    assert.equal(seen[3].reasoning, 'さかなの事件の続きを探す', 'encrypted thinking is unreadable, so the call\'s own why note is the cue');
+    assert.equal(seen[4].reasoning, 'ほぼ空 日付を確かめたい', 'thinking text and why notes are joined; a broken arguments string is ignored');
+    assert.equal(seen.length, 5);
     assert.ok(seen[1].observations > 0);
   }
 
