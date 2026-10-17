@@ -12,7 +12,7 @@ import {
   OTHERS, addTopLevel, includeChannel, includedChannels, listChildren, memoryDb, moveSubtree, normalizePath, removeIncluded,
   removeTopLevel, topLevels
 } from './store.js';
-import { parseEpisodeId, siteOrigin, siteUrl, type SiteTarget } from './site.js';
+import { parseEpisodeId, siteOriginFor, siteUrl, type SiteTarget } from './site.js';
 import { hasMemory, runMemoryTool, type MemoryRefTable } from './tool.js';
 import { errorMessage } from './types.js';
 
@@ -87,9 +87,9 @@ function sourceLinks(guildId: string, refs: { entries: { channelId: string; mess
 /** /memory url: サイトのトップ・ページ・出来事の URL を、チャンネルにそのまま出す。存在しないものは本人にだけ断る。 */
 async function replyWithSiteUrl(interaction: ChatInputCommandInteraction, guildId: string): Promise<void> {
   const refuse = (content: string) => interaction.reply({ content, flags: MessageFlags.Ephemeral, allowedMentions: NO_PINGS });
-  const origin = siteOrigin();
+  const origin = siteOriginFor(guildId);
   if (!origin) {
-    await refuse('記憶の本のサイトはまだ設定されていません (MEMORY_SITE_PUBLIC_URL または GOVERNANCE_LAW_SITE_URL)。');
+    await refuse('このサーバーの記憶の本のサイトはまだありません。');
     return;
   }
   const { getEpisode, getNode } = await import('./store.js');

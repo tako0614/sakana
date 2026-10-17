@@ -1,7 +1,11 @@
 // 記憶の本のサイト (worker/ の /wiki) の URL。/memory url と explore の「サイトで開く」が使う。
 //
-// サイトの origin は MEMORY_SITE_PUBLIC_URL、無ければ法令集と同じ GOVERNANCE_LAW_SITE_URL
-// (同じ Worker なので、法令集の設定が済んでいればそのまま使える)。https のサイトだけ (開発の localhost を除く)。
+// サイトの origin は MEMORY_SITE_PUBLIC_URL だけ (明示したときだけ出す)。法令集の URL (GOVERNANCE_LAW_SITE_URL) は
+// 使わない: 同じ Worker でも、wiki を配備する前に URL だけが出て「not found」になった (2026-10-17)。
+// https のサイトだけ (開発の localhost を除く)。
+//
+// サイトが見せるのは1つのサーバー (builder が記憶を作り、サイトへ送るサーバー = MEMORY_TREE_GUILD) だけ。
+// 別のサーバーでは、そのサーバーのページを確かめても、別のサーバーのサイトへ案内してしまうので、リンクを出さない。
 
 export type SiteTarget =
   | { kind: 'home' }
@@ -9,7 +13,7 @@ export type SiteTarget =
   | { kind: 'episode'; id: number };
 
 export function siteOrigin(env: NodeJS.ProcessEnv = process.env): string | null {
-  const raw = (env.MEMORY_SITE_PUBLIC_URL ?? env.GOVERNANCE_LAW_SITE_URL ?? '').trim();
+  const raw = (env.MEMORY_SITE_PUBLIC_URL ?? '').trim();
   if (!raw) return null;
   try {
     const url = new URL(raw);
@@ -18,6 +22,18 @@ export function siteOrigin(env: NodeJS.ProcessEnv = process.env): string | null 
   } catch {
     return null;
   }
+}
+
+/** サイトが見せるサーバー。 */
+export function siteGuild(env: NodeJS.ProcessEnv = process.env): string | null {
+  const id = (env.MEMORY_SITE_GUILD ?? env.MEMORY_TREE_GUILD ?? '').trim();
+  return /^\d+$/.test(id) ? id : null;
+}
+
+/** そのサーバーで案内してよいサイトの origin。サイトの対象のサーバーでなければ null。 */
+export function siteOriginFor(guildId: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const origin = siteOrigin(env);
+  return origin && siteGuild(env) === guildId ? origin : null;
 }
 
 /** サイトの URL。パスの区切りは / のまま、各部分だけ percent-encode する。 */

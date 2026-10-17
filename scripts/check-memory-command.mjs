@@ -155,65 +155,71 @@ const search = interaction({ sub: 'search', admin: false, options: { query: '統
 await memoryCommand.execute(search);
 assert.match(embedText(search.calls[1][1]), /統治機能を作った/);
 
-// url: サイトの URL を、チャンネルにそのまま出す (本人だけにしない)。存在しないものは本人にだけ断る
+// url: サイトの URL を、チャンネルにそのまま出す (本人だけにしない)。存在しないものは本人にだけ断る。
+// サイトは MEMORY_SITE_PUBLIC_URL を明示したときだけ、サイトが見せるサーバー (MEMORY_TREE_GUILD) でだけ案内する
 {
-  const savedEnv = { site: process.env.GOVERNANCE_LAW_SITE_URL, memory: process.env.MEMORY_SITE_PUBLIC_URL };
-  delete process.env.MEMORY_SITE_PUBLIC_URL;
+  const keys = ['MEMORY_SITE_PUBLIC_URL', 'GOVERNANCE_LAW_SITE_URL', 'MEMORY_TREE_GUILD', 'MEMORY_SITE_GUILD'];
+  const savedEnv = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  for (const key of keys) delete process.env[key];
+  process.env.MEMORY_TREE_GUILD = GUILD;
+  const ask = async (options = {}, overrides = {}) => {
+    const call = interaction({ sub: 'url', admin: false, options });
+    Object.assign(call, overrides);
+    await memoryCommand.execute(call);
+    return call.calls[0][1];
+  };
+  const refused = (payload) => payload.flags === MessageFlags.Ephemeral;
+
+  assert.ok(refused(await ask()), 'without a site URL the answer is private');
+  process.env.GOVERNANCE_LAW_SITE_URL = 'https://laws.example.test';
+  const lawOnly = await ask();
+  assert.ok(refused(lawOnly), 'the law site URL is not used for the wiki (the wiki may not be deployed yet)');
+  assert.match(lawOnly.content, /まだありません/);
   delete process.env.GOVERNANCE_LAW_SITE_URL;
-  const unset = interaction({ sub: 'url', admin: false });
-  await memoryCommand.execute(unset);
-  assert.equal(unset.calls[0][1].flags, MessageFlags.Ephemeral, 'without a site URL the refusal is private');
-  assert.match(unset.calls[0][1].content, /まだ設定されていません/);
 
-  process.env.GOVERNANCE_LAW_SITE_URL = 'http://evil.example';
-  const plain = interaction({ sub: 'url', admin: false });
-  await memoryCommand.execute(plain);
-  assert.equal(plain.calls[0][1].flags, MessageFlags.Ephemeral, 'a plain http site is not used');
+  process.env.MEMORY_SITE_PUBLIC_URL = 'http://evil.example';
+  assert.ok(refused(await ask()), 'a plain http site is not used');
 
-  process.env.GOVERNANCE_LAW_SITE_URL = 'https://laws.example.test/';
+  process.env.MEMORY_SITE_PUBLIC_URL = 'https://wiki.example.test/';
   const home = interaction({ sub: 'url', admin: false });
   await memoryCommand.execute(home);
   assert.deepEqual(home.calls.map((entry) => entry[0]), ['reply'], 'anyone can ask, and it answers at once');
   assert.equal(home.calls[0][1].flags, undefined, 'the answer is public so it can be shared');
-  assert.match(home.calls[0][1].content, /<https:\/\/laws\.example\.test\/wiki>/, 'wrapped in <> so no login-page preview is unfurled');
+  assert.match(home.calls[0][1].content, /<https:\/\/wiki\.example\.test\/wiki>/, 'wrapped in <> so no login-page preview is unfurled');
   assert.match(home.calls[0][1].content, /メンバーだけ読めます/);
   assert.deepEqual(home.calls[0][1].allowedMentions, { parse: [] });
 
-  const page = interaction({ sub: 'url', admin: false, options: { path: '/people/たこ/' } });
-  await memoryCommand.execute(page);
-  assert.match(page.calls[0][1].content, /<https:\/\/laws\.example\.test\/wiki\/people\/%E3%81%9F%E3%81%93>/, 'a page link encodes each part');
-  assert.match(page.calls[0][1].content, /people\/たこ — sakana の作者/);
-  const missing = interaction({ sub: 'url', admin: false, options: { path: 'people/いない' } });
-  await memoryCommand.execute(missing);
-  assert.equal(missing.calls[0][1].flags, MessageFlags.Ephemeral, 'an unknown page is refused privately');
-  const byEpisode = interaction({ sub: 'url', admin: false, options: { id: `E${episode}` } });
-  await memoryCommand.execute(byEpisode);
-  assert.match(byEpisode.calls[0][1].content, new RegExp(`<https://laws\\.example\\.test/e/${episode}>`), 'an episode link');
-  assert.match(byEpisode.calls[0][1].content, /統治機能を作った/);
-  for (const bad of ['e99999', 'abc', '1; DROP']) {
-    const refused = interaction({ sub: 'url', admin: false, options: { id: bad } });
-    await memoryCommand.execute(refused);
-    assert.equal(refused.calls[0][1].flags, MessageFlags.Ephemeral, `an unknown episode (${bad}) is refused privately`);
-  }
-  const mentions = interaction({ sub: 'url', admin: false, options: { path: '@everyone <@&1>' } });
-  await memoryCommand.execute(mentions);
-  assert.equal(mentions.calls[0][1].flags, MessageFlags.Ephemeral, 'a made-up path is refused, and never echoed with a ping');
-  assert.deepEqual(mentions.calls[0][1].allowedMentions, { parse: [] });
+  // 別のサーバーでは、リンクを出さない (サイトが見せるのは MEMORY_TREE_GUILD のサーバーだけ)
+  const other = interaction({ sub: 'url', admin: false });
+  other.guildId = '910000000000000999';
+  await memoryCommand.execute(other);
+  assert.ok(refused(other.calls[0][1]), 'another server gets no link to this server\'s site');
+  process.env.MEMORY_TREE_GUILD = '910000000000000999';
+  assert.ok(refused(await ask()), 'and this server gets none when the site shows a different one');
+  process.env.MEMORY_TREE_GUILD = GUILD;
 
-  process.env.MEMORY_SITE_PUBLIC_URL = 'https://wiki.example.test';
-  const override = interaction({ sub: 'url', admin: false });
-  await memoryCommand.execute(override);
-  assert.match(override.calls[0][1].content, /<https:\/\/wiki\.example\.test\/wiki>/, 'MEMORY_SITE_PUBLIC_URL wins over the law site URL');
-  delete process.env.MEMORY_SITE_PUBLIC_URL;
-  // explore のリンクボタンは、この URL で作られる (後の explore の検査へ)
+  const page = await ask({ path: '/people/たこ/' });
+  assert.match(page.content, /<https:\/\/wiki\.example\.test\/wiki\/people\/%E3%81%9F%E3%81%93>/, 'a page link encodes each part');
+  assert.match(page.content, /people\/たこ — sakana の作者/);
+  assert.ok(refused(await ask({ path: 'people/いない' })), 'an unknown page is refused privately');
+  const byEpisode = await ask({ id: `E${episode}` });
+  assert.match(byEpisode.content, new RegExp(`<https://wiki\\.example\\.test/e/${episode}>`), 'an episode link');
+  assert.match(byEpisode.content, /統治機能を作った/);
+  for (const bad of ['e99999', 'abc', '1; DROP']) assert.ok(refused(await ask({ id: bad })), `an unknown episode (${bad}) is refused privately`);
+  const mentions = await ask({ path: '@everyone <@&1>' });
+  assert.ok(refused(mentions), 'a made-up path is refused, and never echoed with a ping');
+  assert.deepEqual(mentions.allowedMentions, { parse: [] });
+
+  // explore のリンクボタンは、この設定で作られる (後の explore の検査へ)
   globalThis.__restoreSiteEnv = () => {
-    if (savedEnv.site === undefined) delete process.env.GOVERNANCE_LAW_SITE_URL; else process.env.GOVERNANCE_LAW_SITE_URL = savedEnv.site;
-    if (savedEnv.memory === undefined) delete process.env.MEMORY_SITE_PUBLIC_URL; else process.env.MEMORY_SITE_PUBLIC_URL = savedEnv.memory;
+    for (const key of keys) {
+      if (savedEnv[key] === undefined) delete process.env[key]; else process.env[key] = savedEnv[key];
+    }
   };
 }
 
 // explore: メニューでたどる。部品は Discord の制限内で組み立てられる
-const { handleMemoryComponent } = await import('../src/memory/explore.js');
+const { handleMemoryComponent, rootView } = await import('../src/memory/explore.js');
 const explore = interaction({ sub: 'explore', admin: false, options: { path: '' } });
 await memoryCommand.execute(explore);
 const first = explore.calls[1][1];
@@ -280,9 +286,17 @@ assert.match(takoJson.embeds[0].description, /sakana bot を作っている/);
 assert.doesNotMatch(takoJson.embeds[0].description, /\[\[|\[e\d+\]/, 'links and citations are rendered for people');
 assert.match(takoJson.embeds[0].author.name, /記憶の本 › people › たこ/, 'a page shows where it is');
 const linkButtons = (view) => view.components.flatMap((row) => row.components).filter((c) => c.type === 2 && c.style === 5);
-assert.deepEqual(linkButtons(takoJson).map((b) => b.url), ['https://laws.example.test/wiki/people/%E3%81%9F%E3%81%93'], 'a page links to the same page on the site');
-assert.deepEqual(linkButtons(rootJson).map((b) => b.url), ['https://laws.example.test/wiki'], 'the root links to the site home');
+assert.deepEqual(linkButtons(takoJson).map((b) => b.url), ['https://wiki.example.test/wiki/people/%E3%81%9F%E3%81%93'], 'a page links to the same page on the site');
+assert.deepEqual(linkButtons(rootJson).map((b) => b.url), ['https://wiki.example.test/wiki'], 'the root links to the site home');
 assert.ok(linkButtons(takoJson).every((b) => !b.custom_id && /サイトで開く/.test(b.label)));
+{
+  // サイトが見せるのは MEMORY_TREE_GUILD のサーバーだけ。別のサーバーの画面にはボタンを出さない
+  const savedGuild = process.env.MEMORY_TREE_GUILD;
+  process.env.MEMORY_TREE_GUILD = '910000000000000999';
+  const foreign = json(rootView(GUILD));
+  assert.deepEqual(linkButtons(foreign), [], 'no site button when the site shows another server');
+  process.env.MEMORY_TREE_GUILD = savedGuild;
+}
 assert.ok(buttonsOf(takoJson).some((b) => b.custom_id === `memx:n:${peopleOption.value.split(':')[1]}`), 'up goes to the parent');
 const episodeOption = takoJson.components.flatMap((row) => row.components).filter((c) => c.type === 3)
   .flatMap((c) => c.options).find((o) => o.value.startsWith('e:'));
@@ -291,7 +305,7 @@ const openEpisode = click({ customId: 'memx:open', values: [episodeOption.value]
 await handleMemoryComponent(openEpisode);
 const episodeJson = json(openEpisode.updates[0]);
 checkLimits(episodeJson, 'episode');
-assert.deepEqual(linkButtons(episodeJson).map((b) => b.url), [`https://laws.example.test/e/${store.getEpisode(GUILD, Number(episodeOption.value.split(':')[1])).id}`], 'an episode links to its page on the site');
+assert.deepEqual(linkButtons(episodeJson).map((b) => b.url), [`https://wiki.example.test/e/${store.getEpisode(GUILD, Number(episodeOption.value.split(':')[1])).id}`], 'an episode links to its page on the site');
 assert.match(episodeJson.embeds[0].description, /discord\.com\/channels/, 'episode view links its sources');
 // 開いたページへ戻れる
 const takoId = takoOption.value.split(':')[1];
