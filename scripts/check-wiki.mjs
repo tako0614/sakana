@@ -17,6 +17,47 @@ const { handleIngest, parseNode, parseEpisode } = await import('../worker/src/wi
 const { handleWiki } = await import('../worker/src/wiki/router.ts');
 const store = await import('../worker/src/wiki/store.ts');
 
+// ---- 左の木: 深いページでは上の段を畳む (段ごとのインデントで名前を書く幅が足りなくなる) --------------------
+{
+  const { treeNav } = await import('../worker/src/wiki/views.ts');
+  const { makeLinks } = await import('../worker/src/wiki/links.ts');
+  const links = makeLinks('1255359848644608035');
+  const node = (path, extra = {}) => ({ path, name: path.split('/').at(-1), summary: '', child_count: 0, episode_count: 1, weight: 0, ...extra });
+  const tops = [node('people', { child_count: 3 }), node('events')];
+  const chain = new Map([
+    ['people', [node('people/あかり', { child_count: 2 }), node('people/たこ')]],
+    ['people/あかり', [node('people/あかり/技術', { child_count: 2 }), node('people/あかり/ネタ')]],
+    ['people/あかり/技術', [node('people/あかり/技術/Web'), node('people/あかり/技術/ツール')]],
+    ['people/あかり/技術/Web', [node('people/あかり/技術/Web/CSS')]]
+  ]);
+  const depth = (text) => Math.max(...[...text.matchAll(/<ul>|<\/ul>/g)].reduce((acc, m) => { acc.depth += m[0] === '<ul>' ? 1 : -1; acc.max.push(acc.depth); return acc; }, { depth: 0, max: [0] }).max);
+
+  // 浅いうちは従来どおり (分類 → people → あかり の 3 段)
+  const shallow = treeNav(tops, chain, 'people/あかり', links).value;
+  assert.ok(!shallow.includes('class="up"'), 'a shallow page keeps the whole tree');
+  assert.ok(shallow.includes('>events<') || shallow.includes('events'), 'the top-level categories are listed');
+  assert.equal(depth(shallow), 3);
+
+  // 深いページ: 段は 3 つまで。畳んだ上の段は「↑ 親」のリンクになり、分類の一覧は出ない
+  for (const current of ['people/あかり/技術', 'people/あかり/技術/Web']) {
+    const deep = treeNav(tops, chain, current, links).value;
+    assert.ok(depth(deep) <= 3, `${current}: at most three levels deep (${depth(deep)})`);
+    assert.match(deep, /class="up"><a href="[^"]*">↑ /, `${current}: folded levels become an up link`);
+    assert.ok(!deep.includes('>events<'), `${current}: the top-level list is folded away`);
+    assert.ok(deep.includes('class="here"'), `${current}: the current page is still marked`);
+  }
+  const folded = treeNav(tops, chain, 'people/あかり/技術', links).value;
+  assert.ok(folded.includes('↑ people') && folded.includes('たこ'), 'one level folded: up to the category, its children are the first level');
+  const twice = treeNav(tops, chain, 'people/あかり/技術/Web', links).value;
+  assert.ok(twice.includes('↑ あかり') && !twice.includes('たこ'), 'two levels folded: up to the parent of the siblings shown');
+  assert.ok(twice.includes('CSS'), 'the children of the current page are shown');
+  // 畳んだ先の子が多すぎて一覧に出し切れていないときは、残りの件数を出す
+  const more = treeNav([node('people', { child_count: 9 })], new Map([['people', [node('people/あかり', { child_count: 2 })]], ['people/あかり', [node('people/あかり/技術')]], ['people/あかり/技術', []]]), 'people/あかり/技術', links).value;
+  assert.ok(more.includes('ほか 8 件'), 'hidden siblings are counted');
+  // 一覧が取れていなければ、畳まずに従来の木を出す (壊れた木を出さない)
+  assert.ok(!treeNav(tops, new Map(), 'people/あかり/技術', links).value.includes('class="up"'), 'no data for the folded level: fall back to the full tree');
+}
+
 // ---- html: 値は必ず escape される --------------------------------------------------
 {
   const evil = '<script>alert(1)</script>"\'&';

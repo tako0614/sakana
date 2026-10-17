@@ -73,6 +73,9 @@ export function pageItem(node: NodeBrief, links: Links): SafeHtml {
   return html`<li><a href="${links.wiki(node.path)}"><b>${node.name}</b></a>${text ? html`<small>${text}</small>` : ''}</li>`;
 }
 
+/** 木の段数の上限。深いページでは、これを超える上の段を「↑ 親」に畳む (段ごとのインデントで、名前を書く幅が足りなくなる)。 */
+const TREE_LEVELS = 3;
+
 /** 左の分類の木。いまのページの祖先だけ開き、その中身を出す。 */
 export function treeNav(tops: readonly NodeBrief[], chain: ReadonlyMap<string, readonly NodeBrief[]>, current: string, links: Links): SafeHtml {
   const list = (nodes: readonly NodeBrief[]): SafeHtml => html`<ul>${nodes.map((node) => {
@@ -82,7 +85,17 @@ export function treeNav(tops: readonly NodeBrief[], chain: ReadonlyMap<string, r
     const showChildren = children && (here || open);
     return html`<li class="${here ? 'here' : open ? 'open' : ''}"><a href="${links.wiki(node.path)}"><span>${node.name}</span>${node.episode_count ? html`<span class="n">${number(node.episode_count)}</span>` : ''}</a>${showChildren ? html`${list(children)}${node.child_count > children.length ? html`<div class="more"><a href="${links.wiki(node.path)}">ほか ${number(node.child_count - children.length)} 件 →</a></div>` : ''}` : ''}</li>`;
   })}</ul>`;
-  return html`<nav class="tree"><h2>分類</h2>${list(tops)}</nav>`;
+  // 段数 = 祖先の数 + 1 (いちばん下は自分の子)。上限を超えたぶんだけ上を落とし、いちばん上の段を「その下の子の一覧」に替える
+  const parts = current ? current.split('/') : [];
+  const drop = Math.max(0, parts.length + 1 - TREE_LEVELS);
+  const root = parts.slice(0, drop).join('/');
+  const rootChildren = drop > 0 ? chain.get(root) : null;
+  if (!rootChildren) return html`<nav class="tree"><h2>分類</h2>${list(tops)}</nav>`;
+
+  const above = drop > 1 ? chain.get(parts.slice(0, drop - 1).join('/')) : tops;
+  const up = above?.find((node) => node.path === root);
+  const hidden = up ? up.child_count - rootChildren.length : 0;
+  return html`<nav class="tree"><h2>分類</h2><div class="up"><a href="${links.wiki(root)}">↑ ${up?.name ?? parts[drop - 1] ?? root}</a></div>${list(rootChildren)}${hidden > 0 ? html`<div class="more"><a href="${links.wiki(root)}">ほか ${number(hidden)} 件 →</a></div>` : ''}</nav>`;
 }
 
 // ---- トップ -----------------------------------------------------------------
