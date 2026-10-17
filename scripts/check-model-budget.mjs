@@ -267,6 +267,44 @@ async function main() {
     assert.deepEqual(authPosts,['test/account-limited']);
     assert.equal(cost.modelBudgetStatus('auth-stop').unknownCalls,0);
 
+    // A busy (429) paid route hands over to the next route straight away instead of sleeping
+    // through Retry-After, and the reason OpenRouter gave (with the upstream provider) is kept.
+    const providerBusy = await import(`../src/ai/provider.js?busy=${Date.now()}`);
+    cost.ensureModelBudget({ id:'busy-route',guildId:'g',limitUsd:30 });
+    const busyPosts = [];
+    globalThis.fetch = async (url, init) => {
+      if (url.endsWith('/endpoints')) return jsonResponse({ data:{ endpoints:paidEndpoints } });
+      const body = JSON.parse(init.body); busyPosts.push(body.model);
+      if (body.model === 'test/busy-primary') {
+        return jsonResponse({ error:{ code:429,message:'Provider returned error',metadata:{ provider_name:'Novita',raw:'rate limited' } } },429,
+          { 'Retry-After':'120' });
+      }
+      return jsonResponse({ id:'busy-fallback',provider:'DeepInfra',usage:{ cost:0.01,prompt_tokens:5,completion_tokens:2 },
+        choices:[{ message:{ content:'fallback took over' } }] });
+    };
+    const busyStarted = Date.now();
+    const busy = await providerBusy.requestModel({ model:'test/busy-primary',fallbackModels:['test/busy-secondary'],
+      messages:[{ role:'user',content:'u' }],maxOutputTokens:20,guildId:'g',budgetId:'busy-route',retries:2 });
+    assert.equal(busy.choices[0].message.content,'fallback took over');
+    assert.deepEqual(busyPosts,['test/busy-primary','test/busy-secondary'],'one try on the busy route, then the fallback');
+    assert.ok(Date.now()-busyStarted < 5000,'a 429 with a fallback route must not wait for Retry-After');
+    busyPosts.length = 0;
+    await assert.rejects(providerBusy.requestModel({ model:'test/busy-primary',messages:[{ role:'user',content:'u' }],maxOutputTokens:20,
+      guildId:'g',budgetId:'busy-route',retries:0 }),
+      error => error.status === 429 && /Novita/.test(error.detail) && /rate limited/.test(error.detail) && !('apiKey' in error));
+    assert.equal(cost.modelBudgetStatus('busy-route').unknownCalls,0);
+
+    // fallbackStatuses limits the hand-over: a 500 stays on the route it failed on.
+    busyPosts.length = 0;
+    globalThis.fetch = async (url, init) => {
+      if (url.endsWith('/endpoints')) return jsonResponse({ data:{ endpoints:paidEndpoints } });
+      busyPosts.push(JSON.parse(init.body).model);
+      return jsonResponse({ error:{ code:500 } },500);
+    };
+    await assert.rejects(providerBusy.requestModel({ model:'test/busy-primary',fallbackModels:['test/busy-secondary'],fallbackStatuses:[429],
+      messages:[{ role:'user',content:'u' }],maxOutputTokens:20,guildId:'g',budgetId:'busy-route',retries:0 }),error => error.status === 500);
+    assert.deepEqual(busyPosts,['test/busy-primary'],'a 500 does not fan out to the other models');
+
     // A sent request whose response is lost remains conservatively reserved.
     const providerAmbiguous = await import(`../src/ai/provider.js?ambiguous=${Date.now()}`);
     cost.ensureModelBudget({ id:'ambiguous',guildId:'g',limitUsd:30 });

@@ -18,7 +18,9 @@ export class ProviderError extends Error {
   retryable: boolean;
   declare retryAt?: number;
   declare fallbackAllowed?: boolean;
-  constructor(message: string, status: number, details: { retryAt?: number | undefined; cause?: unknown } = {}) {
+  /** OpenRouter の本文にあった理由と、断った provider 名 (診断用。プロンプトは含まない)。 */
+  declare detail?: string;
+  constructor(message: string, status: number, details: { retryAt?: number | undefined; detail?: string | undefined; cause?: unknown } = {}) {
     super(message);
     this.status = status;
     this.retryable = status === 0 || status === 429 || status >= 500;
@@ -63,6 +65,23 @@ function header(response: { headers?: unknown } | null | undefined, name: string
   const read = canGet(headers) ? headers.get(name) : undefined;
   if (read != null) return read;
   return isRecord(headers) ? headers[name] ?? headers[name.toLowerCase()] : undefined;
+}
+
+/**
+ * 失敗した応答の本文から、理由と断った provider を短く取り出す。429 が「OpenRouter 全体」なのか
+ * 「上流の provider」なのかは本文にしか書かれていない。読めなくても失敗の扱いは変えない。
+ */
+async function errorDetail(response: Response): Promise<string | undefined> {
+  try {
+    const parsed: unknown = await response.json();
+    const error = isRecord(parsed) && isRecord(parsed.error) ? parsed.error : null;
+    if (!error) return undefined;
+    const metadata = isRecord(error.metadata) ? error.metadata : {};
+    const parts = [typeof error.message === 'string' ? error.message : '',
+      typeof metadata.provider_name === 'string' ? `provider=${metadata.provider_name}` : '',
+      typeof metadata.raw === 'string' ? `raw=${metadata.raw}` : ''].filter(Boolean);
+    return parts.join(' | ').replace(/\s+/g,' ').slice(0,300) || undefined;
+  } catch { return undefined; }
 }
 
 function retryAtFrom(response: { headers?: unknown } | null | undefined, now = Date.now()): number {
@@ -258,6 +277,8 @@ export async function fetchKeyUsage({ timeoutMs = 15000 }: { timeoutMs?: number 
 export interface RequestModelOptions {
   model?: string;
   fallbackModels?: readonly string[];
+  /** 指定すると、この status で失敗したときだけ fallbackModels へ回る (無指定は再試行できる失敗すべて)。 */
+  fallbackStatuses?: readonly number[];
   messages: readonly ChatMessage[];
   tools?: readonly ToolDefinition[] | null;
   jsonOnly?: boolean;
@@ -289,7 +310,7 @@ function modelResponse(data: JsonRecord & { usage: ModelUsage }): ModelResponse 
   return response;
 }
 
-export async function requestModel({ model = providerConfig.model,fallbackModels = [],messages,tools,jsonOnly = false,
+export async function requestModel({ model = providerConfig.model,fallbackModels = [],fallbackStatuses,messages,tools,jsonOnly = false,
   maxOutputTokens = 8000,timeoutMs = 120000,deadlineAt = Infinity,reasoning,temperature,
   guildId = null,role = 'chat',runId = null,retries = 0,budgetId = null,consumeRequest,beforeSend,ignoreProviders = [],
   maxPrice = null }: RequestModelOptions): Promise<ModelResponse> {
@@ -343,7 +364,8 @@ export async function requestModel({ model = providerConfig.model,fallbackModels
           noCharge = knownNoCharge(response.status);
           finishStatus = noCharge ? 'rejected' : undefined;
           const error = new ProviderError(`OpenRouter HTTP ${response.status}`,response.status,{
-            retryAt:response.status === 429 ? retryAtFrom(response) : undefined
+            retryAt:response.status === 429 ? retryAtFrom(response) : undefined,
+            detail:await errorDetail(response)
           });
           if (free && (response.status === 400 || response.status === 404)) error.fallbackAllowed = true;
           throw error;
@@ -371,10 +393,14 @@ export async function requestModel({ model = providerConfig.model,fallbackModels
         if (!sent) { noCharge = true; finishStatus = 'cancelled'; }
         const details = detailsOf(error);
         if (free && (details.retryable || details.fallbackAllowed)) cacheFreeFailure(route,error);
-        const delay = !free && details.retryable && attempt < retries ? retryDelay(attempt,error,deadlineAt) : null;
-        if (delay !== null) { await new Promise(resolve => setTimeout(resolve,delay)); continue; }
         const canFallback = routeIndex+1 < routes.length && details.status !== 401 && details.status !== 402
-          && (details.retryable || details.fallbackAllowed);
+          && (details.retryable || details.fallbackAllowed)
+          && (!fallbackStatuses || (typeof details.status === 'number' && fallbackStatuses.includes(details.status)));
+        // 混んでいる (429) ときは、別の route があるならそちらへ先に回る。同じ route で Retry-After
+        // (ヘッダーが無ければ60秒) を待つと、会話は2分以上止まったままエラーになる。
+        const delay = !free && details.retryable && attempt < retries && !(canFallback && details.status === 429)
+          ? retryDelay(attempt,error,deadlineAt) : null;
+        if (delay !== null) { await new Promise(resolve => setTimeout(resolve,delay)); continue; }
         if (canFallback) { lastError = error; break; }
         throw error;
       } finally {
