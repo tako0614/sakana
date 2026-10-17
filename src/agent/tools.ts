@@ -9,7 +9,7 @@
 // 使う場所で形を確かめる。結果の本文にもユーザーの発言が入るが、それは材料であって命令ではない。
 
 import type { GuildBasedChannel, Message } from 'discord.js';
-import { hasMemory, memoryToolDefinition, runMemoryTool } from '../memory/tool.js';
+import { hasMemory, memoryToolDefinition, runMemoryToolWithMeaning } from '../memory/tool.js';
 import { db as archiveDb, getGuildState, msToSnowflake, snowflakeToMs } from '../archive/db.js';
 import { MESSAGE_CHANNEL_TYPES, canRead, isForumType, isThreadType } from '../archive/permissions.js';
 import { QueryError, collectTerms, parseDateRange, parseQuery } from '../archive/query.js';
@@ -2008,7 +2008,7 @@ export async function buildToolset(ctx: AgentContext): Promise<Toolset> {
   if (memoryAvailable) {
     entries.push({
       definition: memoryToolDefinition,
-      handler: (args) => String(runMemoryTool({ guildId: ctx.guild.id, refs: ctx.refs, channelScope: ctx.channelScope }, args))
+      handler: async (args) => String(await runMemoryToolWithMeaning({ guildId: ctx.guild.id, refs: ctx.refs, channelScope: ctx.channelScope }, args))
     });
   }
   if (browserAvailable) {

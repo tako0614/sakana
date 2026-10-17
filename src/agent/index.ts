@@ -17,7 +17,7 @@ import {
   type MessageReplyOptions
 } from 'discord.js';
 import { canBotAttach, canBotSpeak, canManageIndex, getChannelScope } from '../archive/permissions.js';
-import { recallFor } from '../memory/recall.js';
+import { meaningReader, recallWithMeaning, type RecallParts } from '../memory/recall.js';
 import { siteConfigFor, siteUrl } from '../memory/site.js';
 import { getEpisode } from '../memory/store.js';
 import { isSelfHosted } from '../mimic/client.js';
@@ -473,6 +473,8 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
 
     const system = buildSystemPrompt(runContext, toolset);
     const request = stripMention(message.content, client.user.id);
+    // 呼ばれたときの想起: 名前の照合 + 意味の近い記憶 (間に合わなければ名前だけ)
+    const recalled = toolset.memoryAvailable ? await recallSafely(guild.id, request, replyChain, recent) : null;
     const userContent = buildUserContent({
       ctx: runContext,
       prompt: request,
@@ -483,12 +485,14 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
       replyChain,
       requestMessage: { ...fromDiscordMessage(message), referenceState: replyChain.referenceState },
       refs,
-      recall: toolset.memoryAvailable ? recallSafely(guild.id, request, replyChain, recent) : ''
+      recall: recalled?.text ?? ''
     });
 
     const result = await runAgent({
       model,
       guildId: guild.id,
+      // 考えている途中の想起: 往復ごとに、いま調べていることに近い記憶のうち、まだ出していないものを足す
+      ...(toolset.memoryAvailable ? { memory: { read: meaningReader(guild.id, { request, shown: recalled ?? undefined }) } } : {}),
       // Discord input identity survives a process restart, so an unfinished
       // run resumes from its checkpoint instead of starting over. Completed
       // runs still use the runtime's default reuseCompleted=false behavior if
@@ -599,14 +603,14 @@ function memoryEpisodeUrl(guildId: string, id: number): string | null {
  * 依頼と返信先を強い手がかり、直近の会話を弱い手がかりにして思い出す。
  * 記憶が読めなくても会話は止めない。
  */
-function recallSafely(guildId: string, request: string, replyChain: AgentMessage[], recent: AgentMessage[]): string {
+async function recallSafely(guildId: string, request: string, replyChain: AgentMessage[], recent: AgentMessage[]): Promise<RecallParts | null> {
   try {
-    return recallFor(guildId, {
+    return await recallWithMeaning(guildId, {
       request: [request, ...replyChain.map((entry) => entry.content ?? '')].join('\n'),
       context: recent.slice(-10).map((entry) => entry.content ?? '').join('\n')
     });
   } catch (error) {
     console.error('Memory recall failed:', error);
-    return '';
+    return null;
   }
 }

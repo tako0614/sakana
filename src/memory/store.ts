@@ -306,6 +306,19 @@ export function memoryDb(): Database.Database {
     );
 
     CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+    -- ページと出来事の意味ベクトル (vectors.ts)。想起と memory ツールの意味検索が使う。
+    -- text_hash が変わったものだけ振り直す。model は埋め込みモデル名 (別モデルのベクトルは使わない)。
+    CREATE TABLE IF NOT EXISTS memory_vectors (
+      guild_id TEXT NOT NULL,
+      kind TEXT NOT NULL,              -- 'node' | 'episode'
+      id INTEGER NOT NULL,
+      model TEXT NOT NULL,
+      text_hash TEXT NOT NULL,
+      vec BLOB NOT NULL,               -- float32 を L2 正規化したもの
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (guild_id, kind, id)
+    );
   `);
 
   // 種類名と決め台詞の列 (2026-10-15 に追加)。古い DB には足す

@@ -35,6 +35,7 @@ import { agentEnabled } from './agent/config.js';
 import { sweepStaleIndicators } from './agent/indicators.js';
 import { pruneCalls } from './agent/ratelimit.js';
 import { sweepEnabledGuilds } from './archive/embed-job.js';
+import { sweepMemoryVectors } from './memory/vectors.js';
 import { embedConfig } from './embed/config.js';
 import { governanceConfig } from './governance/config.js';
 import { handleGovernanceComponent } from './governance/commands.js';
@@ -186,6 +187,14 @@ client.once(Events.ClientReady, (readyClient) => {
       console.error('Embed sweep failed:', error);
     });
   });
+
+  // 記憶 (ページと出来事) の意味ベクトル。builder が書き直したぶんだけを夜に振り直し、
+  // 初回 (全部が未計算) は起動の少しあとに始める。重い Python は、振るあいだだけ起きる。
+  const sweepMemory = () => sweepMemoryVectors().catch((error: unknown) => {
+    console.error('Memory vector sweep failed:', error);
+  });
+  cron.schedule('0 20 5 * * *', sweepMemory);
+  setTimeout(sweepMemory, 120_000).unref();
 
   // 落ちていた間に流れたメッセージを取りに行く。
   // live indexing は追いつくまで区間を伸ばさないので、ここで埋めないと

@@ -4,7 +4,9 @@ import {
   topLevels, episodesFor, getEpisode, getNode, hasTree, linkedPages, listChildren, loadPublicChannels, nameOf,
   normalizePath, searchEpisodes, searchNodes, sharedEpisodes, type MemoryNode
 } from './store.js';
+import { meaningLines } from './recall.js';
 import { scopeAllows, type ChannelScope, type QuoteFilter } from './types.js';
+import { meaningOf, type Meaning } from './vectors.js';
 
 // 会話 agent から見た記憶。根は system に常駐させ (毎回同じ文面なのでキャッシュが効く)、
 // それより下は memory ツールでたどる: ページ → つながったページ / 関わった出来事 → 根拠の発言。
@@ -202,6 +204,28 @@ export function runMemoryTool(ctx: MemoryToolContext, args: MemoryToolArgs = {})
       ...shared.map((episode) => `- ${episodeLine(episode)}: ${episode.summary.slice(0, 160)}`)].join('\n');
   }
   return openPage(guildId, node);
+}
+
+/**
+ * runMemoryTool に、意味の近い記憶を足したもの (agent が使う)。query のときだけ。
+ * 言葉が一致しなくても (「レビューを飛ばした」→ ダブスタのページ) 近い話に届くようにする。
+ * 埋め込みが間に合わない・ベクトルが無いときは runMemoryTool の結果そのまま。
+ */
+export async function runMemoryToolWithMeaning(ctx: MemoryToolContext, args: MemoryToolArgs = {}): Promise<string> {
+  const base = runMemoryTool(ctx, args);
+  const query = String(args.query ?? '').trim();
+  if (!query || args.episode) return base;
+  const meaning = await meaningOf(ctx.guildId, query, { nodeLimit: 3, episodeLimit: 3, timeoutMs: 3000 });
+  if (!meaning) return base;
+  // すでに言葉の検索で出たものは繰り返さない
+  const fresh: Meaning = {
+    nodes: meaning.nodes.filter((node) => !base.includes(`[[${node.path}]]`)),
+    episodes: meaning.episodes.filter((episode) => !new RegExp(`(^|\\s)e${episode.id}\\s`).test(base))
+  };
+  const lines = meaningLines(fresh);
+  if (lines.length === 0) return base;
+  const notFound = base.startsWith('記憶に「');
+  return [notFound ? '' : base, '意味が近い記憶 (言葉は一致しないが、話が似ている):', ...lines].filter((line) => line !== '').join('\n');
 }
 
 /**

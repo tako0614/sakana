@@ -2,10 +2,12 @@ import {
   episodesFor, getNode, linkedPages, nodeNames, recentEpisodesFor, searchEpisodes, searchNodes, sharedEpisodes,
   type NodeName
 } from './store.js';
+import { meaningOf, type Meaning } from './vectors.js';
 
 // 思い出す。会話に出た名前や言葉を手がかりに、関係するページと出来事を数件だけ引く。
-// 埋め込みは使わない (ページ名と別名の照合 + 全文検索)。手がかりから1段だけ
+// 同期の recallFor は名前・別名の照合 + 全文検索。手がかりから1段だけ
 // つながりをたどる: 2人の名前が出たら、その2人が両方関わった出来事を出す。
+// 非同期の recallWithMeaning / meaningReader は、そのあとに意味の近い記憶 (vectors.ts) を足す。
 //
 // 書く側 (build.js) も同じ照合で「この区切りに出てくる既知のページ」を見つけ、
 // 書く前に渡す (重複を避け、変化として書かせ、前の出来事と結ばせる)。
@@ -56,12 +58,24 @@ const termsOf = (text: unknown): string[] => [...new Set(String(text ?? '')
   .split(/[\s　、。！？!?「」『』()（）:：,，.]+/)
   .filter((term) => [...term].length >= 3 && [...term].length <= 20))].slice(0, 6);
 
+/** 思い出した文面と、そこに出したページ・出来事 (あとの想起で同じものを繰り返さないため)。 */
+export interface RecallParts {
+  text: string;
+  paths: Set<string>;
+  episodeIds: Set<number>;
+}
+
 /**
  * 会話 agent の入力に足す「思い出したこと」。何も当たらなければ空文字 (何も足さない)。
  * request: いま話しかけられた文 (と返信先)。context: 直近の会話 (弱い手がかり)。
  */
 export function recallFor(guildId: string,
   { request = '', context = '', maxChars = 1800 }: { request?: string; context?: string; maxChars?: number } = {}): string {
+  return recallParts(guildId, { request, context, maxChars }).text;
+}
+
+export function recallParts(guildId: string,
+  { request = '', context = '', maxChars = 1800 }: { request?: string; context?: string; maxChars?: number } = {}): RecallParts {
   const scores = new Map<string, number>();
   const add = (path: string, value: number): void => { scores.set(path, (scores.get(path) ?? 0) + value); };
   for (const { path, score } of matchPages(guildId, request)) add(path, score);
@@ -74,7 +88,7 @@ export function recallFor(guildId: string,
   const episodeHits = terms ? searchEpisodes(guildId, terms, 3) : [];
 
   const pages = [...scores].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([path]) => path);
-  if (pages.length === 0 && episodeHits.length === 0) return '';
+  if (pages.length === 0 && episodeHits.length === 0) return { text: '', paths: new Set(), episodeIds: new Set() };
 
   const lines = ['思い出したこと (記憶から。詳しくは memory ツールで path / episode を開く):'];
   const shown = new Set<number>();
@@ -105,7 +119,59 @@ export function recallFor(guildId: string,
     for (const episode of extra) lines.push(`  e${episode.id} ${date(episode.at_ms)} ${episode.title}`);
   }
   const text = lines.join('\n');
-  return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+  return { text: text.length > maxChars ? `${text.slice(0, maxChars)}…` : text, paths: new Set(pages), episodeIds: shown };
+}
+
+const MEANING_HEAD = '- 意味が近い記憶 (言葉は一致しないが、話が似ている):';
+
+/** 意味で引いた記憶を、想起の1節にする。何も無ければ空配列。 */
+export function meaningLines(meaning: Meaning | null): string[] {
+  if (!meaning) return [];
+  return [
+    ...meaning.nodes.map((node) => `  [[${node.path}]] ${node.summary || ''}`.trimEnd()),
+    ...meaning.episodes.map((episode) => `  e${episode.id} ${date(episode.atMs)}${episode.kind ? ` [${episode.kind}]` : ''} ${episode.title}`)
+  ];
+}
+
+/**
+ * 呼ばれたときの想起: 名前の照合に、意味の近い記憶を足す。
+ * 質問側の埋め込みが間に合わない・ベクトルが無いときは、名前の想起だけを返す (遅くしない)。
+ */
+export async function recallWithMeaning(guildId: string,
+  { request = '', context = '', maxChars = 2400, timeoutMs = 3000 }: { request?: string; context?: string; maxChars?: number; timeoutMs?: number } = {}): Promise<RecallParts> {
+  const parts = recallParts(guildId, { request, context, maxChars: 1800 });
+  const lines = meaningLines(await meaningOf(guildId, request, { excludePaths: parts.paths, excludeEpisodes: parts.episodeIds, timeoutMs }));
+  if (lines.length === 0) return parts;
+  const head = parts.text || '思い出したこと (記憶から。詳しくは memory ツールで path / episode を開く):';
+  const text = [head, MEANING_HEAD, ...lines].join('\n');
+  for (const line of lines) {
+    const page = /^ {2}\[\[([^\]]+)\]\]/.exec(line)?.[1];
+    if (page) parts.paths.add(page);
+    const episode = /^ {2}e(\d+) /.exec(line)?.[1];
+    if (episode) parts.episodeIds.add(Number(episode));
+  }
+  return { text: text.length > maxChars ? `${text.slice(0, maxChars)}…` : text, paths: parts.paths, episodeIds: parts.episodeIds };
+}
+
+/**
+ * 考えている途中の想起 (runtime が往復ごとに呼ぶ)。いま調べていること (道具の結果) と依頼から、
+ * まだ出していない記憶だけを足す。最初の往復 (道具の結果がまだ無い) は、呼ばれたときの想起が済んでいるので何も足さない。
+ */
+export function meaningReader(guildId: string, seed: { request: string; shown?: RecallParts | undefined }):
+  (query: { observations: string[] }) => Promise<{ text: string } | null> {
+  const paths = new Set(seed.shown?.paths);
+  const episodeIds = new Set(seed.shown?.episodeIds);
+  return async ({ observations }) => {
+    if (observations.length === 0) return null;
+    const noticed = observations.map((observation) => observation.replace(/^tool:[^:]*:\s*/, '').slice(0, 500));
+    const query = [seed.request.slice(0, 400), ...noticed].join('\n').slice(0, 1400);
+    const meaning = await meaningOf(guildId, query, { nodeLimit: 2, episodeLimit: 2, excludePaths: paths, excludeEpisodes: episodeIds, timeoutMs: 2000 });
+    const lines = meaningLines(meaning);
+    if (lines.length === 0 || !meaning) return null;
+    for (const node of meaning.nodes) paths.add(node.path);
+    for (const episode of meaning.episodes) episodeIds.add(episode.id);
+    return { text: ['調べている内容に近い記憶 (まだ出していないもの。詳しくは memory ツールで path / episode を開く):', ...lines].join('\n') };
+  };
 }
 
 /**
