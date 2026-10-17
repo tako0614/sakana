@@ -6,7 +6,8 @@
 // どちらも壊れても例外は出ず、静かに読みにくさと費用になるだけなので門を置く。
 
 import { browserToolDefinition } from '../src/agent/browser.js';
-import { RefTable, expandCitations } from '../src/agent/format.js';
+import { RefTable, expandCitations, fromArchiveRow, fromRawMessage, stripTrailingSubtext } from '../src/agent/format.js';
+import * as formatModule from '../src/agent/format.js';
 import { buildSystemPrompt, buildUserContent } from '../src/agent/prompt.js';
 
 function fail(message) {
@@ -152,6 +153,29 @@ const link = (no, url) => `[${no}](<${url}>)`;
   // 引用が無くてもモデル名は出す
   const bare = expandCitations('ログに出てないから分からん。', refs, { label: 'evex-1' });
   if (!bare.endsWith('-# evex-1')) fail(`引用0件でもモデル名を出す: ${bare}`);
+
+  // モデルが履歴を真似て末尾の `-# モデル名` を自分で書いても、二重にならない (z-ai/glm-5.3-flash が 2 行になっていた)
+  for (const written of ['-# deepseek v4 flash', '-# z-ai/glm-5.3-flash', '-# evex-1 / たこ として', '  -# 何か']) {
+    const doubled = expandCitations(`分からん。\n\n${written}\n\n${written}`, refs, { label: 'deepseek v4 flash' });
+    if (doubled !== '分からん。\n\n-# deepseek v4 flash') fail(`モデルが書いた末尾は落として 1 行だけ足す: ${JSON.stringify(doubled)}`);
+  }
+  // 本文の途中の `-#` は触らない
+  const middle = expandCitations('前置き\n-# 補足の小さな字\n本題。', refs, { label: 'm' });
+  if (middle !== '前置き\n-# 補足の小さな字\n本題。\n\n-# m') fail(`途中の subtext は残す: ${JSON.stringify(middle)}`);
+
+  // 履歴の bot の返答からは、末尾のモデル名を落とす (人の発言・本文だけの発言・経過表示は触らない)
+  if (stripTrailingSubtext('まとめるとこう。\n\n-# z-ai/glm-5.3-flash\n') !== 'まとめるとこう。') fail('末尾のモデル名を落とす');
+  if (stripTrailingSubtext('a\n-# x\n-# y') !== 'a') fail('末尾の subtext は複数でも落とす');
+  if (stripTrailingSubtext('-# thinking <t:1:R> · 検索') !== '-# thinking <t:1:R> · 検索') fail('経過表示は見分けに使うので残す');
+  if (stripTrailingSubtext('普通の文。') !== '普通の文。' || stripTrailingSubtext('-# 小さな字\nあとに本文') !== '-# 小さな字\nあとに本文') fail('末尾でなければ触らない');
+  const footer = 'こうだよ。\n\n-# z-ai/glm-5.3-flash';
+  const row = { guild_id: 'g', channel_id: 'c', message_id: '1', author_id: 'bot', author_name: 'bot', is_bot: 1, content: footer, created_at: 1 };
+  if (fromArchiveRow(row).content !== 'こうだよ。') fail('アーカイブの bot の返答から末尾を落とす');
+  if (fromArchiveRow({ ...row, is_bot: 0 }).content !== footer) fail('人の発言は触らない');
+  const discordMessage = (bot) => ({ id: '1', channelId: 'c', guildId: 'g', author: { id: 'bot', bot }, content: footer, createdTimestamp: 1, attachments: new Map(), embeds: [], stickers: new Map() });
+  if (formatModule.fromDiscordMessage(discordMessage(true)).content !== 'こうだよ。' || formatModule.fromDiscordMessage(discordMessage(false)).content !== footer) fail('Discord の発言も同じ');
+  const raw = (bot) => ({ id: '1', channel_id: 'c', author: { id: 'bot', bot }, content: footer, timestamp: '2026-10-18T00:00:00Z' });
+  if (fromRawMessage(raw(true), 'g').content !== 'こうだよ。' || fromRawMessage(raw(false), 'g').content !== footer) fail('検索結果の生のメッセージも同じ');
 
   // ラベルを渡さなければ末尾は足さない
   const plain = expandCitations('分からん。', refs);

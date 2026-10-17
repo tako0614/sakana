@@ -144,6 +144,25 @@ const sourceLink = (no: number, url: string): string => `[${sourceMark(no)}](<${
  * 数字の括弧が引用とは限らないので、発言の番号として引けないものは触らない。
  * [e12] は episodeUrl で実在を確かめられたものだけリンクにする (最初の3件まで)。
  */
+const SUBTEXT_LINE = /^[ \t　]*-#(?:[ \t　]|$)/;
+
+/**
+ * 末尾の subtext (`-# ...`) の行を落とす。
+ *
+ * 返答の末尾には `-# モデル名` を付けているので、会話の履歴にそのまま入れると、モデルが footer ごと
+ * 真似して自分でも書き、送るときに足す分と二重になっていた (`-# z-ai/glm-5.3-flash` が 2 行)。
+ * 自作モデル側は同じ理由で行ごと落としている (mimic/respond.ts)。
+ * 本文が残らないとき (経過表示 `-# thinking ...` だけの発言) は、見分けに使うので元のまま返す。
+ */
+export function stripTrailingSubtext(text: string): string {
+  const lines = String(text ?? '').split('\n');
+  let end = lines.length;
+  while (end > 0 && String(lines[end - 1]).trim() === '') end -= 1;
+  if (end === 0 || !SUBTEXT_LINE.test(String(lines[end - 1]))) return text;
+  while (end > 0 && (String(lines[end - 1]).trim() === '' || SUBTEXT_LINE.test(String(lines[end - 1])))) end -= 1;
+  return end === 0 ? text : lines.slice(0, end).join('\n');
+}
+
 export function expandCitations(
   text: unknown,
   refs: RefTable,
@@ -198,8 +217,9 @@ export function expandCitations(
       return links.join('');
     });
 
-  // どのモデルが書いたかは毎回出す (出典は文中にあるので、末尾はこれだけ)
-  return label ? `${body.trim()}\n\n-# ${label}` : body.trim();
+  // どのモデルが書いたかは毎回出す (出典は文中にあるので、末尾はこれだけ)。
+  // モデルが自分で書いた末尾の `-# ...` は落とす (足すのはここだけ。二重になる)
+  return label ? `${stripTrailingSubtext(body.trim()).trim()}\n\n-# ${label}` : body.trim();
 }
 
 function collapse(text: unknown): string {
@@ -237,7 +257,7 @@ export function fromArchiveRow(row: MessageRow, channelName?: string | null): Ag
     authorId: row.author_id,
     authorName: row.author_name || 'unknown',
     isBot: Boolean(row.is_bot),
-    content: row.content ?? '',
+    content: row.is_bot ? stripTrailingSubtext(row.content ?? '') : row.content ?? '',
     extra: row.extra ?? '',
     createdAt: row.created_at,
     editedAt: row.edited_at,
@@ -302,7 +322,7 @@ export function fromDiscordMessage(message: Message, channelName?: string | null
       ?? message.author?.username
       ?? 'unknown',
     isBot: Boolean(message.author?.bot),
-    content: message.content ?? '',
+    content: message.author?.bot ? stripTrailingSubtext(message.content ?? '') : message.content ?? '',
     extra: discordExtraText(message),
     createdAt: message.createdTimestamp,
     editedAt: message.editedTimestamp ?? null,
@@ -347,7 +367,7 @@ export function fromRawMessage(raw: RawMessage, guildId: string, channelName?: s
       ?? stringField(author, 'username')
       ?? 'unknown',
     isBot: Boolean(author?.bot),
-    content: stringField(raw, 'content') ?? '',
+    content: author?.bot ? stripTrailingSubtext(stringField(raw, 'content') ?? '') : stringField(raw, 'content') ?? '',
     extra: discordExtraText(raw),
     createdAt: parsedTime(raw.timestamp) ?? Date.now(),
     editedAt: parsedTime(raw.edited_timestamp),
