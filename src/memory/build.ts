@@ -56,7 +56,7 @@ export const treeConfig = {
   reasoning: REASONING[process.env.MEMORY_TREE_REASONING || 'low'] ?? REASONING.low,
   segmentChars: Number(process.env.MEMORY_TREE_SEGMENT_CHARS || 40000),
   // 新着の尻尾がこれ未満で、まだ会話が続いていそうなら次の起動まで貯める。
-  // 1時間止まったら読む (timer は15分おき)。日々の会話をその日のうちに入れる
+  // 1時間止まったら読む。timer は2日おきで、その回に溜まっている新着をまとめて読む
   minChars: Number(process.env.MEMORY_TREE_MIN_CHARS || 6000),
   idleMs: Number(process.env.MEMORY_TREE_IDLE_MS || 3_600_000),
   // ページの統合待ちがこれだけ溜まったら書き直す。読み終えたら残りも書き直す

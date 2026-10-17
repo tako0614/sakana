@@ -43,11 +43,11 @@ function statusEmbed(status: MemoryStatus & { included: string[] }): EmbedBuilde
   const progress = status.totals
     ? `${number(status.read)} / ${number(status.totals.messages)} 件 (${percent(status.read, status.totals.messages)})`
     : `${number(status.read)} 件 (総数は builder の初回で数える)`;
-  const eta = status.remaining === 0 ? '読み終えた (新着は15分おきに見て、会話が1時間止まったら読む)'
+  const eta = status.remaining === 0 ? '読み終えた (新着は2日おきにまとめて読む)'
     : status.etaHours === null ? '直近1時間に進んでいないので見込みなし'
       : `あと約 ${status.etaHours < 1 ? `${Math.ceil(status.etaHours * 60)} 分` : `${status.etaHours.toFixed(1)} 時間`} (直近1時間 ${number(status.lastHour.messages)} 件)`;
   const state = status.paused ? `⏸ 一時停止中 (${status.paused.by})`
-    : status.running ? '▶ 読み込み中' : '待機中 (timer が15分おきに起動)';
+    : status.running ? '▶ 読み込み中' : '待機中 (timer が2日おきに起動)';
   const budget = status.budgetUsd > 0 ? ` / 月の上限 $${status.budgetUsd}` : '';
   return new EmbedBuilder()
     .setColor('#2b2d31')
