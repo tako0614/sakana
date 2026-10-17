@@ -261,10 +261,29 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
   if (!(await joins[0].join.stillLatest())) fail('最後の発言のままなら送ってよい');
   joins[0].join.report('sent');
   say(channel, '知らないなあ');
-  if (await joins[0].join.stillLatest()) fail('会話が進んでいたら送らない');
+  say(channel, 'ところで今日寒くない？');
+  if (!(await joins[0].join.stillLatest())) fail('少し進んだだけなら送ってよい');
+  say(channel, 'それな');
+  if (await joins[0].join.stillLatest()) fail('3 件以上進んでいたら送らない');
   joins[0].join.report('moved_on');
   joins[0].join.report('passed');
   if (actions('chan1') !== 'joined,sent,moved_on:before_send,passed') fail(`結果の台帳: ${actions('chan1')}`);
+}
+
+{
+  // 送る直前: 答え (その発言への返信) が付いたら送らない
+  resetDecideState();
+  api.respond = () => ({ status: 200, p: 0.9 });
+  const channel = makeChannel('chan9');
+  const { judge, joins } = makeJudge(ambientConfig({ VEX_COOLDOWN_MS: '0', VEX_MAX_PER_HOUR: '99' }));
+  const asked = say(channel, 'この関数って結局どう書くのが正解なんだろう？');
+  judge.observe(asked);
+  await sleep(200);
+  if (joins.length !== 1) fail('入るはず');
+  say(channel, 'ちょっと待ってね');
+  if (!(await joins[0].join.stillLatest())) fail('関係ない発言が 1 件増えただけなら送ってよい');
+  say(channel, 'それはこう書けばいいよ', { reference: { messageId: asked.id } });
+  if (await joins[0].join.stillLatest()) fail('答えが付いたら送らない');
 }
 
 {
@@ -318,7 +337,7 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
   if (ok('ありがとう')) fail('相槌は回さない');
   if (ok('うん')) fail('短すぎる発言は回さない');
   if (ok('')) fail('本文が無い (画像だけ) は回さない');
-  if (ok('そうだよね、それで合ってると思うよ', { reference: { messageId: '1' } })) fail('返信は回さない (特定の相手との会話)');
+  if (!ok('そうだよね、それで合ってると思うよ', { reference: { messageId: '1' } })) fail('返信も回す (雑談は返信が多い)');
   if (ok('<@222> これってどうなってるの？', { mentions: ['222'] })) fail('別の人宛ては回さない');
   if (!ok('<@bot-self> これってどうなってるの？', { mentions: ['bot-self'] })) fail('自分宛てのメンションだけなら回す (呼びは別経路で扱う)');
   if (ok('これってどうなってるの？', { webhookId: 'w' })) fail('webhook は回さない');

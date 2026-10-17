@@ -56,6 +56,8 @@ export interface AmbientDeps {
   now?: () => number;
 }
 
+/** 入る直前に、後から来てよい発言の数。 */
+const LATER_LIMIT = 2;
 const HOUR = 3_600_000;
 const DAY = 86_400_000;
 
@@ -112,8 +114,8 @@ export class AmbientJudge {
     // 画像だけ・スタンプだけ・極端に短い発言には入らない
     if (text.length < 6) return false;
     if (isBareAck(text)) return false;
-    // 返信は特定の相手との会話、メンションは別の人宛て
-    if (message.reference?.messageId) return false;
+    // メンションは別の人宛て。返信 (Discord の返信機能) は除かない: 雑談では発言の半分近くが返信で、
+    // 除くと会話の流れに入れなくなる (入るときは、その発言への返信として送るので宛先は分かる)
     const self = this.deps.selfId();
     if (message.mentions.users.size > 0 && !(self && message.mentions.users.size === 1 && message.mentions.users.has(self))) return false;
     return true;
@@ -181,9 +183,12 @@ export class AmbientJudge {
       // 入ると決めた時点で数える (agent が (skip) と答えても冷却は掛かる。同じ場面で何度も払わない)
       this.record(message, { ...common, action: 'joined' });
       await this.deps.join(message, {
+        // 考えている間に会話が少し進むのは普通。入ってよいのは、後から来た発言が少なく、
+        // その発言への返信 (= 答えが付いた) が無いとき
         stillLatest: async () => {
-          const last = asArray(await message.channel.messages.fetch({ limit: 1 })).at(-1);
-          return !last || last.id === message.id;
+          const later = asArray(await message.channel.messages.fetch({ limit: LATER_LIMIT + 2 }))
+            .filter((entry) => BigInt(entry.id) > BigInt(message.id));
+          return later.length <= LATER_LIMIT && !later.some((entry) => entry.reference?.messageId === message.id);
         },
         report: (outcome) => this.record(message, { ...common, action: outcome === 'sent' ? 'sent' : outcome === 'passed' ? 'passed' : outcome === 'moved_on' ? 'moved_on' : 'error', note: outcome === 'moved_on' ? 'before_send' : outcome === 'failed' ? 'agent_failed' : null })
       });
