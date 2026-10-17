@@ -40,7 +40,7 @@ const countStmt = db.prepare<[string]>('SELECT engine, COUNT(*) n FROM agent_eng
 /**
  * 選べるエンジン。
  *
- * 別物なのは「モデル名が違う」だけではない。ling / glm / qwen は道具を持ったエージェントで、
+ * 別物なのは「モデル名が違う」だけではない。ling / glm / qwen / luna / deepseek / mimo は道具を持ったエージェントで、
  * evex は 94万件から作った 5.87M の言語モデルで、道具も system プロンプトも使えず
  * 会話の続きを書くだけ。答えの形そのものが変わる。
  */
@@ -56,7 +56,19 @@ export const ENGINES: Record<string, EngineInfo> = {
   },
   qwen: {
     label: AGENT_ENGINES.qwen,
-    summary: '同じエージェントを qwen3.7-flash で'
+    summary: '同じエージェントを qwen3.8-flash で。ノリが良く道具も使えるが、考えるぶん答えが遅い (30秒前後)'
+  },
+  luna: {
+    label: AGENT_ENGINES.luna,
+    summary: '同じエージェントを gpt-6-luna で。簡潔で正確、調べ物が丁寧。いじりは控えめで、調べる回数が多め'
+  },
+  deepseek: {
+    label: AGENT_ENGINES.deepseek,
+    summary: '同じエージェントを deepseek-v4.1-flash で。glm に近い出来でいじりも上手い。出典に無い URL を作ることがある'
+  },
+  mimo: {
+    label: AGENT_ENGINES.mimo,
+    summary: '同じエージェントを mimo-v2.6-flash で。安くて言い回しが面白い。調べ物で検索を重ねがち'
   },
   evex: {
     label: 'evex-2',
@@ -149,8 +161,8 @@ export function engineInfo(engine: unknown): EngineInfo | null {
 // **消したエンジンの読み替え先。**選択は DB に残るので、名前を消しただけだと
 // `ENGINES[row.engine]` が undefined になって**黙って既定に落ちる**。
 // 選び直しを強いるのも筋が違うので、後継に読み替える
-// deepseek は 2026-10-15 に廃止 (OpenRouter の安いモデルへ)。選んでいた人は既定のエージェントへ
-const RENAMED: Record<string, string> = { 'evex-5.2-a': 'evex-5.2', 'evex-5.2-b': 'evex-5.2', deepseek: DEFAULT_AGENT_ENGINE };
+// deepseek は 2026-10-15 に一度廃止したが、2026-10-17 に v4.1-flash で復活させた (読み替えは外した)
+const RENAMED: Record<string, string> = { 'evex-5.2-a': 'evex-5.2', 'evex-5.2-b': 'evex-5.2' };
 
 function renamed(engine: string): string {
   return Object.hasOwn(RENAMED, engine) ? RENAMED[engine] ?? engine : engine;

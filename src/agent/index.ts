@@ -343,7 +343,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
   const governanceTopic = Boolean(governance.getGovernanceGuild(guild.id))
     && isGovernanceAgentTopic(message.content);
   const chosen = engineFor(message.author.id, guild.id);
-  // 会話 agent のモデルはその人が /model で選んだもの (ling / glm / qwen)。
+  // 会話 agent のモデルはその人が /model で選んだもの (ling / glm / qwen / luna / deepseek / mimo)。
   // 自作モデルを選んでいる人が統治の話をしたときは既定のモデルで答える
   const model = agentModelFor(isAgentEngine(chosen) ? chosen : DEFAULT_AGENT_ENGINE);
   // 自作モデル側はどれも「会話の続きを1発言書く」だけ。道具も検索も使えない。

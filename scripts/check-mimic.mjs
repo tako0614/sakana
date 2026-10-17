@@ -252,21 +252,32 @@ console.log(
 // --- エンジンの選択 ---
 
 const USER = 'check-model-user';
+
+// 混んだとき (429) の回し先: 選んだものを除き、優先順の2つまで (価格が一段上の luna・deepseek は入れない)
+{
+  const { agentFallbackModels, AGENT_ENGINES } = await import('../src/agent/engines.js');
+  const fromGlm = agentFallbackModels(AGENT_ENGINES.glm);
+  if (fromGlm.length !== 2 || fromGlm.includes(AGENT_ENGINES.glm)) fail(`glm の回し先: ${fromGlm}`);
+  if (fromGlm.join() !== [AGENT_ENGINES.mimo, AGENT_ENGINES.qwen].join()) fail(`優先順 (mimo → qwen): ${fromGlm}`);
+  const fromLuna = agentFallbackModels(AGENT_ENGINES.luna);
+  if (fromLuna.join() !== [AGENT_ENGINES.glm, AGENT_ENGINES.mimo].join()) fail(`luna の回し先: ${fromLuna}`);
+  if (agentFallbackModels(AGENT_ENGINES.mimo).includes(AGENT_ENGINES.mimo)) fail('選んだモデル自身へは回さない');
+}
 const clear = () => db.prepare('DELETE FROM agent_engine WHERE user_id = ?').run(USER);
 
 clear();
 try {
   if (engineFor(USER, TEST_GUILD) !== DEFAULT_ENGINE) fail('既定は glm');
   if (DEFAULT_ENGINE !== 'glm') fail('既定のエンジンは glm');
-  // deepseek は廃止。選んでいた人は既定へ読み替える (黙って別物に落ちない)
+  // deepseek は 2026-10-15 に廃止したが v4.1-flash で復活した。選んでいた人はそのまま deepseek (黙って別物に落ちない)
   db.prepare('INSERT OR REPLACE INTO agent_engine (guild_id, user_id, engine, updated_at) VALUES (?, ?, ?, ?)').run(TEST_GUILD, USER, 'deepseek', Date.now());
-  if (engineFor(USER, TEST_GUILD) !== DEFAULT_ENGINE) fail('deepseek を選んでいた人は既定のエージェントに読み替える');
+  if (engineFor(USER, TEST_GUILD) !== 'deepseek') fail('deepseek は v4.1-flash で復活したので、選んでいた人はそのまま deepseek');
   clear();
-  for (const key of ['ling', 'glm', 'qwen']) {
+  for (const key of ['ling', 'glm', 'qwen', 'luna', 'deepseek', 'mimo']) {
     if (!ENGINES[key] || !isAgentEngine(key)) fail(`${key} を会話 agent として選べない`);
     if (!agentModelFor(key).includes('/')) fail(`${key} の OpenRouter モデルが無い`);
   }
-  if (ENGINES.deepseek) fail('deepseek は選択肢から消す');
+  if (!ENGINES.deepseek) fail('deepseek (v4.1-flash) は選択肢にある');
   if (!ENGINES[DEFAULT_ENGINE]) fail('既定のエンジンが ENGINES に無い');
 
   if (!setEngine(USER, 'evex', TEST_GUILD)) fail('evex を選べない');

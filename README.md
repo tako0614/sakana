@@ -306,7 +306,7 @@ system prompt は毎ターン送り直すので短さがそのまま費用です
 
 ### モデルとトークン
 
-OpenRouter の安いモデルを人ごとに `/model` で選びます。既定は `glm` (`z-ai/glm-5.3-flash`、2026-10-17 に ling から変更)、ほかに `ling` (`inclusionai/ling-3.0-flash`、いちばん安い) と `qwen` (`qwen/qwen3.7-flash`)。思考は `reasoning.effort=medium` です (flash 系は `high` だと考えるだけで分単位になる)。2026-10-15 に DeepSeek v4 flash から切り替えました。
+OpenRouter の安いモデルを人ごとに `/model` で選びます。既定は `glm` (`z-ai/glm-5.3-flash`、2026-10-17 に ling から変更)、ほかに `ling` (`inclusionai/ling-3.0-flash`、いちばん安い)、`qwen` (`qwen/qwen3.8-flash`)、`luna` (`openai/gpt-6-luna`)、`deepseek` (`deepseek/deepseek-v4.1-flash-1017`)、`mimo` (`xiaomi/mimo-v2.6-flash`)。思考は `reasoning.effort=medium` です (flash 系は `high` だと考えるだけで分単位になる)。2026-10-15 に DeepSeek v4 flash から切り替えました。
 
 トークンを使わないための作りが何点かあります。
 
