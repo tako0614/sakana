@@ -10,12 +10,9 @@
   "workers_dev": true,
   "preview_urls": false,
   "routes": [{ "pattern": "sakana.takos.jp", "custom_domain": true }],
-  // 記憶 (/wiki) は、このサーバーのメンバーだけに見せる (既定は閉じている)。
-  //   MEMORY_GUILD_IDS                    見せるサーバー (カンマ区切り。URL は /<サーバーID>/wiki。ここに無いサーバーの URL は 404)
-  //   MEMORY_ACCESS                       'members' (既定) | 'public'
-  //   secret: SESSION_SECRET (cookie の署名) / MEMORY_LINK_SECRET (bot のログインリンクの署名。bot の MEMORY_SITE_LINK_SECRET と同じ)
-  //   任意: DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET (「Discord でログイン」。OAuth2 > Redirects に https://<このサイト>/auth/callback)
-  "vars": { "MEMORY_GUILD_IDS": "1255359848644608035", "MEMORY_ACCESS": "members" },
+  // 記憶 (/<サーバーID>/wiki) は誰でも読める公開サイト (ログインは無い。検索エンジンには noindex)。
+  //   MEMORY_GUILD_IDS   見せるサーバー (カンマ区切り。ここに無いサーバーの URL は 404)
+  "vars": { "MEMORY_GUILD_IDS": "1255359848644608035" },
   "d1_databases": [
     {
       "binding": "LAWS",

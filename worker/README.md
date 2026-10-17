@@ -74,8 +74,8 @@ bot側は `GOVERNANCE_LAW_API_URL`（このWorkerのorigin）、`GOVERNANCE_LAW_
 ## 記憶 (wiki)
 
 法令集と同じ Worker に、記憶 (bot が会話を読んでまとめた人・もの・ネタ・出来事) を wiki として出しています。
-**法令集は公開のまま、記憶はこのサーバーのメンバーだけ**が読めます (Discord で `/memory url` を使うと入り口のリンクが出ます)
-(人物の紹介や発言の引用が入るため。設定が済むまでは閉じたままです)。
+法令集も記憶も**誰でも読める公開サイト**で、ログインはありません (Discord で `/memory url` を使うとリンクが出ます)。
+検索エンジンには `noindex` を出しています (人物の紹介や発言の引用が入るため。見つけてもらう場ではなく、リンクで渡す場として使う)。
 
 | path | 内容 |
 |---|---|
@@ -85,32 +85,25 @@ bot側は `GOVERNANCE_LAW_API_URL`（このWorkerのorigin）、`GOVERNANCE_LAW_
 | `/<サーバーID>/t`, `/t/YYYY-MM` | 年表 (月ごとの多さが色で分かる) / その月の出来事を日ごとに |
 | `/<サーバーID>/s?q=` | 検索 (ページと出来事。3文字以上は文中も探し、短い語は名前と説明から) |
 | `/<サーバーID>/random` | ランダムなページ |
-| `/auth/link` (`/auth/login`, `/auth/callback`), `/<サーバーID>/auth/logout` | bot のログインリンク (サーバーはリンクの署名の中) / ログアウト (任意で Discord OAuth2) |
+| `/auth/link` など | 以前のログインリンク。開かれたら記憶のトップへ転送 |
 | `/v1/memory/*` | bot からの取り込み (Bearer)。`hashes` / `batch` / `prune` / `finish` |
 
 画面は Worker が D1 から組み立てます (JavaScript なし。分類の木は `<details>`、スマホのメニューはチェックボックス)。
 本文は未信頼のテキストなので、HTML は `src/wiki/html.ts` の `html``` (埋め込んだ値は必ず escape) だけで組み、
 CSP は `default-src 'none'` です。型検査は `npx tsc -p tsconfig.json` (strict)。
 
-### 見せる範囲と入り方
+### 見せる範囲
 
-- **入り方 (既定)**: サーバーのメンバーが Discord で **`/memory url`** を使うと、bot が (そのサーバーにいる人だと分かっているので)
-  その人だけに、10分だけ有効で1回だけ開けるログインリンクを返します。サイトは署名・サーバー・期限・使用済みかを確かめて、
-  署名つき cookie (7日) を渡します。**Discord の OAuth アプリも Client Secret も要りません**。
-  鍵は bot の `MEMORY_SITE_LINK_SECRET` と Worker の secret `MEMORY_LINK_SECRET` を同じ値にします。
-- **Discord でログイン (任意)**: OAuth の設定 (`DISCORD_CLIENT_ID` / `DISCORD_CLIENT_SECRET`) があれば、ログイン画面に
-  「Discord でログイン」も出ます (`identify guilds` だけ。アクセストークンは使い捨てて失効させる)。
-- **閉じたまま**: `SESSION_SECRET` と入り方の設定が揃うまで、`/wiki` は「まだ公開されていません」と閉じています。
-  `MEMORY_ACCESS=public` にすると誰でも読めます (人物ページに個人の自己申告が入るので、既定は `members`)。
+- **誰でも読める**: ログイン・cookie・署名の鍵はありません。見せるサーバーは `MEMORY_GUILD_IDS` に書いたものだけで、一覧に無い ID の URL は
+  そのサーバーがあるかも教えずに 404 です。
 - **引用**: 出来事の根拠の発言の原文は、全員に見えるチャンネルのものだけをサイトへ送ります
   (`/memory include` で足したチャンネル・名前に nsfw などを含むチャンネル・消された発言は送らない)。
   送らなかった発言は件数だけ出し、「見られるチャンネルが限られている発言 n 件は載せていません」と表示します。
-- ページの本文と要約は、メンバー全員が読める前提です (`/memory include` した内容も、本文には入ります)。
-- **サーバーごとに分ける**: URL は `/<サーバーID>/wiki/…`。見せるサーバーは `MEMORY_GUILD_IDS` (カンマ区切り) に書いたものだけで、
-  一覧に無い ID の URL は、そのサーバーがあるかも教えずに 404 です。データ (D1 の `guild_id`)・cookie (名前 `sk_session_<サーバーID>`・
-  送られるパス `/<サーバーID>`)・入場 (リンクの署名と cookie の中のサーバー)・取り込みのどれも、サーバーをまたいで混ざりません
-  (同じ ID・同じパスで別の内容を入れて確かめています: `scripts/check-wiki.mjs`)。サーバーの付かない旧い URL (`/wiki` など) は、
-  見せているサーバーが1つのときだけそこへ転送します。
+- ページの本文と要約は、公開される前提です (`/memory include` した内容も、本文には入ります)。人物ページには会話から読み取った
+  自己申告 (学校・身長体重など) が入りうるので、載せたくない内容は builder の入力 (チャンネルの公開範囲・`/memory include`) 側で止めてください。
+- **サーバーごとに分ける**: URL は `/<サーバーID>/wiki/…`。データ (D1 の `guild_id`)・リンク・検索・取り込みのどれも、
+  サーバーをまたいで混ざりません (同じ ID・同じパスで別の内容を入れて確かめています: `scripts/check-wiki.mjs`)。
+  サーバーの付かない旧い URL (`/wiki` など) は、見せているサーバーが1つのときだけそこへ転送します。
 - **サーバーを足す**: `wrangler.jsonc` の `MEMORY_GUILD_IDS` に ID を足して配備し、bot の `.env` の `MEMORY_SITE_GUILDS` にも足します
   (builder がそのサーバーの記憶を作り終えていること。記憶の無いサーバーは送りません)。
 
@@ -119,13 +112,10 @@ CSP は `default-src 'none'` です。型検査は `npx tsc -p tsconfig.json` (s
 ```bash
 cd worker
 npm run migrate                                  # 0003_memory.sql (記憶の表と全文検索) を本番 D1 へ
-# 鍵を2つ作る。MEMORY_LINK_SECRET は bot の .env の MEMORY_SITE_LINK_SECRET と同じ値にする
-openssl rand -base64 32 | npx wrangler secret put SESSION_SECRET
-openssl rand -base64 32 | tee /tmp/link-secret | npx wrangler secret put MEMORY_LINK_SECRET
 npm run deploy
 ```
 
-`wrangler.jsonc` の `vars` で `MEMORY_GUILD_IDS` (見せるサーバー) と `MEMORY_ACCESS` を決めています。
+`wrangler.jsonc` の `vars` で `MEMORY_GUILD_IDS` (見せるサーバー) を決めています。
 書き込みの Bearer は法令集と同じ `GOVERNANCE_LAW_API_TOKEN` です。
 
 bot 側 (builder の後に差分だけ送り、入り口を出す):
@@ -134,7 +124,7 @@ bot 側 (builder の後に差分だけ送り、入り口を出す):
 cp deploy/sakana-memory-site.{service,timer} /etc/systemd/system/    # 10分おき (AI は使わない)
 systemctl enable --now sakana-memory-site.timer
 # .env: GOVERNANCE_LAW_API_URL / _TOKEN があればそのまま使う (別にするなら MEMORY_SITE_URL / MEMORY_SITE_TOKEN)
-#       MEMORY_SITE_PUBLIC_URL=https://<このサイト>   MEMORY_SITE_LINK_SECRET=<上の MEMORY_LINK_SECRET と同じ値>
+#       MEMORY_SITE_PUBLIC_URL=https://<このサイト>
 tsx scripts/memory-site-sync.ts --dry-run          # 何件送るか (送らない)
 ```
 
@@ -145,13 +135,13 @@ tsx scripts/memory-site-sync.ts --dry-run          # 何件送るか (送らな�
 
 ```bash
 cd worker
-printf 'GOVERNANCE_LAW_API_TOKEN=dev-token\nMEMORY_ACCESS=public\nMEMORY_GUILD_IDS=<id>\n' > .dev.vars    # コミットしない
+printf 'GOVERNANCE_LAW_API_TOKEN=dev-token\nMEMORY_GUILD_IDS=<id>\n' > .dev.vars    # コミットしない
 npm run migrate:local && npx wrangler dev --local --port 8799
 # 別の端末で: 実データの写しを作って (本番では --out)、手元へ送る
 MEMORY_SITE_URL=http://127.0.0.1:8799 MEMORY_SITE_TOKEN=dev-token MEMORY_SITE_GUILDS=<id> tsx scripts/memory-site-sync.ts [--from snapshot.json]
 open http://127.0.0.1:8799/<サーバーID>/wiki
 ```
 
-検査は `tsx scripts/check-wiki.mjs` (escape・取り込み・検索・ログイン・gate・全画面) と
+検査は `tsx scripts/check-wiki.mjs` (escape・取り込み・検索・サーバーの分離・全画面) と
 `tsx scripts/check-memory-site.mjs` (記憶 DB → 差分送信 → 取り込み、引用の制限)。D1 は better-sqlite3 の代用品
 (`test/d1-shim.ts`) で、FTS5・`json_each`・トリガーは本物の D1 と同じ SQLite の機能です。

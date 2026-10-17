@@ -4,17 +4,10 @@ export interface Env {
   LAWS: D1Database;
   GOVERNANCE_LAW_API_TOKEN?: string;
   DEFAULT_GUILD_ID?: string;
-  /** wiki を見せるサーバー (カンマ・空白区切り)。URL の /<サーバーID> がこの一覧に無ければ 404。サーバーごとにメンバーかを確かめる */
+  /** wiki を見せるサーバー (カンマ・空白区切り)。URL の /<サーバーID> がこの一覧に無ければ 404。*/
   MEMORY_GUILD_IDS?: string;
   /** 旧: 1つだけ見せるとき (MEMORY_GUILD_IDS に足して扱う) */
   MEMORY_GUILD_ID?: string;
-  /** 'members' (既定: Discord ログインとサーバーのメンバー確認が要る) | 'public' (誰でも) */
-  MEMORY_ACCESS?: string;
-  DISCORD_CLIENT_ID?: string;
-  DISCORD_CLIENT_SECRET?: string;
-  SESSION_SECRET?: string;
-  /** bot が発行するログインリンクの署名の鍵 (bot の MEMORY_SITE_LINK_SECRET と同じ値) */
-  MEMORY_LINK_SECRET?: string;
 }
 
 export interface NodeRow {
@@ -116,11 +109,3 @@ export interface EpisodePayload {
   contentHash: string;
 }
 
-export interface Session {
-  /** どのサーバーの入場か。cookie はサーバーごとだが、確かめ直す */
-  g: string;
-  uid: string;
-  name: string;
-  avatar: string | null;
-  exp: number;
-}

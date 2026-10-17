@@ -1,8 +1,16 @@
 // サイトの URL の作り方。記憶はサーバーごとに分け、すべての URL に /<サーバーID> を付ける。
-//   /<g>/wiki  /<g>/wiki/<path>  /<g>/e/<id>  /<g>/t[/YYYY-MM]  /<g>/s  /<g>/random  /<g>/auth/logout
+//   /<g>/wiki  /<g>/wiki/<path>  /<g>/e/<id>  /<g>/t[/YYYY-MM]  /<g>/s  /<g>/random
 // 画面は links を通して href を作る (サーバーの違うページへ、うっかり飛ばないように)。
 
+import type { Env } from './types.ts';
+
 export const GUILD_ID = /^\d{5,25}$/;
+
+/** 記憶を見せるサーバー。URL の /<サーバーID> がこの一覧にあるものだけ開く (無ければ 404)。 */
+export function memoryGuilds(env: Env): string[] {
+  const raw = `${env.MEMORY_GUILD_IDS ?? ''} ${env.MEMORY_GUILD_ID ?? ''} ${env.DEFAULT_GUILD_ID ?? ''}`;
+  return [...new Set(raw.split(/[\s,]+/).filter((id) => GUILD_ID.test(id)))];
+}
 
 export interface Links {
   guild: string;
@@ -15,7 +23,6 @@ export interface Links {
   month(month: string, kind?: string): string;
   search: string;
   random: string;
-  logout: string;
   /** 法令集 (サーバーごとの一覧) */
   laws: string;
 }
@@ -34,7 +41,6 @@ export function makeLinks(guild: string): Links {
     month: (month, kind = '') => `${base}/t/${month}${kind ? `?kind=${encodeURIComponent(kind)}` : ''}`,
     search: `${base}/s`,
     random: `${base}/random`,
-    logout: `${base}/auth/logout`,
     laws: `/?guild=${encodeURIComponent(guild)}`
   };
 }

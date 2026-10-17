@@ -454,14 +454,3 @@ export function messageView(title: string, message: string, options: { status?: 
   };
 }
 
-export function loginView(next: string, methods: { oauth: boolean; link: boolean }, links: Links): Page {
-  return {
-    title: 'ログイン - 記憶',
-    narrow: true,
-    status: 401,
-    main: html`<section class="card msg"><h1>📖 記憶</h1>
-    <p>サーバーの人のことや会話がまとまっているので、このサーバーのメンバーだけが読めます。</p>
-    ${methods.link ? html`<p class="notice">Discord のサーバーで <b>/memory url</b> を使うと、あなただけに入り口のリンクが出ます (10分だけ有効・1回だけ使えます)。</p>` : ''}
-    ${methods.oauth ? html`<a class="btn" href="/auth/login${qs({ g: links.guild, next })}">Discord でログイン</a><p style="font-size:.8rem">ユーザー名とサーバーに入っているかを確かめるだけで、メッセージやフレンドは見ません。</p>` : ''}</section>`
-  };
-}

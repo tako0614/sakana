@@ -3,8 +3,7 @@
 //   - 描画は escape 済みの部品だけで組まれる: 本文・名前・発言に <script> や onerror= を書いても文字として出る
 //   - bot からの取り込み: Bearer が要る / 変な本文は 400 / 同じ内容を何度送っても同じ / 消した行は prune で消える
 //   - 全文検索 (trigram) と 3 文字未満の LIKE
-//   - ログイン: state・メンバー確認・署名つき cookie・戻り先の検証
-//   - gate: 設定が無ければ閉じる / ログインが無ければ入れない / public のときだけ誰でも
+//   - 公開: ログインも cookie も無しで誰でも読める / 以前のログインリンクはトップへ転送 / 見せていないサーバーは 404
 //   - 画面: トップ・記事 (出典の番号・赤リンク・目次)・年表・出来事・検索・存在しないページ
 //
 // D1 は better-sqlite3 の代用品 (worker/test/d1-shim.ts)。同じ SQLite なので SQL はそのまま通る。
@@ -15,8 +14,6 @@ const { createD1 } = await import('../worker/test/d1-shim.ts');
 const { html, esc, raw } = await import('../worker/src/wiki/html.ts');
 const { renderMarkdown, scanReferences, highlightSnippet, plainText } = await import('../worker/src/wiki/markdown.ts');
 const { handleIngest, parseNode, parseEpisode } = await import('../worker/src/wiki/ingest.ts');
-const auth = await import('../worker/src/wiki/auth.ts');
-const botSite = await import('../src/memory/site.ts');
 const { handleWiki } = await import('../worker/src/wiki/router.ts');
 const store = await import('../worker/src/wiki/store.ts');
 
@@ -76,7 +73,7 @@ const GUILD = '1255359848644608035';
 const P = `/${GUILD}`;   // サーバーごとの URL の接頭辞
 const TOKEN = 'secret-token';
 const db = createD1();
-const env = { LAWS: db, GOVERNANCE_LAW_API_TOKEN: TOKEN, MEMORY_GUILD_IDS: GUILD, MEMORY_ACCESS: 'public' };
+const env = { LAWS: db, GOVERNANCE_LAW_API_TOKEN: TOKEN, MEMORY_GUILD_IDS: GUILD };
 const NOW = Date.UTC(2026, 9, 16, 12, 0, 0);
 const at = (y, m, d) => Date.UTC(y, m - 1, d, 3, 0, 0);
 
@@ -175,152 +172,37 @@ const post = (path, body, token = TOKEN) => handleIngest(new Request(`https://x.
   assert.deepEqual(store.searchTerms('a  bb ccc dddd'), { long: ['ccc', 'dddd'], short: ['a', 'bb'] });
 }
 
-// ---- ログイン ---------------------------------------------------------------------
-const SESSION_SECRET = 'session-secret-for-tests';
-const authEnv = { ...env, MEMORY_ACCESS: 'members', DISCORD_CLIENT_ID: '111', DISCORD_CLIENT_SECRET: 'client-secret', SESSION_SECRET };
-let fakeFetch = async () => new Response('{}', { status: 500 });
-const calls = [];
-const deps = {
-  auth: { fetch: (input, init) => { calls.push(String(input)); return fakeFetch(input, init); }, now: () => NOW, random: () => new Uint8Array(16).fill(7) },
-  now: () => NOW
-};
+// ---- 公開 (ログインは無い) -----------------------------------------------------------
+const deps = { now: () => NOW };
 {
-  assert.equal(auth.safeNext(`${P}/wiki/people`, GUILD), `${P}/wiki/people`);
-  assert.equal(auth.safeNext(`${P}`, GUILD), `${P}`, 'the server root itself is fine');
-  for (const bad of ['//evil.example', 'https://evil.example', '/\\evil.example', '/a\nb', null, '', 'wiki', '/' + 'x'.repeat(400),
-    '/wiki/people', '/999999999/wiki', `${P}x/wiki`, `/${GUILD.slice(0, -1)}/wiki`]) {
-    assert.equal(auth.safeNext(bad, GUILD), `${P}/wiki`, `unsafe next (another server, no server, off-site, malformed): ${bad}`);
+  const get = (path, init = {}, e = env) => handleWiki(new Request(`https://wiki.test${path}`, init), e, deps);
+
+  // 何も持たない訪問者が、全部の画面を読める (cookie も鍵も要らない)
+  for (const path of [`${P}/wiki`, `${P}/wiki/people/%E3%81%9F%E3%81%93`, `${P}/e/1`, `${P}/s?q=tako`, `${P}/t`, `${P}/t/2025-06`]) {
+    const response = await get(path);
+    assert.equal(response.status, 200, `a visitor reads ${path}`);
+    assert.equal(response.headers.get('set-cookie'), null, 'and gets no cookie');
+    const text = await response.text();
+    assert.ok(!/ログイン|ログアウト|\/auth\//.test(text), `${path} has no login or logout`);
   }
+  assert.equal((await get(`${P}/random`)).status, 302);
+  // 公開でも検索エンジンには載せない (人物ページがあるため)
+  assert.match(await (await get(`${P}/wiki`)).text(), /<meta name="robots" content="noindex, nofollow">/);
+  assert.match((await get(`${P}/wiki`)).headers.get('cache-control'), /public/);
 
-  const session = { g: GUILD, uid: '42', name: 'たこ', avatar: null, exp: Math.floor(NOW / 1000) + 3600 };
-  const token = await auth.signSession(session, SESSION_SECRET);
-  assert.deepEqual(await auth.verifySession(token, SESSION_SECRET, NOW), session);
-  assert.equal(await auth.verifySession(token, 'other-secret', NOW), null, 'a different secret does not verify');
-  assert.equal(await auth.verifySession(`${token.split('.')[0]}x.${token.split('.')[1]}`, SESSION_SECRET, NOW), null, 'a tampered payload does not verify');
-  assert.equal(await auth.verifySession(token, SESSION_SECRET, NOW + 7200_000), null, 'an expired session does not verify');
-  assert.equal(await auth.verifySession('garbage', SESSION_SECRET, NOW), null);
-  const forged = `${Buffer.from(JSON.stringify({ ...session, uid: '1' })).toString('base64url')}.${token.split('.')[1]}`;
-  assert.equal(await auth.verifySession(forged, SESSION_SECRET, NOW), null, 'a forged payload with a real signature does not verify');
-
-  const login = await handleWiki(new Request(`https://wiki.test/auth/login?g=${GUILD}&next=${P}/wiki/people/%E3%81%9F%E3%81%93`), authEnv, deps);
-  assert.equal(login.status, 302);
-  const location = new URL(login.headers.get('location'));
-  assert.equal(location.origin + location.pathname, 'https://discord.com/oauth2/authorize');
-  assert.equal(location.searchParams.get('scope'), 'identify guilds');
-  assert.equal(location.searchParams.get('redirect_uri'), 'https://wiki.test/auth/callback');
-  assert.equal(location.searchParams.get('client_id'), '111');
-  const stateCookie = login.headers.get('set-cookie');
-  assert.match(stateCookie, /sk_state=[^;]+; Max-Age=600; Path=\/auth; HttpOnly; SameSite=Lax; Secure/);
-  assert.equal((await handleWiki(new Request('https://wiki.test/auth/login?g=999999999'), authEnv, deps)).status, 404, 'login for a server that is not served is a 404');
-  assert.equal((await handleWiki(new Request('https://wiki.test/auth/login'), authEnv, deps)).status, 404, 'login needs a server');
-  const state = location.searchParams.get('state');
-  const cookieValue = stateCookie.split(';')[0];
-
-  const callback = (query, cookie = cookieValue) => handleWiki(new Request(`https://wiki.test/auth/callback?${query}`, { headers: { cookie } }), authEnv, deps);
-  const discord = (guilds, user = { id: '42', username: 'tako', global_name: 'たこ', avatar: 'abc' }) => async (input) => {
-    const url = String(input);
-    if (url.endsWith('/oauth2/token')) return Response.json({ access_token: 'tok' });
-    if (url.endsWith('/users/@me')) return Response.json(user);
-    if (url.endsWith('/users/@me/guilds')) return Response.json(guilds);
-    return new Response('{}');
-  };
-
-  assert.equal((await callback(`code=c&state=wrong`)).status, 400, 'a state mismatch is refused');
-  assert.equal((await callback(`code=c&state=${state}`, 'other=1')).status, 400, 'no state cookie is refused');
-  assert.equal((await callback(`error=access_denied&state=${state}`)).status, 400);
-
-  fakeFetch = discord([{ id: '999' }]);
-  const outsider = await callback(`code=c&state=${state}`);
-  assert.equal(outsider.status, 403, 'someone who is not in the server is refused');
-  assert.ok(!(outsider.headers.get('set-cookie') ?? '').includes('sk_session_') || /sk_session_\d+=;/.test(outsider.headers.get('set-cookie') ?? ''), 'and gets no session');
-
-  calls.length = 0;
-  fakeFetch = discord([{ id: '999' }, { id: GUILD }]);
-  const member = await callback(`code=c&state=${state}`);
-  assert.equal(member.status, 302);
-  assert.equal(member.headers.get('location'), `${P}/wiki/people/%E3%81%9F%E3%81%93`, 'returns to the page they came from (as an ASCII Location)');
-  assert.equal(auth.asciiLocation('/wiki/a b/たこ?q=1%20x'), '/wiki/a%20b/%E3%81%9F%E3%81%93?q=1%20x');
-  const cookies = member.headers.getSetCookie();
-  const sessionCookie = cookies.find((entry) => entry.startsWith(`sk_session_${GUILD}=`));
-  assert.match(sessionCookie, /HttpOnly; SameSite=Lax; Secure/);
-  assert.ok(sessionCookie.includes(`Path=${P};`), 'the session cookie is only sent to this server\'s paths');
-  assert.ok(cookies.some((entry) => entry.startsWith('sk_state=;')), 'the state cookie is cleared');
-  assert.ok(calls.some((url) => url.endsWith('/oauth2/token/revoke')), 'the access token is revoked after use');
-  const sessionValue = sessionCookie.split(';')[0];
-
-  // gate
-  const get = (path, cookie = '', e = authEnv) => handleWiki(new Request(`https://wiki.test${path}`, { headers: cookie ? { cookie } : {} }), e, deps);
-  const closed = await get(`${P}/wiki`, '', { ...authEnv, DISCORD_CLIENT_SECRET: undefined });
-  assert.equal(closed.status, 503, 'without login set up the wiki stays closed');
-  const gate = await get(`${P}/wiki/people/たこ`);
-  assert.equal(gate.status, 401);
-  const gateHtml = await gate.text();
-  assert.match(gateHtml, /Discord でログイン/);
-  assert.ok(!gateHtml.includes('sakana bot の作者'), 'nothing from the book leaks to a visitor');
-  assert.match(gateHtml, new RegExp(`href="/auth/login\\?g=${GUILD}&amp;next=%2F${GUILD}%2Fwiki%2Fpeople%2F`));
-  assert.equal((await get(`${P}/e/1`)).status, 401);
-  assert.equal((await get(`${P}/s?q=tako`)).status, 401);
-  assert.equal((await get(`${P}/wiki`, `sk_session_${GUILD}=forged.value`)).status, 401, 'a forged cookie does not pass');
-  assert.equal((await get(`${P}/wiki`, sessionValue)).status, 200, 'a member passes');
-  assert.equal((await handleWiki(new Request(`https://wiki.test${P}/wiki`), env, deps)).status, 200, 'public mode needs no login');
-  assert.equal((await handleWiki(new Request(`https://wiki.test${P}/wiki`), { ...env, MEMORY_GUILD_IDS: '', MEMORY_GUILD_ID: '', DEFAULT_GUILD_ID: '' }, deps)).status, 404, 'no server configured: nothing is served');
-  const out = await handleWiki(new Request(`https://wiki.test${P}/auth/logout`), authEnv, deps);
-  assert.match(out.headers.get('set-cookie'), new RegExp(`sk_session_${GUILD}=; Max-Age=0; Path=/${GUILD};`));
-  assert.equal(await handleWiki(new Request('https://wiki.test/law/1'), authEnv, deps), null, 'law pages are not handled here');
-  assert.equal(await handleWiki(new Request('https://wiki.test/'), authEnv, deps), null);
-  assert.equal((await handleWiki(new Request(`https://wiki.test${P}/wiki`, { method: 'POST' }), env, deps)).status, 405);
-
-  // ---- bot のログインリンク (Discord の OAuth アプリが無くても入れる) ----
-  {
-    const LINK_SECRET = 'link-secret-0123456789abcdef';
-    const linkEnv = { ...env, MEMORY_ACCESS: 'members', SESSION_SECRET, MEMORY_LINK_SECRET: LINK_SECRET };   // OAuth の設定は無い
-    const config = { origin: 'https://wiki.test', secret: LINK_SECRET, guildId: GUILD };
-    const user = { id: '42', name: 'たこ', avatar: 'abc' };
-    const make = (target = { kind: 'page', path: 'people/たこ' }, at = NOW, cfg = config) => botSite.siteLoginUrl(cfg, user, target, at);
-    const open = (url, e = linkEnv, cookie = '') => handleWiki(new Request(url, { headers: cookie ? { cookie } : {} }), e, deps);
-
-    const gate = await open(`https://wiki.test${P}/wiki`);
-    assert.equal(gate.status, 401, 'without a session the book stays closed');
-    const gateText = await gate.text();
-    assert.match(gateText, /\/memory url/, 'the login page tells members how to get in');
-    assert.ok(!gateText.includes('Discord でログイン'), 'and offers no OAuth button when OAuth is not set up');
-    assert.equal((await open(`https://wiki.test${P}/wiki`, { ...linkEnv, MEMORY_LINK_SECRET: undefined })).status, 503, 'with no way to log in at all the book is closed');
-
-    const link = make();
-    const entered = await open(link);
-    assert.equal(entered.status, 302, await entered.clone().text());
-    assert.equal(entered.headers.get('location'), `${P}/wiki/people/%E3%81%9F%E3%81%93`, 'goes to the page the link was made for');
-    const cookie = entered.headers.get('set-cookie').split(';')[0];
-    assert.match(entered.headers.get('set-cookie'), /HttpOnly; SameSite=Lax; Secure/);
-    assert.equal(entered.headers.get('referrer-policy'), 'no-referrer', 'the one-time token is not leaked in a Referer');
-    const inside = await open(`https://wiki.test${P}/wiki`, linkEnv, cookie);
-    assert.equal(inside.status, 200);
-    assert.match(await inside.text(), /<span class="uname">たこ<\/span>/, 'the session knows who came in');
-
-    const again = await open(link);
-    assert.equal(again.status, 400, 'a link works once');
-    assert.match(await again.text(), /もう使われています/);
-    assert.equal((await open(make(undefined, NOW - 11 * 60_000))).status, 400, 'an expired link does not work');
-    assert.equal((await open(make(undefined, NOW + 5 * 60_000))).status, 400, 'a link from the future does not work');
-    assert.equal((await open(make(undefined, NOW, { ...config, guildId: '999' }))).status, 400, 'a link for another server does not work');
-    assert.equal((await open(make(undefined, NOW, { ...config, secret: 'a-different-secret-0123456789' }))).status, 400, 'a link signed with another key does not work');
-    const tampered = new URL(make());
-    const [payload, signature] = tampered.searchParams.get('t').split('.');
-    const forged = Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(payload, 'base64url').toString()), uid: '1' })).toString('base64url');
-    tampered.searchParams.set('t', `${forged}.${signature}`);
-    assert.equal((await open(tampered)).status, 400, 'a changed payload does not verify');
-    assert.equal((await open('https://wiki.test/auth/link')).status, 400, 'no token');
-    assert.equal((await open(make(), { ...linkEnv, MEMORY_LINK_SECRET: undefined })).status, 503, 'links are refused when the Worker has no key');
-
-    const evil = new URL(make());
-    evil.searchParams.set('next', '//evil.example');
-    assert.equal((await open(evil)).headers.get('location'), `${P}/wiki`, 'an off-site next is ignored');
-    assert.equal(db.raw.prepare("SELECT COUNT(*) n FROM memory_meta WHERE guild_id = '~link'").get().n >= 1, true, 'used links are remembered');
-    // 期限を過ぎた記録は、次のリンクを開いたときに掃除される
-    db.raw.prepare("INSERT INTO memory_meta (guild_id, key, value) VALUES ('~link', 'old-one-0123456789', ?)").run(String(Math.floor(NOW / 1000) - 3600));
-    await open(make());
-    assert.equal(db.raw.prepare("SELECT COUNT(*) n FROM memory_meta WHERE key = 'old-one-0123456789'").get().n, 0, 'expired records are swept');
+  // 以前のログインリンク・ログアウトは、記憶のトップへ送る (Discord に残っているリンクが行き止まりにならない)
+  for (const path of ['/auth/link?t=old.token&next=%2Fx', '/auth/login?g=' + GUILD, '/auth/callback?code=x', `${P}/auth/logout`]) {
+    const response = await get(path);
+    assert.equal(response.status, 302, `${path} goes to the book`);
+    assert.equal(response.headers.get('location'), `${P}/wiki`);
   }
+  assert.equal((await get('/auth/link?t=x', {}, { ...env, MEMORY_GUILD_IDS: `${GUILD} 1517186886714789910` })).status, 404, 'with two servers an old link cannot pick one');
+
+  assert.equal((await get(`${P}/wiki`, {}, { ...env, MEMORY_GUILD_IDS: '', MEMORY_GUILD_ID: '', DEFAULT_GUILD_ID: '' })).status, 404, 'no server configured: nothing is served');
+  assert.equal(await handleWiki(new Request('https://wiki.test/law/1'), env, deps), null, 'law pages are not handled here');
+  assert.equal(await handleWiki(new Request('https://wiki.test/'), env, deps), null);
+  assert.equal((await get(`${P}/wiki`, { method: 'POST' })).status, 405);
+  assert.equal(await get(`${P}/t/abc`), null, 'an unknown /t/ path is not a wiki page');
 
   // ---- 画面 ----
   const page = async (path, e = env) => {
@@ -345,7 +227,6 @@ const deps = {
   assert.match(home.response.headers.get('content-security-policy'), /default-src 'none'/);
   assert.equal(home.response.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(home.response.headers.get('x-frame-options'), 'DENY');
-  assert.match(home.response.headers.get('cache-control'), /no-store/);
   noLive(home.text, 'home');
 
   const article = await page(`${P}/wiki/people/%E3%81%9F%E3%81%93`);
@@ -435,12 +316,11 @@ const deps = {
 }
 
 // ---- サーバーごとの分離 ---------------------------------------------------------------
-// 別のサーバーを足しても、データ・URL・cookie・入場のどれも混ざらない。同じ id・同じパスで別の内容を入れて確かめる。
+// 別のサーバーを足しても、データ・URL・リンク・検索・取り込みのどれも混ざらない。同じ id・同じパスで別の内容を入れて確かめる。
 {
   const OTHER = '1517186886714789910';
   const Q = `/${OTHER}`;
-  const LINK_SECRET = 'link-secret-0123456789abcdef';
-  const both = { ...env, MEMORY_GUILD_IDS: `${GUILD} ${OTHER}`, MEMORY_ACCESS: 'members', SESSION_SECRET: 'session-secret-for-tests', MEMORY_LINK_SECRET: LINK_SECRET };
+  const both = { ...env, MEMORY_GUILD_IDS: `${GUILD} ${OTHER}` };
   const postTo = (e, path, body, token = TOKEN) => handleIngest(new Request(`https://x.test${path}`, {
     method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(body) }), e, NOW);
 
@@ -461,67 +341,39 @@ const deps = {
   await postTo(both, '/v1/memory/finish', { guildId: OTHER });
   assert.equal(db.raw.prepare('SELECT COUNT(*) n FROM memory_nodes WHERE id = 5').get().n, 2, 'both servers hold a page with the same id');
 
-  const enter = async (guild, uid = '42') => {
-    const link = botSite.siteLoginUrl({ origin: 'https://wiki.test', secret: LINK_SECRET, guildId: guild }, { id: uid, name: 'たこ', avatar: null }, { kind: 'home' }, NOW);
-    const response = await handleWiki(new Request(link), both, deps);
-    assert.equal(response.status, 302, `enter ${guild}: ${await response.clone().text()}`);
-    return { cookie: response.headers.get('set-cookie').split(';')[0], setCookie: response.headers.get('set-cookie'), location: response.headers.get('location') };
-  };
-  const fetchAs = async (path, cookie = '') => {
-    const response = await handleWiki(new Request(`https://wiki.test${path}`, { headers: cookie ? { cookie } : {} }), both, deps);
+  const fetchPage = async (path, e = both) => {
+    const response = await handleWiki(new Request(`https://wiki.test${path}`), e, deps);
     return { status: response.status, text: await response.text(), headers: response.headers };
   };
-  const a = await enter(GUILD);
-  const b = await enter(OTHER);
-  assert.match(a.setCookie, new RegExp(`^sk_session_${GUILD}=`));
-  assert.match(b.setCookie, new RegExp(`^sk_session_${OTHER}=.*Path=/${OTHER};`), 'the cookie of one server is only sent to that server\'s paths');
-  assert.equal(a.location, `${P}/wiki`);
-  assert.equal(b.location, `${Q}/wiki`);
 
   // それぞれ自分のデータだけが出る
-  const mine = await fetchAs(`${P}/wiki/people/%E3%81%9F%E3%81%93`, a.cookie);
-  const theirs = await fetchAs(`${Q}/wiki/people/%E3%81%9F%E3%81%93`, b.cookie);
+  const mine = await fetchPage(`${P}/wiki/people/%E3%81%9F%E3%81%93`);
+  const theirs = await fetchPage(`${Q}/wiki/people/%E3%81%9F%E3%81%93`);
   assert.match(mine.text, /sakana bot の作者/);
   assert.ok(!mine.text.includes('OTHER') && !mine.text.includes(OTHER), 'one server\'s page shows nothing of the other');
   assert.match(theirs.text, /OTHER だけのたこ/);
   assert.ok(!theirs.text.includes('sakana bot の作者') && !theirs.text.includes(GUILD), 'and the other way round');
-  assert.match((await fetchAs(`${Q}/e/1`, b.cookie)).text, /OTHER の出来事[\s\S]*OTHER だけの発言/, 'the same episode number is a different episode');
-  assert.match((await fetchAs(`${P}/e/1`, a.cookie)).text, /sakana bot を作り始めた/);
-  assert.ok(!(await fetchAs(`${P}/e/1`, a.cookie)).text.includes('OTHER'));
-  const searchMine = (await fetchAs(`${P}/s?q=${encodeURIComponent('たこ')}`, a.cookie)).text;
-  const searchTheirs = (await fetchAs(`${Q}/s?q=${encodeURIComponent('たこ')}`, b.cookie)).text;
+  assert.match((await fetchPage(`${Q}/e/1`)).text, /OTHER の出来事[\s\S]*OTHER だけの発言/, 'the same episode number is a different episode');
+  assert.match((await fetchPage(`${P}/e/1`)).text, /sakana bot を作り始めた/);
+  assert.ok(!(await fetchPage(`${P}/e/1`)).text.includes('OTHER'));
+  const searchMine = (await fetchPage(`${P}/s?q=${encodeURIComponent('たこ')}`)).text;
+  const searchTheirs = (await fetchPage(`${Q}/s?q=${encodeURIComponent('たこ')}`)).text;
   assert.ok(!searchMine.includes('OTHER'), 'search does not cross servers');
   assert.ok(searchTheirs.includes('OTHER') && !searchTheirs.includes('sakana bot'), 'search stays inside the server');
-  const homeTheirs = (await fetchAs(`${Q}/wiki`, b.cookie)).text;
+  const homeTheirs = (await fetchPage(`${Q}/wiki`)).text;
   assert.match(homeTheirs, /OTHER のトップです/);
   assert.ok(homeTheirs.includes(`href="${Q}/t"`) && !homeTheirs.includes(`href="${P}/`), 'every link stays inside the server');
-  assert.ok(!(await fetchAs(`${P}/t`, a.cookie)).text.includes(`href="${Q}/`));
-  const rand = await handleWiki(new Request(`https://wiki.test${Q}/random`, { headers: { cookie: b.cookie } }), both, deps);
+  assert.ok(!(await fetchPage(`${P}/t`)).text.includes(`href="${Q}/`));
+  const rand = await handleWiki(new Request(`https://wiki.test${Q}/random`), both, deps);
   assert.match(rand.headers.get('location'), new RegExp(`^${Q}/wiki/`), 'random stays inside the server');
 
-  // 入場も cookie も混ざらない
-  assert.equal((await fetchAs(`${Q}/wiki`, a.cookie)).status, 401, 'a session for one server does not open another');
-  assert.equal((await fetchAs(`${P}/wiki`, b.cookie)).status, 401);
-  const forgedName = a.cookie.replace(`sk_session_${GUILD}=`, `sk_session_${OTHER}=`);
-  assert.equal((await fetchAs(`${Q}/wiki`, forgedName)).status, 401, 'a real session moved under another server\'s cookie name is refused (its server is checked too)');
-  assert.equal((await fetchAs(`${Q}/wiki`, `${a.cookie}; ${b.cookie}`)).status, 200, 'with both cookies each server uses its own');
-  // OTHER のリンクで、GUILD のページへは進めない (next は自分のサーバーの中だけ)
-  const crossLink = new URL(botSite.siteLoginUrl({ origin: 'https://wiki.test', secret: LINK_SECRET, guildId: OTHER }, { id: '42', name: 'たこ', avatar: null }, { kind: 'home' }, NOW));
-  crossLink.searchParams.set('next', `${P}/wiki/people`);
-  assert.equal((await handleWiki(new Request(crossLink), both, deps)).headers.get('location'), `${Q}/wiki`, 'a link for one server cannot send you into another');
-  // 載せていないサーバー宛てのリンクは受け付けない
-  const stranger = botSite.siteLoginUrl({ origin: 'https://wiki.test', secret: LINK_SECRET, guildId: '777777777' }, { id: '42', name: 'たこ', avatar: null }, { kind: 'home' }, NOW);
-  assert.equal((await handleWiki(new Request(stranger), both, deps)).status, 400, 'a link for a server the site does not serve is refused');
-
   // 載せていないサーバーの URL は、何も見せずに 404
-  for (const path of ['/777777777/wiki', '/777777777/e/1', '/777777777/s?q=a', '/777777777/auth/logout']) {
-    const response = await handleWiki(new Request(`https://wiki.test${path}`), both, deps);
-    if (path.endsWith('/auth/logout')) continue;   // ログアウトは cookie を消すだけ
+  for (const path of ['/777777777/wiki', '/777777777/e/1', '/777777777/s?q=a']) {
+    const response = await fetchPage(path);
     assert.equal(response.status, 404, `${path} is not served`);
-    const text = await response.text();
-    assert.ok(!text.includes('sakana') && !text.includes('OTHER'), 'and shows nothing from any server');
+    assert.ok(!response.text.includes('sakana') && !response.text.includes('OTHER'), 'and shows nothing from any server');
     // どの番号でも同じ答え (そのサーバーがあるかどうかも教えない)
-    assert.equal(text, await (await handleWiki(new Request('https://wiki.test/888888888/wiki'), both, deps)).text(), 'every unserved server answers alike');
+    assert.equal(response.text, (await fetchPage('/888888888/wiki')).text, 'every unserved server answers alike');
   }
   // 旧い URL (サーバーなし): 1つだけ見せているときは転送、複数なら 404 (どのサーバーか決められない)
   const legacy = await handleWiki(new Request('https://wiki.test/wiki/people?tab=timeline'), env, deps);
@@ -548,4 +400,4 @@ const deps = {
   assert.equal(store.monthRange('x'), null);
 }
 
-console.log('wiki ok (escape / 取り込みと差分と prune / 検索 / ログインとメンバー確認 / gate / 全画面 / サーバーごとの分離: データ・URL・cookie・入場・取り込み)');
+console.log('wiki ok (escape / 取り込みと差分と prune / 検索 / 公開 (ログイン無し) / 全画面 / サーバーごとの分離: データ・URL・リンク・検索・取り込み)');

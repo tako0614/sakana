@@ -84,7 +84,7 @@ function sourceLinks(guildId: string, refs: { entries: { channelId: string; mess
     .join(' ');
 }
 
-/** /memory url: サイトの入り口 (その人専用のログインリンク) を、その人にだけ返す。存在しないページ・出来事も本人にだけ断る。 */
+/** /memory url: サイトのリンクを、押した人にだけ返す。存在しないページ・出来事も本人にだけ断る。 */
 async function replyWithSiteUrl(interaction: ChatInputCommandInteraction, guildId: string): Promise<void> {
   const refuse = (content: string) => interaction.reply({ content, flags: MessageFlags.Ephemeral, allowedMentions: NO_PINGS });
   const config = siteConfigFor(guildId);
@@ -134,7 +134,7 @@ export const memoryCommand = {
       .addStringOption((option) => option.setName('query').setDescription('探す語').setRequired(true)))
     .addSubcommand((sub) => sub.setName('episode').setDescription('出来事と根拠の発言を開く')
       .addStringOption((option) => option.setName('id').setDescription('出来事の番号。例: e12').setRequired(true)))
-    .addSubcommand((sub) => sub.setName('url').setDescription('記憶のサイトへの入り口 (あなただけのリンク) を出す')
+    .addSubcommand((sub) => sub.setName('url').setDescription('記憶のサイト (誰でも読める) へのリンクを出す')
       .addStringOption((option) => option.setName('path').setDescription('開くページ。例: people/たこ。空ならトップ'))
       .addStringOption((option) => option.setName('id').setDescription('開く出来事の番号。例: e12')))
     .addSubcommand((sub) => sub.setName('status').setDescription('読み込みの進み具合と費用 (管理者)'))

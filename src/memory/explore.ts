@@ -112,7 +112,7 @@ const button = (customId: string, label: string, { disabled = false, style = But
 const buttonRow = (...buttons: ButtonBuilder[]): ButtonRow => new ActionRowBuilder<ButtonBuilder>().addComponents(buttons);
 
 /**
- * 「サイトで開く」ボタン。押した人にだけ、その人専用のログインリンクを返す (共有した画面でも、リンクは押した人のもの)。
+ * 「サイトで開く」ボタン。押した人にだけ、サイトへのリンクを返す (共有した画面を、リンクで埋めない)。
  * サイトの設定が無い・別のサーバーなら null (ボタンを出さない)。target は画面と同じ表し方 (root / n:<ページ> / e:<出来事>)。
  */
 function siteButton(guildId: string, target: string): ButtonBuilder | null {

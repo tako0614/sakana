@@ -1,6 +1,5 @@
 import { SafeHtml, html, raw } from './html.ts';
 import type { Links } from './links.ts';
-import type { Session } from './types.ts';
 
 // 記憶の枠 (ヘッダー・左の木・右の欄・フッター) と CSS。画面ごとの中身は views.ts。
 // JavaScript は使わない: 木は <details>、スマホの分類メニューはチェックボックス、脚注の強調は :target。
@@ -33,17 +32,15 @@ export interface LayoutOptions {
   nav?: SafeHtml;
   /** 右の欄 (情報欄・目次) */
   rail?: SafeHtml;
-  user?: Session | null;
   query?: string;
-  /** このサーバーの URL (ヘッダーのリンクと検索の送り先)。サーバーが決まらない画面 (ログイン前の案内など) では無い */
+  /** このサーバーの URL (ヘッダーのリンクと検索の送り先)。サーバーが決まらない画面では無い */
   links?: Links;
-  /** ログインなどのように左右の欄が要らない画面 */
+  /** メッセージだけの画面のように左右の欄が要らないもの */
   narrow?: boolean;
 }
 
 export function layout(options: LayoutOptions): SafeHtml {
-  const { title, main, nav, rail, user, query = '', narrow = false, links } = options;
-  const avatar = user?.avatar ? `https://cdn.discordapp.com/avatars/${user.uid}/${user.avatar}.png?size=64` : null;
+  const { title, main, nav, rail, query = '', narrow = false, links } = options;
   return html`<!doctype html>
 <html lang="ja">
 <head>
@@ -67,7 +64,6 @@ ${options.description ? html`<meta name="description" content="${options.descrip
       <input type="search" name="q" value="${query}" placeholder="人・もの・ネタ・出来事を探す" aria-label="検索" autocomplete="off" maxlength="100">
       <button type="submit">検索</button>
     </form>` : ''}
-    ${user && links ? html`<div class="user">${avatar ? html`<img src="${avatar}" alt="" width="24" height="24">` : ''}<span class="uname">${user.name}</span><a href="${links.logout}">ログアウト</a></div>` : ''}
   </div>
 </header>
 ${nav ? html`<input type="checkbox" id="navtoggle" class="navtoggle" aria-hidden="true">` : ''}
@@ -122,9 +118,6 @@ pre.code { background: var(--surface-2); border: 1px solid var(--line); border-r
 .search input { flex: 1; min-width: 0; font: inherit; font-size: .95rem; padding: .42rem .8rem; border: 1px solid var(--line); border-right: 0; border-radius: 999px 0 0 999px; background: var(--surface-2); color: var(--ink); }
 .search input:focus { outline: 2px solid var(--accent); outline-offset: -1px; background: var(--surface); }
 .search button { font: inherit; font-size: .9rem; padding: .42rem .95rem; border: 1px solid var(--accent); border-radius: 0 999px 999px 0; background: var(--accent); color: #fff; cursor: pointer; }
-.user { display: flex; align-items: center; gap: .5rem; font-size: .85rem; color: var(--muted); white-space: nowrap; }
-.user img { border-radius: 50%; }
-.user .uname { max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
 .burger { display: none; cursor: pointer; font-size: 1.3rem; padding: 0 .3rem; user-select: none; }
 .navtoggle { display: none; }
 
@@ -309,7 +302,7 @@ a.m:hover { border-color: var(--accent); }
 .hit .path { font-size: .76rem; color: var(--muted); margin-left: .5rem; font-weight: 400; }
 .empty { color: var(--muted); padding: 1rem 0; }
 
-/* ログイン・メッセージ */
+/* メッセージ */
 .msg { padding: 2rem 1.8rem; text-align: center; }
 .msg h1 { font-size: 1.5rem; margin-bottom: .6rem; }
 .msg p { color: var(--muted); margin: .5rem 0; }
@@ -337,7 +330,6 @@ a.m:hover { border-color: var(--accent); }
 @media (max-width: 860px) {
   .topnav { display: none; }
   .burger { display: block; }
-  .user .uname { display: none; }
   .shell, .shell.has-nav, .shell.has-nav.has-rail, .shell.has-rail { grid-template-columns: minmax(0, 1fr); padding-top: .8rem; }
   .shell.has-nav.has-rail .rail, .shell.has-nav.has-rail main { grid-column: 1; }
   .shell.has-nav.has-rail main { grid-row: 2; }

@@ -155,15 +155,13 @@ const search = interaction({ sub: 'search', admin: false, options: { query: '統
 await memoryCommand.execute(search);
 assert.match(embedText(search.calls[1][1]), /統治機能を作った/);
 
-// url: サイトの入り口 (その人専用のログインリンク) を、その人にだけ返す。存在しないものも本人にだけ断る。
-// 設定 (MEMORY_SITE_PUBLIC_URL と MEMORY_SITE_LINK_SECRET) が揃っていて、サイトが見せるサーバー (MEMORY_TREE_GUILD) でだけ出す
-const { verifyLinkToken } = await import('../worker/src/wiki/auth.ts');
+// url: 記憶のサイト (誰でも読める。ログインは無い) へのリンクを、押した人にだけ返す。存在しないものも本人にだけ断る。
+// 設定 (MEMORY_SITE_PUBLIC_URL) があり、サイトが見せるサーバー (MEMORY_TREE_GUILD) でだけ出す
 {
-  const keys = ['MEMORY_SITE_PUBLIC_URL', 'MEMORY_SITE_LINK_SECRET', 'GOVERNANCE_LAW_SITE_URL', 'MEMORY_TREE_GUILD', 'MEMORY_SITE_GUILD', 'MEMORY_SITE_GUILDS'];
+  const keys = ['MEMORY_SITE_PUBLIC_URL', 'GOVERNANCE_LAW_SITE_URL', 'MEMORY_TREE_GUILD', 'MEMORY_SITE_GUILD', 'MEMORY_SITE_GUILDS'];
   const savedEnv = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   for (const key of keys) delete process.env[key];
   process.env.MEMORY_TREE_GUILD = GUILD;
-  const SECRET = 'link-secret-0123456789abcdef';
   const ask = async (options = {}, overrides = {}) => {
     const call = interaction({ sub: 'url', admin: false, options });
     Object.assign(call, overrides);
@@ -179,11 +177,6 @@ const { verifyLinkToken } = await import('../worker/src/wiki/auth.ts');
   assert.ok(refused(lawOnly), 'the law site URL is not used for the wiki (the wiki may not be deployed yet)');
   assert.match(lawOnly.content, /まだありません/);
   delete process.env.GOVERNANCE_LAW_SITE_URL;
-  process.env.MEMORY_SITE_PUBLIC_URL = 'https://wiki.example.test/';
-  assert.ok(refused(await ask()), 'a site URL without the signing key gives no link');
-  process.env.MEMORY_SITE_LINK_SECRET = 'short';
-  assert.ok(refused(await ask()), 'a weak key is not used');
-  process.env.MEMORY_SITE_LINK_SECRET = SECRET;
   process.env.MEMORY_SITE_PUBLIC_URL = 'http://evil.example';
   assert.ok(refused(await ask()), 'a plain http site is not used');
   process.env.MEMORY_SITE_PUBLIC_URL = 'https://wiki.example.test/';
@@ -192,18 +185,11 @@ const { verifyLinkToken } = await import('../worker/src/wiki/auth.ts');
   await memoryCommand.execute(home);
   assert.deepEqual(home.calls.map((entry) => entry[0]), ['reply'], 'anyone can ask, and it answers at once');
   const homeReply = home.calls[0][1];
-  assert.equal(homeReply.flags, MessageFlags.Ephemeral, 'the link is personal, so only the asker sees it');
+  assert.equal(homeReply.flags, MessageFlags.Ephemeral, 'it answers only the asker (the channel is not filled with links)');
   assert.deepEqual(homeReply.allowedMentions, { parse: [] });
   assert.ok(!homeReply.content.includes('https://'), 'the link is only in the button');
-  assert.match(homeReply.content, /1回だけ開けます/);
-  const homeUrl = new URL(linkOf(homeReply));
-  assert.equal(homeUrl.origin + homeUrl.pathname, 'https://wiki.example.test/auth/link');
-  assert.equal(homeUrl.searchParams.get('next'), `/${GUILD}/wiki`);
-  const claims = await verifyLinkToken(homeUrl.searchParams.get('t'), SECRET, GUILD, Date.now());
-  assert.ok(claims, 'the Worker accepts what the bot made');
-  assert.deepEqual([claims.uid, claims.name, claims.g], ['u1', 'tako', GUILD], 'it names the person who asked and this server');
-  assert.equal(await verifyLinkToken(homeUrl.searchParams.get('t'), SECRET, '910000000000000999', Date.now()), null, 'and not another server');
-  assert.notEqual(new URL(linkOf(await ask())).searchParams.get('t'), homeUrl.searchParams.get('t'), 'every link is different (one-time)');
+  assert.equal(linkOf(homeReply), `https://wiki.example.test/${GUILD}/wiki`, 'a plain public URL: no token, no login');
+  assert.ok(!/1回だけ|あなただけ/.test(homeReply.content), 'and no talk of one-time links');
 
   // サイトに載せていないサーバーでは、リンクを出さない。載せているが記憶がまだ無いサーバーも出さない
   assert.ok(refused(await ask({}, { guildId: '910000000000000999' })), 'a server the site does not list gets no link');
@@ -214,16 +200,15 @@ const { verifyLinkToken } = await import('../worker/src/wiki/auth.ts');
   const noBook = await ask({}, { guildId: '910000000000000999' });
   assert.ok(refused(noBook) && /まだできていません/.test(noBook.content), 'a listed server without a book gets no link either');
   assert.ok(linkOf(await ask()), 'the listed server with a book still gets one');
-  const listed = new URL(linkOf(await ask()));
-  assert.equal(listed.searchParams.get('next'), `/${GUILD}/wiki`, 'the link points into this server\'s own path');
+  assert.equal(linkOf(await ask()), `https://wiki.example.test/${GUILD}/wiki`, 'the link points into this server\'s own path');
   delete process.env.MEMORY_SITE_GUILDS;
 
   const page = await ask({ path: '/people/たこ/' });
-  assert.equal(new URL(linkOf(page)).searchParams.get('next'), `/${GUILD}/wiki/people/%E3%81%9F%E3%81%93`, 'a page link encodes each part');
+  assert.equal(linkOf(page), `https://wiki.example.test/${GUILD}/wiki/people/%E3%81%9F%E3%81%93`, 'a page link encodes each part');
   assert.match(page.content, /people\/たこ — sakana の作者/);
   assert.ok(refused(await ask({ path: 'people/いない' })), 'an unknown page is refused');
   const byEpisode = await ask({ id: `E${episode}` });
-  assert.equal(new URL(linkOf(byEpisode)).searchParams.get('next'), `/${GUILD}/e/${episode}`, 'an episode link');
+  assert.equal(linkOf(byEpisode), `https://wiki.example.test/${GUILD}/e/${episode}`, 'an episode link');
   assert.match(byEpisode.content, /統治機能を作った/);
   for (const bad of ['e99999', 'abc', '1; DROP']) assert.ok(refused(await ask({ id: bad })), `an unknown episode (${bad}) is refused`);
   const mentions = await ask({ path: '@everyone <@&1>' });
@@ -329,15 +314,12 @@ checkLimits(episodeJson, 'episode');
 const episodeId = store.getEpisode(GUILD, Number(episodeOption.value.split(':')[1])).id;
 assert.deepEqual(siteButtons(episodeJson).map((b) => b.custom_id), [`memx:site:e:${episodeId}`], 'an episode has one too');
 {
-  // 押すと、押した人にだけ専用のログインリンクが返る (共有した画面でも、リンクは押した人のもの)
+  // 押すと、押した人にだけサイトへのリンクが返る (共有した画面を、リンクで埋めない)
   const pressed = click({ customId: `memx:site:n:${siteNodeId}`, allowReply: true });
   assert.equal(await handleMemoryComponent(pressed), true);
   const reply = pressed.replies[0];
   assert.equal(reply.flags, MessageFlags.Ephemeral, 'the link goes only to whoever pressed');
-  const url = new URL(reply.components[0].toJSON().components[0].url);
-  assert.equal(url.searchParams.get('next'), `/${GUILD}/wiki/people/%E3%81%9F%E3%81%93`);
-  const claims = await verifyLinkToken(url.searchParams.get('t'), 'link-secret-0123456789abcdef', GUILD, Date.now());
-  assert.equal(claims?.uid, 'u1');
+  assert.equal(reply.components[0].toJSON().components[0].url, `https://wiki.example.test/${GUILD}/wiki/people/%E3%81%9F%E3%81%93`, 'a plain public URL');
   const gone = click({ customId: 'memx:site:n:999999', allowReply: true });
   await handleMemoryComponent(gone);
   assert.match(gone.replies[0].content, /サイトにありません/, 'a page that is gone says so');

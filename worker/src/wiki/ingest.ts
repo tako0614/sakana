@@ -1,4 +1,4 @@
-import { memoryGuilds } from './auth.ts';
+import { memoryGuilds } from './links.ts';
 import { GUILD_ID } from './links.ts';
 import type { EpisodePayload, Env, NodePayload } from './types.ts';
 
