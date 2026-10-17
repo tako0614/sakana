@@ -1,4 +1,4 @@
-// 記憶の本 (wiki) の型。D1 の行・押し込みの本文・画面に渡す値。
+// 記憶 (wiki) の型。D1 の行・押し込みの本文・画面に渡す値。
 
 export interface Env {
   LAWS: D1Database;

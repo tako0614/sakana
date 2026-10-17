@@ -57,7 +57,7 @@ export interface TestD1 {
   raw: Database.Database;
 }
 
-/** migrations/ の SQL を順に当てた空の D1。0001/0002 (法令集) と 0003 (記憶の本) を入れる。 */
+/** migrations/ の SQL を順に当てた空の D1。0001/0002 (法令集) と 0003 (記憶) を入れる。 */
 export function createD1(): TestD1 {
   const db = new Database(':memory:');
   const dir = join(dirname(fileURLToPath(import.meta.url)), '..', 'migrations');

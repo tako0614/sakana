@@ -2,7 +2,7 @@ import { memoryGuilds } from './auth.ts';
 import { GUILD_ID } from './links.ts';
 import type { EpisodePayload, Env, NodePayload } from './types.ts';
 
-// bot (builder の後に動く memory-site-sync) から記憶の本を受け取る口。
+// bot (builder の後に動く memory-site-sync) から記憶を受け取る口。
 //   GET  /v1/memory/hashes?guild=ID      いま持っている行の content_hash (差分を取るため)
 //   POST /v1/memory/batch                ページと出来事を入れ替える (複数件)
 //   POST /v1/memory/prune                bot で消えた行を消す

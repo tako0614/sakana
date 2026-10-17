@@ -1,7 +1,7 @@
 import { createHmac, randomBytes } from 'node:crypto';
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, type User } from 'discord.js';
 
-// 記憶の本のサイト (worker/ の /wiki) への入り口。/memory url と explore の「サイトで開く」が使う。
+// 記憶のサイト (worker/ の /wiki) への入り口。/memory url と explore の「サイトで開く」が使う。
 //
 // サイトはメンバーだけに見せる。入り方は bot のログインリンク: メンバーがこの bot を使うと、bot は
 // (そのサーバーにいる人だと分かっているので) 10分だけ有効な1回限りのリンクを、その人にだけ返す。

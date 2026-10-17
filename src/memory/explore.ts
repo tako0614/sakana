@@ -13,7 +13,7 @@ import {
 import { replyWithSiteLink, siteConfigFor, type SiteTarget } from './site.js';
 import { errorCode, errorMessage, type QuoteFilter } from './types.js';
 
-// /memory explore: 記憶の本を Discord の中でたどる画面。本人にだけ見える。
+// /memory explore: 記憶を Discord の中でたどる画面。本人にだけ見える。
 //
 //   ページ   パンくず・説明・本文 ([[リンク]] は太字の名前、[e12] は消してメニューへ)・
 //            子ページ (ページ送り)・つながり・最近の出来事
@@ -102,7 +102,7 @@ function nodeById(guildId: string, id: unknown): MemoryNode | null {
   return row ? getNode(guildId, row.path) : null;
 }
 
-const breadcrumb = (path: string): string => ['📖 記憶の本', ...(path ? path.split('/') : [])].join(' › ');
+const breadcrumb = (path: string): string => ['📖 記憶', ...(path ? path.split('/') : [])].join(' › ');
 
 const select = (customId: string, placeholder: string, options: MenuOption[]): MenuRow => new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
   new StringSelectMenuBuilder().setCustomId(customId).setPlaceholder(placeholder).addOptions(uniqueOptions(options))
@@ -122,12 +122,12 @@ function siteButton(guildId: string, target: string): ButtonBuilder | null {
 /** 画面の target を、サイトの行き先にする。存在しなければ null。 */
 function siteTargetFor(guildId: string, target: string): { target: SiteTarget; label: string } | null {
   const [kind, rawId] = target.split(':');
-  if (target === 'root') return { target: { kind: 'home' }, label: '記憶の本' };
+  if (target === 'root') return { target: { kind: 'home' }, label: '記憶' };
   const id = Number(rawId);
   if (!Number.isSafeInteger(id) || id < 0) return null;
   if (kind === 'n') {
     const node = nodeById(guildId, id);
-    return node ? { target: node.path ? { kind: 'page', path: node.path } : { kind: 'home' }, label: node.path || '記憶の本' } : null;
+    return node ? { target: node.path ? { kind: 'page', path: node.path } : { kind: 'home' }, label: node.path || '記憶' } : null;
   }
   if (kind === 'e') {
     const episode = getEpisode(guildId, id);
@@ -172,7 +172,7 @@ export function pageView(guildId: string, node: MemoryNode, { offset = 0, shared
 
   const embed = new EmbedBuilder().setColor(COLOR)
     .setAuthor({ name: clip(breadcrumb(node.path), 250) })
-    .setTitle(clip(isRoot ? '記憶の本' : nameOf(node.path), 250));
+    .setTitle(clip(isRoot ? '記憶' : nameOf(node.path), 250));
 
   const totalChildren = countChildren(guildId, node.path);
   const children = listChildren(guildId, node.path, offset + CHILDREN_PER_PAGE).slice(offset);
@@ -317,7 +317,7 @@ export function timelineView(guildId: string, node: MemoryNode, { offset = 0, sh
   const { total, rows } = episodeTimeline(guildId, node.path, { offset, limit: TIMELINE_PER_PAGE });
   const embed = new EmbedBuilder().setColor(COLOR)
     .setAuthor({ name: clip(breadcrumb(node.path), 250) })
-    .setTitle(clip(`🕒 ${nameOf(node.path) || '記憶の本'} の年表`, 250))
+    .setTitle(clip(`🕒 ${nameOf(node.path) || '記憶'} の年表`, 250))
     .setDescription(rows.length
       ? clip(rows.map((episode) => `${kindEmoji(episode.kind)} **${day(episode.at_ms)}** ${episode.title}\n-# ${clip(renderText(episode.summary), 110)}`).join('\n'), 3800)
       : 'まだ出来事がありません。')
@@ -341,7 +341,7 @@ export function searchView(guildId: string, query: string): MemoryView {
   if (pages.length) lines.push('**ページ**', ...pages.map((row) => `📁 **${row.path}** ${row.summary ?? ''}`));
   if (episodes.length) lines.push('', '**出来事**', ...episodes.map((row) => `${kindEmoji(row.kind)} ${day(row.at_ms)} ${row.title}`));
   const embed = new EmbedBuilder().setColor(COLOR)
-    .setAuthor({ name: '📖 記憶の本 › 探す' })
+    .setAuthor({ name: '📖 記憶 › 探す' })
     .setTitle(clip(`🔍 「${query}」`, 250))
     .setDescription(lines.length ? clip(lines.join('\n'), 3800) : '見つかりませんでした。別の言い方で探すか、原文は /search で。');
   const options: MenuOption[] = [];
@@ -361,7 +361,7 @@ export function searchView(guildId: string, query: string): MemoryView {
 
 export function rootView(guildId: string, { shared = false }: { shared?: boolean } = {}): MemoryView {
   const root = getNode(guildId, '');
-  return root ? pageView(guildId, root, { shared }) : { content: '記憶の本はまだできていません。', embeds: [], components: [] };
+  return root ? pageView(guildId, root, { shared }) : { content: '記憶はまだできていません。', embeds: [], components: [] };
 }
 
 /**
@@ -482,7 +482,7 @@ function shareRefusal(interaction: MemoryInteraction, guildId: string, target: s
 const sharedIn = (interaction: MemoryInteraction): boolean => Boolean(interaction.message) && !interaction.message?.flags?.has?.(MessageFlags.Ephemeral);
 
 function searchModal(): ModalBuilder {
-  return new ModalBuilder().setCustomId(`${PREFIX}:q`).setTitle('記憶の本を探す').addComponents(
+  return new ModalBuilder().setCustomId(`${PREFIX}:q`).setTitle('記憶を探す').addComponents(
     new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder().setCustomId('query').setLabel('探す語 (人・作ったもの・ネタ・レスバなど)')
       .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(100))
   );
@@ -528,7 +528,7 @@ export async function handleMemoryComponent(interaction: MemoryInteraction): Pro
       if (refusal) { await interaction.reply({ content: refusal, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } }); return true; }
       await reply({
         ...viewFor(guildId, target, { shared: true, canQuote: sharedQuotes }),
-        content: `-# 📖 ${interaction.user} が記憶の本を共有しました · ボタンは誰でも操作できます (全員の画面が変わります)`,
+        content: `-# 📖 ${interaction.user} が記憶を共有しました · ボタンは誰でも操作できます (全員の画面が変わります)`,
         allowedMentions: { parse: [] }
       });
       return true;

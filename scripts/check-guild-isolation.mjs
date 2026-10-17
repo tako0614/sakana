@@ -9,7 +9,7 @@ const directory = mkdtempSync(join(tmpdir(), 'sakana-guild-isolation-'));
 process.env.DATABASE_PATH = join(directory, 'main.sqlite');
 process.env.ARCHIVE_DB_PATH = join(directory, 'archive.sqlite');
 process.env.AGENT_RUNTIME_PATH = join(directory, 'runs.sqlite');
-// 記憶の本の DB と本物のブラウザには触れない (tools.js を読み込むだけで開かれる)
+// 記憶の DB と本物のブラウザには触れない (tools.js を読み込むだけで開かれる)
 process.env.MEMORY_DB_PATH ??= join(directory, 'memory.sqlite');
 process.env.AGENT_BROWSER = '0';
 const { db, saveMessage, upsertChannel } = await import('../src/archive/db.js');

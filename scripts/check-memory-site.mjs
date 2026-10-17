@@ -1,4 +1,4 @@
-// 記憶の本を公開サイトへ送る経路の検証 (npm run check から tsx で呼ぶ)。
+// 記憶を公開サイトへ送る経路の検証 (npm run check から tsx で呼ぶ)。
 //
 //   memory.sqlite → buildSnapshot → syncSite → (HTTP の代わりに) サイトの取り込み口 → D1 (代用品)
 //

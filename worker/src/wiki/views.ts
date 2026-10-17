@@ -116,7 +116,7 @@ export function homeView(data: HomeData): Page {
     : null;
   const main = html`
 <section class="card hero">
-  <h1>📖 記憶の本</h1>
+  <h1>📖 記憶</h1>
   <p>サーバーの会話をひとつずつ読んで、人・作ったもの・ネタ・出来事としてまとめた、みんなの wiki です。ページの文末の [数字] から、元になった出来事と発言までたどれます。</p>
   <div class="stats">
     <span><b>${number(stats.pages)}</b>ページ</span>
@@ -148,7 +148,7 @@ ${recentMonths.length > 1 ? html`<section class="sec">
   </section>
 </div>
 ${stats.syncedAt ? html`<p class="empty" style="margin-top:2rem;font-size:.8rem">最終更新 ${fmtDate(stats.syncedAt)} ${fmtTime(stats.syncedAt)}</p>` : ''}`;
-  return { title: '記憶の本', description: '会話から作った、サーバーの wiki', main };
+  return { title: '記憶', description: '会話から作った、サーバーの wiki', main };
 }
 
 // ---- 記事 -------------------------------------------------------------------
@@ -251,7 +251,7 @@ export function articleView(data: ArticleData): Page {
   const top = node.path.split('/')[0] ?? '';
   const refs = [...numbering.entries()].map(([id, no]) => ({ id, no, ep: data.cited.get(id) })).filter((entry): entry is { id: number; no: number; ep: EpisodeBrief } => Boolean(entry.ep));
 
-  const crumbs = html`<nav class="crumbs" aria-label="パンくず"><a href="${links.home}">記憶の本</a>${data.ancestors.map((ancestor) => html`<span class="sep">›</span>${ancestor.found ? html`<a href="${links.wiki(ancestor.path)}">${ancestor.name}</a>` : html`<span class="missing">${ancestor.name}</span>`}`)}</nav>`;
+  const crumbs = html`<nav class="crumbs" aria-label="パンくず"><a href="${links.home}">記憶</a>${data.ancestors.map((ancestor) => html`<span class="sep">›</span>${ancestor.found ? html`<a href="${links.wiki(ancestor.path)}">${ancestor.name}</a>` : html`<span class="missing">${ancestor.name}</span>`}`)}</nav>`;
 
   let content: SafeHtml;
   if (data.tab === 'timeline' && data.timeline) {
@@ -312,7 +312,7 @@ export function articleView(data: ArticleData): Page {
     ${node.pending_count ? html`<dt>メモ</dt><dd>${number(node.pending_count)} 件が本文待ち</dd>` : ''}
   </dl></div>
   ${body && body.headings.length > 1 ? html`<nav class="card toc" aria-label="目次"><h2>目次</h2><ol>${body.headings.map((heading) => html`<li><a class="l${heading.level}" href="#${heading.id}">${heading.text}</a></li>`)}</ol></nav>` : ''}`;
-  return { title: `${node.name} - 記憶の本`, description: node.summary || undefined, main, rail, nav: data.nav };
+  return { title: `${node.name} - 記憶`, description: node.summary || undefined, main, rail, nav: data.nav };
 }
 
 function safeJsonArray(value: string): string[] {
@@ -347,7 +347,7 @@ export function episodeView(data: EpisodeData): Page {
   const evidence = data.quotes.filter((quote) => !quote.highlight);
   const main = html`<article class="card article ${style.cls}">
   <header class="ep-head">
-    <nav class="crumbs" aria-label="パンくず"><a href="${links.home}">記憶の本</a><span class="sep">›</span><a href="${links.timeline}">年表</a><span class="sep">›</span><a href="${links.month(jstMonth(ep.at_ms))}">${fmtMonth(jstMonth(ep.at_ms))}</a></nav>
+    <nav class="crumbs" aria-label="パンくず"><a href="${links.home}">記憶</a><span class="sep">›</span><a href="${links.timeline}">年表</a><span class="sep">›</span><a href="${links.month(jstMonth(ep.at_ms))}">${fmtMonth(jstMonth(ep.at_ms))}</a></nav>
     <div class="when">${kindPill(ep.kind)}<time datetime="${fmtDate(ep.at_ms)}">${fmtDate(ep.at_ms)} ${fmtTime(ep.at_ms)}</time>${ep.channel_name ? html`<span>#${ep.channel_name}</span>` : ''}<span class="imp" title="重要度">${stars(ep.importance)}</span></div>
     <h1>${ep.title}</h1>
   </header>
@@ -361,7 +361,7 @@ export function episodeView(data: EpisodeData): Page {
     ${data.after.length ? html`<div><h3>続き →</h3><ul class="eps">${data.after.map((row) => episodeItem(row, links, { channel: false }))}</ul></div>` : ''}
   </div></section>` : ''}
 </article>`;
-  return { title: `${ep.title} - 記憶の本`, description: plainText(ep.summary, 120), main, nav: data.nav };
+  return { title: `${ep.title} - 記憶`, description: plainText(ep.summary, 120), main, nav: data.nav };
 }
 
 // ---- 年表 -------------------------------------------------------------------
@@ -387,7 +387,7 @@ export function timelineIndexView(months: { month: string; n: number }[], nav: S
       : html`<span class="m empty">${index + 1}月<small>-</small></span>`;
   })}</div></div>`)}</div>
 </section>`;
-  return { title: '年表 - 記憶の本', main, nav };
+  return { title: '年表 - 記憶', main, nav };
 }
 
 export interface MonthData {
@@ -412,7 +412,7 @@ export function monthView(data: MonthData): Page {
     days.set(key, [...(days.get(key) ?? []), row]);
   }
   const main = html`<section class="card article">
-  <nav class="crumbs" aria-label="パンくず"><a href="${links.home}">記憶の本</a><span class="sep">›</span><a href="${links.timeline}">年表</a></nav>
+  <nav class="crumbs" aria-label="パンくず"><a href="${links.home}">記憶</a><span class="sep">›</span><a href="${links.timeline}">年表</a></nav>
   <div class="monthnav">${data.prev ? html`<a href="${links.month(data.prev, data.kind)}">← ${fmtMonth(data.prev)}</a>` : html`<span></span>`}${data.next ? html`<a href="${links.month(data.next, data.kind)}">${fmtMonth(data.next)} →</a>` : html`<span></span>`}</div>
   <h1 style="font-size:1.7rem">${fmtMonth(data.month)} <small style="font-size:.9rem;color:var(--muted);font-weight:400">${number(data.total)} 件</small></h1>
   <div class="filters" role="group" aria-label="種類で絞る">
@@ -422,7 +422,7 @@ export function monthView(data: MonthData): Page {
   ${data.rows.length ? joinHtml([...days.entries()].map(([date, rows]) => html`<h3 class="month-h">${fmtDay(rows[0]?.at_ms ?? 0)}</h3><ul class="eps">${rows.map((row) => episodeItem(row, links))}</ul>`)) : html`<p class="empty">この月の出来事はありません。</p>`}
   ${pager((page) => `${links.month(data.month, data.kind)}${data.kind ? '&' : '?'}page=${page}`, data.page, data.total, data.perPage)}
 </section>`;
-  return { title: `${fmtMonth(data.month)} - 年表 - 記憶の本`, main, nav: data.nav };
+  return { title: `${fmtMonth(data.month)} - 年表 - 記憶`, main, nav: data.nav };
 }
 
 // ---- 検索 -------------------------------------------------------------------
@@ -439,14 +439,14 @@ export function searchView(query: string, nodes: NodeHit[], episodes: EpisodeHit
     ${episodes.length ? html`<ul class="eps">${episodes.map((hit) => episodeItem(hit, links))}</ul>` : html`<p class="empty">一致する出来事はありません。</p>`}
   </section>` : ''}
 </section>`;
-  return { title: `${query} - 検索 - 記憶の本`, main, nav };
+  return { title: `${query} - 検索 - 記憶`, main, nav };
 }
 
 // ---- メッセージ ---------------------------------------------------------------
 
 export function messageView(title: string, message: string, options: { status?: number; link?: { href: string; label: string }; nav?: SafeHtml } = {}): Page {
   return {
-    title: `${title} - 記憶の本`,
+    title: `${title} - 記憶`,
     status: options.status ?? 200,
     narrow: !options.nav,
     nav: options.nav,
@@ -456,10 +456,10 @@ export function messageView(title: string, message: string, options: { status?: 
 
 export function loginView(next: string, methods: { oauth: boolean; link: boolean }, links: Links): Page {
   return {
-    title: 'ログイン - 記憶の本',
+    title: 'ログイン - 記憶',
     narrow: true,
     status: 401,
-    main: html`<section class="card msg"><h1>📖 記憶の本</h1>
+    main: html`<section class="card msg"><h1>📖 記憶</h1>
     <p>サーバーの人のことや会話がまとまっているので、このサーバーのメンバーだけが読めます。</p>
     ${methods.link ? html`<p class="notice">Discord のサーバーで <b>/memory url</b> を使うと、あなただけに入り口のリンクが出ます (10分だけ有効・1回だけ使えます)。</p>` : ''}
     ${methods.oauth ? html`<a class="btn" href="/auth/login${qs({ g: links.guild, next })}">Discord でログイン</a><p style="font-size:.8rem">ユーザー名とサーバーに入っているかを確かめるだけで、メッセージやフレンドは見ません。</p>` : ''}</section>`

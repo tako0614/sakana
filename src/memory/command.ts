@@ -16,7 +16,7 @@ import { parseEpisodeId, replyWithSiteLink, siteConfigFor, type SiteTarget } fro
 import { hasMemory, runMemoryTool, type MemoryRefTable } from './tool.js';
 import { errorMessage } from './types.js';
 
-// /memory: 記憶の本の進み具合を見る・止める (管理者)、ページや出来事を開く (誰でも)。
+// /memory: 記憶の進み具合を見る・止める (管理者)、ページや出来事を開く (誰でも)。
 // 記憶 (要約とページ) は公開チャンネルと管理者が入れたチャンネルから作っていて、開くのは誰に見せてもよい。
 // ただし出来事の原文 (根拠の発言とそのリンク) は、開いた人が見られるチャンネルのものだけ出す。
 // 返事は本人にだけ見える形にし (チャンネルを流さない)、誰にも通知しない (allowedMentions)。
@@ -51,7 +51,7 @@ function statusEmbed(status: MemoryStatus & { included: string[] }): EmbedBuilde
   const budget = status.budgetUsd > 0 ? ` / 月の上限 $${status.budgetUsd}` : '';
   return new EmbedBuilder()
     .setColor('#2b2d31')
-    .setTitle('🧠 記憶の本')
+    .setTitle('🧠 記憶')
     .addFields(
       { name: '状態', value: state, inline: true },
       { name: '最後に読んだ区切り', value: ago(status.lastDoneAt), inline: true },
@@ -89,23 +89,23 @@ async function replyWithSiteUrl(interaction: ChatInputCommandInteraction, guildI
   const refuse = (content: string) => interaction.reply({ content, flags: MessageFlags.Ephemeral, allowedMentions: NO_PINGS });
   const config = siteConfigFor(guildId);
   if (!config) {
-    await refuse('このサーバーの記憶の本のサイトはまだありません。');
+    await refuse('このサーバーの記憶のサイトはまだありません。');
     return;
   }
   if (!hasMemory(guildId)) {
-    await refuse('このサーバーの記憶の本はまだできていません。');
+    await refuse('このサーバーの記憶はまだできていません。');
     return;
   }
   const { getEpisode, getNode } = await import('./store.js');
   const idText = interaction.options.getString('id');
   const pathText = (interaction.options.getString('path') ?? '').replace(/^\/+|\/+$/g, '').trim();
   let target: SiteTarget = { kind: 'home' };
-  let label = '記憶の本';
+  let label = '記憶';
   if (idText) {
     const id = parseEpisodeId(idText);
     const episode = id === null ? null : getEpisode(guildId, id);
     if (id === null || !episode) {
-      await refuse(`出来事 ${idText.slice(0, 20)} は記憶の本にありません。`);
+      await refuse(`出来事 ${idText.slice(0, 20)} は記憶にありません。`);
       return;
     }
     target = { kind: 'episode', id };
@@ -113,7 +113,7 @@ async function replyWithSiteUrl(interaction: ChatInputCommandInteraction, guildI
   } else if (pathText) {
     const node = getNode(guildId, pathText);
     if (!node) {
-      await refuse(`ページ「${pathText.slice(0, 60)}」は記憶の本にありません。`);
+      await refuse(`ページ「${pathText.slice(0, 60)}」は記憶にありません。`);
       return;
     }
     target = { kind: 'page', path: node.path };
@@ -125,8 +125,8 @@ async function replyWithSiteUrl(interaction: ChatInputCommandInteraction, guildI
 export const memoryCommand = {
   data: new SlashCommandBuilder()
     .setName('memory')
-    .setDescription('記憶の本 (過去ログを整理したもの) を見る')
-    .addSubcommand((sub) => sub.setName('explore').setDescription('記憶の本をメニューでたどって読む')
+    .setDescription('記憶 (過去ログを整理したもの) を見る')
+    .addSubcommand((sub) => sub.setName('explore').setDescription('記憶をメニューでたどって読む')
       .addStringOption((option) => option.setName('path').setDescription('最初に開くページ。例: people/たこ。空なら根')))
     .addSubcommand((sub) => sub.setName('show').setDescription('ページを開く (説明・子・つながり・出来事)')
       .addStringOption((option) => option.setName('path').setDescription('例: people/たこ。空なら根')))
@@ -134,7 +134,7 @@ export const memoryCommand = {
       .addStringOption((option) => option.setName('query').setDescription('探す語').setRequired(true)))
     .addSubcommand((sub) => sub.setName('episode').setDescription('出来事と根拠の発言を開く')
       .addStringOption((option) => option.setName('id').setDescription('出来事の番号。例: e12').setRequired(true)))
-    .addSubcommand((sub) => sub.setName('url').setDescription('記憶の本のサイトへの入り口 (あなただけのリンク) を出す')
+    .addSubcommand((sub) => sub.setName('url').setDescription('記憶のサイトへの入り口 (あなただけのリンク) を出す')
       .addStringOption((option) => option.setName('path').setDescription('開くページ。例: people/たこ。空ならトップ'))
       .addStringOption((option) => option.setName('id').setDescription('開く出来事の番号。例: e12')))
     .addSubcommand((sub) => sub.setName('status').setDescription('読み込みの進み具合と費用 (管理者)'))
@@ -186,7 +186,7 @@ export const memoryCommand = {
       }
       if (interaction.options.getSubcommandGroup?.(false) === 'category') {
         if (sub === 'list') {
-          await edit({ embeds: [new EmbedBuilder().setColor('#2b2d31').setTitle('記憶の本の最上位')
+          await edit({ embeds: [new EmbedBuilder().setColor('#2b2d31').setTitle('記憶の最上位')
             .setDescription(`${categoryList(guildId)}\n\n書き手は必ずこの中から選び、合わなければ ${OTHERS} に入れる。最上位の下は自由。`)] });
           return;
         }
@@ -233,7 +233,7 @@ export const memoryCommand = {
         return;
       }
       if (!hasMemory(guildId)) {
-        await edit('記憶の本はまだできていません。');
+        await edit('記憶はまだできていません。');
         return;
       }
       // 出来事の原文は、このコマンドを使った人が見られるチャンネルのものだけ

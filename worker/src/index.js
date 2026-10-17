@@ -159,7 +159,7 @@ function html(body, status = 200) {
 
 export default {
   async fetch(request, env) {
-    // 記憶の本 (/wiki・/e・/t・/s・/auth・/v1/memory)。該当しなければ null で、法令集の処理へ進む
+    // 記憶 (/wiki・/e・/t・/s・/auth・/v1/memory)。該当しなければ null で、法令集の処理へ進む
     const wiki = await handleWiki(request, env);
     if (wiki) return wiki;
     const url = new URL(request.url);

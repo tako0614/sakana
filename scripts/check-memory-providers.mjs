@@ -1,4 +1,4 @@
-// 記憶の本の書き手が、壊れた出力を返す provider を外して取り直すことの検証 (npm run check から呼ぶ)。
+// 記憶の書き手が、壊れた出力を返す provider を外して取り直すことの検証 (npm run check から呼ぶ)。
 //
 // 2026-10-15、OpenRouter が glm-5.3-flash を回す先のうち OpenInference は3万トークン読ませても
 // {"episodes":[],"facts":[]} だけを返し、Morph は半数が 16000 トークンまで暴走した。

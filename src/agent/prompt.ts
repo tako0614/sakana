@@ -153,7 +153,7 @@ export function buildSystemPrompt(ctx: PromptContext, toolset: ToolAvailability)
   // ブラウザを「貼られたリンクを開く道具」としか書いていなかったので、
   // モデルは知らないことを記憶で埋めるか「分からない」で終わらせていた。
   // 使える場面 (ログの外の事実) の側から書く。
-  // 記憶の本。根は末尾に置く (毎回同じ文面なのでキャッシュの前方一致を壊さない)。
+  // 記憶。根は末尾に置く (毎回同じ文面なのでキャッシュの前方一致を壊さない)。
   if (toolset.memoryAvailable) {
     lines.push(
       '- このサーバーの人・作っているもの・過去の出来事・用語は、まず「記憶」と入力の「思い出したこと」を見て、'
@@ -235,7 +235,7 @@ export function buildUserContent({ ctx, prompt, extras, recent, replyChain, requ
 
   sections.push(head.join('\n'));
 
-  // 会話に出た名前から思い出したこと (記憶の本)。背景知識なので会話より前に置く。
+  // 会話に出た名前から思い出したこと (記憶)。背景知識なので会話より前に置く。
   if (recall) sections.push(`## ${recall}`);
 
   const chain = replyChain ?? [];

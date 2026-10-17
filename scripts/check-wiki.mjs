@@ -1,4 +1,4 @@
-// 記憶の本 (wiki) の検証 (npm run check から tsx で呼ぶ)。
+// 記憶 (wiki) の検証 (npm run check から tsx で呼ぶ)。
 //
 //   - 描画は escape 済みの部品だけで組まれる: 本文・名前・発言に <script> や onerror= を書いても文字として出る
 //   - bot からの取り込み: Bearer が要る / 変な本文は 400 / 同じ内容を何度送っても同じ / 消した行は prune で消える
@@ -337,7 +337,7 @@ const deps = {
 
   const home = await page(`${P}/wiki`);
   assert.equal(home.response.status, 200);
-  assert.match(home.text, /<title>記憶の本<\/title>/);
+  assert.match(home.text, /<title>記憶<\/title>/);
   assert.match(home.text, /開発と雑談のサーバー/, 'the root page is the overview');
   assert.match(home.text, /href="\/1255359848644608035\/wiki\/people"/, 'categories');
   assert.match(home.text, /href="\/1255359848644608035\/e\/\d+"/, 'recent episodes');

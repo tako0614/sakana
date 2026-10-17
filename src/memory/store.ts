@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { tuneSqlite } from '../sqlite.js';
 import { isRecord, stringList, type Cursor, type SegmentRecord } from './types.js';
 
-// 記憶の本。過去ログを区切りごとに AI へ渡して、2層に整理する。
+// 記憶。過去ログを区切りごとに AI へ渡して、2層に整理する。
 //
 //   出来事 (episodes): いつ・誰が・何を・どうなった、の短い要約。根拠の発言 ID を持つ。
 //                      ここが「元の発言までたどれる」層で、関わったページ同士を結ぶ。

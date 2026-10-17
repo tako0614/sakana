@@ -13,7 +13,7 @@ import { memoryRootPrompt, runMemoryTool } from '../src/memory/tool.js';
 import { planPack } from '../src/memory/transcript.js';
 import { arrayOf, errorMessage, isLockState, isRecord, type JsonRecord } from '../src/memory/types.js';
 
-// 記憶の本の builder。bot とは別プロセスで動かす (systemd timer: deploy/sakana-memory.*)。
+// 記憶の builder。bot とは別プロセスで動かす (systemd timer: deploy/sakana-memory.*)。
 // TypeScript なので tsx を通して動かす (src の .ts を読む)。
 //
 //   node --import tsx scripts/memory-tree.ts status  --guild ID          進み具合 (AI を呼ばない)

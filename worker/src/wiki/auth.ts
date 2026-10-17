@@ -1,7 +1,7 @@
 import { GUILD_ID } from './links.ts';
 import type { Env, Session } from './types.ts';
 
-// 記憶の本を読めるのは、このサーバーのメンバーだけにする。入り方は2つ:
+// 記憶を読めるのは、このサーバーのメンバーだけにする。入り方は2つ:
 //   1. bot のログインリンク (既定): メンバーが Discord で /memory url を使うと、bot が (そのサーバーのメンバーだと
 //      分かっているので) 10分だけ有効な1回限りのリンクを本人にだけ返す。サイトは署名を確かめて cookie を渡す。
 //      Discord 側の設定 (OAuth アプリ・Client Secret) が要らない。
@@ -94,7 +94,7 @@ function setCookie(url: URL, name: string, value: string, options: { maxAge: num
 
 // ---- 設定 -------------------------------------------------------------------
 
-/** 記憶の本を見せるサーバー。URL の /<サーバーID> がこの一覧にあるものだけ開く (無ければ 404)。 */
+/** 記憶を見せるサーバー。URL の /<サーバーID> がこの一覧にあるものだけ開く (無ければ 404)。 */
 export function memoryGuilds(env: Env): string[] {
   const raw = `${env.MEMORY_GUILD_IDS ?? ''} ${env.MEMORY_GUILD_ID ?? ''} ${env.DEFAULT_GUILD_ID ?? ''}`;
   return [...new Set(raw.split(/[\s,]+/).filter((id) => GUILD_ID.test(id)))];

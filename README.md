@@ -2,7 +2,7 @@
 
 `discord.js` で動く、憲法・立法・司法・行政執行を備えたAIコミュニティ統治botです。
 
-過去ログは[記憶の本](docs/memory-tree.md)にまとめます。公開チャンネルのログを区切りごとにOpenRouterの無料モデルへ渡し、根拠の発言を持つ出来事と、それを統合したページの木に整理します。会話では根だけを常駐させ、会話に出た名前から関係するページと出来事を思い出し、`memory`ツールでページ → 出来事 → 元の発言とたどります。
+過去ログは[記憶](docs/memory-tree.md)にまとめます。公開チャンネルのログを区切りごとにOpenRouterの無料モデルへ渡し、根拠の発言を持つ出来事と、それを統合したページの木に整理します。会話では根だけを常駐させ、会話に出た名前から関係するページと出来事を思い出し、`memory`ツールでページ → 出来事 → 元の発言とたどります。
 
 ## Browser chat
 
@@ -636,7 +636,7 @@ AI_MODEL=z-ai/glm-5.3-flash         # 統治と、モデルを指定しない呼
 AGENT_MODEL_LING=inclusionai/ling-3.0-flash   # /model ling (既定)
 AGENT_MODEL_GLM=z-ai/glm-5.3-flash            # /model glm
 AGENT_MODEL_QWEN=qwen/qwen3.7-flash           # /model qwen
-MEMORY_TREE_MODELS=z-ai/glm-5.3-flash,inclusionai/ling-3.0-flash  # 記憶の本を作るモデル (docs/memory-tree.md)
+MEMORY_TREE_MODELS=z-ai/glm-5.3-flash,inclusionai/ling-3.0-flash  # 記憶を作るモデル (docs/memory-tree.md)
 AGENT_REASONING_EFFORT=medium       # low / medium / high
 AGENT_THINKING=true
 
@@ -839,7 +839,7 @@ EMOTION_ANALYSIS_TIMEOUT_MS=180000
 
 ## Install
 
-Node.js 22.13以上が必要です。会話・統治agentは共通の実行基盤を使います。過去ログの記憶は別プロセスの builder が[記憶の本](docs/memory-tree.md)に整理します。
+Node.js 22.13以上が必要です。会話・統治agentは共通の実行基盤を使います。過去ログの記憶は別プロセスの builder が[記憶](docs/memory-tree.md)に整理します。
 
 ```bash
 npm install
@@ -920,4 +920,4 @@ evex 側 (20.1% / 32.2% / 10) に寄る。
 学習は t4-small で 88 分・$0.59 (batch 48 + `torch.compile` で 93,500 tok/s)。
 `torch.compile` は速いだけでなくメモリも減り、単体では OOM する batch 48 が通る。
 
-過去ログの記憶は[記憶の本](docs/memory-tree.md)、本番の反映状態は[運用メモ](docs/deployment.md)を参照してください。
+過去ログの記憶は[記憶](docs/memory-tree.md)、本番の反映状態は[運用メモ](docs/deployment.md)を参照してください。

@@ -5,7 +5,7 @@ import Database from 'better-sqlite3';
 import 'dotenv/config';
 import { siteGuilds } from '../src/memory/site.js';
 
-// 記憶の本を公開サイト (Worker + D1) へ送る。builder の後に timer から動かす (deploy/sakana-memory-site.*)。
+// 記憶を公開サイト (Worker + D1) へ送る。builder の後に timer から動かす (deploy/sakana-memory-site.*)。
 //
 //   tsx scripts/memory-site-sync.ts [--dry-run] [--out FILE] [--from FILE]
 //

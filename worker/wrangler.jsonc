@@ -10,7 +10,7 @@
   "workers_dev": true,
   "preview_urls": false,
   "routes": [{ "pattern": "sakana.takos.jp", "custom_domain": true }],
-  // 記憶の本 (/wiki) は、このサーバーのメンバーだけに見せる (既定は閉じている)。
+  // 記憶 (/wiki) は、このサーバーのメンバーだけに見せる (既定は閉じている)。
   //   MEMORY_GUILD_IDS                    見せるサーバー (カンマ区切り。URL は /<サーバーID>/wiki。ここに無いサーバーの URL は 404)
   //   MEMORY_ACCESS                       'members' (既定) | 'public'
   //   secret: SESSION_SECRET (cookie の署名) / MEMORY_LINK_SECRET (bot のログインリンクの署名。bot の MEMORY_SITE_LINK_SECRET と同じ)

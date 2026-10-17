@@ -156,7 +156,7 @@ client.on(Events.GuildCreate, (guild) => {
 client.once(Events.ClientReady, (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
   setVisibilityClient(readyClient);
-  // 記憶の本の builder (別プロセス) が読んでよいチャンネルの控え
+  // 記憶の builder (別プロセス) が読んでよいチャンネルの控え
   startMemorySnapshots(readyClient);
   console.log(
     agentEnabled
@@ -501,7 +501,7 @@ async function handleInteractionCreate(interaction: Interaction): Promise<void> 
     return;
   }
 
-  // 記憶の本の閲覧 (/memory explore) のメニュー・ボタン・探す入力欄
+  // 記憶の閲覧 (/memory explore) のメニュー・ボタン・探す入力欄
   if ((interaction.isButton() || interaction.isStringSelectMenu() || interaction.isModalSubmit())
     && await handleMemoryComponent(interaction)) return;
 

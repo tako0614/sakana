@@ -205,7 +205,7 @@ const { verifyLinkToken } = await import('../worker/src/wiki/auth.ts');
   assert.equal(await verifyLinkToken(homeUrl.searchParams.get('t'), SECRET, '910000000000000999', Date.now()), null, 'and not another server');
   assert.notEqual(new URL(linkOf(await ask())).searchParams.get('t'), homeUrl.searchParams.get('t'), 'every link is different (one-time)');
 
-  // サイトに載せていないサーバーでは、リンクを出さない。載せているが記憶の本がまだ無いサーバーも出さない
+  // サイトに載せていないサーバーでは、リンクを出さない。載せているが記憶がまだ無いサーバーも出さない
   assert.ok(refused(await ask({}, { guildId: '910000000000000999' })), 'a server the site does not list gets no link');
   process.env.MEMORY_TREE_GUILD = '910000000000000999';
   assert.ok(refused(await ask()), 'and this server gets none when the site lists only another one');
@@ -245,7 +245,7 @@ await memoryCommand.execute(explore);
 const first = explore.calls[1][1];
 const json = (view) => ({ embeds: view.embeds.map((e) => e.toJSON()), components: view.components.map((c) => c.toJSON()) });
 const rootJson = json(first);
-assert.match(rootJson.embeds[0].title, /記憶の本/);
+assert.match(rootJson.embeds[0].title, /記憶/);
 const menu = rootJson.components.find((row) => row.components[0].type === 3).components[0];
 const peopleOption = menu.options.find((option) => /people/.test(option.label));
 assert.ok(peopleOption, 'the root menu lists top-level pages');
@@ -304,7 +304,7 @@ for (const [label, view] of [['root', rootJson], ['people', peopleJson], ['tako'
 assert.match(takoJson.embeds[0].description, /sakana bot を作っている/);
 // 本文の [[リンク]] は太字の名前に、[e12] は消して読みやすく
 assert.doesNotMatch(takoJson.embeds[0].description, /\[\[|\[e\d+\]/, 'links and citations are rendered for people');
-assert.match(takoJson.embeds[0].author.name, /記憶の本 › people › たこ/, 'a page shows where it is');
+assert.match(takoJson.embeds[0].author.name, /記憶 › people › たこ/, 'a page shows where it is');
 const siteNodeId = takoOption.value.split(':')[1];
 const siteButtons = (view) => view.components.flatMap((row) => row.components).filter((c) => c.type === 2 && c.custom_id?.startsWith('memx:site:'));
 assert.deepEqual(siteButtons(takoJson).map((b) => b.custom_id), [`memx:site:n:${siteNodeId}`], 'a page has a button that opens it on the site');
@@ -375,7 +375,7 @@ const found = searchJson.components.find((row) => row.components[0].type === 3)?
 assert.ok(found, 'search results can be opened');
 const back = click({ customId: 'memx:root' });
 await handleMemoryComponent(back);
-assert.match(json(back.updates[0]).embeds[0].title, /記憶の本/);
+assert.match(json(back.updates[0]).embeds[0].title, /記憶/);
 assert.equal(await handleMemoryComponent(click({ customId: 'archive:reset:1' })), false, 'other components pass through');
 
 // 共有: 📢 で今の画面をチャンネルに出す (本人だけではないメッセージ)。出したものは誰でも操作でき、🔎 で自分だけに開ける
@@ -386,7 +386,7 @@ const share = click({ customId: shareId, allowReply: true, channel: { nsfw: fals
 await handleMemoryComponent(share);
 assert.equal(share.replies.length, 1);
 assert.equal(share.replies[0].flags, undefined, 'the shared view is a normal message');
-assert.match(share.replies[0].content, /<@u1> が記憶の本を共有/);
+assert.match(share.replies[0].content, /<@u1> が記憶を共有/);
 assert.deepEqual(share.replies[0].allowedMentions, { parse: [] }, 'sharing does not ping');
 const sharedJson = json(share.replies[0]);
 checkLimits(sharedJson, 'shared');

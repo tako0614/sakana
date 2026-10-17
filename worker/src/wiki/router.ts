@@ -14,7 +14,7 @@ import {
   type ArticleData, type Page, type TimelineData
 } from './views.ts';
 
-// 記憶の本の URL と、gate (入場) と、画面ごとの読み出し。サーバーごとに URL を分ける:
+// 記憶の URL と、gate (入場) と、画面ごとの読み出し。サーバーごとに URL を分ける:
 //   /<サーバーID>/wiki           トップ            /<サーバーID>/wiki/<path>   記事 (?tab=timeline|links&kind=&order=&page=&cp=)
 //   /<サーバーID>/e/<id>         出来事            /<サーバーID>/t, /t/YYYY-MM 年表
 //   /<サーバーID>/s?q=           検索              /<サーバーID>/random        ランダムなページ
@@ -120,7 +120,7 @@ export async function handleWiki(request: Request, env: Env, deps: Deps = defaul
   let user: Session | null = null;
   if (!isPublicAccess(env)) {
     if (!loginAvailable(env)) {
-      return respond(messageView('まだ公開されていません', '記憶の本は、ログインの設定が済むまで閉じています。', { status: 503 }), { user: null, links });
+      return respond(messageView('まだ公開されていません', '記憶は、ログインの設定が済むまで閉じています。', { status: 503 }), { user: null, links });
     }
     user = await currentSession(request, env, guild, deps.now());
     if (!user) return respond(loginView(`${url.pathname}${url.search}`, { oauth: authConfigured(env), link: linkConfigured(env) }, links), { user: null, links });
@@ -179,7 +179,7 @@ export async function handleWiki(request: Request, env: Env, deps: Deps = defaul
       const id = Number(episodePath[1]);
       const ep = await store.getEpisode(db, guild, id);
       const navigation = await nav('');
-      if (!ep) return respond(messageView('見つかりません', `出来事 ${id} は記憶の本にありません。`, { status: 404, nav: navigation, link: { href: links.home, label: 'トップへ' } }), ctx);
+      if (!ep) return respond(messageView('見つかりません', `出来事 ${id} は記憶にありません。`, { status: 404, nav: navigation, link: { href: links.home, label: 'トップへ' } }), ctx);
       const [quotes, nodes, neighbors] = await Promise.all([store.quotesOf(db, guild, id), store.episodeNodes(db, guild, id), store.episodeNeighbors(db, guild, id)]);
       return respond(episodeView({ guildId: guild, ep, quotes, nodes, before: neighbors.before, after: neighbors.after, nav: navigation, links }), ctx);
     }
@@ -203,7 +203,7 @@ export async function handleWiki(request: Request, env: Env, deps: Deps = defaul
         const guess = await store.guessNode(db, guild, nodePath);
         if (guess) return redirect(links.wiki(guess.path));
         const name = nodePath.split('/').at(-1) ?? nodePath;
-        return respond(messageView('まだこのページはありません', `「${nodePath}」は記憶の本にありません。名前が違うか、まだ作られていないページです。`, {
+        return respond(messageView('まだこのページはありません', `「${nodePath}」は記憶にありません。名前が違うか、まだ作られていないページです。`, {
           status: 404, nav: await nav(''), link: { href: `${links.search}?q=${encodeURIComponent(name)}`, label: `「${name}」を検索` }
         }), ctx);
       }

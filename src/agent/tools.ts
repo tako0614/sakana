@@ -1978,7 +1978,7 @@ export interface Toolset extends AgentToolset {
  */
 export async function buildToolset(ctx: AgentContext): Promise<Toolset> {
   const archiveAvailable = Boolean(getGuildState(ctx.guild.id));
-  // 記憶の本ができているサーバーだけ。根は system に、残りはこのツールでたどる
+  // 記憶ができているサーバーだけ。根は system に、残りはこのツールでたどる
   const memoryAvailable = Boolean(hasMemory(ctx.guild.id));
   const browserAvailable = await cdpAvailable();
   const governanceAvailable = Boolean(governanceRecords.getGovernanceGuild(ctx.guild.id));

@@ -6,7 +6,7 @@ import {
 } from './store.js';
 import { scopeAllows, type ChannelScope, type QuoteFilter } from './types.js';
 
-// 会話 agent から見た記憶の本。根は system に常駐させ (毎回同じ文面なのでキャッシュが効く)、
+// 会話 agent から見た記憶。根は system に常駐させ (毎回同じ文面なのでキャッシュが効く)、
 // それより下は memory ツールでたどる: ページ → つながったページ / 関わった出来事 → 根拠の発言。
 // 記憶 (要約とページ) は公開チャンネルと管理者が入れたチャンネルから作っていて、そのサーバーの誰に見せてもよい。
 // 根拠の発言 (原文) は開くときにもう一度、いま読んでよいチャンネルかどうかを確かめ、
@@ -53,7 +53,7 @@ export const memoryToolDefinition: ToolDefinition = {
   type: 'function',
   function: {
     name: 'memory',
-    description: '記憶の本 (このサーバーの過去ログを整理したもの) を読む。path でページ (説明・子・つながり・出来事)、'
+    description: '記憶 (このサーバーの過去ログを整理したもの) を読む。path でページ (説明・子・つながり・出来事)、'
       + 'path と with で2つが両方関わった出来事、query で検索、episode で出来事と根拠の発言 (引用番号つき) を開く。',
     parameters: {
       type: 'object',
@@ -178,7 +178,7 @@ export function runMemoryTool(ctx: MemoryToolContext, args: MemoryToolArgs = {})
   if (query) {
     const pages = searchNodes(guildId, query, 6);
     const episodes = searchEpisodes(guildId, query, 6);
-    if (!pages.length && !episodes.length) return `記憶の本に「${query}」は見つかりませんでした。原文は search で探せます。`;
+    if (!pages.length && !episodes.length) return `記憶に「${query}」は見つかりませんでした。原文は search で探せます。`;
     return [
       ...(pages.length ? ['ページ:', ...pages.map((row) => `- [[${row.path}]] ${row.summary || ''}${row.snippet ? `\n  ${row.snippet.replace(/\n/g, ' ')}` : ''}`)] : []),
       ...(episodes.length ? ['出来事:', ...episodes.map((row) => `- ${episodeLine(row)}: ${row.summary.slice(0, 120)}`)] : [])
@@ -213,7 +213,7 @@ export function memoryRootPrompt(guildId: string): string {
   const root = getNode(guildId, '');
   const lines = [
     '## 記憶',
-    'このサーバーの過去ログ (公開チャンネル) を整理した「記憶の本」の根。会話に出た名前から思い出したことは入力に添える。'
+    'このサーバーの過去ログ (公開チャンネル) を整理した「記憶」の根。会話に出た名前から思い出したことは入力に添える。'
       + '足りなければ memory ツールでページ・つながり・出来事をたどり、根拠が要るときは episode で元の発言を開いて引用番号で示す。'
       + '記憶は要約なので、言い切る前に根拠を確かめる。'
   ];

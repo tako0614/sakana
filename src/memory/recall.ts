@@ -76,7 +76,7 @@ export function recallFor(guildId: string,
   const pages = [...scores].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([path]) => path);
   if (pages.length === 0 && episodeHits.length === 0) return '';
 
-  const lines = ['思い出したこと (記憶の本から。詳しくは memory ツールで path / episode を開く):'];
+  const lines = ['思い出したこと (記憶から。詳しくは memory ツールで path / episode を開く):'];
   const shown = new Set<number>();
   for (const path of pages) {
     const node = getNode(guildId, path);

@@ -1,4 +1,4 @@
-// 記憶の本のモジュールどうしで受け渡す形と、外から来た値 (state 表の JSON・モデルの出力) を
+// 記憶のモジュールどうしで受け渡す形と、外から来た値 (state 表の JSON・モデルの出力) を
 // 確かめる小さな型ガード。
 
 import { arrayOf, isRecord } from '../ai/types.js';

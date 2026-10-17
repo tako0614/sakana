@@ -71,10 +71,10 @@ bot側は `GOVERNANCE_LAW_API_URL`（このWorkerのorigin）、`GOVERNANCE_LAW_
 `GOVERNANCE_LAW_SITE_URL`（公開ページのorigin。手続チャンネルのリンクに使う）を設定します。
 未設定なら押し込みは行わず、統治機能はDiscord内だけで動きます。
 
-## 記憶の本 (wiki)
+## 記憶 (wiki)
 
-法令集と同じ Worker に、記憶の本 (bot が会話を読んでまとめた人・もの・ネタ・出来事) を wiki として出しています。
-**法令集は公開のまま、記憶の本はこのサーバーのメンバーだけ**が読めます (Discord で `/memory url` を使うと入り口のリンクが出ます)
+法令集と同じ Worker に、記憶 (bot が会話を読んでまとめた人・もの・ネタ・出来事) を wiki として出しています。
+**法令集は公開のまま、記憶はこのサーバーのメンバーだけ**が読めます (Discord で `/memory url` を使うと入り口のリンクが出ます)
 (人物の紹介や発言の引用が入るため。設定が済むまでは閉じたままです)。
 
 | path | 内容 |
@@ -118,7 +118,7 @@ CSP は `default-src 'none'` です。型検査は `npx tsc -p tsconfig.json` (s
 
 ```bash
 cd worker
-npm run migrate                                  # 0003_memory.sql (記憶の本の表と全文検索) を本番 D1 へ
+npm run migrate                                  # 0003_memory.sql (記憶の表と全文検索) を本番 D1 へ
 # 鍵を2つ作る。MEMORY_LINK_SECRET は bot の .env の MEMORY_SITE_LINK_SECRET と同じ値にする
 openssl rand -base64 32 | npx wrangler secret put SESSION_SECRET
 openssl rand -base64 32 | tee /tmp/link-secret | npx wrangler secret put MEMORY_LINK_SECRET

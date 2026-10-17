@@ -1,6 +1,6 @@
 import type { EpisodeBrief, EpisodeRow, NodeBrief, NodeRow, QuoteRow } from './types.ts';
 
-// 記憶の本の読み取り。D1 への問い合わせだけを置き、HTML は作らない。
+// 記憶の読み取り。D1 への問い合わせだけを置き、HTML は作らない。
 // 値はすべて bind で渡す (SQL に文字列を連結しない)。D1 は1回の問い合わせの bind が100個までなので、
 // IN (...) は CHUNK 個ずつに分ける。
 

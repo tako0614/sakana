@@ -321,7 +321,7 @@ function layout({ title, guildId, docTitle = null, docSub = null, body, search =
       <a href="/?guild=${guild}&amp;type=constitution">憲法</a>
       <a href="/?guild=${guild}&amp;type=law">法律</a>
       <a href="/v1/laws?guild=${guild}">API</a>
-      <a href="/wiki">記憶の本</a>
+      <a href="/wiki">記憶</a>
     </nav>
   </div>
 </header>
@@ -340,7 +340,7 @@ ${body}
       <li><a href="/?guild=${guild}">法令集</a></li>
       <li><a href="/?guild=${guild}&amp;history=1">旧版・停止・廃止を含む一覧</a></li>
       <li><a href="/v1/laws?guild=${guild}">法令データ (JSON)</a></li>
-      <li><a href="/wiki">記憶の本 (メンバー向け)</a></li>
+      <li><a href="/wiki">記憶 (メンバー向け)</a></li>
     </ul>
   </div>
   <div class="copyright">統治botが公布した正本をそのまま掲載しています。</div>

@@ -2,7 +2,7 @@ import { SafeHtml, html, raw } from './html.ts';
 import type { Links } from './links.ts';
 import type { Session } from './types.ts';
 
-// 記憶の本の枠 (ヘッダー・左の木・右の欄・フッター) と CSS。画面ごとの中身は views.ts。
+// 記憶の枠 (ヘッダー・左の木・右の欄・フッター) と CSS。画面ごとの中身は views.ts。
 // JavaScript は使わない: 木は <details>、スマホの分類メニューはチェックボックス、脚注の強調は :target。
 
 export interface KindStyle {
@@ -59,7 +59,7 @@ ${options.description ? html`<meta name="description" content="${options.descrip
 <header class="top">
   <div class="top-in">
     ${nav ? html`<label class="burger" for="navtoggle" title="分類を開く">☰<span class="sr">分類</span></label>` : ''}
-    <a class="brand" href="${links?.home ?? '/'}"><span class="logo">📖</span><span>記憶の本</span></a>
+    <a class="brand" href="${links?.home ?? '/'}"><span class="logo">📖</span><span>記憶</span></a>
     ${links ? html`<nav class="topnav" aria-label="サイト">
       <a href="${links.home}">ページ</a><a href="${links.timeline}">年表</a><a href="${links.random}">ランダム</a><a href="${links.laws}">法令集</a>
     </nav>
@@ -77,7 +77,7 @@ ${nav ? html`<input type="checkbox" id="navtoggle" class="navtoggle" aria-hidden
   ${rail ? html`<aside class="rail">${rail}</aside>` : ''}
 </div>
 <footer class="foot">
-  <p>記憶の本は、サーバーの会話を AI が読んでまとめたものです。間違いや抜けがあります。各ページの [数字] から出典の出来事をたどれます。</p>
+  <p>記憶は、サーバーの会話を AI が読んでまとめたものです。間違いや抜けがあります。各ページの [数字] から出典の出来事をたどれます。</p>
 </footer>
 </body>
 </html>`;
