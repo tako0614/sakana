@@ -158,13 +158,13 @@ export async function handleWiki(request: Request, env: Env, deps: Deps = defaul
     }
 
     if (rest === '/wiki' || rest === '/wiki/') {
-      const [root, stats, tops, recent, popular, updated, months] = await Promise.all([
+      const [root, stats, tops, recent, popular, updated] = await Promise.all([
         store.getNode(db, guild, ''), store.siteStats(db, guild), store.topLevels(db, guild), store.recentEpisodes(db, guild, 8),
-        store.popularNodes(db, guild, 8), store.recentNodes(db, guild, 6), store.monthCounts(db, guild)
+        store.popularNodes(db, guild, 8), store.recentNodes(db, guild, 6)
       ]);
       const referenced = root?.body ? scanReferences(root.body).paths : [];
       const known = new Map((await store.nodesByPaths(db, guild, referenced)).map((node) => [node.path, node]));
-      return respond(homeView({ root, stats, tops, recent, popular, updated, months, nodeNames: known, links }), ctx);
+      return respond(homeView({ root, stats, tops, recent, popular, updated, nodeNames: known, links }), ctx);
     }
 
     const wiki = /^\/wiki\/(.+)$/.exec(rest);

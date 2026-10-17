@@ -1,5 +1,4 @@
 import { SafeHtml, html, joinHtml, raw } from './html.ts';
-import { kindStyle } from './layout.ts';
 import type { Links } from './links.ts';
 import { highlightSnippet, plainText, renderMarkdown, scanReferences } from './markdown.ts';
 import { jstDate, jstMonth } from './store.ts';
@@ -44,21 +43,12 @@ export function qs(params: Record<string, string | number | null | undefined>): 
 
 // ---- 部品 -------------------------------------------------------------------
 
-export function kindPill(kind: string): SafeHtml {
-  if (!kind) return html``;
-  const style = kindStyle(kind);
-  return html`<span class="kind ${style.cls}">${style.emoji} ${kind}</span>`;
-}
-
 const stars = (importance: number): string => '★'.repeat(Math.max(1, Math.min(3, importance || 2)));
 
 export function episodeItem(ep: EpisodeBrief, links: Links, options: { channel?: boolean } = {}): SafeHtml {
-  const style = kindStyle(ep.kind);
-  return html`<li class="ep ${style.cls}"><a href="${links.episode(ep.id)}">
-    <div class="ep-meta">${kindPill(ep.kind)}<time datetime="${fmtDate(ep.at_ms)}">${fmtDate(ep.at_ms)}</time>${options.channel !== false && ep.channel_name ? html`<span>#${ep.channel_name}</span>` : ''}<span class="imp" title="重要度">${stars(ep.importance)}</span></div>
-    <div class="ep-title">${ep.title}</div>
-    <p class="ep-sum">${ep.summary}</p>
-  </a></li>`;
+  return html`<li><a class="t" href="${links.episode(ep.id)}">${ep.title}</a>
+    <div class="meta"><time datetime="${fmtDate(ep.at_ms)}">${fmtDate(ep.at_ms)}</time>${ep.kind ? html`<span>${ep.kind}</span>` : ''}${options.channel !== false && ep.channel_name ? html`<span>#${ep.channel_name}</span>` : ''}</div>
+    ${ep.summary ? html`<p class="sum">${ep.summary}</p>` : ''}</li>`;
 }
 
 /** 新しい順 (または古い順) の出来事を月ごとの見出しで区切る。 */
@@ -76,8 +66,11 @@ export function episodeList(rows: readonly EpisodeBrief[], links: Links, options
     <ul class="eps">${group.rows.map((row) => episodeItem(row, links, options))}</ul>`));
 }
 
-export function pageCard(node: NodeBrief, links: Links): SafeHtml {
-  return html`<a class="pcard" href="${links.wiki(node.path)}"><b>${node.name}</b>${node.summary ? html`<span>${node.summary}</span>` : ''}${node.episode_count ? html`<small>出来事 ${number(node.episode_count)}${node.child_count ? ` · 子ページ ${number(node.child_count)}` : ''}</small>` : ''}</a>`;
+/** ページの一覧の1行 (名前・要約・件数)。 */
+export function pageItem(node: NodeBrief, links: Links): SafeHtml {
+  const counts = node.episode_count ? `出来事 ${number(node.episode_count)}${node.child_count ? ` · 子ページ ${number(node.child_count)}` : ''}` : '';
+  const text = [node.summary, counts].filter(Boolean).join(' — ');
+  return html`<li><a href="${links.wiki(node.path)}"><b>${node.name}</b></a>${text ? html`<small>${text}</small>` : ''}</li>`;
 }
 
 /** 左の分類の木。いまのページの祖先だけ開き、その中身を出す。 */
@@ -101,53 +94,32 @@ export interface HomeData {
   recent: EpisodeBrief[];
   popular: NodeBrief[];
   updated: (NodeBrief & { updated_at: number })[];
-  months: { month: string; n: number }[];
   nodeNames: ReadonlyMap<string, NodeBrief>;
   links: Links;
 }
 
 export function homeView(data: HomeData): Page {
   const { root, stats, links } = data;
-  const recentMonths = data.months.slice(-24);
-  const peak = Math.max(1, ...recentMonths.map((entry) => entry.n));
-  // 本文の先頭の「# タイトル」は節の見出し「このサーバーについて」と重なるので外す
+  // 本文の先頭の「# タイトル」はこの画面の見出し「記憶」と重なるので外す
   const overview = root?.body
     ? renderMarkdown(root.body.replace(/^\s*#\s+.*\n+/, ''), { wikiHref: (path) => links.wiki(path), resolvePath: (path) => data.nodeNames.get(path) ?? null, citeNumber: () => null }).html
     : null;
+  const span = stats.firstAt && stats.lastAt ? `${fmtMonth(jstMonth(stats.firstAt))}〜${fmtMonth(jstMonth(stats.lastAt))}` : '';
   const main = html`
-<section class="card hero">
-  <h1>📖 記憶</h1>
-  <p>サーバーの会話をひとつずつ読んで、人・作ったもの・ネタ・出来事としてまとめた、みんなの wiki です。ページの文末の [数字] から、元になった出来事と発言までたどれます。</p>
-  <div class="stats">
-    <span><b>${number(stats.pages)}</b>ページ</span>
-    <span><b>${number(stats.episodes)}</b>出来事</span>
-    ${stats.firstAt && stats.lastAt ? html`<span><b>${fmtMonth(jstMonth(stats.firstAt))}</b>〜${fmtMonth(jstMonth(stats.lastAt))}</span>` : ''}
-  </div>
-  <div class="cta"><a class="btn plain" href="${links.timeline}">📅 年表をひらく</a><a class="btn ghost" href="${links.random}">🎲 ランダムに1ページ</a><a class="btn ghost" href="${links.search}?q=${encodeURIComponent('レスバ')}">⚔️ レスバを探す</a></div>
-</section>
-${overview ? html`<section class="sec card article"><h2>このサーバーについて</h2><div class="prose">${overview}</div></section>` : ''}
+<h1>記憶</h1>
+<p class="lead">サーバーの会話を読んで、人・作ったもの・ネタ・出来事としてまとめた wiki です。</p>
+<p class="meta">${number(stats.pages)} ページ · ${number(stats.episodes)} 出来事${span ? ` · ${span}` : ''}${stats.syncedAt ? ` · 最終更新 ${fmtDate(stats.syncedAt)}` : ''}</p>
+${overview ? html`<div class="prose">${overview}</div>` : ''}
 <section class="sec">
-  <h2>分類 <small><a href="${links.random}">ランダムに1ページ →</a></small></h2>
-  <div class="catgrid">${data.tops.map((node) => html`<a class="cat" href="${links.wiki(node.path)}"><span class="n">${number(node.child_count)}</span><b>${node.name}</b>${node.summary ? html`<p>${node.summary}</p>` : ''}</a>`)}</div>
+  <h2>分類</h2>
+  <ul class="plain cols2">${data.tops.map((node) => html`<li><a href="${links.wiki(node.path)}"><b>${node.name}</b></a> <small style="display:inline">(${number(node.child_count)})</small>${node.summary ? html`<small>${node.summary}</small>` : ''}</li>`)}</ul>
 </section>
-${recentMonths.length > 1 ? html`<section class="sec">
-  <h2>出来事の多さ <small><a href="${links.timeline}">年表 →</a></small></h2>
-  <div class="spark" role="img" aria-label="月ごとの出来事の数">${recentMonths.map((entry) => html`<a href="${links.month(entry.month)}" style="--h:${Math.max(4, Math.round((entry.n / peak) * 100))}%" title="${fmtMonth(entry.month)}: ${entry.n} 件"></a>`)}</div>
-  <div class="spark-axis"><span>${fmtMonth(recentMonths[0]?.month ?? '')}</span><span>${fmtMonth(recentMonths.at(-1)?.month ?? '')}</span></div>
-</section>` : ''}
-<div class="sec cols">
-  <section>
-    <h2>最近の出来事 <small><a href="${links.month(jstMonth(stats.lastAt ?? Date.now()))}">もっと →</a></small></h2>
-    ${episodeList(data.recent, links, { group: false })}
-  </section>
-  <section>
-    <h2>よく話題になるページ</h2>
-    <ul class="plist">${data.popular.map((node) => html`<li><a href="${links.wiki(node.path)}"><b>${node.name}</b><small>${node.summary || `出来事 ${number(node.episode_count)} 件`}</small></a></li>`)}</ul>
-    <h2 style="margin-top:1.6rem">最近書き直されたページ</h2>
-    <ul class="plist">${data.updated.map((node) => html`<li><a href="${links.wiki(node.path)}"><b>${node.name}</b><small>${fmtDate(node.updated_at)} · ${node.summary}</small></a></li>`)}</ul>
-  </section>
-</div>
-${stats.syncedAt ? html`<p class="empty" style="margin-top:2rem;font-size:.8rem">最終更新 ${fmtDate(stats.syncedAt)} ${fmtTime(stats.syncedAt)}</p>` : ''}`;
+<section class="sec">
+  <h2>最近の出来事 <small><a href="${links.timeline}">年表で見る</a></small></h2>
+  ${episodeList(data.recent, links, { group: false })}
+</section>
+${data.popular.length ? html`<section class="sec"><h2>よく話題になるページ</h2><ul class="plain cols2">${data.popular.map((node) => pageItem(node, links))}</ul></section>` : ''}
+${data.updated.length ? html`<section class="sec"><h2>最近書き直されたページ</h2><ul class="plain cols2">${data.updated.map((node) => html`<li><a href="${links.wiki(node.path)}"><b>${node.name}</b></a><small>${fmtDate(node.updated_at)}${node.summary ? ` — ${node.summary}` : ''}</small></li>`)}</ul></section>` : ''}`;
   return { title: '記憶', description: '会話から作った、サーバーの wiki', main };
 }
 
@@ -216,9 +188,9 @@ function timelinePanel(data: ArticleData, timeline: TimelineData): SafeHtml {
   const link = (params: Record<string, string | number | null>) => articleHref(links, node.path, { tab: 'timeline', ...params });
   return html`
 <div class="filters" role="group" aria-label="種類で絞る">
-  <a class="chip" href="${link({ order: timeline.order === 'old' ? 'old' : null })}"${timeline.kind ? '' : raw(' aria-current="true"')}>すべて ${number(node.episode_count)}</a>
-  ${timeline.kinds.filter((entry) => entry.kind).map((entry) => html`<a class="chip" href="${link({ kind: entry.kind, order: timeline.order === 'old' ? 'old' : null })}"${timeline.kind === entry.kind ? raw(' aria-current="true"') : ''}>${kindStyle(entry.kind).emoji} ${entry.kind} ${number(entry.n)}</a>`)}
-  <span style="margin-left:auto"><a class="chip" href="${link({ kind: timeline.kind, order: timeline.order === 'old' ? null : 'old' })}">${timeline.order === 'old' ? '新しい順にする' : '古い順にする'}</a></span>
+  <a href="${link({ order: timeline.order === 'old' ? 'old' : null })}"${timeline.kind ? '' : raw(' aria-current="true"')}>すべて ${number(node.episode_count)}</a>
+  ${timeline.kinds.filter((entry) => entry.kind).map((entry) => html`<a href="${link({ kind: entry.kind, order: timeline.order === 'old' ? 'old' : null })}"${timeline.kind === entry.kind ? raw(' aria-current="true"') : ''}>${entry.kind} ${number(entry.n)}</a>`)}
+  <a style="margin-left:auto" href="${link({ kind: timeline.kind, order: timeline.order === 'old' ? null : 'old' })}">${timeline.order === 'old' ? '新しい順にする' : '古い順にする'}</a>
 </div>
 ${episodeList(timeline.rows, links, { channel: true })}
 ${pager((page) => link({ kind: timeline.kind, order: timeline.order === 'old' ? 'old' : null, page: page > 1 ? page : null }), timeline.page, timeline.total, timeline.perPage)}`;
@@ -228,8 +200,8 @@ function linksPanel(data: ArticleData): SafeHtml {
   const { links } = data;
   if (!data.neighbors.length) return html`<p class="empty">まだつながりのあるページがありません。</p>`;
   const peak = Math.max(1, ...data.neighbors.map((entry) => entry.link_weight));
-  return html`<div class="notice">同じ出来事に一緒に出てくる回数や、本文のリンクが多いページの順です。</div>
-<ul class="plist">${data.neighbors.map((entry) => html`<li><a href="${links.wiki(entry.path)}"><b>${entry.name}</b> <small style="display:inline">つながり ${'●'.repeat(Math.max(1, Math.round((entry.link_weight / peak) * 5)))}</small><small>${entry.summary}</small></a></li>`)}</ul>`;
+  return html`<p class="meta">同じ出来事に一緒に出てくる回数や、本文のリンクが多いページの順です。</p>
+<ul class="plain">${data.neighbors.map((entry) => html`<li><a href="${links.wiki(entry.path)}"><b>${entry.name}</b></a> <small style="display:inline">${'●'.repeat(Math.max(1, Math.round((entry.link_weight / peak) * 5)))}</small>${entry.summary ? html`<small>${entry.summary}</small>` : ''}</li>`)}</ul>`;
 }
 
 export function articleView(data: ArticleData): Page {
@@ -263,22 +235,22 @@ export function articleView(data: ArticleData): Page {
     if (body) {
       parts.push(html`<div class="prose">${body.html}</div>`);
       if (pending && node.pending_count > 0) {
-        parts.push(html`<details class="memo"><summary>📝 まだ本文に入っていない知識のメモ (${number(node.pending_count)} 件)</summary><div class="prose">${pending.html}</div></details>`);
+        parts.push(html`<details class="memo"><summary>まだ本文に入っていない知識のメモ (${number(node.pending_count)} 件)</summary><div class="prose">${pending.html}</div></details>`);
       }
     } else if (pending) {
-      parts.push(html`<div class="notice warn">📝 このページはまだ本文にまとめられていません。下は集まっている知識のメモです (次の書き直しで本文になります)。</div><div class="prose">${pending.html}</div>`);
+      parts.push(html`<div class="notice warn">このページはまだ本文にまとめられていません。下は集まっている知識のメモです (次の書き直しで本文になります)。</div><div class="prose">${pending.html}</div>`);
     } else if (!data.children.length) {
       parts.push(html`<p class="empty">このページにはまだ書かれていることがありません。</p>`);
     }
     if (node.child_count > 0) {
       const total = node.child_count;
-      parts.push(html`<section class="sec"><h2>子ページ <small>${number(total)} 件</small></h2><div class="cards">${data.children.map((child) => pageCard(child, links))}</div>${pager((page) => articleHref(links, node.path, { cp: page > 1 ? page : null }), data.childPage, total, data.childPerPage)}</section>`);
+      parts.push(html`<section class="sec"><h2>子ページ <small>${number(total)} 件</small></h2><ul class="plain cols2">${data.children.map((child) => pageItem(child, links))}</ul>${pager((page) => articleHref(links, node.path, { cp: page > 1 ? page : null }), data.childPage, total, data.childPerPage)}</section>`);
     }
     if (data.recent.length) {
-      parts.push(html`<section class="sec"><h2>最近の出来事 <small><a href="${articleHref(links, node.path, { tab: 'timeline' })}">年表で全部見る (${number(node.episode_count)}) →</a></small></h2><ul class="eps">${data.recent.map((ep) => episodeItem(ep, links))}</ul></section>`);
+      parts.push(html`<section class="sec"><h2>最近の出来事 <small><a href="${articleHref(links, node.path, { tab: 'timeline' })}">年表で全部見る (${number(node.episode_count)})</a></small></h2><ul class="eps">${data.recent.map((ep) => episodeItem(ep, links))}</ul></section>`);
     }
     if (data.neighbors.length) {
-      parts.push(html`<section class="sec"><h2>関連するページ <small><a href="${articleHref(links, node.path, { tab: 'links' })}">もっと →</a></small></h2><div class="chips">${data.neighbors.slice(0, 10).map((entry) => html`<a class="chip" href="${links.wiki(entry.path)}">${entry.name}</a>`)}</div></section>`);
+      parts.push(html`<section class="sec"><h2>関連するページ <small><a href="${articleHref(links, node.path, { tab: 'links' })}">もっと見る</a></small></h2><div class="chips">${data.neighbors.slice(0, 10).map((entry) => html`<a href="${links.wiki(entry.path)}">${entry.name}</a>`)}</div></section>`);
     }
     if (refs.length) {
       const list = html`<ol class="refs">${refs.map(({ id, no, ep }) => html`<li id="ref-${no}"><a class="no" href="#cite-${no}" title="本文へ戻る">${no}</a><span class="txt"><time>${fmtDate(ep.at_ms)}</time> <a href="${links.episode(id)}" title="${plainText(ep.summary, 120)}">${ep.title}</a></span></li>`)}</ol>`;
@@ -290,28 +262,26 @@ export function articleView(data: ArticleData): Page {
     content = joinHtml(parts);
   }
 
-  const main = html`<article class="card article">
-  <header class="art-head">
-    ${crumbs}
-    <h1>${node.name}</h1>
-    ${node.summary ? html`<p class="lead">${node.summary}</p>` : ''}
-    ${aliases.length ? html`<div class="chips"><span class="lbl">別名</span>${aliases.map((alias) => html`<span class="chip">${alias}</span>`)}</div>` : ''}
-  </header>
+  const main = html`<article>
+  ${crumbs}
+  <h1>${node.name}</h1>
+  ${node.summary ? html`<p class="lead">${node.summary}</p>` : ''}
+  ${aliases.length ? html`<p class="meta">別名: ${aliases.join('、')}</p>` : ''}
   ${tabs(data)}
   ${content}
 </article>`;
 
   const parent = node.parent && node.parent !== '' ? data.ancestors.at(-1) : null;
-  const rail = html`<div class="card infobox"><h2>このページ</h2><dl>
-    ${top && top !== node.path ? html`<dt>分類</dt><dd><a href="${links.wiki(top)}">${data.ancestors[0]?.name ?? top}</a></dd>` : ''}
-    ${parent && parent.path !== top ? html`<dt>親</dt><dd><a href="${links.wiki(parent.path)}">${parent.name}</a></dd>` : ''}
-    <dt>出来事</dt><dd>${number(node.episode_count)} 件${node.episode_count ? html` · <a href="${articleHref(links, node.path, { tab: 'timeline' })}">年表</a>` : ''}</dd>
-    ${node.child_count ? html`<dt>子ページ</dt><dd>${number(node.child_count)}</dd>` : ''}
-    ${node.first_at ? html`<dt>期間</dt><dd>${fmtMonth(jstMonth(node.first_at))}〜${fmtMonth(jstMonth(node.last_at ?? node.first_at))}</dd>` : ''}
-    <dt>更新</dt><dd>${fmtDate(node.updated_at)}</dd>
-    ${node.pending_count ? html`<dt>メモ</dt><dd>${number(node.pending_count)} 件が本文待ち</dd>` : ''}
-  </dl></div>
-  ${body && body.headings.length > 1 ? html`<nav class="card toc" aria-label="目次"><h2>目次</h2><ol>${body.headings.map((heading) => html`<li><a class="l${heading.level}" href="#${heading.id}">${heading.text}</a></li>`)}</ol></nav>` : ''}`;
+  const rail = html`<table class="infobox"><caption>${node.name}</caption>
+    ${top && top !== node.path ? html`<tr><th>分類</th><td><a href="${links.wiki(top)}">${data.ancestors[0]?.name ?? top}</a></td></tr>` : ''}
+    ${parent && parent.path !== top ? html`<tr><th>親</th><td><a href="${links.wiki(parent.path)}">${parent.name}</a></td></tr>` : ''}
+    <tr><th>出来事</th><td>${number(node.episode_count)} 件${node.episode_count ? html` · <a href="${articleHref(links, node.path, { tab: 'timeline' })}">年表</a>` : ''}</td></tr>
+    ${node.child_count ? html`<tr><th>子ページ</th><td>${number(node.child_count)}</td></tr>` : ''}
+    ${node.first_at ? html`<tr><th>期間</th><td>${fmtMonth(jstMonth(node.first_at))}〜${fmtMonth(jstMonth(node.last_at ?? node.first_at))}</td></tr>` : ''}
+    <tr><th>更新</th><td>${fmtDate(node.updated_at)}</td></tr>
+    ${node.pending_count ? html`<tr><th>メモ</th><td>${number(node.pending_count)} 件が本文待ち</td></tr>` : ''}
+  </table>
+  ${body && body.headings.length > 1 ? html`<nav class="toc" aria-label="目次"><h2>目次</h2><ol>${body.headings.map((heading) => html`<li><a class="l${heading.level}" href="#${heading.id}">${heading.text}</a></li>`)}</ol></nav>` : ''}`;
   return { title: `${node.name} - 記憶`, description: node.summary || undefined, main, rail, nav: data.nav };
 }
 
@@ -342,23 +312,20 @@ const messageUrl = (guildId: string, quote: Pick<QuoteRow, 'channel_id' | 'messa
 
 export function episodeView(data: EpisodeData): Page {
   const { ep, links } = data;
-  const style = kindStyle(ep.kind);
   const highlights = data.quotes.filter((quote) => quote.highlight);
   const evidence = data.quotes.filter((quote) => !quote.highlight);
-  const main = html`<article class="card article ${style.cls}">
-  <header class="ep-head">
-    <nav class="crumbs" aria-label="パンくず"><a href="${links.home}">記憶</a><span class="sep">›</span><a href="${links.timeline}">年表</a><span class="sep">›</span><a href="${links.month(jstMonth(ep.at_ms))}">${fmtMonth(jstMonth(ep.at_ms))}</a></nav>
-    <div class="when">${kindPill(ep.kind)}<time datetime="${fmtDate(ep.at_ms)}">${fmtDate(ep.at_ms)} ${fmtTime(ep.at_ms)}</time>${ep.channel_name ? html`<span>#${ep.channel_name}</span>` : ''}<span class="imp" title="重要度">${stars(ep.importance)}</span></div>
-    <h1>${ep.title}</h1>
-  </header>
-  <p class="ep-summary">${ep.summary}</p>
-  ${data.nodes.length ? html`<div class="chips"><span class="lbl">関わったページ</span>${data.nodes.map((node) => html`<a class="chip" href="${links.wiki(node.path)}">${node.name}</a>`)}</div>` : ''}
+  const main = html`<article>
+  <nav class="crumbs" aria-label="パンくず"><a href="${links.home}">記憶</a><span class="sep">›</span><a href="${links.timeline}">年表</a><span class="sep">›</span><a href="${links.month(jstMonth(ep.at_ms))}">${fmtMonth(jstMonth(ep.at_ms))}</a></nav>
+  <h1>${ep.title}</h1>
+  <p class="meta"><time datetime="${fmtDate(ep.at_ms)}">${fmtDate(ep.at_ms)} ${fmtTime(ep.at_ms)}</time>${ep.kind ? html` · <span class="kind">${ep.kind}</span>` : ''}${ep.channel_name ? html` · #${ep.channel_name}` : ''} · <span title="重要度">${stars(ep.importance)}</span></p>
+  <p>${ep.summary}</p>
+  ${data.nodes.length ? html`<div class="chips"><span class="lbl">関わったページ</span>${data.nodes.map((node) => html`<a href="${links.wiki(node.path)}">${node.name}</a>`)}</div>` : ''}
   ${highlights.length ? html`<section class="sec"><h2>決め台詞・印象的な発言</h2>${highlights.map((quote) => html`<blockquote class="quote"><p>${quote.content}</p><footer><span>${quote.author_name}</span><time>${fmtDate(quote.created_at)} ${fmtTime(quote.created_at)}</time><a href="${messageUrl(data.guildId, quote)}" rel="noopener noreferrer" target="_blank">Discord で開く ↗</a></footer></blockquote>`)}</section>` : ''}
   ${evidence.length ? html`<section class="sec"><h2>根拠の発言</h2><ul class="evidence">${evidence.map((quote) => html`<li><a href="${messageUrl(data.guildId, quote)}" rel="noopener noreferrer" target="_blank">${fmtTime(quote.created_at)} ↗</a><span class="who">${quote.author_name}</span><span class="text">${quote.content}</span></li>`)}</ul></section>` : ''}
-  ${ep.hidden_quotes > 0 ? html`<p class="empty" style="font-size:.85rem">🔒 見られるチャンネルが限られている発言 ${number(ep.hidden_quotes)} 件は、ここには載せていません。</p>` : ''}
+  ${ep.hidden_quotes > 0 ? html`<p class="empty" style="font-size:.85rem">見られるチャンネルが限られている発言 ${number(ep.hidden_quotes)} 件は、ここには載せていません。</p>` : ''}
   ${data.before.length || data.after.length ? html`<section class="sec"><h2>この出来事の前後</h2><div class="flow">
-    ${data.before.length ? html`<div><h3>← 前の出来事 (きっかけ・前振り)</h3><ul class="eps">${data.before.map((row) => episodeItem(row, links, { channel: false }))}</ul></div>` : ''}
-    ${data.after.length ? html`<div><h3>続き →</h3><ul class="eps">${data.after.map((row) => episodeItem(row, links, { channel: false }))}</ul></div>` : ''}
+    ${data.before.length ? html`<div><h3>前の出来事 (きっかけ・前振り)</h3><ul class="eps">${data.before.map((row) => episodeItem(row, links, { channel: false }))}</ul></div>` : ''}
+    ${data.after.length ? html`<div><h3>続き</h3><ul class="eps">${data.after.map((row) => episodeItem(row, links, { channel: false }))}</ul></div>` : ''}
   </div></section>` : ''}
 </article>`;
   return { title: `${ep.title} - 記憶`, description: plainText(ep.summary, 120), main, nav: data.nav };
@@ -376,17 +343,17 @@ export function timelineIndexView(months: { month: string; n: number }[], nav: S
   }
   const peak = Math.max(1, ...months.map((entry) => entry.n));
   const years = [...byYear.keys()].sort().reverse();
-  const main = html`<section class="card article">
-  <h1 style="font-size:1.7rem">年表</h1>
+  const main = html`<article>
+  <h1>年表</h1>
   <p class="lead">月をえらぶと、その月の出来事が日ごとに並びます。色が濃い月ほど出来事が多い月です。</p>
-  <div class="years" style="margin-top:1.4rem">${years.map((year) => html`<div class="year"><h2>${year}</h2><div class="months">${Array.from({ length: 12 }, (_, index) => {
+  <div class="years">${years.map((year) => html`<div class="year"><h2>${year}</h2><div class="months">${Array.from({ length: 12 }, (_, index) => {
     const key = `${year}-${String(index + 1).padStart(2, '0')}`;
     const n = byYear.get(year)?.get(key) ?? 0;
     return n
       ? html`<a class="m" style="--i:${(Math.sqrt(n / peak)).toFixed(2)}" href="${links.month(key)}">${index + 1}月<small>${number(n)}</small></a>`
       : html`<span class="m empty">${index + 1}月<small>-</small></span>`;
   })}</div></div>`)}</div>
-</section>`;
+</article>`;
   return { title: '年表 - 記憶', main, nav };
 }
 
@@ -411,34 +378,34 @@ export function monthView(data: MonthData): Page {
     const key = fmtDate(row.at_ms);
     days.set(key, [...(days.get(key) ?? []), row]);
   }
-  const main = html`<section class="card article">
+  const main = html`<article>
   <nav class="crumbs" aria-label="パンくず"><a href="${links.home}">記憶</a><span class="sep">›</span><a href="${links.timeline}">年表</a></nav>
+  <h1>${fmtMonth(data.month)} <small style="font-size:.9rem;font-weight:400">${number(data.total)} 件</small></h1>
   <div class="monthnav">${data.prev ? html`<a href="${links.month(data.prev, data.kind)}">← ${fmtMonth(data.prev)}</a>` : html`<span></span>`}${data.next ? html`<a href="${links.month(data.next, data.kind)}">${fmtMonth(data.next)} →</a>` : html`<span></span>`}</div>
-  <h1 style="font-size:1.7rem">${fmtMonth(data.month)} <small style="font-size:.9rem;color:var(--muted);font-weight:400">${number(data.total)} 件</small></h1>
   <div class="filters" role="group" aria-label="種類で絞る">
-    <a class="chip" href="${links.month(data.month)}"${data.kind ? '' : raw(' aria-current="true"')}>すべて</a>
-    ${data.kinds.filter((entry) => entry.kind).map((entry) => html`<a class="chip" href="${links.month(data.month, entry.kind)}"${data.kind === entry.kind ? raw(' aria-current="true"') : ''}>${kindStyle(entry.kind).emoji} ${entry.kind} ${number(entry.n)}</a>`)}
+    <a href="${links.month(data.month)}"${data.kind ? '' : raw(' aria-current="true"')}>すべて</a>
+    ${data.kinds.filter((entry) => entry.kind).map((entry) => html`<a href="${links.month(data.month, entry.kind)}"${data.kind === entry.kind ? raw(' aria-current="true"') : ''}>${entry.kind} ${number(entry.n)}</a>`)}
   </div>
   ${data.rows.length ? joinHtml([...days.entries()].map(([date, rows]) => html`<h3 class="month-h">${fmtDay(rows[0]?.at_ms ?? 0)}</h3><ul class="eps">${rows.map((row) => episodeItem(row, links))}</ul>`)) : html`<p class="empty">この月の出来事はありません。</p>`}
   ${pager((page) => `${links.month(data.month, data.kind)}${data.kind ? '&' : '?'}page=${page}`, data.page, data.total, data.perPage)}
-</section>`;
+</article>`;
   return { title: `${fmtMonth(data.month)} - 年表 - 記憶`, main, nav: data.nav };
 }
 
 // ---- 検索 -------------------------------------------------------------------
 
 export function searchView(query: string, nodes: NodeHit[], episodes: EpisodeHit[], nav: SafeHtml, links: Links): Page {
-  const main = html`<section class="card article">
-  <h1 style="font-size:1.5rem">「${query}」の検索結果</h1>
+  const main = html`<article>
+  <h1>「${query}」の検索結果</h1>
   ${!query.trim() ? html`<p class="empty">検索する言葉を入れてください。3文字以上の言葉は文中も探します。</p>` : ''}
   ${query.trim() ? html`
   <section class="sec"><h2>ページ <small>${number(nodes.length)} 件</small></h2>
-    ${nodes.length ? html`<ul class="hits">${nodes.map((hit) => html`<li class="hit"><a href="${links.wiki(hit.path)}"><b>${hit.name}</b><span class="path">${hit.path}</span><p>${hit.summary}</p>${hit.snippet ? html`<p>${highlightSnippet(hit.snippet)}</p>` : ''}</a></li>`)}</ul>` : html`<p class="empty">一致するページはありません。</p>`}
+    ${nodes.length ? html`<ul class="hits">${nodes.map((hit) => html`<li><a href="${links.wiki(hit.path)}"><b>${hit.name}</b></a><span class="path">${hit.path}</span>${hit.summary ? html`<p>${hit.summary}</p>` : ''}${hit.snippet ? html`<p>${highlightSnippet(hit.snippet)}</p>` : ''}</li>`)}</ul>` : html`<p class="empty">一致するページはありません。</p>`}
   </section>
   <section class="sec"><h2>出来事 <small>${number(episodes.length)} 件</small></h2>
     ${episodes.length ? html`<ul class="eps">${episodes.map((hit) => episodeItem(hit, links))}</ul>` : html`<p class="empty">一致する出来事はありません。</p>`}
   </section>` : ''}
-</section>`;
+</article>`;
   return { title: `${query} - 検索 - 記憶`, main, nav };
 }
 
@@ -450,7 +417,7 @@ export function messageView(title: string, message: string, options: { status?: 
     status: options.status ?? 200,
     narrow: !options.nav,
     nav: options.nav,
-    main: html`<section class="card msg"><h1>${title}</h1><p>${message}</p>${options.link ? html`<a class="btn plain" href="${options.link.href}">${options.link.label}</a>` : ''}</section>`
+    main: html`<section class="msg"><h1>${title}</h1><p>${message}</p>${options.link ? html`<a href="${options.link.href}">${options.link.label}</a>` : ''}</section>`
   };
 }
 
