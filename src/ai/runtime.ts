@@ -191,22 +191,10 @@ function memoryFocusThought(state: AgentState): string | undefined {
   return thought || undefined;
 }
 
-/** 道具の呼び出しに添えられた「なぜ呼ぶか」の一言 (引数 why)。思考を返さない・暗号化するモデルでも、意図が読める。 */
-function callNotes(entry: StateMessage): string {
-  return arrayOf(entry.tool_calls).map((call) => {
-    try {
-      const args: unknown = JSON.parse(String(callFunction(call).arguments ?? '{}'));
-      return isRecord(args) && typeof args.why === 'string' ? args.why : '';
-    } catch {
-      return '';
-    }
-  }).filter(Boolean).join(' ');
-}
-
 /**
- * モデル自身が直前に考えていたこと。思考の文章 (reasoning / reasoning_details の text・summary) と、
- * 道具の呼び出しに添えた一言 (why) をつなげる。いちばん新しい往復の分だけ。
- * 思考が暗号化されていて読めない (gpt-6-luna)・ほぼ空 (glm は「Search past logs.」だけ) のモデルは、why が頼り。
+ * モデル自身が直前に考えていたこと (CoT)。provider が思考を返したときだけ。
+ * 道具を呼んだ往復の assistant メッセージに、思考の文章 (reasoning) か、その細目 (reasoning_details の text / summary) が残っている。
+ * 暗号化された思考 (中身が読めないもの) と、思考の無い往復は無い扱い。いちばん新しい往復の分だけ。
  */
 function latestReasoning(state: AgentState): string | undefined {
   for (let index = state.messages.length - 1; index >= 0; index -= 1) {
@@ -216,7 +204,7 @@ function latestReasoning(state: AgentState): string | undefined {
     const detailed = arrayOf(entry.reasoning_details)
       .map((detail) => (isRecord(detail) ? String(detail.text ?? detail.summary ?? '') : ''))
       .filter(Boolean).join('\n');
-    const text = [direct || detailed, callNotes(entry)].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+    const text = (direct || detailed).replace(/\s+/g, ' ').trim();
     if (text) return text.slice(-1500);
     // 思考の無い往復を飛ばして古い思考を使うと、いまの関心とずれる
     return undefined;

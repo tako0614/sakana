@@ -253,14 +253,14 @@ console.log(
 
 const USER = 'check-model-user';
 
-// 混んだとき (429) の回し先: 選んだものを除き、優先順の2つまで (価格が一段上の luna・deepseek は入れない)
+// 混んだとき (429) の回し先: 選んだものを除き、優先順の2つまで (価格が一段上の deepseek は入れない)
 {
   const { agentFallbackModels, AGENT_ENGINES } = await import('../src/agent/engines.js');
   const fromGlm = agentFallbackModels(AGENT_ENGINES.glm);
   if (fromGlm.length !== 2 || fromGlm.includes(AGENT_ENGINES.glm)) fail(`glm の回し先: ${fromGlm}`);
   if (fromGlm.join() !== [AGENT_ENGINES.mimo, AGENT_ENGINES.qwen].join()) fail(`優先順 (mimo → qwen): ${fromGlm}`);
-  const fromLuna = agentFallbackModels(AGENT_ENGINES.luna);
-  if (fromLuna.join() !== [AGENT_ENGINES.glm, AGENT_ENGINES.mimo].join()) fail(`luna の回し先: ${fromLuna}`);
+  const fromDeepseek = agentFallbackModels(AGENT_ENGINES.deepseek);
+  if (fromDeepseek.join() !== [AGENT_ENGINES.glm, AGENT_ENGINES.mimo].join()) fail(`deepseek の回し先: ${fromDeepseek}`);
   if (agentFallbackModels(AGENT_ENGINES.mimo).includes(AGENT_ENGINES.mimo)) fail('選んだモデル自身へは回さない');
 }
 const clear = () => db.prepare('DELETE FROM agent_engine WHERE user_id = ?').run(USER);
@@ -272,8 +272,12 @@ try {
   // deepseek は 2026-10-15 に廃止したが v4.1-flash で復活した。選んでいた人はそのまま deepseek (黙って別物に落ちない)
   db.prepare('INSERT OR REPLACE INTO agent_engine (guild_id, user_id, engine, updated_at) VALUES (?, ?, ?, ?)').run(TEST_GUILD, USER, 'deepseek', Date.now());
   if (engineFor(USER, TEST_GUILD) !== 'deepseek') fail('deepseek は v4.1-flash で復活したので、選んでいた人はそのまま deepseek');
+  // luna は足した日に廃止した。選んでいた人は既定へ読み替える (黙って別物に落ちない)
+  db.prepare('INSERT OR REPLACE INTO agent_engine (guild_id, user_id, engine, updated_at) VALUES (?, ?, ?, ?)').run(TEST_GUILD, USER, 'luna', Date.now());
+  if (engineFor(USER, TEST_GUILD) !== DEFAULT_ENGINE) fail('luna を選んでいた人は既定に読み替える');
+  if (ENGINES.luna) fail('luna は選択肢に無い');
   clear();
-  for (const key of ['ling', 'glm', 'qwen', 'luna', 'deepseek', 'mimo']) {
+  for (const key of ['ling', 'glm', 'qwen', 'deepseek', 'mimo']) {
     if (!ENGINES[key] || !isAgentEngine(key)) fail(`${key} を会話 agent として選べない`);
     if (!agentModelFor(key).includes('/')) fail(`${key} の OpenRouter モデルが無い`);
   }

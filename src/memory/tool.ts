@@ -63,8 +63,7 @@ export const memoryToolDefinition: ToolDefinition = {
         path: { type: 'string', description: '例: people/たこ。空なら根' },
         with: { type: 'string', description: 'path と一緒に関わったページ' },
         query: { type: 'string', description: '探す語 (スペース区切り)' },
-        episode: { type: 'string', description: '出来事の番号。例: e12' },
-        why: { type: 'string', description: 'なぜ・何を知りたくて呼ぶか (1文。想起の手がかりになる)' }
+        episode: { type: 'string', description: '出来事の番号。例: e12' }
       }
     }
   }

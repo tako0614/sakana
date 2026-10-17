@@ -4,12 +4,12 @@
 // 既定は glm (2026-10-17 に ling から変更: 日本語と、検索してから答える道具の使い方が安定している。
 // 日付・固有名にも強く、記憶の比較で最良)。ling はいちばん安い。
 // 同じ日に、偽の検索ツールで10モデルに同じ3問を出して比べた (道具を先に使うか・日本語・いじりの面白さ・捏造):
-// qwen は 3.7 が別人の話をして作り話もしたので 3.8 に、luna・deepseek・mimo を足した。
+// qwen は 3.7 が別人の話をして作り話もしたので 3.8 に、deepseek・mimo を足した。
+// luna (openai/gpt-6-luna) は足したが、思考が暗号化されて読めず、いじりも控えめなので同じ日に廃止した。
 export const AGENT_ENGINES = {
   ling: process.env.AGENT_MODEL_LING || 'inclusionai/ling-3.0-flash',
   glm: process.env.AGENT_MODEL_GLM || 'z-ai/glm-5.3-flash',
   qwen: process.env.AGENT_MODEL_QWEN || 'qwen/qwen3.8-flash',
-  luna: process.env.AGENT_MODEL_LUNA || 'openai/gpt-6-luna',
   deepseek: process.env.AGENT_MODEL_DEEPSEEK || 'deepseek/deepseek-v4.1-flash-1017',
   mimo: process.env.AGENT_MODEL_MIMO || 'xiaomi/mimo-v2.6-flash'
 };
@@ -26,7 +26,7 @@ export const agentModelFor = (engine: unknown): string => (
   isAgentEngine(engine) ? AGENT_ENGINES[engine] : AGENT_ENGINES[DEFAULT_AGENT_ENGINE]
 );
 
-// 混んだときの回し先の優先順 (出来が良くて安いもの)。luna・deepseek は価格が一段上なので入れない。
+// 混んだときの回し先の優先順 (出来が良くて安いもの)。deepseek は価格が一段上なので入れない。
 const FALLBACK_ORDER: readonly AgentEngine[] = ['glm', 'mimo', 'qwen', 'ling'];
 
 /**

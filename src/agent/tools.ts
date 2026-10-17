@@ -529,8 +529,7 @@ export function searchToolDefinition({ archiveAvailable, semanticAvailable }: Se
     sort: { type: 'string', description: 'new / old / relevance / reactions / long (後ろ2つはローカルのみ。mode:keyword だけ効く)' },
     ...(archiveAvailable ? { source: { type: 'string', description: 'discord (既定) / archive。ローカル専用の条件を書けば指定しなくてもローカルを引く' } } : {}),
     offset: { type: 'number', description: '先頭から飛ばす件数。古い方を見るなら sort:old か during: のほうが早い' },
-    limit: { type: 'number', description: '件数 (既定 10、最大 25)' },
-    why: { type: 'string', description: 'なぜ・何を知りたくて呼ぶか (1文。想起の手がかりになる)' }
+    limit: { type: 'number', description: '件数 (既定 10、最大 25)' }
   };
 
   return {
