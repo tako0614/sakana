@@ -28,6 +28,7 @@ import { governance, type GovernanceReservation } from './boundary.js';
 import { closeBrowserSandbox } from './browser.js';
 import { failureNotice } from './failure.js';
 import { stripAddressNarration } from './narration.js';
+import { dropRestartedAnswer } from './repeat.js';
 import { agentConfig, agentEnabled } from './config.js';
 import {
   RefTable,
@@ -529,7 +530,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
     // 文字列でなければ回答として使わない
     const text = typeof result.text === 'string' ? result.text.trim() : '';
     const answer = text
-      ? expandCitations(stripAddressNarration(text, member.displayName), refs, {
+      ? expandCitations(stripAddressNarration(dropRestartedAnswer(text), member.displayName), refs, {
         label: modelLabel(model), selfId: client.user.id, episodeUrl: (id) => memoryEpisodeUrl(guild.id, id)
       })
       : 'うまく答えをまとめられませんでした。条件を絞ってもう一度聞いてください。';
