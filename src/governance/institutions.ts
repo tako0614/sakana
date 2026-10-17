@@ -9,6 +9,7 @@ import {
   isEffectiveLegalSystem,
   isRecord,
   isStringArray,
+  type Constitution,
   type InstitutionTaskOutput,
   type InstitutionTaskResult,
   type LegalTask
@@ -66,7 +67,10 @@ export async function runInstitutionProcedures(guild: Guild, now = Date.now()): 
       if (!snapshot || snapshot.guildId !== guild.id) throw new Error('機関の適用法令snapshotが不正です。');
       const rules = snapshot.rules;
       if (!isEffectiveLegalSystem(rules)) throw new Error('機関の適用法令snapshotが不正です。');
-      const constitution = { ...getConstitution(snapshot.constitutionId), ...snapshot };
+      const stored = getConstitution(snapshot.constitutionId);
+      if (!stored) throw new Error('機関の適用法令snapshotが不正です。');
+      // 案件を受けた時点の法体系 (snapshot) の実行規則と実行値で、その憲法を読み替える。
+      const constitution: Constitution = { ...stored, rules, policy: snapshot.policy };
       const procedure = rules.procedures[task.procedure_id];
       if (!procedure) throw new Error('procedure: object required');
       await runLegalProcedure({ procedure, state: task.state, context: task.context, wakeAt: task.wake_at,

@@ -16,11 +16,13 @@ import { db as archiveDb } from '../archive/db.js';
 import {
   activateRestriction,
   addCaseEvidence,
+  addCaseSubmission,
   authorizeTrustedMutation,
   castProposalVote,
   castHumanVeto,
   completeAction,
   consumeTrustedMutation,
+  createAdministrativeAct,
   createAppeal,
   createCase,
   createDetention,
@@ -28,6 +30,7 @@ import {
   deactivateRestrictionForSanction,
   enactConstitution,
   enactLaw,
+  enqueueAction,
   expireDetentions,
   expireRestrictions,
   expireGovernanceIntakes,
@@ -58,6 +61,7 @@ import {
   listCaseApprovals,
   listCaseEvidence,
   listCaseDecisions,
+  listCases,
   listCaseSubmissions,
   listCurrentCaseSubmissions,
   listGovernanceGuilds,
@@ -80,13 +84,15 @@ import {
   legalApprovalResult,
   setOperationalSetting,
   snapshotProposalVoters,
+  transitionWorkflowInstance,
   updateAppeal,
   updateAdministrativeAct,
   updateCase,
   updateGovernanceGuild,
   updateLaw,
   updateProposal,
-  updateSanction
+  updateSanction,
+  writeAudit
 } from './db.js';
 import {
   postEnforcementRecord,
@@ -125,121 +131,96 @@ import { governanceActionAllowed, reserveRestrictedAgentCall } from './restricti
 import { notifyCaseParty } from './notifications.js';
 import { publishInstrument, syncLawSite } from './lawsite.js';
 import { investigationSummary } from './tools.js';
+import type { AgendaOutcome } from './parliament.js';
 import { runInstitutionProcedures } from './institutions.js';
 import { WAITING_ACTIONS } from './legal-system.js';
 import { procedureExhausted, recordProcedureVisit } from './procedure-runtime.js';
 import { requiresManualExecution, manualExecutionDetail, requestManualExecution } from './manual-execution.js';
 
-import { closeGovernanceVote, durationMilliseconds, workflowFor } from './rules.js';
+import { closeGovernanceVote, compileConstitution, durationMilliseconds } from './rules.js';
+import { assertSanctionExecution } from './execution-authority.js';
+import { selectHumanMembers, type HumanMemberCandidate } from './human-authority.js';
 import {
-  addCaseSubmission,
-  assertSanctionExecution,
-  autonomousPolicy,
-  compileConstitution,
-  createAdministrativeAct,
-  enqueueAction,
   errorMessage,
-  isActivityRow,
-  isAdministrativeActRow,
-  isAppealRow,
-  isApprovalContext,
-  isApprovalResult,
-  isApprovalRow,
-  isCaseRow,
-  isConstitutionRow,
-  isDetentionRow,
-  isEvidenceRow,
-  isGovernanceGuildRow,
-  isGovernanceRules,
-  isLawRow,
   isNumber,
-  isOutboxRow,
-  isPoliceProcedure,
-  isProposalRow,
   isRecord,
-  isReservation,
-  isSanctionDefinitionRow,
-  isSanctionRow,
   isString,
+  isCaseEvidenceSubmission,
   isStringArray,
-  isSubmissionRow,
   isUnknown,
-  isVetoResult,
-  isVoteCloseResult,
-  isVoteSummary,
-  isWorkflowInstanceRow,
-  listCases,
   narrow,
   narrowList,
-  narrowRequired,
-  nullable,
   optional,
-  policyOf,
-  requirePolicy,
+  requireRow,
+  requireText,
   requireValue,
-  rulesOf,
-  selectHumanMembers,
   shape,
-  transitionWorkflowInstance,
-  writeAudit,
-  type AdministrativeActRow,
   type AttemptMember,
-  type CaseRow,
+  type CaseEvidenceSubmission,
   type ConstitutionalChallengeInput,
-  type ConstitutionRow,
   type CriminalCaseInput,
-  type EvidenceRow,
   type GovernanceActor,
-  type GovernanceGuildRow,
   type GovernanceMessage,
-  type GovernancePolicy,
   type GovernanceReservation,
-  type GovernanceRules,
-  type HumanAuthoritySnapshot,
   type JudicialPanel,
-  type LawRow,
-  type OutboxRow,
   type PanelCase,
   type PanelTraces,
-  type PoliceProcedure,
-  type ProposalRow,
   type ProposalRuntime,
   type ProposalTransition,
   type Reporter,
   type RetrievedRecord,
   type ReviewTarget,
   type SanctionChoice,
-  type SanctionExecutionDetail,
-  type SanctionRow,
-  type Workflow,
-  type WorkflowState
+  type SeatPanel,
+  type SanctionExecutionDetail
 } from './types-service.js';
+import {
+  isEffectiveLegalSystem,
+  isWorkflowKey,
+  idOrNull,
+  oneOf,
+  requireId,
+  type ActiveConstitution,
+  type AdministrativeAct,
+  type CaseRecord,
+  type CaseEvidenceRow,
+  type Constitution,
+  type ConstitutionPolicy,
+  type DetentionRow,
+  type GovernanceGuild,
+  type GovernanceRules,
+  type HumanAuthority,
+  type HumanAuthoritySnapshot,
+  type Id,
+  type Law,
+  type LegalProcedure,
+  type OutboxAction,
+  type PoliceProcedurePolicy,
+  type ProcedureState,
+  type Proposal,
+  type ProposalBody,
+  type RecoveryRules,
+  type Sanction
+} from './types.js';
 
-// ---- DB の行を確かめて読む ----
+// ---- DB の行 ----
 
-const governanceGuild = (guildId: unknown) => narrow(getGovernanceGuild(guildId), isGovernanceGuildRow, 'governance guild');
-const caseById = (caseId: unknown) => narrow(getCase(caseId), isCaseRow, 'case');
-const requireCase = (value: unknown) => narrowRequired(value, isCaseRow, 'case');
-const proposalById = (proposalId: unknown) => narrow(getProposal(proposalId), isProposalRow, 'proposal');
-const requireProposal = (value: unknown) => narrowRequired(value, isProposalRow, 'proposal');
-const lawById = (lawId: unknown) => narrow(getLaw(lawId), isLawRow, 'law');
-const sanctionById = (sanctionId: unknown) => narrow(getSanction(sanctionId), isSanctionRow, 'sanction');
-const requireSanction = (value: unknown) => narrowRequired(value, isSanctionRow, 'sanction');
-const caseSanction = (caseId: unknown) => narrow(getCaseSanction(caseId), isSanctionRow, 'sanction');
-const activeConstitution = (guildId: unknown) => narrow(getActiveConstitution(guildId), isConstitutionRow, 'constitution');
-const appealOf = (caseId: unknown) => narrow(getAppeal(caseId), isAppealRow, 'appeal');
-const workflowInstance = (subjectType: string, subjectId: unknown) => narrow(getWorkflowInstance(subjectType, subjectId), isWorkflowInstanceRow, 'workflow instance');
-const caseEvidence = (caseId: unknown) => narrowList(listCaseEvidence(caseId), isEvidenceRow, 'case evidence');
-const currentSubmissions = (caseId: unknown) => narrowList(listCurrentCaseSubmissions(caseId), isSubmissionRow, 'case submission');
-const settingNumber = (guildId: string, key: string): number => Number(getOperationalSetting(guildId, key));
-const durationMs = (duration: unknown): number => Number(durationMilliseconds(duration));
-const procedureOf = (policy: unknown): PoliceProcedure | null => narrow(policeProcedure(policy), isPoliceProcedure, 'police procedure');
-const waitingActions: readonly string[] = narrowList(WAITING_ACTIONS, isString, 'waiting action');
+// 呼びかけの投稿や権限の対象から来る id は、サーバー外 (DM)・省略で null / undefined のこともある。
+// その場合は「統治の設定が無い」として探さない。
+const governanceGuild = (guildId: Id | null | undefined): GovernanceGuild | null => (
+  guildId === null || guildId === undefined ? null : getGovernanceGuild(guildId)
+);
+const activeConstitution = (guildId: Id | null | undefined): ActiveConstitution | null => (
+  guildId === null || guildId === undefined ? null : getActiveConstitution(guildId)
+);
+const requireCase = (value: CaseRecord | null | undefined): CaseRecord => requireRow(value, 'case');
+const requireProposal = (value: Proposal | null | undefined): Proposal => requireRow(value, 'proposal');
+const requireSanction = (value: Sanction | null | undefined): Sanction => requireRow(value, 'sanction');
 
 // 席の調査は要約だけ公開する（憲法第九条8・実行規則 investigation.publicRecord）。
 const PANEL_LENS_LABELS = ['textual', 'rights', 'adversarial'];
 
-function investigationLines(panel: PanelTraces, policy: GovernancePolicy | null | undefined): string[] {
+function investigationLines(panel: PanelTraces, policy: ConstitutionPolicy | null | undefined): string[] {
   if ((policy?.investigation?.publicRecord ?? 'none') === 'none') return [];
   return (panel.traces ?? [])
     .flatMap(({ seat, trace }) => {
@@ -255,26 +236,31 @@ function investigationLines(panel: PanelTraces, policy: GovernancePolicy | null 
 const RETRY_BASE_MS = 5 * 60_000;
 const RETRY_MAX_MS = 60 * 60_000;
 
-// 案件受付時の憲法を compile した実行規則。
-const isCompiledConstitution = shape({ rules: isGovernanceRules, rulesHash: optional(isString), policy: isUnknown });
-
-function proposalRuntime(proposal: ProposalRow): ProposalRuntime | null {
-  const constitution = narrow(constitutionForSubject('proposal', proposal), isConstitutionRow, 'constitution');
+function proposalRuntime(proposal: Proposal): ProposalRuntime | null {
+  const constitution = constitutionForSubject('proposal', proposal);
   if (!constitution) throw new Error('案件受付時の憲法がありません。');
-  const source: unknown = constitution.rules
+  // 保存済みの実行規則があればそれを使い、無ければ憲法本文から compile する (compile は policy を取らない)。
+  const compiled = constitution.rules
     ? { rules: constitution.rules, rulesHash: constitution.rules_hash, policy: constitution.policy }
-    : compileConstitution({ content: constitution.content, policy: constitution.policy });
+    : compileConstitution({ content: constitution.content });
   const key = proposal.kind === 'amendment' ? 'constitutionalAmendment' : 'law';
-  // 手続が無ければ rules.js が理由を付けて止める。続けて実行規則全体の形を確かめる。
-  workflowFor(source, key);
-  const compiled = narrowRequired(source, isCompiledConstitution, 'compiled constitution');
-  const workflow = requireValue(compiled.rules.workflows[key], `憲法にworkflow ${key} がありません。`);
+  // 権限だけの憲法 (法律と合わせて組み立てる前) は手続を持たない。
+  const rules = compiled.rules;
+  if (!('workflows' in rules)) throw new Error(`憲法にworkflow ${key} がありません。`);
+  const workflow = requireValue(rules.workflows[key], `憲法にworkflow ${key} がありません。`);
   const state = workflow.states[proposal.status];
   if (!state) return null;
-  return { constitution, compiled, key, workflow, stateName: proposal.status, state };
+  return {
+    constitution,
+    compiled: { rules, rulesHash: compiled.rulesHash, policy: compiled.policy },
+    key,
+    workflow,
+    stateName: proposal.status,
+    state
+  };
 }
 
-function proposalTransition(proposal: ProposalRow, outcome: string): ProposalTransition {
+function proposalTransition(proposal: Proposal, outcome: string): ProposalTransition {
   const runtime = proposalRuntime(proposal);
   return proposalTransitionFrom(runtime, runtime?.stateName, outcome);
 }
@@ -291,7 +277,7 @@ function proposalTransitionFrom(runtime: ProposalRuntime | null, stateName: stri
     outcome,
     targetName,
     target,
-    durationMilliseconds: target.duration === null || target.duration === undefined ? null : durationMs(target.duration)
+    durationMilliseconds: target.duration === null || target.duration === undefined ? null : durationMilliseconds(target.duration)
   };
 }
 
@@ -299,13 +285,13 @@ function proposalStageEnd(transition: ProposalTransition, now = Date.now()): num
   return transition.durationMilliseconds === null ? null : now + transition.durationMilliseconds;
 }
 
-function specialElectorateName(guild: Guild, governance: GovernanceGuildRow | null): string {
+function specialElectorateName(guild: Guild, governance: GovernanceGuild | null): string {
   return governance?.trusted_role_id
     ? (guild.roles.cache.get(governance.trusted_role_id)?.name ?? '特別有権者')
     : '特別有権者';
 }
 
-function publicLawDetails(law: LawRow | null | undefined, offenseCode: unknown): string[] {
+function publicLawDetails(law: Law | null | undefined, offenseCode: unknown): string[] {
   const offense = law?.provisions?.offenses?.find((entry) => entry.code === offenseCode);
   return [
     law ? `適用法: ${law.title}` : '適用法: 裁判記録に記載',
@@ -358,52 +344,52 @@ export function retryPatch(record: { failure_count?: number | null } | null | un
   };
 }
 
-function requireGovernance(guildId: unknown): { governance: GovernanceGuildRow; constitution: ConstitutionRow; policy: GovernancePolicy } {
+function requireGovernance(guildId: Id | null | undefined): { governance: GovernanceGuild; constitution: Constitution; policy: ConstitutionPolicy } {
   const governance = governanceGuild(guildId);
   if (!governance) throw new Error('このサーバーでは統治機能が初期化されていません。');
   if (governance.status !== 'active') throw new Error('統治機能は現在一時停止中です。');
   const constitution = activeConstitution(guildId);
   if (!constitution) throw new Error('有効な憲法がありません。');
-  return { governance, constitution, policy: requirePolicy(constitution.policy) };
+  return { governance, constitution, policy: constitution.policy };
 }
 
-function constitutionForCase(caseRecord: CaseRow): ConstitutionRow {
-  return requireValue((caseRecord.constitution_id ? narrow(constitutionForSubject('case', caseRecord), isConstitutionRow, 'constitution') : null)
+function constitutionForCase(caseRecord: CaseRecord): Constitution {
+  return requireValue((caseRecord.constitution_id ? constitutionForSubject('case', caseRecord) : null)
     ?? activeConstitution(caseRecord.guild_id), '事件に適用される憲法がありません。');
 }
 
 /** 制度修復中か (実行規則の recovery)。形を問わず、あれば修復中として扱う。 */
-function recoveryOf(rules: unknown): unknown {
-  return isRecord(rules) ? rules['recovery'] : undefined;
+function recoveryOf(rules: GovernanceRules | null | undefined): RecoveryRules | undefined {
+  return rules?.recovery;
 }
 
-const casePolicy = (caseRecord: CaseRow): GovernancePolicy => requirePolicy(constitutionForCase(caseRecord).policy);
-const caseRules = (caseRecord: CaseRow): GovernanceRules => requireValue(rulesOf(constitutionForCase(caseRecord).rules), '事件に適用される実行規則がありません。');
+const casePolicy = (caseRecord: CaseRecord): ConstitutionPolicy => constitutionForCase(caseRecord).policy;
+const caseRules = (caseRecord: CaseRecord): GovernanceRules => requireValue(constitutionForCase(caseRecord).rules, '事件に適用される実行規則がありません。');
 
 /** 事件の手続段階 (法律で組織を定める憲法のとき)。 */
-function caseStage(rules: GovernanceRules, instance: { workflow_key: string; current_state: string }): { workflow: Workflow; stage: WorkflowState | undefined } {
-  const workflow = requireValue(rules.workflows[instance.workflow_key], '案件に適用される手続がありません。');
+function caseStage(rules: GovernanceRules, instance: { workflow_key: string; current_state: string }): { workflow: LegalProcedure; stage: ProcedureState | undefined } {
+  const workflow = requireValue(isWorkflowKey(instance.workflow_key) ? rules.workflows[instance.workflow_key] : undefined, '案件に適用される手続がありません。');
   return { workflow, stage: workflow.states[instance.current_state] };
 }
 
-function casePeriod(caseRecord: CaseRow, outcome: string, handler: string, fallback: number): number {
+function casePeriod(caseRecord: CaseRecord, outcome: string, handler: string, fallback: number): number {
   const constitution = constitutionForCase(caseRecord);
-  if (!autonomousPolicy(constitution.policy)) return fallback;
-  const instance = requireValue(workflowInstance('case', caseRecord.id), '案件の手続状態がありません。');
+  if (!constitution.policy.autonomous) return fallback;
+  const instance = requireValue(getWorkflowInstance('case', caseRecord.id), '案件の手続状態がありません。');
   const { workflow: procedure, stage } = caseStage(caseRules(caseRecord), instance);
   const current = requireValue(stage, '案件に適用される手続段階がありません。');
   const targetName = current.on[outcome];
   const target = targetName === undefined ? undefined : procedure.states[targetName];
   const period = target?.handler === handler ? target : Object.values(procedure.states).find((entry) => entry.handler === handler);
   if (!period?.duration) throw new Error('法令に必要な期間がありません。');
-  return durationMs(period.duration);
+  return durationMilliseconds(period.duration);
 }
 
-function caseProcedure(caseRecord: CaseRow): PoliceProcedure | null {
-  return procedureOf(constitutionForCase(caseRecord)?.policy);
+function caseProcedure(caseRecord: CaseRecord): PoliceProcedurePolicy | null {
+  return policeProcedure(constitutionForCase(caseRecord)?.policy);
 }
 
-function governanceSurface(channel: { id: string; parentId?: string | null } | null | undefined, governance: GovernanceGuildRow | null): boolean {
+function governanceSurface(channel: { id: string; parentId?: string | null } | null | undefined, governance: GovernanceGuild | null): boolean {
   if (!channel || !governance) return false;
   const ids = new Set([
     governance.category_id,
@@ -416,7 +402,7 @@ function governanceSurface(channel: { id: string; parentId?: string | null } | n
   return ids.has(channel.id) || (typeof channel.parentId === 'string' && ids.has(channel.parentId));
 }
 
-function publicChannel(message: GovernanceMessage, governance: GovernanceGuildRow | null = null): boolean {
+function publicChannel(message: GovernanceMessage, governance: GovernanceGuild | null = null): boolean {
   const channel = message.channel;
   if (!channel || channel.isDMBased?.()) return false;
   // 議会Forumのスレは議題そのもの。proposal行になる前の討論も国会が読めるよう記録する。
@@ -438,7 +424,7 @@ export function recordGovernanceMessage(message: GovernanceMessage): boolean {
   if (!governance || !publicChannel(message, governance)) return false;
   const constitution = activeConstitution(message.guildId);
   if (!constitution) return false;
-  const policy = requirePolicy(constitution.policy);
+  const policy = constitution.policy;
   const normalized = normalizeActivityContent(message.content);
   if (Array.from(normalized).length < policy.eligibility.minimumVisibleCharacters || /^[/!]/.test(normalized)) return false;
   return Boolean(recordActivity({
@@ -450,7 +436,7 @@ export function recordGovernanceMessage(message: GovernanceMessage): boolean {
     activityDate: activityDate(message.createdTimestamp, policy.timezoneOffsetMinutes),
     contentHash: sha256(normalized),
     content: String(message.content ?? ''),
-    structureJson: JSON.stringify({ ...narrowRequired(discordStructure(message), isRecord, 'message structure'), observedAt: null }),
+    structureJson: JSON.stringify({ ...discordStructure(message), observedAt: null }),
     createdAt: message.createdTimestamp
   }));
 }
@@ -467,10 +453,6 @@ function memberHasRole(roles: unknown, roleId: string): boolean {
   return false;
 }
 
-function reservation(value: unknown): GovernanceReservation {
-  return narrowRequired(value, isReservation, 'attempt reservation');
-}
-
 /**
  * 通常会話agentの回数壁。費用上限とは別で、prompt injectionの試行回数を抑える。
  * trustedはサーバー名ではなく、初期化時に指定したrole IDだけで判定する。
@@ -479,15 +461,15 @@ export function reserveGovernanceAgentAttempt(member: AttemptMember | null | und
   const guildId = member?.guild?.id;
   const governance = governanceGuild(guildId);
   if (!member || !guildId || !governance) return { ok: true, governed: false };
-  const restricted = reservation(reserveRestrictedAgentCall(guildId, member.id, eventId));
+  const restricted = reserveRestrictedAgentCall(guildId, member.id, eventId);
   if (!restricted.ok) return { ...restricted, governed: true, scope: 'sanction' };
   const trusted = Boolean(governance.trusted_role_id) && memberHasRole(member.roles, governance.trusted_role_id);
-  const rawLimit = settingNumber(
+  const rawLimit = getOperationalSetting(
     guildId,
     trusted ? 'trusted_daily_calls' : 'general_daily_calls'
   );
   const limit = Math.max(0, Math.floor(rawLimit));
-  const attempt = reservation(reserveAgentAttempt(guildId, member.id, trusted, limit));
+  const attempt = reserveAgentAttempt(guildId, member.id, trusted, limit);
   return {
     ...attempt,
     governed: true,
@@ -506,18 +488,18 @@ export function reserveGovernanceIntakeAttempt(
   const governance = governanceGuild(guildId);
   const constitution = activeConstitution(guildId);
   if (!member || !guildId || !governance || !constitution) return { ok: true, governed: false };
-  const restricted = reservation(reserveRestrictedAgentCall(guildId, member.id, eventId));
+  const restricted = reserveRestrictedAgentCall(guildId, member.id, eventId);
   if (!restricted.ok) return { ...restricted, governed: true, scope: 'sanction' };
-  const limit = requirePolicy(constitution.policy).judiciary.constitutionalChallengesPerMemberPerDay;
+  const limit = constitution.policy.judiciary.constitutionalChallengesPerMemberPerDay;
   return {
-    ...reservation(reserveAgentAttempt(
+    ...reserveAgentAttempt(
       guildId,
       member.id,
       false,
       limit,
       DAY_MS,
       'constitutional_challenge'
-    )),
+    ),
     governed: true,
     trusted: false,
     scope: 'constitutional_challenge'
@@ -588,10 +570,11 @@ export async function backfillGovernanceActivity(guild: Guild): Promise<number> 
 
 export async function buildElectorateSnapshot(guild: Guild, proposalId: number) {
   const { governance, policy: activePolicy } = requireGovernance(guild.id);
-  const proposal = requireValue(narrow(repairInstitutionProposalScope(proposalId), isProposalRow, 'proposal'), '投票案件が見つかりません。');
-  const policy = policyOf(narrow(constitutionForSubject('proposal', proposal), isConstitutionRow, 'constitution')?.policy) ?? activePolicy;
+  const proposal = requireValue(repairInstitutionProposalScope(proposalId), '投票案件が見つかりません。');
+  const policy = constitutionForSubject('proposal', proposal)?.policy ?? activePolicy;
   const scope = proposal.vote_scope ?? policy.voting.defaultScope;
-  if (!policy.voting.allowedScopes.includes(scope)) throw new Error('この投票scopeは現行憲法で許可されていません。');
+  const allowedScopes: readonly string[] = policy.voting.allowedScopes;
+  if (!allowedScopes.includes(scope)) throw new Error('この投票scopeは現行憲法で許可されていません。');
   const members = await guild.members.fetch();
   const rows: { userId: string; eligibleGeneral: boolean; trusted: boolean }[] = [];
   for (const member of members.values()) {
@@ -608,24 +591,23 @@ export async function buildElectorateSnapshot(guild: Guild, proposalId: number) 
 
 export async function snapshotHumanAuthority(
   guild: Guild,
-  authority: Record<string, unknown>,
-  exclude: readonly unknown[] = [],
-  members: unknown = null
+  authority: HumanAuthority,
+  exclude: readonly (string | null | undefined)[] = [],
+  members: { values(): Iterable<HumanMemberCandidate> } | null = null
 ): Promise<HumanAuthoritySnapshot> {
   const governance = governanceGuild(guild.id);
-  const operators = narrowList(governanceConfig.operators, isString, 'governance operator');
-  return { ...authority, members: narrowList(selectHumanMembers(members ?? await guild.members.fetch(), authority,
-    { guild, trustedRoleId: governance?.trusted_role_id, operators, exclude }), isString, 'authority member') };
+  return { ...authority, members: selectHumanMembers(members ?? await guild.members.fetch(), authority,
+    { guild, trustedRoleId: governance?.trusted_role_id, operators: governanceConfig.operators, exclude }) };
 }
 
 export async function exerciseHumanVeto(interaction: GovernanceActor, subjectType: string, subjectId: number) {
   requireGovernance(interaction.guildId);
-  const proposal = subjectType === 'proposal' ? proposalById(subjectId) : null;
-  const caseRecord = subjectType === 'case' ? caseById(subjectId) : null;
+  const proposal = subjectType === 'proposal' ? getProposal(subjectId) : null;
+  const caseRecord = subjectType === 'case' ? getCase(subjectId) : null;
   const record = proposal ?? caseRecord;
   if (!record || record.guild_id !== interaction.guildId || interaction.user.bot) throw new Error('拒否権の対象が見つかりません。');
   const guild = requireValue(interaction.guild, 'サーバー内でのみ使えます。');
-  const result = narrowRequired(castHumanVeto(subjectType, subjectId, interaction.user.id), isVetoResult, 'veto result');
+  const result = castHumanVeto(subjectType, subjectId, interaction.user.id);
   // Persisted vetoes block commit/execution even if their Discord notice fails.
   if (proposal) {
     await advanceProposal(guild, requireProposal(getProposal(subjectId)));
@@ -637,20 +619,20 @@ export async function exerciseHumanVeto(interaction: GovernanceActor, subjectTyp
   return result;
 }
 
-function proposalBody(proposal: ProposalRow): Record<string, unknown> {
-  return requireValue(isRecord(proposal.body) ? proposal.body : null, '議案の本文がありません。');
+function proposalBody(proposal: Proposal): ProposalBody {
+  return requireValue(proposal.body, '議案の本文がありません。');
 }
 
-function voteRuleFor(proposal: ProposalRow, rules: GovernanceRules) {
+function voteRuleFor(proposal: Proposal, rules: GovernanceRules) {
   const votes = requireValue(rules.votes, '憲法に投票規則がありません。');
   return proposal.kind === 'amendment' ? votes.constitutionalAmendment : votes.law;
 }
 
-export async function openProposalVote(guild: Guild, proposal: ProposalRow, outcome = 'adopted'): Promise<ProposalRow> {
+export async function openProposalVote(guild: Guild, proposal: Proposal, outcome = 'adopted'): Promise<Proposal> {
   const { governance } = requireGovernance(guild.id);
   const transition = proposalTransition(proposal, outcome);
   if (transition.target.handler !== 'public_vote') throw new Error('投票開始へ遷移できない案件です。');
-  const procedurePolicy = requirePolicy(transition.constitution.policy);
+  const procedurePolicy = transition.constitution.policy;
   const voteRule = voteRuleFor(proposal, transition.compiled.rules);
   const snapshot = await buildElectorateSnapshot(guild, proposal.id);
   const now = Date.now();
@@ -674,19 +656,16 @@ export async function openProposalVote(guild: Guild, proposal: ProposalRow, outc
   }));
 }
 
-const isEnactedConstitution = shape({ version: isNumber });
-const isEnactedLaw = shape({ id: isNumber, title: isString, version: optional(isNumber) });
-
-async function closeProposalVote(guild: Guild, proposal: ProposalRow): Promise<ProposalRow> {
+async function closeProposalVote(guild: Guild, proposal: Proposal): Promise<Proposal> {
   const { governance } = requireGovernance(guild.id);
   const runtime = proposalRuntime(proposal);
   if (!runtime || runtime.state.handler !== 'public_vote') throw new Error('この案件は投票中ではありません。');
   const constitution = runtime.constitution;
-  const summary = narrowRequired(proposalVoteSummary(proposal.id), isVoteSummary, 'vote summary');
-  const result = narrowRequired(closeGovernanceVote(
+  const summary = proposalVoteSummary(proposal.id);
+  const result = closeGovernanceVote(
     { kind: proposal.kind, scope: proposal.vote_scope, ...summary },
     runtime.compiled.rules
-  ), isVoteCloseResult, 'vote result');
+  );
   if (!result.passed) {
     const electorate = specialElectorateName(guild, governance);
     const transition = proposalTransition(proposal, 'rejected');
@@ -704,16 +683,15 @@ async function closeProposalVote(guild: Guild, proposal: ProposalRow): Promise<P
       return proposal;
     }
     const body = proposalBody(proposal);
-    const next = narrowRequired(enactConstitution({
+    const next = requireRow(enactConstitution({
       guildId: guild.id,
-      content: body['content'],
-      policy: body['policy'],
-      bootstrapLaws: body['bootstrapLaws'],
+      content: requireText(body.content, '改憲案の本文がありません。'),
+      bootstrapLaws: body.bootstrapLaws,
       proposalId: proposal.id,
       enactedBy: 'vote',
       targetConstitutionId: proposal.target_id,
       targetHash: proposal.target_hash
-    }), isEnactedConstitution, 'constitution');
+    }), 'constitution');
     const transition = proposalTransition(proposal, 'passed');
     proposal = requireProposal(updateProposal(proposal.id, { status: transition.targetName, stage_ends_at: Date.now() }));
     await postProposalUpdate(guild, proposal, `改憲が成立しました。憲法 v${next.version} が有効です。`, { state: '成立' });
@@ -725,7 +703,7 @@ async function closeProposalVote(guild: Guild, proposal: ProposalRow): Promise<P
     // 改憲で既存法との関係が変わり得るため、各現行法を自動的に事後審査へ送る。
     // 審査自体は通常どおり答弁記録期間とpolicy指定のpanelを経る。
     const systemReporter = { id: guild.client.user.id };
-    for (const law of narrowList(listLaws(guild.id), isLawRow, 'law')) {
+    for (const law of listLaws(guild.id)) {
       try {
         await fileConstitutionalChallenge(guild, systemReporter, {
           targetType: 'law',
@@ -740,7 +718,7 @@ async function closeProposalVote(guild: Guild, proposal: ProposalRow): Promise<P
     return proposal;
   }
   if (proposal.target_type === 'law') {
-    const currentTarget = narrow(getCurrentLawVersion(proposal.target_id), isLawRow, 'law');
+    const currentTarget = getCurrentLawVersion(proposal.target_id);
     if (!currentTarget || currentTarget.content_hash !== proposal.target_hash) {
       const staleTarget = runtime.state.on['stale'] ?? runtime.state.on['rejected'];
       proposal = requireProposal(updateProposal(proposal.id, { status: staleTarget, stage_ends_at: Date.now() }));
@@ -749,18 +727,18 @@ async function closeProposalVote(guild: Guild, proposal: ProposalRow): Promise<P
     }
   }
   const body = proposalBody(proposal);
-  const law = narrowRequired(enactLaw({
+  const law = enactLaw({
     guildId: guild.id,
     proposalId: proposal.id,
     code: `LAW-${proposal.id}-R${proposal.revision}`,
     title: proposal.title,
-    text: body['text'],
-    provisions: body['provisions'],
+    text: body.text,
+    provisions: body.provisions,
     constitutionId: constitution.id,
     supersedesLawId: proposal.target_type === 'law' ? Number(proposal.target_id) : null,
     targetHash: proposal.target_hash,
     effectiveAt: Date.now()
-  }), isEnactedLaw, 'law');
+  });
   const transition = proposalTransition(proposal, 'passed');
   proposal = requireProposal(updateProposal(proposal.id, { status: transition.targetName, stage_ends_at: Date.now() }));
   await postProposalUpdate(guild, proposal, proposal.target_type === 'law'
@@ -777,14 +755,13 @@ async function closeProposalVote(guild: Guild, proposal: ProposalRow): Promise<P
 const VOTE_LABELS: Record<string, string> = { yes: '賛成', no: '反対', abstain: '棄権' };
 const APPROVAL_LABELS: Record<string, string> = { approve: '承認', reject: '拒否' };
 const REVIEW_TARGET_NAMES: Record<string, string> = { law: '法律', case: '判決', sanction: '処分', administrative_act: '行政行為' };
-const isCastVote = shape({ proposal: isProposalRow, oldChoice: nullable(isString) });
 
 export async function castAndPublishVote(interaction: GovernanceActor, proposalId: number, choice: string) {
   const { governance } = requireGovernance(interaction.guildId);
-  if (proposalById(proposalId)?.guild_id !== interaction.guildId) throw new Error('このサーバーの投票案件ではありません。');
+  if (getProposal(proposalId)?.guild_id !== interaction.guildId) throw new Error('このサーバーの投票案件ではありません。');
   if (!governanceActionAllowed(interaction.guildId, interaction.user.id, 'vote')) throw new Error('投票権が制裁により停止されています。');
   const guild = requireValue(interaction.guild, 'サーバー内でのみ使えます。');
-  const result = narrowRequired(castProposalVote(proposalId, interaction.user.id, choice), isCastVote, 'vote');
+  const result = castProposalVote(proposalId, interaction.user.id, choice);
   const proposal = result.proposal;
   const label = VOTE_LABELS[choice];
   const oldLabel = (result.oldChoice === null ? undefined : VOTE_LABELS[result.oldChoice]) ?? result.oldChoice;
@@ -793,24 +770,26 @@ export async function castAndPublishVote(interaction: GovernanceActor, proposalI
   return { proposal, governance, choice };
 }
 
-function evidenceTime(entry: unknown): number {
-  return Number(isRecord(entry) ? entry['occurredAt'] : undefined);
+/** 提出された証拠 (受付が取り直した投稿・保存した受付の証拠) の形を確かめる。 */
+function caseEvidenceSubmission(entry: unknown): CaseEvidenceSubmission {
+  if (!isCaseEvidenceSubmission(entry)) throw new Error('提出された証拠を読めません。');
+  return entry;
 }
 
-export async function fileCriminalCase(guild: Guild, reporter: Reporter, input: CriminalCaseInput): Promise<CaseRow> {
+export async function fileCriminalCase(guild: Guild, reporter: Reporter, input: CriminalCaseInput): Promise<CaseRecord> {
   const { constitution, policy } = requireGovernance(guild.id);
   if (recoveryOf(constitution.rules)) throw new Error('制度修復中は新しい処罰手続を開始できません。');
   if (!governanceActionAllowed(guild.id, reporter.id, 'petition')) throw new Error('事件申立てが制裁により停止されています。');
-  const law = lawById(input.lawId);
+  const law = getLaw(idOrNull(input.lawId));
   if (!law || law.guild_id !== guild.id || law.status !== 'active') throw new Error('有効な法律ではありません。');
   const offense = law.provisions.offenses?.find((entry) => entry.code === input.offenseCode);
   if (!offense) throw new Error('その法律に指定された犯罪構成要件がありません。');
-  const evidenceRows = input.evidences ?? [input.evidence];
-  if (!evidenceRows.length || evidenceRows.some((entry) => evidenceTime(entry) < law.effective_at)) {
+  const evidenceRows = (input.evidences ?? [input.evidence]).map(caseEvidenceSubmission);
+  if (!evidenceRows.length || evidenceRows.some((entry) => Number(entry.occurredAt) < law.effective_at)) {
     throw new Error('法律の施行前の行為には適用できません。');
   }
   if (!input.attemptReserved) requireGovernanceAiAttempt(reporter, input.eventId ?? `case:${reporter.id}:${Date.now()}`);
-  const procedure = procedureOf(policy);
+  const procedure = policeProcedure(policy);
   const latestEvidence = evidenceRows.at(-1);
   const caseRecord = requireCase(createCase({
     guildId: guild.id,
@@ -818,17 +797,17 @@ export async function fileCriminalCase(guild: Guild, reporter: Reporter, input: 
     accusedId: input.accused.id,
     lawId: law.id,
     offenseCode: offense.code,
-    summary: input.summary,
+    summary: requireText(input.summary, '申立ての内容がありません。'),
     status: procedure ? 'police_review' : 'filing',
     defenseUntil: null,
-    allegedAt: isRecord(latestEvidence) ? latestEvidence['occurredAt'] : undefined,
+    allegedAt: latestEvidence?.occurredAt,
     constitutionId: constitution.id,
     procedureVersion: procedure ? 2 : 1,
     policeEventKey: input.policeEventKey ?? null,
     reporterType: input.official ? 'ai' : 'member'
   }));
   for (const evidence of evidenceRows) {
-    addCaseEvidence({ caseId: caseRecord.id, submittedBy: reporter.id, ...(isRecord(evidence) ? evidence : {}) });
+    addCaseEvidence({ caseId: caseRecord.id, submittedBy: reporter.id, ...evidence });
   }
   try {
     if (policy.autonomous) {
@@ -839,7 +818,7 @@ export async function fileCriminalCase(guild: Guild, reporter: Reporter, input: 
       ? await finishPoliceReview(guild, caseRecord)
       : await finishCaseFiling(guild, caseRecord);
   } catch (error) {
-    updateCase(caseRecord.id, retryPatch(caseById(caseRecord.id), error));
+    updateCase(caseRecord.id, retryPatch(getCase(caseRecord.id), error));
     console.error(`Initial court setup failed for case ${caseRecord.id}:`, error);
     throw acceptedWorkflowError(
       '申立てを受理しました。準備ができると裁判所に表示されます。',
@@ -849,16 +828,16 @@ export async function fileCriminalCase(guild: Guild, reporter: Reporter, input: 
   }
 }
 
-function profileForSanction(law: LawRow, sanction: SanctionChoice, policy: GovernancePolicy): unknown {
+function profileForSanction(law: Law, sanction: SanctionChoice, policy: ConstitutionPolicy): unknown {
   if (sanction.type !== 'restriction') return null;
-  const definition = narrow(getSanctionDefinition(law.id, sanction.definitionCode), isSanctionDefinitionRow, 'sanction definition');
+  const definition = sanction.definitionCode ? getSanctionDefinition(law.id, sanction.definitionCode) : null;
   if (!definition || !validateRestrictionDefinition(definition.profile, policy)) {
     throw new Error('成立法に有効な制裁定義がありません。');
   }
   return definition.profile;
 }
 
-async function notifyPoliceSanction(guild: Guild, caseRecord: CaseRow, sanction: SanctionRow): Promise<boolean> {
+async function notifyPoliceSanction(guild: Guild, caseRecord: CaseRecord, sanction: Sanction): Promise<boolean> {
   const member = await guild.members.fetch(sanction.user_id).catch(() => null);
   if (!member) return false;
   const label = sanction.type === 'warning'
@@ -897,7 +876,7 @@ function sanctionLabel(sanction: { type?: string; duration_seconds?: number | nu
 
 // 拘留は罰ではなく審理を確保する保全。裁判所へ送った事件の答弁期間だけ、
 // 憲法が定める上限の範囲で置く。経過時間は後の期間処分から差し引く。
-async function detainForCourt(guild: Guild, caseRecord: CaseRow, procedure: PoliceProcedure) {
+async function detainForCourt(guild: Guild, caseRecord: CaseRecord, procedure: PoliceProcedurePolicy) {
   const { governance } = requireGovernance(guild.id);
   if (getCaseDetention(caseRecord.id)) return null;
   const now = Date.now();
@@ -906,16 +885,16 @@ async function detainForCourt(guild: Guild, caseRecord: CaseRow, procedure: Poli
     Math.max(0, Math.floor(((caseRecord.defense_until ?? now) - now) / 1000))
   );
   if (seconds <= 0) return null;
-  const detention = narrowRequired(createDetention({
+  const detention = requireRow(createDetention({
     caseId: caseRecord.id,
     guildId: guild.id,
-    userId: caseRecord.accused_id,
+    userId: requireValue(caseRecord.accused_id, '拘留する被申立人がいません。'),
     reason: caseRecord.summary,
     durationSeconds: seconds,
     startedAt: now,
     endsAt: now + seconds * 1000,
     status: governance.enforcement_mode === 'live' ? 'active' : 'simulated'
-  }), isDetentionRow, 'detention');
+  }), 'detention');
   writeAudit({
     guildId: guild.id,
     actorType: 'system',
@@ -934,10 +913,10 @@ async function detainForCourt(guild: Guild, caseRecord: CaseRow, procedure: Poli
   return detention;
 }
 
-export async function releaseCaseDetention(guild: Guild, caseId: number): Promise<unknown> {
-  const detention = narrow(getCaseDetention(caseId), isDetentionRow, 'detention');
+export async function releaseCaseDetention(guild: Guild, caseId: number): Promise<DetentionRow | null> {
+  const detention = getCaseDetention(caseId);
   if (!detention || detention.status !== 'active') return null;
-  const released: unknown = releaseDetention(caseId);
+  const released = releaseDetention(caseId);
   writeAudit({
     guildId: guild.id,
     actorType: 'system',
@@ -949,9 +928,9 @@ export async function releaseCaseDetention(guild: Guild, caseId: number): Promis
   return released;
 }
 
-async function continuePoliceSanction(guild: Guild, caseRecord: CaseRow, sanction: SanctionRow, procedure: PoliceProcedure): Promise<CaseRow> {
+async function continuePoliceSanction(guild: Guild, caseRecord: CaseRecord, sanction: Sanction, procedure: PoliceProcedurePolicy): Promise<CaseRecord> {
   const policy = casePolicy(caseRecord);
-  const courtFirst = procedure.courtFirstSanctions.includes(sanction.type)
+  const courtFirst = oneOf(procedure.courtFirstSanctions, sanction.type)
     || (Boolean(policy.autonomous) && sanction.type === 'timeout' && Number(sanction.duration_seconds) > policy.judiciary.immediateTimeoutMaximumSeconds);
   if (courtFirst) {
     if (caseRecord.status === 'defense' || caseRecord.public_thread_id) return caseRecord;
@@ -986,7 +965,7 @@ async function continuePoliceSanction(guild: Guild, caseRecord: CaseRow, sanctio
   return requireCase(getCase(caseRecord.id));
 }
 
-export async function ensurePublicCaseRecord(guild: Guild, caseRecord: CaseRow): Promise<CaseRow> {
+export async function ensurePublicCaseRecord(guild: Guild, caseRecord: CaseRecord): Promise<CaseRecord> {
   if (caseRecord.public_thread_id) return caseRecord;
   const { governance } = requireGovernance(guild.id);
   let current = caseRecord;
@@ -998,25 +977,21 @@ export async function ensurePublicCaseRecord(guild: Guild, caseRecord: CaseRow):
   return current;
 }
 
-function lawForCaseRecord(caseRecord: CaseRow): LawRow {
-  return narrowRequired(lawForCase(caseRecord), isLawRow, 'law');
-}
-
-async function finishPoliceReview(guild: Guild, caseRecord: CaseRow): Promise<CaseRow> {
+async function finishPoliceReview(guild: Guild, caseRecord: CaseRecord): Promise<CaseRecord> {
   requireGovernance(guild.id);
   const constitution = constitutionForCase(caseRecord);
-  const policy = policyOf(constitution?.policy);
-  const procedure = procedureOf(policy);
+  const policy = constitution?.policy;
+  const procedure = policeProcedure(policy);
   if (!procedure) return finishCaseFiling(guild, caseRecord);
   // 警察手続は policy から読んだので、ここでは policy が必ずある。
   const lawPolicy = requireValue(policy, '有効な憲法の実行値がありません。');
   let current = requireCase(getCase(caseRecord.id));
-  const law = lawForCaseRecord(current);
+  const law = lawForCase(current);
   const offense = law.provisions.offenses?.find((entry) => entry.code === current.offense_code);
   if (!offense) throw new Error('犯罪構成要件が法律にありません。');
-  const existingSanction = caseSanction(current.id);
+  const existingSanction = getCaseSanction(current.id);
   if (existingSanction) return continuePoliceSanction(guild, current, existingSanction, procedure);
-  const evidence = caseEvidence(current.id);
+  const evidence = listCaseEvidence(current.id);
   const panel = await runJudicialPanel({
     guildId: guild.id,
     caseRecord: current,
@@ -1058,12 +1033,12 @@ async function finishPoliceReview(guild: Guild, caseRecord: CaseRow): Promise<Ca
     return current;
   }
   const profile = profileForSanction(law, panel.sanction, lawPolicy);
-  const trialFirst = procedure.courtFirstSanctions.includes(panel.sanction.type)
+  const trialFirst = oneOf(procedure.courtFirstSanctions, panel.sanction.type)
     || (Boolean(lawPolicy.autonomous) && panel.sanction.type === 'timeout' && Number(panel.sanction.durationSeconds) > lawPolicy.judiciary.immediateTimeoutMaximumSeconds);
   const sanction = requireSanction(createSanction({
     caseId: current.id,
     guildId: guild.id,
-    userId: current.accused_id,
+    userId: requireValue(current.accused_id, '処分する被申立人がいません。'),
     type: panel.sanction.type,
     durationSeconds: panel.sanction.durationSeconds,
     definitionCode: panel.sanction.definitionCode,
@@ -1076,10 +1051,10 @@ async function finishPoliceReview(guild: Guild, caseRecord: CaseRow): Promise<Ca
   return continuePoliceSanction(guild, current, sanction, procedure);
 }
 
-async function finishCaseFiling(guild: Guild, caseRecord: CaseRow): Promise<CaseRow> {
+async function finishCaseFiling(guild: Guild, caseRecord: CaseRecord): Promise<CaseRecord> {
   const { governance } = requireGovernance(guild.id);
   const policy = casePolicy(caseRecord);
-  const procedure = procedureOf(policy);
+  const procedure = policeProcedure(policy);
   let current = requireCase(getCase(caseRecord.id));
   const thread = await createCourtCaseThread(guild, governance, current, {
     onPartial: (patch) => { current = requireCase(updateCase(current.id, patch)); }
@@ -1101,7 +1076,7 @@ async function finishCaseFiling(guild: Guild, caseRecord: CaseRow): Promise<Case
 }
 
 export async function addEvidenceToCase(guild: Guild, member: { id: string }, caseId: number, evidence: unknown): Promise<number> {
-  const caseRecord = caseById(caseId);
+  const caseRecord = getCase(caseId);
   if (!caseRecord || caseRecord.guild_id !== guild.id) throw new Error('事件が見つかりません。');
   if (!['defense', 'appeal'].includes(caseRecord.status)) throw new Error('証拠受付中ではありません。');
   if (![caseRecord.reporter_id, caseRecord.accused_id].includes(member.id)) throw new Error('この事件の当事者ではありません。');
@@ -1109,15 +1084,15 @@ export async function addEvidenceToCase(guild: Guild, member: { id: string }, ca
   if (caseRecord.procedure_version === 2 && member.id !== defenseEvidenceOwner) {
     throw new Error('迅速裁判の取締り側証拠は開始時点で固定されています。新しい行為は別事件として申し立ててください。');
   }
-  if (caseEvidence(caseId).length >= CASE_EVIDENCE_LIMIT) {
+  if (listCaseEvidence(caseId).length >= CASE_EVIDENCE_LIMIT) {
     throw new Error(`証拠は事件ごとに${CASE_EVIDENCE_LIMIT}件までです。関連する内容を1件の提出にまとめてください。`);
   }
-  const id = Number(addCaseEvidence({ caseId, submittedBy: member.id, ...(isRecord(evidence) ? evidence : {}) }));
-  await ensureEvidenceDisclosures(guild, caseById(caseId));
+  const id = addCaseEvidence({ caseId, submittedBy: member.id, ...caseEvidenceSubmission(evidence) });
+  await ensureEvidenceDisclosures(guild, getCase(caseId));
   return id;
 }
 
-function evidenceDisclosure(entry: EvidenceRow & { guild_id: string }, ordinal: number): string {
+function evidenceDisclosure(entry: CaseEvidenceRow & { guild_id: string }, ordinal: number): string {
   const source = entry.message_id && entry.channel_id
     ? `[元の投稿を開く](https://discord.com/channels/${entry.guild_id ?? '@me'}/${entry.channel_id}/${entry.message_id})`
     : '保存された提出';
@@ -1131,9 +1106,9 @@ function evidenceDisclosure(entry: EvidenceRow & { guild_id: string }, ordinal: 
   ].join('\n');
 }
 
-async function ensureEvidenceDisclosures(guild: Guild, caseRecord: CaseRow | null): Promise<void> {
+async function ensureEvidenceDisclosures(guild: Guild, caseRecord: CaseRecord | null): Promise<void> {
   if (!caseRecord?.public_thread_id) return;
-  const evidence = caseEvidence(caseRecord.id);
+  const evidence = listCaseEvidence(caseRecord.id);
   for (const [index, entry] of evidence.entries()) {
     if (entry.disclosed_at) continue;
     const withGuild = { ...entry, guild_id: guild.id };
@@ -1144,10 +1119,10 @@ async function ensureEvidenceDisclosures(guild: Guild, caseRecord: CaseRow | nul
 
 const VERDICT_LABELS: Record<string, string> = { responsible: '責任あり', not_responsible: '責任なし', insufficient: '立証不十分' };
 
-async function publishDecisionRecord(guild: Guild, caseRecord: CaseRow, phase: string, panel: JudicialPanel): Promise<void> {
-  const evidence = caseEvidence(caseRecord.id);
+async function publishDecisionRecord(guild: Guild, caseRecord: CaseRecord, phase: string, panel: JudicialPanel): Promise<void> {
+  const evidence = listCaseEvidence(caseRecord.id);
   const evidenceOrder = new Map(evidence.map((entry, index) => [entry.id, index + 1]));
-  const law = lawById(caseRecord.law_id);
+  const law = getLaw(caseRecord.law_id);
   const phaseLabel = phase === 'appeal' ? '上訴審' : '第一審';
   const publicLines = panel.outputs.map((output, index) => [
     `席 ${index + 1}: ${VERDICT_LABELS[output.verdict] ?? output.verdict}`,
@@ -1158,7 +1133,7 @@ async function publishDecisionRecord(guild: Guild, caseRecord: CaseRow, phase: s
     `判決記録（${phaseLabel}）`,
     ...publicLawDetails(law, caseRecord.offense_code),
     ...publicLines,
-    ...investigationLines(panel, policyOf(constitutionForCase(caseRecord).policy))
+    ...investigationLines(panel, constitutionForCase(caseRecord).policy)
   ].join('\n'));
 
   await postCourtRecord(guild, caseRecord, '構成要件ごとの判断・理由・採用証拠を添付します。', {
@@ -1176,47 +1151,51 @@ async function publishDecisionRecord(guild: Guild, caseRecord: CaseRow, phase: s
 }
 
 function reviewTarget(targetType: unknown, targetId: unknown): ReviewTarget | null {
-  if (targetType === 'law') { const record = lawById(targetId); return record ? { type: 'law', record } : null; }
-  if (targetType === 'case') { const record = caseById(targetId); return record ? { type: 'case', record } : null; }
-  if (targetType === 'sanction') { const record = sanctionById(targetId); return record ? { type: 'sanction', record } : null; }
+  // 識別子の形でない対象は、探すまでもなく見つからない。
+  const id = idOrNull(targetId);
+  if (id === null) return null;
+  if (targetType === 'law') { const record = getLaw(id); return record ? { type: 'law', record } : null; }
+  if (targetType === 'case') { const record = getCase(id); return record ? { type: 'case', record } : null; }
+  if (targetType === 'sanction') { const record = getSanction(id); return record ? { type: 'sanction', record } : null; }
   if (targetType === 'administrative_act') {
-    const record = narrow(getAdministrativeAct(targetId), isAdministrativeActRow, 'administrative act');
+    const record = getAdministrativeAct(id);
     return record ? { type: 'administrative_act', record } : null;
   }
   return null;
 }
 
-export async function fileConstitutionalChallenge(guild: Guild, reporter: { id: string }, input: ConstitutionalChallengeInput): Promise<CaseRow> {
+export async function fileConstitutionalChallenge(guild: Guild, reporter: { id: string }, input: ConstitutionalChallengeInput): Promise<CaseRecord> {
   const { constitution, policy } = requireGovernance(guild.id);
   const target = reviewTarget(input.targetType, input.targetId);
   if (!target || target.record.guild_id !== guild.id) throw new Error('審査対象が見つかりません。');
-  const existing = narrow(findOpenConstitutionalCase(guild.id, input.targetType, input.targetId), isCaseRow, 'case');
+  const reason = requireText(input.reason, '審査を求める理由がありません。');
+  const existing = findOpenConstitutionalCase(guild.id, target.type, target.record.id);
   if (existing) throw new Error('同じ対象の違憲審査が進行中です。裁判所で確認してください。');
   if (!input.system && !input.attemptReserved) {
-    const attempt = reservation(reserveAgentAttempt(
+    const attempt = reserveAgentAttempt(
       guild.id,
       reporter.id,
       false,
       policy.judiciary.constitutionalChallengesPerMemberPerDay,
       DAY_MS,
       'constitutional_challenge'
-    ));
+    );
     if (!attempt.ok) throw new Error(`違憲審査申立ての24時間枠に達しました (${attempt.used}/${attempt.limit})。`);
   }
   const caseRecord = requireCase(createCase({
     guildId: guild.id,
     kind: 'constitutional',
     reporterId: reporter.id,
-    challengedType: input.targetType,
-    challengedId: String(input.targetId),
-    summary: input.reason,
+    challengedType: target.type,
+    challengedId: target.record.id,
+    summary: reason,
     status: 'filing',
     defenseUntil: null,
     constitutionId: constitution.id,
-    procedureVersion: procedureOf(policy) ? 2 : 1,
+    procedureVersion: policeProcedure(policy) ? 2 : 1,
     reporterType: input.official ? 'ai' : 'member'
   }));
-  addCaseEvidence({ caseId: caseRecord.id, submittedBy: reporter.id, content: input.reason, occurredAt: Date.now() });
+  addCaseEvidence({ caseId: caseRecord.id, submittedBy: reporter.id, content: reason, occurredAt: Date.now() });
   try {
     if (policy.autonomous) {
       await advanceCase(guild, caseRecord);
@@ -1224,7 +1203,7 @@ export async function fileConstitutionalChallenge(guild: Guild, reporter: { id: 
     }
     return await finishCaseFiling(guild, caseRecord);
   } catch (error) {
-    updateCase(caseRecord.id, retryPatch(caseById(caseRecord.id), error));
+    updateCase(caseRecord.id, retryPatch(getCase(caseRecord.id), error));
     console.error(`Initial court setup failed for constitutional case ${caseRecord.id}:`, error);
     throw acceptedWorkflowError(
       '違憲審査を受理しました。準備ができると裁判所に表示されます。',
@@ -1250,7 +1229,7 @@ function courtSubmissionText(message: GovernanceMessage | PartialMessage): strin
   ].filter(Boolean).join('\n') || '(本文なし)';
 }
 
-async function courtMessageContext(message: GovernanceMessage | PartialMessage): Promise<{ caseRecord: CaseRow | null; blocked: boolean }> {
+async function courtMessageContext(message: GovernanceMessage | PartialMessage): Promise<{ caseRecord: CaseRecord | null; blocked: boolean }> {
   if (!message?.guildId || message.author?.bot) return { caseRecord: null, blocked: false };
   const governance = governanceGuild(message.guildId);
   let member = message.member ?? null;
@@ -1260,7 +1239,7 @@ async function courtMessageContext(message: GovernanceMessage | PartialMessage):
   }
   const isAppealRestricted = Boolean(governance?.appeal_role_id
     && member?.roles?.cache?.has(governance.appeal_role_id));
-  const caseRecord = message.channel?.isThread?.() ? narrow(getCaseByPublicThread(message.channelId), isCaseRow, 'case') : null;
+  const caseRecord = message.channel?.isThread?.() ? getCaseByPublicThread(message.channelId) : null;
   if (isAppealRestricted
     && (!caseRecord || !(caseRecord.status === 'appeal' && caseRecord.accused_id === message.author?.id))) {
     const deleted = await message.delete().then(() => true).catch(() => false);
@@ -1299,7 +1278,7 @@ export async function recordCourtSubmission(message: GovernanceMessage): Promise
     return 'blocked';
   }
   if (!['defense', 'appeal'].includes(caseRecord.status) || !isParty) return false;
-  const phaseCount = currentSubmissions(caseRecord.id)
+  const phaseCount = listCurrentCaseSubmissions(caseRecord.id)
     .filter((entry) => entry.kind === caseRecord.status).length;
   if (phaseCount >= CASE_SUBMISSION_LIMIT_PER_PHASE) {
     await message.reply({
@@ -1315,7 +1294,6 @@ export async function recordCourtSubmission(message: GovernanceMessage): Promise
   return true;
 }
 
-const isReplacedSubmission = shape({ unchanged: optional(isUnknown) });
 
 export async function recordCourtSubmissionEdit(message: GovernanceMessage): Promise<boolean | 'blocked'> {
   const { caseRecord, blocked } = await courtMessageContext(message);
@@ -1323,7 +1301,7 @@ export async function recordCourtSubmissionEdit(message: GovernanceMessage): Pro
   if (!caseRecord || !message.id) return false;
   const isParty = [caseRecord.reporter_id, caseRecord.accused_id].filter(Boolean).includes(message.author.id);
   if (!isParty) return false;
-  const existing = currentSubmissions(caseRecord.id)
+  const existing = listCurrentCaseSubmissions(caseRecord.id)
     .find((entry) => entry.source_message_id === message.id && entry.author_id === message.author.id);
   if (!existing) return false;
   if (!['defense', 'appeal'].includes(caseRecord.status) || existing.kind !== caseRecord.status) {
@@ -1335,13 +1313,13 @@ export async function recordCourtSubmissionEdit(message: GovernanceMessage): Pro
     }
     return false;
   }
-  const changed = narrow(replaceCaseSubmission(
+  const changed = replaceCaseSubmission(
     caseRecord.id,
     message.author.id,
     caseRecord.status,
     courtSubmissionText(message).slice(0, 8000),
     message.id
-  ), isReplacedSubmission, 'case submission');
+  );
   if (!changed || changed.unchanged) return false;
   if ('send' in message.channel) {
     await message.channel.send({
@@ -1355,9 +1333,9 @@ export async function recordCourtSubmissionEdit(message: GovernanceMessage): Pro
   return true;
 }
 
-async function beginAppealWindow(guild: Guild, caseRecord: CaseRow, sanction: SanctionRow): Promise<void> {
+async function beginAppealWindow(guild: Guild, caseRecord: CaseRecord, sanction: Sanction): Promise<void> {
   const policy = casePolicy(caseRecord);
-  const procedure = procedureOf(policy);
+  const procedure = policeProcedure(policy);
   const now = Date.now();
   sanction = requireSanction(updateSanction(sanction.id, {
     status: 'pending_appeal',
@@ -1371,14 +1349,14 @@ async function beginAppealWindow(guild: Guild, caseRecord: CaseRow, sanction: Sa
 }
 
 function legalApproval(caseId: number, now?: number) {
-  return narrowRequired(now === undefined ? legalApprovalResult(caseId) : legalApprovalResult(caseId, now), isApprovalResult, 'approval result');
+  return legalApprovalResult(caseId, now);
 }
 
-function queueExecution(caseRecord: CaseRow, sanction: SanctionRow): void {
+function queueExecution(caseRecord: CaseRecord, sanction: Sanction): void {
   if (['pending_manual_execution', 'pending_manual_reversal'].includes(sanction.status)) return;
   if (requiresManualExecution(sanction) && ['reversing', 'reversed', 'unavailable'].includes(sanction.status)) return;
   const constitution = constitutionForCase(caseRecord);
-  const autonomous = autonomousPolicy(constitution.policy);
+  const autonomous = constitution.policy.autonomous;
   const vetoRequired = autonomous && Object.values(requireValue(caseRules(caseRecord).workflows['criminalCase'], '刑事手続がありません。').states)
     .some((state) => state.handler === 'human_approval' && state.config.veto);
   if (vetoRequired && !legalApproval(caseRecord.id).passed) {
@@ -1388,7 +1366,7 @@ function queueExecution(caseRecord: CaseRow, sanction: SanctionRow): void {
   }
   if (autonomous && sanction.required_approvals > 0 && !legalApproval(caseRecord.id).passed) throw new Error('法令で必要な人間の執行承認がそろっていません。');
   const current = requireCase(updateCase(caseRecord.id, { status: 'execution' }));
-  if (autonomousPolicy(constitutionForCase(current).policy) && current.workflow_handler !== 'sanction_execution') return;
+  if (constitutionForCase(current).policy.autonomous && current.workflow_handler !== 'sanction_execution') return;
   // 拘留していた時間は刑期から差し引く。第十条4。
   const detained = Number(detainedSeconds(caseRecord.id));
   if (detained > 0 && sanction.duration_seconds && !sanction.restriction_started_at) {
@@ -1404,7 +1382,7 @@ function queueExecution(caseRecord: CaseRow, sanction: SanctionRow): void {
   });
 }
 
-async function trustedApprovers(guild: Guild, governance: GovernanceGuildRow | null, caseRecord: CaseRow): Promise<GuildMember[]> {
+async function trustedApprovers(guild: Guild, governance: GovernanceGuild | null, caseRecord: CaseRecord): Promise<GuildMember[]> {
   return governance?.trusted_role_id
     ? await guild.members.fetch().then((members) => [...members.values()].filter((member) => !member.user.bot
       && member.roles.cache.has(governance.trusted_role_id)
@@ -1412,8 +1390,8 @@ async function trustedApprovers(guild: Guild, governance: GovernanceGuildRow | n
     : [];
 }
 
-async function beginCaseApproval(guild: Guild, caseRecord: CaseRow, sanction: SanctionRow, text: string): Promise<unknown> {
-  if (autonomousPolicy(constitutionForCase(caseRecord).policy)) return beginLegalApproval(guild, caseRecord, sanction, text);
+async function beginCaseApproval(guild: Guild, caseRecord: CaseRecord, sanction: Sanction, text: string): Promise<unknown> {
+  if (constitutionForCase(caseRecord).policy.autonomous) return beginLegalApproval(guild, caseRecord, sanction, text);
   const governance = governanceGuild(guild.id);
   const electorate = specialElectorateName(guild, governance);
   const trustedMembers = await trustedApprovers(guild, governance, caseRecord);
@@ -1429,33 +1407,34 @@ async function beginCaseApproval(guild: Guild, caseRecord: CaseRow, sanction: Sa
   return true;
 }
 
-async function beginLegalApproval(guild: Guild, caseRecord: CaseRow, sanction: SanctionRow, text: string): Promise<CaseRow | undefined> {
+async function beginLegalApproval(guild: Guild, caseRecord: CaseRecord, sanction: Sanction, text: string): Promise<CaseRecord | undefined> {
   if (!caseRecord.public_thread_id) caseRecord = await ensurePublicCaseRecord(guild, caseRecord);
   updateSanction(sanction.id, { status: 'pending_approval' });
   if (caseRecord.workflow_handler !== 'human_approval') caseRecord = requireCase(updateCase(caseRecord.id, { status: 'approval' }));
   if (caseRecord.workflow_handler !== 'human_approval') return;
-  const instance = requireValue(workflowInstance('case', caseRecord.id), '案件の手続状態がありません。');
+  const instance = requireValue(getWorkflowInstance('case', caseRecord.id), '案件の手続状態がありません。');
   const stage = requireValue(caseStage(caseRules(caseRecord), instance).stage, '案件に適用される手続段階がありません。');
-  const currentApproval = narrow(instance.context['approval'], isApprovalContext, 'approval');
+  const currentApproval = instance.context['approval'];
   if (!currentApproval || currentApproval.sanctionHash !== sanctionApprovalHash(sanction)) {
     const fetched = await guild.members.fetch();
     const exclude = [caseRecord.accused_id, caseRecord.reporter_id];
-    const authority = { scope: stage.config.scope, ...(stage.config.users ? { users: stage.config.users } : {}), ...(stage.config.roles ? { roles: stage.config.roles } : {}) };
+    const scope = requireValue(stage.config.scope, '承認の権限対象 (scope) が定められていません。');
+    const authority: HumanAuthority = { scope, ...(stage.config.users ? { users: stage.config.users } : {}), ...(stage.config.roles ? { roles: stage.config.roles } : {}) };
     const { members } = await snapshotHumanAuthority(guild, authority, exclude, fetched);
     const veto = stage.config.veto ? await snapshotHumanAuthority(guild, stage.config.veto, exclude, fetched) : null;
     const now = Date.now();
-    const deadline = now + durationMs(stage.duration);
+    const deadline = now + durationMilliseconds(stage.duration);
     transitionWorkflowInstance({ subjectType: 'case', subjectId: caseRecord.id, toState: instance.current_state,
       context: { ...instance.context, approval: { openedAt: now, deadline,
-        members, authority, veto, scope: stage.config.scope, rejectVotes: stage.config.rejectVotes, sanctionHash: sanctionApprovalHash(sanction) } }, eventType: 'approval.opened' });
+        members, authority, veto, scope, rejectVotes: stage.config.rejectVotes, sanctionHash: sanctionApprovalHash(sanction) } }, eventType: 'approval.opened' });
     const rejectVotes = Number(stage.config.rejectVotes);
-    await postCourtUpdate(guild, requireCase(getCase(caseRecord.id)), `${text}\n承認者: ${humanAuthorityLabel(authority)}\n承認期限: <t:${Math.floor(deadline / 1000)}:F>\n${rejectVotes > 0 ? `承認者の拒否 ${stage.config.rejectVotes}票で執行を取りやめます。` : '承認が不足したまま期限を迎えると執行を取りやめます。'}${veto ? `\n拒否権: ${humanAuthorityLabel(veto)}の${String(veto['required'])}人。期限まで拒否権の行使を受け付けます。` : ''}`, { state: '承認待ち' });
+    await postCourtUpdate(guild, requireCase(getCase(caseRecord.id)), `${text}\n承認者: ${humanAuthorityLabel(authority)}\n承認期限: <t:${Math.floor(deadline / 1000)}:F>\n${rejectVotes > 0 ? `承認者の拒否 ${stage.config.rejectVotes}票で執行を取りやめます。` : '承認が不足したまま期限を迎えると執行を取りやめます。'}${veto ? `\n拒否権: ${humanAuthorityLabel(veto)}の${String(veto.required)}人。期限まで拒否権の行使を受け付けます。` : ''}`, { state: '承認待ち' });
   }
   return requireCase(getCase(caseRecord.id));
 }
 
-function endLegalApproval(caseRecord: CaseRow, outcome: string): void {
-  const sanction = requireValue(caseSanction(caseRecord.id), '承認対象の処分がありません。');
+function endLegalApproval(caseRecord: CaseRecord, outcome: string): void {
+  const sanction = requireValue(getCaseSanction(caseRecord.id), '承認対象の処分がありません。');
   updateSanction(sanction.id, { status: 'unavailable' });
   updateCase(caseRecord.id, { status: outcome, finalized_at: Date.now() });
   if (sanction.executed_at || sanction.restriction_started_at) enqueueAction({ guildId: caseRecord.guild_id,
@@ -1464,10 +1443,10 @@ function endLegalApproval(caseRecord: CaseRow, outcome: string): void {
 
 // 憲法第六条6。裁判所が審理中に見つけた不利な記録は、その場で認定に使わず、
 // 事件記録へ公開したうえで答弁期間をやり直す。上限に達したら二度と開かない。
-async function admitDiscoveredEvidence(guild: Guild, caseRecord: CaseRow, panel: { newEvidence: RetrievedRecord[]; panelId: string }, policy: GovernancePolicy): Promise<CaseRow | null> {
-  const room = CASE_EVIDENCE_LIMIT - caseEvidence(caseRecord.id).length;
+async function admitDiscoveredEvidence(guild: Guild, caseRecord: CaseRecord, panel: { newEvidence: RetrievedRecord[]; panelId: string }, policy: ConstitutionPolicy): Promise<CaseRecord | null> {
+  const room = CASE_EVIDENCE_LIMIT - listCaseEvidence(caseRecord.id).length;
   if (room <= 0) return null;
-  const existing = new Set(caseEvidence(caseRecord.id).map((row) => String(row.message_id)));
+  const existing = new Set(listCaseEvidence(caseRecord.id).map((row) => String(row.message_id)));
   const added = [];
   const { revalidateInvestigationEvidence } = await import('./intake.js');
   const verified = await revalidateInvestigationEvidence({ guild }, panel.newEvidence.slice(0, room), [caseRecord.accused_id]);
@@ -1480,7 +1459,6 @@ async function admitDiscoveredEvidence(guild: Guild, caseRecord: CaseRow, panel:
       channelId: row.channelId,
       authorId: row.authorId,
       content: row.content,
-      contentHash: row.contentHash,
       conversation: row.conversation,
       occurredAt: row.occurredAt
     });
@@ -1515,18 +1493,18 @@ async function admitDiscoveredEvidence(guild: Guild, caseRecord: CaseRow, panel:
   return reopened;
 }
 
-async function adjudicateCriminalCase(guild: Guild, caseRecord: CaseRow, phase = 'initial'): Promise<CaseRow | undefined> {
+async function adjudicateCriminalCase(guild: Guild, caseRecord: CaseRecord, phase = 'initial'): Promise<CaseRecord | undefined> {
   const governance = governanceGuild(guild.id);
   const policy = casePolicy(caseRecord);
-  const procedure = procedureOf(policy);
-  const currentLaw = lawForCaseRecord(caseRecord);
-  const evidence = caseEvidence(caseRecord.id);
+  const procedure = policeProcedure(policy);
+  const currentLaw = lawForCase(caseRecord);
+  const evidence = listCaseEvidence(caseRecord.id);
   const occurredAt = Number(caseRecord.alleged_at);
   if (!Number.isFinite(occurredAt) || occurredAt < currentLaw.effective_at) throw new Error('行為時に有効な法律を確認できません。');
   const offense = currentLaw.provisions.offenses?.find((entry) => entry.code === caseRecord.offense_code);
   if (!offense) throw new Error('犯罪構成要件が法律にありません。');
-  const appeal = phase === 'appeal' ? appealOf(caseRecord.id) : null;
-  const originalSanction = caseSanction(caseRecord.id);
+  const appeal = phase === 'appeal' ? getAppeal(caseRecord.id) : null;
+  const originalSanction = getCaseSanction(caseRecord.id);
   const panelCase: PanelCase = {
     ...caseRecord,
     ...(phase === 'appeal' ? { appealGrounds: appeal?.grounds } : {}),
@@ -1549,7 +1527,7 @@ async function adjudicateCriminalCase(guild: Guild, caseRecord: CaseRow, phase =
     offense,
     evidence,
     // 編集前の主張は監査履歴に残すが、判決入力には各Discord投稿の最新正本だけを使う。
-    submissions: currentSubmissions(caseRecord.id),
+    submissions: listCurrentCaseSubmissions(caseRecord.id),
     policy,
     phase,
     allowNewEvidence
@@ -1565,7 +1543,7 @@ async function adjudicateCriminalCase(guild: Guild, caseRecord: CaseRow, phase =
   await publishDecisionRecord(guild, caseRecord, phase, panel);
   if (panel.verdict !== 'responsible' || !panel.sanction) {
     updateCase(caseRecord.id, { status: phase === 'appeal' ? 'overturned' : 'acquitted', finalized_at: Date.now() });
-    const existing = caseSanction(caseRecord.id);
+    const existing = getCaseSanction(caseRecord.id);
     if (existing) {
       updateSanction(existing.id, { status: 'reversing' });
       enqueueAction({ guildId: guild.id, actionType: 'sanction_reverse', targetId: existing.id, payload: { sanctionId: existing.id }, idempotencyKey: `sanction-reverse:${existing.id}` });
@@ -1577,7 +1555,7 @@ async function adjudicateCriminalCase(guild: Guild, caseRecord: CaseRow, phase =
   }
 
   if (procedure && phase === 'trial') {
-    const currentSanction = requireValue(caseSanction(caseRecord.id), '審理対象の処分がありません。');
+    const currentSanction = requireValue(getCaseSanction(caseRecord.id), '審理対象の処分がありません。');
     const changed = panel.sanction.type !== currentSanction.type
       || Number(panel.sanction.durationSeconds ?? 0) !== Number(currentSanction.duration_seconds ?? 0)
       || String(panel.sanction.definitionCode ?? '') !== String(currentSanction.definition_code ?? '');
@@ -1610,14 +1588,14 @@ async function adjudicateCriminalCase(guild: Guild, caseRecord: CaseRow, phase =
 
   let profile: unknown = null;
   if (panel.sanction.type === 'restriction') {
-    const definition = narrow(getSanctionDefinition(currentLaw.id, panel.sanction.definitionCode), isSanctionDefinitionRow, 'sanction definition');
+    const definition = panel.sanction.definitionCode ? getSanctionDefinition(currentLaw.id, panel.sanction.definitionCode) : null;
     if (!definition || !validateRestrictionDefinition(definition.profile, policy)) throw new Error('成立法に有効な制裁定義がありません。');
     profile = definition.profile;
   }
   const approvals = Number(requiredApprovals(panel.sanction, policy));
   const appealable = Boolean(isAppealable(panel.sanction, policy));
-  const stored = caseSanction(caseRecord.id);
-  let sanction: SanctionRow;
+  const stored = getCaseSanction(caseRecord.id);
+  let sanction: Sanction;
   if (stored) {
     sanction = requireSanction(updateSanction(stored.id, {
       type: panel.sanction.type,
@@ -1632,7 +1610,7 @@ async function adjudicateCriminalCase(guild: Guild, caseRecord: CaseRow, phase =
     sanction = requireSanction(createSanction({
       caseId: caseRecord.id,
       guildId: guild.id,
-      userId: caseRecord.accused_id,
+      userId: requireValue(caseRecord.accused_id, '処分する被申立人がいません。'),
       type: panel.sanction.type,
       durationSeconds: panel.sanction.durationSeconds,
       definitionCode: panel.sanction.definitionCode,
@@ -1679,22 +1657,22 @@ async function adjudicateCriminalCase(guild: Guild, caseRecord: CaseRow, phase =
   return;
 }
 
-function reviewInstitution(caseRecord: CaseRow) {
+function reviewInstitution(caseRecord: CaseRecord): SeatPanel {
   const constitution = constitutionForCase(caseRecord);
   const rules = caseRules(caseRecord);
-  const instance = autonomousPolicy(constitution.policy)
-    ? requireValue(workflowInstance('case', caseRecord.id), '案件の手続状態がありません。')
+  const instance = constitution.policy.autonomous
+    ? requireValue(getWorkflowInstance('case', caseRecord.id), '案件の手続状態がありません。')
     : null;
   const stage = instance ? caseStage(rules, instance).stage : undefined;
   const institution = stage
-    ? requireValue(rules.institutions, '法令に機関の定めがありません。')[stage.config.institution ?? '']
-    : rules.panels?.['constitutional'];
+    ? requireValue(isEffectiveLegalSystem(rules) ? rules.institutions : undefined, '法令に機関の定めがありません。')[stage.config.institution ?? '']
+    : rules.panels.constitutional;
   return requireValue(institution, '違憲審査の機関がありません。');
 }
 
-async function adjudicateConstitutionalCase(guild: Guild, caseRecord: CaseRow): Promise<void> {
+async function adjudicateConstitutionalCase(guild: Guild, caseRecord: CaseRecord): Promise<void> {
   const constitution = constitutionForCase(caseRecord);
-  const autonomous = autonomousPolicy(constitution.policy);
+  const autonomous = constitution.policy.autonomous;
   const institution = reviewInstitution(caseRecord);
   const requiredConstitutional = requireValue(institution.required['constitutional'], '合憲の必要票がありません。');
   const requiredUnconstitutional = requireValue(institution.required['unconstitutional'], '違憲の必要票がありません。');
@@ -1704,10 +1682,11 @@ async function adjudicateConstitutionalCase(guild: Guild, caseRecord: CaseRow): 
   const target = reviewTarget(caseRecord.challenged_type, caseRecord.challenged_id);
   if (!target) throw new Error('違憲審査対象がありません。');
   const reviewTargetData = buildConstitutionalReviewTarget(target);
+  const challengedId = requireValue(caseRecord.challenged_id, '違憲審査対象がありません。');
   let panel = await runConstitutionalPanel({
     guildId: guild.id,
     targetType: target.type,
-    targetId: caseRecord.challenged_id,
+    targetId: challengedId,
     phase: 'post',
     constitution,
     institution,
@@ -1722,7 +1701,7 @@ async function adjudicateConstitutionalCase(guild: Guild, caseRecord: CaseRow): 
     panel = await runConstitutionalPanel({
       guildId: guild.id,
       targetType: target.type,
-      targetId: caseRecord.challenged_id,
+      targetId: challengedId,
       phase: 'post_retry',
       constitution,
       institution,
@@ -1760,7 +1739,7 @@ async function adjudicateConstitutionalCase(guild: Guild, caseRecord: CaseRow): 
   }
   if (target.type === 'law') {
     updateLaw(target.record.id, { status: 'unconstitutional', ended_at: Date.now() });
-    for (const pendingCase of narrowList(listOpenCasesForLaw(target.record.id), isCaseRow, 'case')) {
+    for (const pendingCase of listOpenCasesForLaw(target.record.id)) {
       updateCase(pendingCase.id, {
         status: 'dismissed',
         verdict: { verdict: 'dismissed', reason: 'law_unconstitutional' },
@@ -1768,7 +1747,7 @@ async function adjudicateConstitutionalCase(guild: Guild, caseRecord: CaseRow): 
       });
       await postCourtUpdate(guild, requireCase(getCase(pendingCase.id)), '適用法が違憲審査で維持されなかったため、この事件は処罰なしで終了しました。', { state: '取消' });
     }
-    for (const sanction of narrowList(listSanctionsForLaw(target.record.id), isSanctionRow, 'sanction')) {
+    for (const sanction of listSanctionsForLaw(target.record.id)) {
       updateSanction(sanction.id, { status: 'reversing', reversed_at: Date.now() });
       enqueueAction({
         guildId: guild.id,
@@ -1782,7 +1761,7 @@ async function adjudicateConstitutionalCase(guild: Guild, caseRecord: CaseRow): 
     updateSanction(target.record.id, { status: 'reversing' });
     enqueueAction({ guildId: guild.id, actionType: 'sanction_reverse', targetId: target.record.id, payload: { sanctionId: target.record.id }, idempotencyKey: `sanction-reverse:${target.record.id}` });
   } else if (target.type === 'case') {
-    const sanction = caseSanction(target.record.id);
+    const sanction = getCaseSanction(target.record.id);
     updateCase(target.record.id, { status: 'overturned', finalized_at: Date.now() });
     if (sanction) enqueueAction({ guildId: guild.id, actionType: 'sanction_reverse', targetId: sanction.id, payload: { sanctionId: sanction.id }, idempotencyKey: `sanction-reverse:${sanction.id}` });
   } else {
@@ -1799,15 +1778,15 @@ async function adjudicateConstitutionalCase(guild: Guild, caseRecord: CaseRow): 
   }
 }
 
-const decisionOutputs = (caseId: number): unknown[] => narrowList(listCaseDecisions(caseId), isRecord, 'case decision').map((entry) => entry['output']);
+const decisionOutputs = (caseId: number): unknown[] => listCaseDecisions(caseId).map((entry) => entry.output);
 
 function buildConstitutionalReviewTarget(target: ReviewTarget): unknown {
   if (target.type === 'case') {
     const record = target.record;
     return {
       case: record,
-      law: record.law_id ? lawById(record.law_id) : null,
-      evidence: caseEvidence(record.id).map((entry) => ({
+      law: record.law_id ? getLaw(record.law_id) : null,
+      evidence: listCaseEvidence(record.id).map((entry) => ({
         id: entry.id,
         authorId: entry.author_id,
         occurredAt: entry.occurred_at,
@@ -1819,23 +1798,25 @@ function buildConstitutionalReviewTarget(target: ReviewTarget): unknown {
     };
   }
   if (target.type === 'sanction') {
-    const sourceCase = caseById(target.record.case_id);
+    const sourceCase = getCase(target.record.case_id);
     return {
       sanction: target.record,
       case: sourceCase,
-      law: sourceCase?.law_id ? lawById(sourceCase.law_id) : null,
+      law: sourceCase?.law_id ? getLaw(sourceCase.law_id) : null,
       decisions: sourceCase ? decisionOutputs(sourceCase.id) : []
     };
   }
   return target.record;
 }
 
-async function reverseAdministrativeAct(guild: Guild, act: AdministrativeActRow): Promise<void> {
+async function reverseAdministrativeAct(guild: Guild, act: AdministrativeAct): Promise<void> {
   if (act.status === 'reversed') return;
   const detail = isRecord(act.detail) ? act.detail : {};
   const { operation, before, userId, roleId } = detail;
   if (operation === 'operational_setting') {
-    setOperationalSetting(guild.id, detail['key'], before, guild.client.user.id);
+    const key = detail['key'];
+    if (typeof key !== 'string' || typeof before !== 'number') throw new Error('この行政行為の設定値を読めません。');
+    setOperationalSetting(guild.id, key, before, guild.client.user.id);
   } else if (operation === 'enforcement_mode') {
     updateGovernanceGuild(guild.id, { enforcement_mode: before });
   } else if (operation === 'governance_status') {
@@ -1846,12 +1827,12 @@ async function reverseAdministrativeAct(guild: Guild, act: AdministrativeActRow)
     const member = typeof userId === 'string' ? await guild.members.fetch(userId).catch(() => null) : null;
     if (member && typeof roleId === 'string' && roleId) {
       const desired = operation === 'trusted-remove';
-      authorizeTrustedMutation({ guildId: guild.id, userId, roleId, desired, authorizedBy: guild.client.user.id });
+      authorizeTrustedMutation({ guildId: guild.id, userId: member.id, roleId, desired, authorizedBy: guild.client.user.id });
       if (desired) await member.roles.add(roleId, `Administrative act A-${act.id} reversed`);
       else await member.roles.remove(roleId, `Administrative act A-${act.id} reversed`);
     }
   } else if (operation === 'sanction_execution') {
-    const sanction = sanctionById(detail['sanctionId']);
+    const sanction = getSanction(idOrNull(detail['sanctionId']));
     if (sanction) {
       updateSanction(sanction.id, { status: 'reversing', reversed_at: Date.now() });
       enqueueAction({
@@ -1869,21 +1850,19 @@ async function reverseAdministrativeAct(guild: Guild, act: AdministrativeActRow)
   writeAudit({ guildId: guild.id, actorType: 'system', action: 'administrative_act.reversed', targetType: 'administrative_act', targetId: act.id, detail: { operation } });
 }
 
-const isCaseApproval = shape({ oldDecision: nullable(isString) });
-
 export async function approveCase(interaction: GovernanceActor, caseId: number, decision: string) {
   const { governance } = requireGovernance(interaction.guildId);
   const guild = requireValue(interaction.guild, 'サーバー内でのみ使えます。');
   const member = await actingMember({ member: interaction.member ?? null, user: interaction.user }, guild);
-  const legalCase = caseById(caseId);
-  if (legalCase?.guild_id === interaction.guildId && autonomousPolicy(constitutionForCase(legalCase).policy)) {
+  const legalCase = getCase(caseId);
+  if (legalCase?.guild_id === interaction.guildId && constitutionForCase(legalCase).policy.autonomous) {
     setCaseApproval(caseId, member.id, decision);
     const result = legalApproval(caseId);
-    const sanction = requireValue(caseSanction(caseId), '承認対象の処分がありません。');
+    const sanction = requireValue(getCaseSanction(caseId), '承認対象の処分がありません。');
     await postCourtUpdate(guild, legalCase, `${publicMemberLabel(member.id)} が${decision === 'approve' ? '承認' : '拒否'}しました。承認 ${result.approvals}/${sanction.required_approvals}`);
     if (result.rejected) endLegalApproval(legalCase, 'rejected');
     else if (result.passed) {
-      if (sanction.appealable && !sanction.appeal_deadline && !appealOf(caseId)) await beginAppealWindow(guild, legalCase, sanction);
+      if (sanction.appealable && !sanction.appeal_deadline && !getAppeal(caseId)) await beginAppealWindow(guild, legalCase, sanction);
       else queueExecution(legalCase, sanction);
     }
     return { approvals: result.approvals, required: sanction.required_approvals, policy: casePolicy(legalCase) };
@@ -1891,13 +1870,13 @@ export async function approveCase(interaction: GovernanceActor, caseId: number, 
   if (!governance.trusted_role_id) throw new Error('特別有権者による承認機能は無効です。');
   const electorate = specialElectorateName(guild, governance);
   if (!member.roles.cache.has(governance.trusted_role_id)) throw new Error(`「${electorate}」ロールが必要です。`);
-  const caseRecord = caseById(caseId);
+  const caseRecord = getCase(caseId);
   if (!caseRecord || caseRecord.guild_id !== interaction.guildId || caseRecord.status !== 'approval') throw new Error('承認待ちの事件ではありません。');
   const policy = casePolicy(caseRecord);
   if ([caseRecord.accused_id, caseRecord.reporter_id].includes(member.id)) throw new Error('被告・通報者は執行承認できません。');
-  const approvalResult = narrowRequired(setCaseApproval(caseId, member.id, decision), isCaseApproval, 'case approval');
-  const sanction = requireValue(caseSanction(caseId), '承認対象の処分がありません。');
-  const approvals = narrowList(listCaseApprovals(caseId), isApprovalRow, 'case approval').filter((entry) => entry.decision === 'approve').length;
+  const approvalResult = setCaseApproval(caseId, member.id, decision);
+  const sanction = requireValue(getCaseSanction(caseId), '承認対象の処分がありません。');
+  const approvals = listCaseApprovals(caseId).filter((entry) => entry.decision === 'approve').length;
   const oldLabel = approvalResult.oldDecision === null ? undefined : APPROVAL_LABELS[approvalResult.oldDecision];
   await postCourtUpdate(
     guild,
@@ -1905,9 +1884,9 @@ export async function approveCase(interaction: GovernanceActor, caseId: number, 
     `${publicMemberLabel(member.id)} が執行を${decision === 'approve' ? '承認' : '拒否'}しました${oldLabel ? ` (変更前: ${oldLabel})` : ''}。承認 ${approvals}/${sanction.required_approvals}`
   );
   if (decision === 'approve' && approvals >= sanction.required_approvals) {
-    const procedure = procedureOf(policy);
+    const procedure = policeProcedure(policy);
     const appealWindowAlreadyOffered = Boolean(procedure && sanction.appeal_deadline);
-    if (sanction.appealable && !appealOf(caseId) && !appealWindowAlreadyOffered) {
+    if (sanction.appealable && !getAppeal(caseId) && !appealWindowAlreadyOffered) {
       await beginAppealWindow(guild, caseRecord, sanction);
     }
     else queueExecution(caseRecord, sanction);
@@ -1915,19 +1894,19 @@ export async function approveCase(interaction: GovernanceActor, caseId: number, 
   return { approvals, required: sanction.required_approvals, policy };
 }
 
-export async function appealCase(guild: Guild, member: { id: string }, caseId: number, grounds: string): Promise<CaseRow> {
-  const caseRecord = caseById(caseId);
-  const sanction = caseSanction(caseId);
+export async function appealCase(guild: Guild, member: { id: string }, caseId: number, grounds: string): Promise<CaseRecord> {
+  const caseRecord = getCase(caseId);
+  const sanction = getCaseSanction(caseId);
   if (!caseRecord || !sanction || caseRecord.guild_id !== guild.id) throw new Error('事件または刑が見つかりません。');
   const policy = casePolicy(caseRecord);
   if (caseRecord.accused_id !== member.id) throw new Error('被告本人だけが上訴できます。');
   if (caseRecord.status !== 'appeal_window' || !sanction.appealable || Date.now() >= Number(sanction.appeal_deadline)) throw new Error('上訴受付中ではありません。');
-  if (appealOf(caseId)) throw new Error('上訴は1回だけです。');
+  if (getAppeal(caseId)) throw new Error('上訴は1回だけです。');
   createAppeal(caseId, member.id, grounds);
   const now = Date.now();
   const submissionsUntil = now + policy.judiciary.defenseMilliseconds;
   updateCase(caseId, { status: 'appeal', retry_after: submissionsUntil, last_error: null });
-  if (!procedureOf(policy)) updateSanction(sanction.id, { restriction_started_at: now });
+  if (!policeProcedure(policy)) updateSanction(sanction.id, { restriction_started_at: now });
   enqueueAction({
     guildId: guild.id,
     actionType: 'appeal_restrict',
@@ -1941,18 +1920,18 @@ export async function appealCase(guild: Guild, member: { id: string }, caseId: n
   return requireCase(getCase(caseId));
 }
 
-export async function requestTrial(guild: Guild, member: { id: string }, sanctionId: number): Promise<CaseRow> {
-  const sanction = sanctionById(sanctionId);
+export async function requestTrial(guild: Guild, member: { id: string }, sanctionId: number): Promise<CaseRecord> {
+  const sanction = getSanction(sanctionId);
   if (!sanction || sanction.guild_id !== guild.id) throw new Error('処分が見つかりません。');
   if (sanction.user_id !== member.id) throw new Error('処分を受けた本人だけが裁判を求められます。');
-  const caseRecord = requireValue(caseById(sanction.case_id), '処分の事件が見つかりません。');
-  const policy = policyOf(constitutionForCase(caseRecord)?.policy);
-  const procedure = procedureOf(policy);
+  const caseRecord = requireValue(getCase(sanction.case_id), '処分の事件が見つかりません。');
+  const policy = constitutionForCase(caseRecord)?.policy;
+  const procedure = policeProcedure(policy);
   if (!policy || !procedure || caseRecord.procedure_version !== 2) throw new Error('この処分は簡易裁判の対象ではありません。');
   if (Number(caseRecord.review_count ?? 0) !== 0 || sanction.review_requested_at) {
     throw new Error('この処分の裁判請求は既に使われています。');
   }
-  if (!procedure.immediateSanctions.includes(sanction.type)) throw new Error('この処分は裁判請求の対象ではありません。');
+  if (!oneOf(procedure.immediateSanctions, sanction.type)) throw new Error('この処分は裁判請求の対象ではありません。');
   if (sanction.type !== 'warning') {
     const startedAt = Number(sanction.restriction_started_at ?? sanction.executed_at ?? 0);
     if (!startedAt || startedAt + Number(sanction.duration_seconds ?? 0) * 1000 <= Date.now()) {
@@ -1992,19 +1971,19 @@ export async function requestTrial(guild: Guild, member: { id: string }, sanctio
 }
 
 // 不服申立ての取下げは、未執行処分の法定審査・承認を免除しない。
-export async function withdrawContest(guild: Guild, member: { id: string }, caseId: number): Promise<CaseRow> {
-  const caseRecord = caseById(caseId);
+export async function withdrawContest(guild: Guild, member: { id: string }, caseId: number): Promise<CaseRecord> {
+  const caseRecord = getCase(caseId);
   if (!caseRecord || caseRecord.guild_id !== guild.id) throw new Error('事件が見つかりません。');
   if (caseRecord.accused_id !== member.id) throw new Error('申立てた本人だけが取り下げられます。');
   if (!['defense', 'appeal'].includes(caseRecord.status)) throw new Error('いま取り下げられる申立てはありません。');
-  const sanction = caseSanction(caseId);
+  const sanction = getCaseSanction(caseId);
   if (!sanction) throw new Error('対象の処分がありません。');
   const appealing = caseRecord.status === 'appeal';
   await releaseCaseDetention(guild, caseId);
   if (appealing) updateAppeal(caseId, { status: 'withdrawn', decided_at: Date.now() });
   const current = requireCase(updateCase(caseId, { response_completed_at: Date.now(), retry_after: null, last_error: null }));
   const applied = ['reviewable', 'executed', 'simulated'].includes(sanction.status);
-  const continueProcedure = !applied && autonomousPolicy(constitutionForCase(caseRecord).policy);
+  const continueProcedure = !applied && constitutionForCase(caseRecord).policy.autonomous;
   await postCourtUpdate(guild, current, `${publicMemberLabel(member.id)} が${appealing ? '上訴' : '審理の請求'}を取り下げました。${continueProcedure ? '必要な審査・承認を経て処分を判断します。' : '処分をそのまま確定します。'}`, {
     state: continueProcedure ? '取下げ' : '確定'
   });
@@ -2026,7 +2005,7 @@ export async function withdrawContest(guild: Guild, member: { id: string }, case
     });
     updateCase(caseId, { status: 'final', finalized_at: Date.now() });
   } else {
-    if (autonomousPolicy(constitutionForCase(caseRecord).policy)) {
+    if (constitutionForCase(caseRecord).policy.autonomous) {
       await advanceCase(guild, requireCase(getCase(caseId)));
       return requireCase(getCase(caseId));
     }
@@ -2038,25 +2017,25 @@ export async function withdrawContest(guild: Guild, member: { id: string }, case
 
 const isAutomaticTrigger = shape({ windowSeconds: isNumber, minimumMessages: isNumber });
 
-export async function detectAutomaticEnforcement(message: GovernanceMessage): Promise<CaseRow | null> {
+export async function detectAutomaticEnforcement(message: GovernanceMessage): Promise<CaseRecord | null> {
   if (!message?.guildId || message.author?.bot) return null;
   const { constitution } = requireGovernance(message.guildId);
-  const procedure = procedureOf(constitution.policy);
+  const procedure = policeProcedure(constitution.policy);
   if (!procedure || !publicChannel(message, governanceGuild(message.guildId))) return null;
-  for (const law of narrowList(listLaws(message.guildId), isLawRow, 'law').filter((entry) => entry.status === 'active')) {
+  for (const law of listLaws(message.guildId).filter((entry) => entry.status === 'active')) {
     if (Number(message.createdTimestamp) < Number(law.effective_at)) continue;
     for (const offense of law.provisions.offenses ?? []) {
       const trigger = offense.automaticTrigger;
       if (!validateAutomaticTrigger(trigger) || !isAutomaticTrigger(trigger)) continue;
       const windowMs = trigger.windowSeconds * 1000;
-      const recent = narrowList(recentUserActivity(
+      const recent = recentUserActivity(
         message.guildId,
         message.author.id,
         message.channelId,
         message.createdTimestamp - windowMs,
         message.createdTimestamp,
         100
-      ), isActivityRow, 'activity');
+      );
       if (recent.length < trigger.minimumMessages) continue;
       if (findRecentPoliceCase(message.guildId, message.author.id, law.id, offense.code, message.createdTimestamp - windowMs)) continue;
       const triggerEvidence = recent.slice(-trigger.minimumMessages);
@@ -2085,8 +2064,8 @@ export async function detectAutomaticEnforcement(message: GovernanceMessage): Pr
   return null;
 }
 
-export async function completeCaseResponse(guild: Guild, member: { id: string }, caseId: number): Promise<CaseRow> {
-  const caseRecord = caseById(caseId);
+export async function completeCaseResponse(guild: Guild, member: { id: string }, caseId: number): Promise<CaseRecord> {
+  const caseRecord = getCase(caseId);
   if (!caseRecord || caseRecord.guild_id !== guild.id) throw new Error('事件が見つかりません。');
   const responseController = caseRecord.accused_id ?? caseRecord.reporter_id;
   if (responseController !== member.id) throw new Error('回答する当事者本人だけが回答を完了できます。');
@@ -2106,7 +2085,7 @@ export async function completeCaseResponse(guild: Guild, member: { id: string },
 }
 
 export async function submitCaseAnswer(guild: Guild, member: { id: string }, caseId: number, content: string): Promise<number> {
-  const caseRecord = caseById(caseId);
+  const caseRecord = getCase(caseId);
   if (!caseRecord || caseRecord.guild_id !== guild.id) throw new Error('事件が見つかりません。');
   if (![caseRecord.reporter_id, caseRecord.accused_id].filter(Boolean).includes(member.id)) {
     throw new Error('この事件の当事者だけが回答できます。');
@@ -2114,7 +2093,7 @@ export async function submitCaseAnswer(guild: Guild, member: { id: string }, cas
   if (!['defense', 'appeal'].includes(caseRecord.status)) throw new Error('現在は回答受付中ではありません。');
   const normalized = String(content ?? '').trim();
   if (!normalized || normalized.length > 8000) throw new Error('回答は1文字以上8000文字以内で入力してください。');
-  const count = currentSubmissions(caseRecord.id).filter((entry) => entry.kind === caseRecord.status).length;
+  const count = listCurrentCaseSubmissions(caseRecord.id).filter((entry) => entry.kind === caseRecord.status).length;
   if (count >= CASE_SUBMISSION_LIMIT_PER_PHASE) throw new Error('この審級の回答件数上限に達しました。');
   const id = Number(addCaseSubmission(caseRecord.id, member.id, caseRecord.status, normalized));
   await postCourtRecord(guild, caseRecord, `${publicMemberLabel(member.id)} が回答を提出しました。`);
@@ -2125,7 +2104,7 @@ async function ensureAppealRestriction(guild: Guild, sanctionId: number): Promis
   const governance = governanceGuild(guild.id);
   if (governance?.enforcement_mode !== 'live') return;
   await processGovernanceOutbox(guild.client);
-  let sanction = requireValue(sanctionById(sanctionId), '上訴対象の処分がありません。');
+  let sanction = requireValue(getSanction(sanctionId), '上訴対象の処分がありません。');
   if (!sanction.execution_detail) {
     // shadow中にoutboxが完了したあとliveへ切り替わった場合も、再審より先に
     // 必ず制限を実体化する。適用できなければ例外で審理を止める。
@@ -2143,14 +2122,13 @@ async function ensureAppealRestriction(guild: Guild, sanctionId: number): Promis
 }
 
 // 議題を進めるのは国会だけ。schedulerが自分で進めるのは投票の締切だけになった。
-export async function advanceProposal(guild: Guild, proposal: ProposalRow, now?: number): Promise<unknown> {
+export async function advanceProposal(guild: Guild, proposal: Proposal, now?: number): Promise<Proposal | AgendaOutcome> {
   if (proposal.retry_after && now !== undefined && proposal.retry_after > now) return proposal;
   const runtime = proposalRuntime(proposal);
-  if (runtime && autonomousPolicy(runtime.constitution.policy)) {
+  if (runtime && runtime.constitution.policy.autonomous) {
     if (runtime.state.handler === 'terminal') return proposal;
     const { advanceLegislation } = await import('./legislation.js');
-    const advanced: unknown = await advanceLegislation(guild, proposal, now);
-    return advanced;
+    return advanceLegislation(guild, proposal, now);
   }
   if (!runtime || runtime.state.handler !== 'public_vote') return proposal;
   if (proposal.stage_ends_at !== null && proposal.stage_ends_at !== undefined && now !== undefined && Number(proposal.stage_ends_at) <= now) {
@@ -2164,16 +2142,16 @@ export async function advanceProposal(guild: Guild, proposal: ProposalRow, now?:
   return proposal;
 }
 
-function allBallotsCast(proposal: ProposalRow, runtime: ProposalRuntime): boolean {
+function allBallotsCast(proposal: Proposal, runtime: ProposalRuntime): boolean {
   const vote = voteRuleFor(proposal, runtime.compiled.rules);
   if (vote.earlyClose !== 'all_ballots_cast') return false;
-  const summary = narrowRequired(proposalVoteSummary(proposal.id), isVoteSummary, 'vote summary');
+  const summary = proposalVoteSummary(proposal.id);
   const electorate = Number(summary.electorate);
   if (!Number.isFinite(electorate) || electorate <= 0) return false;
   return summary.yes + summary.no + summary.abstain >= electorate;
 }
 
-async function syncRetriedIntake(guild: Guild, resultType: string, result: CaseRow): Promise<void> {
+async function syncRetriedIntake(guild: Guild, resultType: string, result: CaseRecord): Promise<void> {
   const { updateRetriedIntakeMessage, updateRetriedMentionInvestigationMessage } = await import('./intake.js');
   await updateRetriedIntakeMessage(guild, resultType, result).catch((error: unknown) => {
     console.error(`Failed to update completed ${resultType} intake ${result.id}:`, error);
@@ -2188,25 +2166,25 @@ export function advanceCase(guild: Guild, caseRecord: { id: number }, now = Date
   const key = `${guild.id}:${caseRecord.id}`;
   const running = advancingCases.get(key);
   if (running) return running;
-  const current = caseById(caseRecord.id);
+  const current = getCase(caseRecord.id);
   const task = (current ? advanceCaseState(guild, current, now) : Promise.reject(new Error('事件が見つかりません。')))
     .finally(() => advancingCases.delete(key));
   advancingCases.set(key, task);
   return task;
 }
 
-async function advanceCaseState(guild: Guild, caseRecord: CaseRow, now: number): Promise<unknown> {
+async function advanceCaseState(guild: Guild, caseRecord: CaseRecord, now: number): Promise<unknown> {
   if (caseRecord.retry_after && caseRecord.retry_after > now) return;
   if (recoveryOf(activeConstitution(guild.id)?.rules) && caseRecord.kind !== 'constitutional'
-    && !caseRecord.review_count && !appealOf(caseRecord.id)) return;
+    && !caseRecord.review_count && !getAppeal(caseRecord.id)) return;
   const constitution = constitutionForCase(caseRecord);
-  if (autonomousPolicy(constitution.policy)) {
-    const instance = requireValue(workflowInstance('case', caseRecord.id), '案件の手続状態がありません。');
+  if (constitution.policy.autonomous) {
+    const instance = requireValue(getWorkflowInstance('case', caseRecord.id), '案件の手続状態がありません。');
     const { workflow, stage } = caseStage(caseRules(caseRecord), instance);
     if (!stage) throw new Error('案件に適用される手続段階がありません。');
     const move = (outcome: string, extra: Record<string, unknown> = {}) => updateCase(caseRecord.id, { ...extra, status: outcome });
     if (procedureExhausted(stage, instance.context, instance.current_state)) {
-      const sanction = caseSanction(caseRecord.id);
+      const sanction = getCaseSanction(caseRecord.id);
       if (sanction) {
         updateSanction(sanction.id, { status: 'unavailable' });
         enqueueAction({ guildId: guild.id, actionType: 'sanction_reverse', targetId: sanction.id,
@@ -2232,28 +2210,28 @@ async function advanceCaseState(guild: Guild, caseRecord: CaseRow, now: number):
       judicial_panel: judge,
       constitutional_panel: judge,
       async appeal_window() {
-        const sanction = caseSanction(caseRecord.id);
+        const sanction = getCaseSanction(caseRecord.id);
         if (!sanction) throw new Error('上訴対象の処分がありません。');
         if (Number(sanction.appeal_deadline) > now) return notifyCaseParty(guild, caseRecord, 'appeal', sanction.appeal_deadline);
-        if (!appealOf(caseRecord.id)) {
+        if (!getAppeal(caseRecord.id)) {
           if (sanction.required_approvals > 0 && !legalApproval(caseRecord.id).passed) await beginCaseApproval(guild, caseRecord, sanction, '上訴期間が終了しました。執行には人間の公開承認が必要です。');
           else queueExecution(caseRecord, sanction);
         }
         return undefined;
       },
       async human_approval() {
-        const sanction = requireValue(caseSanction(caseRecord.id), '承認対象の処分がありません。');
+        const sanction = requireValue(getCaseSanction(caseRecord.id), '承認対象の処分がありません。');
         await beginLegalApproval(guild, caseRecord, sanction, `判決の執行には${sanction.required_approvals}人の公開承認が必要です。`);
-        const approval = narrow(workflowInstance('case', caseRecord.id)?.context['approval'], isApprovalContext, 'approval');
+        const approval = getWorkflowInstance('case', caseRecord.id)?.context['approval'];
         const result = legalApproval(caseRecord.id, now);
         if (result.rejected) endLegalApproval(caseRecord, 'rejected');
         else if (result.passed) {
-          if (sanction.appealable && !sanction.appeal_deadline && !appealOf(caseRecord.id)) await beginAppealWindow(guild, caseRecord, sanction);
+          if (sanction.appealable && !sanction.appeal_deadline && !getAppeal(caseRecord.id)) await beginAppealWindow(guild, caseRecord, sanction);
           else queueExecution(caseRecord, sanction);
         } else if (approval && approval.deadline <= now) endLegalApproval(caseRecord, 'expired');
       },
       sanction_execution() {
-        const sanction = caseSanction(caseRecord.id);
+        const sanction = getCaseSanction(caseRecord.id);
         if (!sanction) throw new Error('執行対象の処分がありません。');
         queueExecution(caseRecord, sanction);
       },
@@ -2263,7 +2241,7 @@ async function advanceCaseState(guild: Guild, caseRecord: CaseRow, now: number):
         move('completed');
       },
       wait() {
-        const deadline = Number(instance.wake_at ?? instance.state_entered_at + durationMs(stage.duration));
+        const deadline = Number(instance.wake_at ?? instance.state_entered_at + durationMilliseconds(stage.duration));
         if (deadline <= now) move('expired');
       },
       terminal() {}
@@ -2271,8 +2249,8 @@ async function advanceCaseState(guild: Guild, caseRecord: CaseRow, now: number):
     const handler = handlers[stage.handler];
     if (!handler) throw new Error(`この案件で実行できない手続です: ${stage.handler}`);
     const result = await handler();
-    if (!['terminal', 'sanction_execution', ...waitingActions].includes(stage.handler)) {
-      const updated = requireValue(workflowInstance('case', caseRecord.id), '案件の手続状態がありません。');
+    if (!['terminal', 'sanction_execution', ...WAITING_ACTIONS].includes(stage.handler)) {
+      const updated = requireValue(getWorkflowInstance('case', caseRecord.id), '案件の手続状態がありません。');
       transitionWorkflowInstance({ subjectType: 'case', subjectId: caseRecord.id, toState: updated.current_state,
         wakeAt: updated.wake_at, completed: updated.status === 'completed',
         context: recordProcedureVisit(updated.context, instance.current_state), eventType: 'legal.operation_completed' });
@@ -2284,7 +2262,7 @@ async function advanceCaseState(guild: Guild, caseRecord: CaseRow, now: number):
     return;
   }
   if (caseRecord.status === 'filing') {
-    if (caseRecord.procedure_version === 2 && caseRecord.police_event_key && !caseSanction(caseRecord.id)) {
+    if (caseRecord.procedure_version === 2 && caseRecord.police_event_key && !getCaseSanction(caseRecord.id)) {
       await finishPoliceReview(guild, caseRecord);
     } else {
       await finishCaseFiling(guild, caseRecord);
@@ -2311,18 +2289,18 @@ async function advanceCaseState(guild: Guild, caseRecord: CaseRow, now: number):
     return;
   }
   if (caseRecord.status === 'appeal') {
-    const appealSanction = caseSanction(caseRecord.id);
+    const appealSanction = getCaseSanction(caseRecord.id);
     if (!appealSanction) throw new Error('上訴対象の刑がありません。');
     await ensureAppealRestriction(guild, appealSanction.id);
     await adjudicateCriminalCase(guild, caseRecord, 'appeal');
     return;
   }
-  const sanction = caseSanction(caseRecord.id);
+  const sanction = getCaseSanction(caseRecord.id);
   if (caseRecord.status === 'appeal_window' && sanction && Number(sanction.appeal_deadline) > now) {
     await notifyCaseParty(guild, caseRecord, 'appeal', sanction.appeal_deadline);
     return;
   }
-  if (caseRecord.status === 'appeal_window' && sanction && Number(sanction.appeal_deadline) <= now && !appealOf(caseRecord.id)) {
+  if (caseRecord.status === 'appeal_window' && sanction && Number(sanction.appeal_deadline) <= now && !getAppeal(caseRecord.id)) {
     if (caseRecord.procedure_version === 2 && sanction.required_approvals > 0) {
       await beginCaseApproval(guild, caseRecord, sanction, `上訴がなかったため判決が確定しました。執行には${sanction.required_approvals}人の公開承認が必要です。`);
     } else {
@@ -2340,8 +2318,8 @@ const verifiedRecordUiGuilds = new Set<string>();
 const verifiedIntakeUiGuilds = new Set<string>();
 
 function finalizeElapsedSummarySanctions(guildId: string, now: number): void {
-  for (const caseRecord of narrowList(listCases(guildId, { statuses: ['contest_window'], limit: 100 }), isCaseRow, 'case')) {
-    const sanction = caseSanction(caseRecord.id);
+  for (const caseRecord of listCases(guildId, { statuses: ['contest_window'], limit: 100 })) {
+    const sanction = getCaseSanction(caseRecord.id);
     if (!sanction) continue;
     const elapsed = sanction.type === 'warning'
       || (Number(sanction.restriction_started_at ?? sanction.executed_at ?? 0) > 0
@@ -2352,7 +2330,6 @@ function finalizeElapsedSummarySanctions(guildId: string, now: number): void {
   }
 }
 
-const isExpiredDetention = shape({ guild_id: isString, case_id: isNumber, user_id: isString });
 
 export async function runGovernanceScheduler(client: Client): Promise<void> {
   if (schedulerRunning) return;
@@ -2364,15 +2341,15 @@ export async function runGovernanceScheduler(client: Client): Promise<void> {
       lastPruneAt = now;
     }
     expireRestrictions(now);
-    const expiredDetentions = narrowList(expireDetentions(now), isExpiredDetention, 'detention');
-    const expiredIntakes: unknown = expireGovernanceIntakes(now);
-    if (Array.isArray(expiredIntakes) && expiredIntakes.length > 0) {
+    const expiredDetentions = expireDetentions(now);
+    const expiredIntakes = expireGovernanceIntakes(now);
+    if (expiredIntakes.length > 0) {
       const { updateExpiredIntakeMessages } = await import('./intake.js');
       await updateExpiredIntakeMessages(client, expiredIntakes).catch((error: unknown) => {
         console.error('Failed to update expired governance intake messages:', error);
       });
     }
-    for (const governance of narrowList(listGovernanceGuilds(), isGovernanceGuildRow, 'governance guild')) {
+    for (const governance of listGovernanceGuilds()) {
       const guild = client.guilds.cache.get(governance.guild_id) ?? await client.guilds.fetch(governance.guild_id).catch(() => null);
       if (!guild) continue;
       finalizeElapsedSummarySanctions(guild.id, now);
@@ -2390,7 +2367,7 @@ export async function runGovernanceScheduler(client: Client): Promise<void> {
       try {
         const roles = await ensureGovernanceMentionRoles(guild, currentGovernance);
         if (roles.judiciaryRoleId !== governance.judiciary_role_id) {
-          currentGovernance = narrowRequired(updateGovernanceGuild(guild.id, { judiciary_role_id: roles.judiciaryRoleId }), isGovernanceGuildRow, 'governance guild');
+          currentGovernance = requireRow(updateGovernanceGuild(guild.id, { judiciary_role_id: roles.judiciaryRoleId }), 'governance guild');
         }
       } catch (error) {
         console.error(`Failed to ensure governance mention roles in ${guild.id}:`, error);
@@ -2429,7 +2406,7 @@ export async function runGovernanceScheduler(client: Client): Promise<void> {
       } catch (error) {
         console.error(`Failed to resume mention investigations in ${guild.id}:`, error);
       }
-      for (const proposal of narrowList(listProposals(guild.id, { limit: 100 }), isProposalRow, 'proposal')
+      for (const proposal of listProposals(guild.id, { limit: 100 })
         .filter((entry) => {
           const handler = proposalRuntime(entry)?.state?.handler;
           return handler && !['terminal', 'parliament_agenda'].includes(handler);
@@ -2437,28 +2414,30 @@ export async function runGovernanceScheduler(client: Client): Promise<void> {
         try {
           await advanceProposal(guild, proposal, now);
         } catch (error) {
-          updateProposal(proposal.id, retryPatch(proposalById(proposal.id), error));
+          updateProposal(proposal.id, retryPatch(getProposal(proposal.id), error));
           console.error(`Failed to advance proposal ${proposal.id}:`, error);
         }
       }
       await runInstitutionProcedures(guild, now);
-      const cases = narrowList(listCases(guild.id, { limit: 1000 }), isCaseRow, 'case').filter((entry) => entry.workflow_handler !== 'terminal' && !entry.finalized_at);
+      const cases = listCases(guild.id, { limit: 1000 }).filter((entry) => entry.workflow_handler !== 'terminal' && !entry.finalized_at);
       for (const caseRecord of cases) {
         try {
           await advanceCase(guild, caseRecord, now);
-          const current = caseById(caseRecord.id);
+          const current = getCase(caseRecord.id);
           if (current && !current.retry_after && !['filing', 'police_review'].includes(current.status)) {
             await syncRetriedIntake(guild, 'case', current);
           }
         } catch (error) {
-          updateCase(caseRecord.id, retryPatch(caseById(caseRecord.id), error));
+          updateCase(caseRecord.id, retryPatch(getCase(caseRecord.id), error));
           console.error(`Failed to advance case ${caseRecord.id}:`, error);
         }
       }
       try {
         const { runParliamentSession, recordParliamentFailure } = await import('./parliament.js');
-        const session: unknown = await runParliamentSession(guild, currentGovernance, now).catch((error: unknown) => {
-          recordParliamentFailure(guild, governanceGuild(guild.id), error, now);
+        const session = await runParliamentSession(guild, currentGovernance, now).catch((error: unknown) => {
+          // 統治の設定が消えていれば、失敗を記録する先が無い。元の失敗はそのまま投げる。
+          const latest = governanceGuild(guild.id);
+          if (latest) recordParliamentFailure(guild, latest, error, now);
           throw error;
         });
         if (session) {
@@ -2489,7 +2468,7 @@ function effectType(effect: unknown): unknown {
 
 const stringList = (value: unknown): string[] => (isStringArray(value) ? value : []);
 
-async function reverseDiscordSanction(guild: Guild, governance: GovernanceGuildRow, sanction: SanctionRow, { reverseExternal }: { reverseExternal: boolean }): Promise<void> {
+async function reverseDiscordSanction(guild: Guild, governance: GovernanceGuild, sanction: Sanction, { reverseExternal }: { reverseExternal: boolean }): Promise<void> {
   deactivateRestrictionForSanction(sanction.id);
   const detail = parseExecutionDetail(sanction.execution_detail);
   await releaseAppealRestriction(guild, governance, sanction.user_id, [
@@ -2504,10 +2483,10 @@ async function reverseDiscordSanction(guild: Guild, governance: GovernanceGuildR
   if (reverseExternal && externalType === 'ban') throw new Error('BAN解除は管理者がDiscordで手動実行します。');
 }
 
-async function publishSanctionExecution(guild: Guild, governance: GovernanceGuildRow, sanction: SanctionRow): Promise<void> {
+async function publishSanctionExecution(guild: Guild, governance: GovernanceGuild, sanction: Sanction): Promise<void> {
   const reviewable = sanction.status === 'reviewable';
   const executionLabel = governance.enforcement_mode === 'live' ? '実執行' : '記録のみ';
-  const publicCase = requireValue(caseById(sanction.case_id), '処分の事件が見つかりません。');
+  const publicCase = requireValue(getCase(sanction.case_id), '処分の事件が見つかりません。');
   if (publicCase.public_thread_id) {
     // 裁判所へ来た事件だけが事件投稿を持つ。警察止まりの処分は執行記録へ。
     await postCourtUpdate(guild, publicCase, `裁判で確定した処分を${executionLabel}として処理しました。`, {
@@ -2517,7 +2496,7 @@ async function publishSanctionExecution(guild: Guild, governance: GovernanceGuil
     await postEnforcementRecord(guild, governance, [
       `## ${reviewable ? '即時処分' : '処分の確定'}`,
       `対象: ${publicMemberLabel(publicCase.accused_id, '動作確認用アカウント')}`,
-      `処分: ${sanctionLabel(sanctionById(sanction.id))}`,
+      `処分: ${sanctionLabel(getSanction(sanction.id))}`,
       `理由: ${publicCase.summary}`,
       `${executionLabel}として記録しました。${reviewable ? '本人は期限内に裁判所の審理を求められます。' : ''}`
     ].join('\n'), {
@@ -2533,8 +2512,8 @@ export function processGovernanceOutbox(client: Client): Promise<void> {
   return outboxRunning;
 }
 
-function reconcileSanctionEffect(action: OutboxRow): void {
-  const current = requireValue(sanctionById(action.payload['sanctionId']), '処分が見つかりません。');
+function reconcileSanctionEffect(action: OutboxAction): void {
+  const current = requireValue(getSanction(idOrNull(action.payload['sanctionId'])), '処分が見つかりません。');
   const detail = parseExecutionDetail(current.execution_detail);
   if (!detail['effectIntent'] && !detail['effectReceipt']) return;
   updateSanction(current.id, { status: 'reversing' });
@@ -2547,12 +2526,15 @@ const isManualReport = shape({ reportedBy: isUnknown, result: isUnknown, kind: i
 const isPendingManualRequest = shape({ kind: isUnknown, requestedAt: isUnknown });
 
 async function drainGovernanceOutbox(client: Client): Promise<void> {
-  for (const action of narrowList(pendingActions(25), isOutboxRow, 'outbox action')) {
+  for (const action of pendingActions(25)) {
     if (!markActionRunning(action.id)) continue;
     try {
       // 法令の公開はDiscordを一切触らないので、guildやsanctionの解決より前に処理する。
       if (action.action_type === 'law_publish') {
-        await publishInstrument(action.guild_id, { instrumentType: action.payload['instrumentType'], instrumentId: action.payload['instrumentId'] });
+        await publishInstrument(action.guild_id, {
+          instrumentType: requireText(action.payload['instrumentType'], '公開する法令の種別がありません。'),
+          instrumentId: requireId(action.payload['instrumentId'], '公開する法令の id')
+        });
         completeAction(action.id);
         continue;
       }
@@ -2564,7 +2546,7 @@ async function drainGovernanceOutbox(client: Client): Promise<void> {
         continue;
       }
       if (action.action_type === 'legislation_notice') {
-        const proposal = requireProposal(getProposal(action.payload['proposalId']));
+        const proposal = requireProposal(getProposal(idOrNull(action.payload['proposalId'])));
         await postProposalUpdate(guild, proposal, `## 成立しました\n${proposal.title}\n法令で定めるAI審査・採択と、必要な人間の投票を完了しました。`, {
           state: '成立', files: [{ name: '成立全文.json', attachment: Buffer.from(JSON.stringify(proposal.body, null, 2)) }]
         });
@@ -2572,17 +2554,16 @@ async function drainGovernanceOutbox(client: Client): Promise<void> {
         completeAction(action.id);
         continue;
       }
-      const sanction = sanctionById(action.payload['sanctionId']);
+      const sanction = getSanction(idOrNull(action.payload['sanctionId']));
       if (!governance || !sanction) throw new Error('outbox target is missing');
       if (action.action_type === 'manual_sanction_notice') {
         const report = narrow(action.payload['report'], isManualReport, 'manual report');
-        const manual: unknown = manualExecutionDetail(sanction);
-        const pending = narrow(isRecord(manual) ? manual['manualRequest'] : null, isPendingManualRequest, 'manual execution request');
+        const pending = narrow(manualExecutionDetail(sanction)['manualRequest'], isPendingManualRequest, 'manual execution request');
         if (report || (pending?.kind === action.payload['kind'] && pending?.requestedAt === action.payload['requestedAt'])) {
           const text = report
             ? `管理者 ${publicMemberLabel(report.reportedBy)} が${report.result === 'not_executed' ? '未執行のままの取消' : report.kind === 'execute' ? `${sanction.type}の執行完了` : '処分取消への対応完了'}を報告しました。`
             : `人間の管理者による${pending?.kind === 'execute' ? `${sanction.type}の手動執行` : sanction.type === 'ban' ? 'BAN解除' : '取消通知・再参加案内'}を待っています。「手続」の同じ案件カードから完了を記録してください。`;
-          const caseRecord = requireValue(caseById(sanction.case_id), '処分の事件が見つかりません。');
+          const caseRecord = requireValue(getCase(sanction.case_id), '処分の事件が見つかりません。');
           if (caseRecord.public_thread_id) await postCourtUpdate(guild, caseRecord, text);
           else await postEnforcementRecord(guild, governance, `C-${caseRecord.id}: ${text}`);
         }
@@ -2634,12 +2615,15 @@ async function drainGovernanceOutbox(client: Client): Promise<void> {
           completeAction(action.id);
           continue;
         }
-        const caseRecord = caseById(sanction.case_id);
+        const caseRecord = getCase(sanction.case_id);
         const v2Procedure = caseRecord?.procedure_version === 2 ? caseProcedure(caseRecord) : null;
         if (governance.enforcement_mode === 'live') {
           if (sanction.type === 'restriction') {
             beforeEffect();
-            const definition = narrow(getSanctionDefinition(caseById(sanction.case_id)?.law_id, sanction.definition_code), isSanctionDefinitionRow, 'sanction definition');
+            const lawId = caseRecord?.law_id;
+            const definition = lawId !== null && lawId !== undefined && sanction.definition_code
+              ? getSanctionDefinition(lawId, sanction.definition_code)
+              : null;
             if (!definition) throw new Error('restriction definition is missing');
             const startedAt = sanction.restriction_started_at ?? Date.now();
             updateSanction(sanction.id, { restriction_started_at: startedAt });
@@ -2691,7 +2675,7 @@ async function drainGovernanceOutbox(client: Client): Promise<void> {
         updateSanction(sanction.id, { execution_detail: JSON.stringify(detail) });
         assertSanctionExecution(sanction.id, executionAuthority);
         const reviewable = Boolean(v2Procedure
-          && v2Procedure.immediateSanctions.includes(sanction.type)
+          && oneOf(v2Procedure.immediateSanctions, sanction.type)
           && Number(caseRecord?.review_count ?? 0) === 0);
         updateSanction(sanction.id, {
           status: reviewable ? 'reviewable' : (governance.enforcement_mode === 'live' ? 'executed' : 'simulated'),
@@ -2736,7 +2720,7 @@ async function drainGovernanceOutbox(client: Client): Promise<void> {
       }
       completeAction(action.id);
     } catch (error) {
-      const execution = action.action_type === 'sanction_execute' ? parseExecutionDetail(sanctionById(action.payload['sanctionId'])?.execution_detail) : {};
+      const execution = action.action_type === 'sanction_execute' ? parseExecutionDetail(getSanction(idOrNull(action.payload['sanctionId']))?.execution_detail) : {};
       const code = isRecord(error) ? error['code'] : undefined;
       if (code === 'EXECUTION_REVOKED' || (code === 'EXECUTION_FORBIDDEN' && (execution['effectIntent'] || execution['effectReceipt']))) {
         reconcileSanctionEffect(action);
@@ -2748,20 +2732,18 @@ async function drainGovernanceOutbox(client: Client): Promise<void> {
   }
 }
 
-const isTrustedMutation = shape({ authorized_by: isString });
-
 export async function onTrustedRoleChange(oldMember: GuildMember | PartialGuildMember, newMember: GuildMember): Promise<void> {
   const governance = governanceGuild(newMember.guild.id);
   if (!governance?.trusted_role_id) return;
   const before = oldMember.roles.cache.has(governance.trusted_role_id);
   const after = newMember.roles.cache.has(governance.trusted_role_id);
   if (before === after) return;
-  const authorized = narrow(consumeTrustedMutation({
+  const authorized = consumeTrustedMutation({
     guildId: newMember.guild.id,
     userId: newMember.id,
     roleId: governance.trusted_role_id,
     desired: after
-  }), isTrustedMutation, 'trusted mutation');
+  });
   if (authorized) {
     const electorate = specialElectorateName(newMember.guild, governance);
     writeAudit({ guildId: newMember.guild.id, actorType: 'operator', actorId: authorized.authorized_by, action: after ? 'trusted.added' : 'trusted.removed', targetType: 'member', targetId: newMember.id, detail: { roleId: governance.trusted_role_id } });

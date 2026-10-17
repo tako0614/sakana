@@ -22,7 +22,7 @@ import { isSelfHosted } from '../mimic/client.js';
 import { engineFor } from '../mimic/prefs.js';
 import { handleMimicRequest } from '../mimic/respond.js';
 import { isBareAck } from './ack.js';
-import { governance, type GovernanceAttempt } from './boundary.js';
+import { governance, type GovernanceReservation } from './boundary.js';
 import { closeBrowserSandbox } from './browser.js';
 import { agentConfig, agentEnabled } from './config.js';
 import {
@@ -231,7 +231,7 @@ function limitMessage(reservation: Extract<Reservation, { ok: false }>): string 
     : `${NOTICE_GLOBAL_LIMIT} (${window} ${amount})。${at} に空きます。`;
 }
 
-function attemptLimitMessage(reservation: GovernanceAttempt): string {
+function attemptLimitMessage(reservation: GovernanceReservation): string {
   const at = reservation.retryAt ? ` <t:${Math.floor(reservation.retryAt / 1000)}:R>に空きます。` : '';
   if (reservation.scope === 'sanction') {
     return `${NOTICE_USER_LIMIT}。現在の判決でエージェント利用が制限されています。${at}`;

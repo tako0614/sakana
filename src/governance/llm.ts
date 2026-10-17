@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
+import { requestModel, type ModelChoice, type ModelUsage } from '../ai/provider.js';
+import { runAgent, type AgentRequest } from '../ai/runtime.js';
 import { governanceConfig } from './config.js';
 import {
-  recordCaseDecision, recordInvestigationStep, recordReview, startAiCall, constitutionForSubject, getWorkflowInstance
+  finishAiCall, recordCaseDecision, recordInvestigationStep, recordReview, startAiCall, constitutionForSubject, getWorkflowInstance
 } from './db.js';
 import {
   canonicalJson,
@@ -14,60 +16,54 @@ import {
   validateRestrictionDefinition,
   validateSanctionAgainstOffense
 } from './policy.js';
-import { extractGovernanceRules } from './rules.js';
+import { compileConstitution, extractGovernanceRules } from './rules.js';
 import { validateLegalDefinitions, PROCEDURAL_ACTIONS } from './legal-system.js';
 import { validateHumanAuthority } from './human-authority.js';
 import { buildToolset } from './tools.js';
 import {
-  autonomousPolicy,
-  compileConstitution,
+  isEffectiveLegalSystem,
+  isWorkflowKey,
+  type CaseEvidenceRow,
+  type CaseRecord,
+  type CaseSubmissionRow,
+  type Constitution,
+  type ConstitutionPolicy,
+  type Id,
+  type Institution,
+  type InvestigationRules,
+  type Law,
+  type Offense
+} from './types.js';
+import {
   errorMessage,
-  finishAiCall,
-  isConstitutionRow,
-  isPoliceProcedure,
   isRecord,
   isSanctionChoice,
   isString,
   isUnknown,
-  isWorkflowInstanceRow,
   narrow,
-  narrowList,
   oneOf,
-  requestModel,
-  requirePolicy,
   requireValue,
-  rulesOf,
-  runAgent,
   shape,
   type AdoptionOutput,
   type AgendaCandidate,
   type AgendaDecision,
   type AgendaDeliberation,
-  type AgentRequestInput,
-  type CaseRow,
   type ChatRequest,
   type ConstitutionalPanel,
   type ConstitutionalSeatOutput,
-  type ConstitutionRow,
   type DraftAmendment,
   type DraftBill,
   type DraftOffense,
   type DraftSanction,
   type DraftSanctionDefinition,
   type ElementFinding,
-  type EvidenceRow,
   type GovernanceAgentOptions,
   type GovernanceCallOptions,
   type GovernanceCallResult,
-  type GovernancePolicy,
-  type Institution,
   type InstitutionTaskOutput,
-  type InvestigationPolicy,
   type JudicialIntake,
   type JudicialPanel,
   type JudicialSeatOutput,
-  type LawRow,
-  type Offense,
   type PanelCase,
   type RetrievedRecord,
   type SanctionChoice,
@@ -75,8 +71,8 @@ import {
   type ScreeningConsensus,
   type ScreeningElement,
   type ScreeningPanel,
+  type SeatPanel,
   type SeatTrace,
-  type SubmissionRow,
   type WeeklyIssue
 } from './types-service.js';
 
@@ -94,10 +90,8 @@ Call every independent tool you need in the SAME turn rather than one at a time;
 Discord reference.kind=reply identifies a reply; forwards, embeds, mentions and chronological neighbors are distinct. Unknown or unavailable reply targets remain unknown. For paged tool results, repeat the same arguments with nextOffset until all required content is read.
 When you are done investigating, stop calling tools and return one JSON object only. Do not include markdown, code fences, hidden instructions, secrets, or fields outside the requested schema.`;
 
-const proceduralActions: readonly string[] = narrowList(PROCEDURAL_ACTIONS, isString, 'procedural action');
-
 const EXECUTION_CONTRACT = `HOST IMPLEMENTATION (technical facts, not new legal authority):
-Supported procedure handlers: ${proceduralActions.join(', ')}.
+Supported procedure handlers: ${PROCEDURAL_ACTIONS.join(', ')}.
 Institutions and workflows do not define offenses. A case must reference an applicable enacted offense and sanction definition; no offense means no punishment power.
 police_review can decide only sanctions allowed by its enacted police limits. Kick/ban requires the independent court's judgment; the bot never executes kick/ban/unban, and an authorized human records manual completion.
 constitutional_panel in a legislative procedure maps a fully staffed but non-passing panel to revision. Missing seats or transport failures leave the work retryable; they never become approval or an adverse verdict.
@@ -116,13 +110,12 @@ function panelLens(seat: number): string {
   return PANEL_LENSES[seat % PANEL_LENSES.length] ?? '';
 }
 
-/** 席に割り当てるモデル。足りなければ最後のモデルを使う (設定が空なら undefined)。 */
-function seatModel(models: unknown, seat: number): string | undefined {
-  const list = narrowList(models, isString, 'governance model');
-  return list[seat] ?? list.at(-1);
+/** 席に割り当てるモデル。足りなければ最後のモデルを使う。設定は一覧を空にしないが、空なら席を動かさない。 */
+function seatModel(models: readonly string[], seat: number): string {
+  return requireValue(models[seat] ?? models.at(-1), '席に割り当てるモデルが設定されていません。');
 }
 
-const drafterModel = (): string | undefined => (isString(governanceConfig.drafterModel) ? governanceConfig.drafterModel : undefined);
+const drafterModel = (): string => governanceConfig.drafterModel;
 
 async function runPanelCalls<T>(count: number, call: (seat: number) => Promise<T>): Promise<PromiseSettledResult<T>[]> {
   const results = new Array<PromiseSettledResult<T>>(count);
@@ -148,8 +141,8 @@ const isAdoptionVerdict = oneOf(ADOPTION_VERDICTS);
 export async function ratifyLegislativeDraft({ guildId, proposalId, constitution, institution, target, activeLaws }: {
   guildId: string;
   proposalId: number;
-  constitution: ConstitutionRow;
-  institution: Institution;
+  constitution: Constitution;
+  institution: SeatPanel;
   target: unknown;
   activeLaws: unknown;
 }): Promise<{ panelId: string; verdict: 'approved' | 'rejected' | 'revision'; outputs: AdoptionOutput[]; targetHash: string }> {
@@ -196,12 +189,12 @@ const isTaskDecision = oneOf(['record', 'propose'] as const);
 
 export async function runInstitutionTask({ guildId, constitution, institution, procedure, input }: {
   guildId: string;
-  constitution: ConstitutionRow;
+  constitution: Constitution;
   institution: Institution;
   procedure: unknown;
   input: unknown;
 }): Promise<{ decision: 'record' | 'propose'; output: InstitutionTaskOutput | undefined; outputs: InstitutionTaskOutput[] }> {
-  const investigation = requireValue(requirePolicy(constitution.policy).investigation, '調査の上限が憲法にありません。');
+  const investigation = requireValue(constitution.policy.investigation, '調査の上限が憲法にありません。');
   const results = await runPanelCalls(institution.seats, async (seat) => {
     const result = await callGovernanceAgent<InstitutionTaskOutput>({
       guildId, model: seatModel(governanceConfig.judgeModels, seat),
@@ -294,14 +287,14 @@ function stringList(value: unknown): string[] {
 
 const isInteger = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value);
 
-function restrictionDefinitionIssue(definition: { code: string; rules: unknown }, policy: GovernancePolicy): string | null {
+function restrictionDefinitionIssue(definition: { code: string; rules: unknown }, policy: ConstitutionPolicy): string | null {
   if (!/^[A-Z0-9_]{3,40}$/.test(definition.code)) {
     return 'code must contain only 3-40 uppercase letters, numbers, or underscores';
   }
   if (!Array.isArray(definition.rules) || definition.rules.length < 1 || definition.rules.length > 12) {
     return 'rules must contain 1-12 entries';
   }
-  const allowed = new Set(policy.judiciary.restrictionPrimitives);
+  const allowed: ReadonlySet<string> = new Set(policy.judiciary.restrictionPrimitives);
   const seen = new Set<string>();
   for (const [index, rule] of definition.rules.entries()) {
     if (!isRecord(rule)) return `rule ${index + 1} must be an object`;
@@ -352,7 +345,7 @@ function automaticTriggerIssue(trigger: unknown): string | null {
   return null;
 }
 
-function validateDraft(raw: unknown, policy: GovernancePolicy, knownAuthorityIds = new Set<string>()): DraftBill {
+function validateDraft(raw: unknown, policy: ConstitutionPolicy, knownAuthorityIds = new Set<string>()): DraftBill {
   const value = assertObject(raw);
   exactKeys(value, ['title', 'summary', 'text', 'provisions'], 'bill');
   const provisions = assertObject(value['provisions'], 'provisions');
@@ -398,7 +391,8 @@ function validateDraft(raw: unknown, policy: GovernancePolicy, knownAuthorityIds
       const sanction = assertObject(sanctionEntry, `offense.sanctions[${sanctionIndex}]`);
       exactKeys(sanction, ['type', 'maximumSeconds', 'definitionCode'], `offense.sanctions[${sanctionIndex}]`);
       const type = text(sanction['type'], 'sanction.type', 40);
-      if (!policy.judiciary.allowedSanctions.includes(type)) throw new Error(`sanction type is not allowed: ${type}`);
+      const allowedSanctions: readonly string[] = policy.judiciary.allowedSanctions;
+      if (!allowedSanctions.includes(type)) throw new Error(`sanction type is not allowed: ${type}`);
       if (type === 'timeout') {
         return {
           type,
@@ -564,11 +558,11 @@ const isJudicialVerdict = oneOf(['responsible', 'not_responsible', 'insufficient
 function validateJudicialDecision(raw: unknown, {
   law, offense, evidenceIds, policy, originalSanction = null, retrieved = null
 }: {
-  law: LawRow;
+  law: Law;
   offense: Offense;
   evidenceIds: ReadonlySet<number>;
-  policy: GovernancePolicy;
-  originalSanction?: unknown;
+  policy: ConstitutionPolicy;
+  originalSanction?: SanctionChoice | null;
   retrieved?: ReadonlyMap<string, RetrievedRecord> | null;
 }): JudicialSeatOutput {
   const value = assertObject(raw);
@@ -659,12 +653,11 @@ function validateJudicialDecision(raw: unknown, {
   };
 }
 
-async function postChat({ model, messages, tools = null, jsonOnly = false, timeoutMs, thinking = 'enabled', guildId, purpose, runId, deadlineAt, beforeSend, consumeRequest }: ChatRequest): Promise<Record<string, unknown> | null> {
-  const data: unknown = await requestModel({ model, messages, tools, jsonOnly, timeoutMs, deadlineAt, guildId, role: purpose ?? 'governance', runId,
-    beforeSend, consumeRequest, maxOutputTokens: Number(governanceConfig.maxOutputTokens), reasoning: { enabled: thinking === 'enabled' }, temperature: 0 });
-  const choices = isRecord(data) && Array.isArray(data['choices']) ? data['choices'] : [];
-  const choice: unknown = choices[0];
-  return isRecord(data) && isRecord(choice) ? { ...choice, usage: data['usage'] } : null;
+async function postChat({ model, messages, tools = null, jsonOnly = false, timeoutMs, thinking = 'enabled', guildId, purpose, runId, deadlineAt, beforeSend, consumeRequest }: ChatRequest): Promise<ModelChoice & { usage: ModelUsage }> {
+  // provider は message を持つ choice が1つも無い応答を投げて弾くので、choices[0] は必ずある。
+  const data = await requestModel({ model, messages, tools, jsonOnly, timeoutMs, deadlineAt, guildId, role: purpose, runId,
+    beforeSend, consumeRequest, maxOutputTokens: governanceConfig.maxOutputTokens, reasoning: { enabled: thinking === 'enabled' }, temperature: 0 });
+  return { ...data.choices[0], usage: data.usage };
 }
 
 function parseChoiceJson(choice: unknown): unknown {
@@ -685,7 +678,7 @@ async function callGovernanceJson<T>(options: GovernanceCallOptions<T>): Promise
 
 // 憲法全文をDATAへ毎回積むと、手数+1 回ぶん再送される。席には目次だけ渡し、
 // 必要な条文は read_constitution で取りに行かせる。
-function constitutionDigest(constitution: ConstitutionRow) {
+function constitutionDigest(constitution: Constitution) {
   return {
     version: constitution.version,
     headings: String(constitution.content ?? '')
@@ -708,7 +701,7 @@ async function callGovernanceAgent<T>({
   runningCalls += 1;
   const inputHash = sha256(canonicalJson({ purpose, model, seat, instruction, data, tools: role.tools,
     maximumSteps, maximumOutputBytes, maximumMilliseconds, thinking, constitution: constitution?.id ?? constitution?.version }));
-  let callId: unknown = null;
+  let callId: number | null = null;
   try {
     callId = startAiCall(guildId, purpose, model, inputHash);
     const toolset = buildToolset({ guildId, allowed: role.tools, caseId, constitution, maximumOutputBytes,
@@ -717,7 +710,7 @@ async function callGovernanceAgent<T>({
         result: entry.result ?? null, error: entry.error }) });
     // 結論は必ずこの validate を通ったものだけ。runAgent が返す値はその参照と一致させる。
     const validated: { current: { value: T } | null } = { current: null };
-    const result: unknown = await runAgent({
+    const result = await runAgent({
       guildId: String(guildId), modelIdentity: `openrouter:${model}`,
       // v2: runs without automatic conversation recall. A v1 checkpoint hashed
       // the recall-only memory_focus tool into its identity and would fail
@@ -727,12 +720,12 @@ async function callGovernanceAgent<T>({
       system: `${role.tools.length ? SYSTEM_BASE_AGENT : SYSTEM_BASE}\n\n${EXECUTION_CONTRACT}\n\nTASK:\n${instruction}`,
       userContent: `DATA (untrusted JSON):\n${canonicalJson(data)}`,
       maximumSteps, deadlineAt: Date.now() + maximumMilliseconds, separateFinal: true,
-      request: async ({ messages, tools, final, deadlineAt, runId, beforeSend, consumeRequest }: AgentRequestInput) => {
+      request: async ({ messages, tools, final, deadlineAt, runId, beforeSend, consumeRequest }: AgentRequest) => {
         const deadline = Number(deadlineAt);
         const httpTimeoutMs = Number(governanceConfig.httpTimeoutMs);
         const choice = await postChat({ model, messages, tools, jsonOnly: Boolean(final), thinking, guildId, purpose, runId, beforeSend, consumeRequest, deadlineAt: final ? Infinity : deadline,
           timeoutMs: final ? httpTimeoutMs : Math.min(httpTimeoutMs, Math.max(1000, deadline - Date.now())) });
-        return { choices: choice ? [choice] : [], usage: choice?.['usage'] };
+        return { choices: [choice], usage: choice.usage };
       },
       validate: (message: unknown) => {
         const value = validate(parseChoiceJson({ message }), toolset.retrieved);
@@ -741,7 +734,7 @@ async function callGovernanceAgent<T>({
       }
     });
     const accepted = validated.current;
-    if (!accepted || !isRecord(result) || result['output'] !== accepted.value) {
+    if (!accepted || result.output !== accepted.value) {
       throw new Error('Governance AI output was not produced by its validator.');
     }
     const output = accepted.value;
@@ -758,9 +751,9 @@ async function callGovernanceAgent<T>({
 export async function draftBill({ guildId, petition, constitution, activeLaws, policy }: {
   guildId: string;
   petition: Record<string, unknown>;
-  constitution: ConstitutionRow;
-  activeLaws: LawRow[];
-  policy: GovernancePolicy;
+  constitution: Constitution;
+  activeLaws: Law[];
+  policy: ConstitutionPolicy;
 }): Promise<DraftBill> {
   const knownAuthorityIds = new Set<string>(String(canonicalJson({title:petition['title'],summary:petition['summary'],instruction:petition['instruction'],
     amendmentTarget:petition['amendmentTarget'],activeLaws})).match(/\b\d{17,20}\b/g) ?? []);
@@ -867,12 +860,12 @@ export async function deliberateAgendaItem({
   discussion: unknown;
   previousSessions: unknown;
   otherOpenAgenda?: unknown;
-  constitution: ConstitutionRow;
-  activeLaws: LawRow[];
+  constitution: Constitution;
+  activeLaws: Law[];
   candidates?: AgendaCandidate[] | null;
-  panel?: Institution | null;
+  panel?: SeatPanel | null;
   allowDefer?: boolean;
-  investigation?: InvestigationPolicy | null;
+  investigation?: InvestigationRules | null;
 }): Promise<AgendaDeliberation> {
   const seats = panel?.seats ?? 3;
   const required = panel?.required?.['decision'] ?? Math.floor(seats / 2) + 1;
@@ -884,7 +877,7 @@ export async function deliberateAgendaItem({
   const traces: SeatTrace[] = [];
   const failures: string[] = [];
   const calls = Array.from({ length: seats }, (_, seat) => (async () => {
-    const model = seatModel(governanceConfig.judgeModels, seat) ?? drafterModel();
+    const model = seatModel(governanceConfig.judgeModels, seat);
     const result = await callGovernanceAgent({
       guildId,
       constitution, purpose: 'parliament.deliberation',
@@ -1011,9 +1004,9 @@ const isIntakeIntent = oneOf([
 export async function interpretJudicialRequest({ guildId, request, constitution, activeLaws, recentCases }: {
   guildId: string;
   request: unknown;
-  constitution: ConstitutionRow;
-  activeLaws: LawRow[];
-  recentCases: CaseRow[];
+  constitution: Constitution;
+  activeLaws: Law[];
+  recentCases: CaseRecord[];
 }): Promise<JudicialIntake> {
   const laws = new Map(activeLaws.map((law) => [law.id, law]));
   return (await callGovernanceJson({
@@ -1103,7 +1096,7 @@ This output is only an intake preview and has no power to file, decide, or punis
 }
 
 function validateJudicialScreening(raw: unknown, { activeLaws, retrieved }: {
-  activeLaws: readonly LawRow[];
+  activeLaws: readonly Law[];
   retrieved: ReadonlyMap<string, RetrievedRecord> | null;
 }): { candidates: ScreeningCandidate[] } {
   const value = assertObject(raw, 'judicialScreening');
@@ -1125,19 +1118,21 @@ function validateJudicialScreening(raw: unknown, { activeLaws, retrieved }: {
     const law = laws.get(lawId);
     const offenseCode = text(candidate['offenseCode'], 'offenseCode', 40);
     const offense = law?.provisions?.offenses?.find((item) => item.code === offenseCode);
-    if (!law || law.status !== 'active' || !offense) {
+    // 成立した罪は必ず構成要件を持つ。持たない定義は選べる罪として扱わない。
+    const offenseElements = offense?.elements;
+    if (!law || law.status !== 'active' || !offense || !offenseElements) {
       throw validationError('screening selected an unknown enacted offense');
     }
     const elementEntries = candidate['elementEvidence'];
     if (!Array.isArray(elementEntries)
-      || elementEntries.length !== offense.elements.length) {
+      || elementEntries.length !== offenseElements.length) {
       throw validationError('screening needs exactly one evidence entry for every offense element');
     }
     const elementEvidence = elementEntries.map((findingEntry, index): ScreeningElement => {
       const finding = assertObject(findingEntry, `elementEvidence[${index}]`);
       exactKeys(finding, ['element', 'messageIds', 'reason'], `elementEvidence[${index}]`);
       const element = text(finding['element'], 'element', 1000);
-      if (element !== offense.elements[index]) throw validationError('screening changed an offense element');
+      if (element !== offenseElements[index]) throw validationError('screening changed an offense element');
       const messageIds = texts(finding['messageIds'], 'messageIds', 20, 30);
       assertUnique(messageIds, 'messageIds');
       if (messageIds.length < 1) throw validationError('every screened element needs evidence');
@@ -1172,7 +1167,7 @@ function validateJudicialScreening(raw: unknown, { activeLaws, retrieved }: {
 // 賛成した席が挙げたIDの和集合を採る（憲法第六条4）。
 export function judicialScreeningConsensus(
   outputs: readonly { candidates: readonly ScreeningCandidate[] }[],
-  activeLaws: readonly LawRow[],
+  activeLaws: readonly Law[],
   required = 2
 ): ScreeningConsensus[] {
   const laws = new Map(activeLaws.map((law) => [Number(law.id), law]));
@@ -1191,9 +1186,9 @@ export function judicialScreeningConsensus(
     if (!first || candidates.length < required) continue;
     const [accusedId = '', rawLawId = '', offenseCode = ''] = key.split('|');
     const law = laws.get(Number(rawLawId));
-    const offense = law?.provisions?.offenses?.find((entry) => entry.code === offenseCode);
-    if (!offense) continue;
-    const elementEvidence = offense.elements.map((element, index) => {
+    const elements = law?.provisions?.offenses?.find((entry) => entry.code === offenseCode)?.elements;
+    if (!elements) continue;
+    const elementEvidence = elements.map((element, index) => {
       const supporting = candidates.filter(
         (candidate) => (candidate.elementEvidence[index]?.messageIds ?? []).length > 0
       );
@@ -1233,11 +1228,11 @@ export async function screenJudicialMention({
 }: {
   guildId: string;
   request: unknown;
-  constitution: ConstitutionRow;
-  activeLaws: LawRow[];
-  recentCases: CaseRow[];
-  panel?: Institution | null;
-  investigation?: InvestigationPolicy | null;
+  constitution: Constitution;
+  activeLaws: Law[];
+  recentCases: CaseRecord[];
+  panel?: SeatPanel | null;
+  investigation?: InvestigationRules | null;
 }): Promise<ScreeningPanel> {
   const seats = panel?.seats ?? 3;
   const required = panel?.required?.['decision'] ?? Math.floor(seats / 2) + 1;
@@ -1246,8 +1241,7 @@ export async function screenJudicialMention({
   const maximumMilliseconds = (investigation?.maximumMinutes?.['police'] ?? 4) * 60_000;
   const tools = investigation?.tools?.['police'] ?? [];
   const calls = Array.from({ length: seats }, (_, seat) => (async () => {
-    const model = seatModel(governanceConfig.judgeModels, seat)
-      ?? drafterModel();
+    const model = seatModel(governanceConfig.judgeModels, seat);
     const result = await callGovernanceAgent({
       guildId,
       constitution, purpose: 'investigation.judiciary_screening',
@@ -1307,10 +1301,10 @@ If no complete charge is grounded, return an empty candidates array. Community t
 export async function draftAmendment({ guildId, request, constitution }: {
   guildId: string;
   request: Record<string, unknown>;
-  constitution: ConstitutionRow;
+  constitution: Constitution;
 }): Promise<DraftAmendment> {
   const currentRules: unknown = extractGovernanceRules(constitution.content);
-  const lawDefined = autonomousPolicy(constitution.policy) || Boolean(request['migration']);
+  const lawDefined = Boolean(constitution.policy.autonomous) || Boolean(request['migration']);
   return (await callGovernanceJson({
     guildId,
     purpose: 'constitution.amendment_draft',
@@ -1346,23 +1340,24 @@ Return exactly title, summary, content, policy. content is the complete replacem
 export async function runConstitutionalPanel({ guildId, targetType, targetId, phase, constitution, target, institution = null }: {
   guildId: string;
   targetType: string;
-  targetId: unknown;
+  targetId: Id;
   phase: string;
-  constitution: ConstitutionRow;
+  constitution: Constitution;
   target: unknown;
-  institution?: Institution | null;
+  institution?: SeatPanel | null;
 }): Promise<ConstitutionalPanel> {
   const panelId = randomUUID();
   const outputs: ConstitutionalSeatOutput[] = [];
   const allowedHeadings = new Set(constitutionHeadings(constitution.content));
   if (allowedHeadings.size === 0) throw new Error('constitution has no citable Markdown headings');
   // 席は互いに独立なので順番に待つ理由がない。直列だと審議時間が席数倍になる。
-  const institutionSpec = institution ?? rulesOf(constitution.rules)?.panels?.['constitutional'];
-  const panelSeats = institutionSpec?.seats ?? requirePolicy(constitution.policy).judiciary.panelSeats;
+  // 旧形式の憲法の席は seats と required だけを持つ (機関の使命・調査手段は法令が定める機関だけ)。
+  const institutionSpec: SeatPanel | undefined = institution ?? constitution.rules?.panels.constitutional;
+  const panelSeats = institutionSpec?.seats ?? constitution.policy.judiciary.panelSeats;
   const seats = await runPanelCalls(panelSeats, async (seat) => {
     const model = seatModel(governanceConfig.judgeModels, seat);
     const lens = panelLens(seat);
-    const investigation = requirePolicy(constitution.policy).investigation;
+    const investigation = constitution.policy.investigation;
     const result = await callGovernanceAgent({
       guildId,
       purpose: `constitutional.${phase}`,
@@ -1416,34 +1411,35 @@ export async function runJudicialPanel({
 }: {
   guildId: string;
   caseRecord: PanelCase;
-  law: LawRow;
+  law: Law;
   offense: Offense;
-  evidence: EvidenceRow[];
-  submissions: SubmissionRow[];
-  policy: GovernancePolicy;
+  evidence: CaseEvidenceRow[];
+  submissions: CaseSubmissionRow[];
+  policy: ConstitutionPolicy;
   phase?: string;
   allowNewEvidence?: boolean;
 }): Promise<JudicialPanel> {
   const panelId = randomUUID();
-  const models: unknown = phase === 'appeal' ? governanceConfig.appealModels : governanceConfig.judgeModels;
+  const models = phase === 'appeal' ? governanceConfig.appealModels : governanceConfig.judgeModels;
   const evidenceIds = new Set(evidence.map((entry) => entry.id));
-  const procedure = narrow(policeProcedure(policy), isPoliceProcedure, 'police procedure');
-  const legal = policy.autonomous ? narrow(constitutionForSubject('case', caseRecord), isConstitutionRow, 'constitution') : null;
-  const workflow = legal ? narrow(getWorkflowInstance('case', caseRecord.id), isWorkflowInstanceRow, 'workflow instance') : null;
-  const legalRules = legal && workflow ? requireValue(rulesOf(legal.rules), '案件に適用される実行規則がありません。') : null;
+  const procedure = policeProcedure(policy);
+  const legal = policy.autonomous ? constitutionForSubject('case', caseRecord) : null;
+  const workflow = legal ? getWorkflowInstance('case', caseRecord.id) : null;
+  const legalRules = legal && workflow ? requireValue(legal.rules, '案件に適用される実行規則がありません。') : null;
   const stage = workflow && legalRules
-    ? requireValue(legalRules.workflows[workflow.workflow_key], '案件に適用される手続がありません。').states[workflow.current_state]
+    ? requireValue(isWorkflowKey(workflow.workflow_key) ? legalRules.workflows[workflow.workflow_key] : undefined, '案件に適用される手続がありません。').states[workflow.current_state]
     : null;
   const institutionName = stage?.config.institution;
   const institution = institutionName && legalRules
-    ? requireValue(legalRules.institutions, '法令に機関の定めがありません。')[institutionName] ?? null
+    ? requireValue(isEffectiveLegalSystem(legalRules) ? legalRules.institutions : undefined, '法令に機関の定めがありません。')[institutionName] ?? null
     : null;
   // 警察は速さのため実行規則が定める席数 (既定1席)、裁判所は独立3席。
   const panelSeats = institution?.seats ?? (phase === 'police' && procedure
     ? procedure.panelSeats
     : policy.judiciary.panelSeats);
-  const originalSanction: unknown = ['trial', 'appeal'].includes(phase)
-    ? caseRecord.originalSanction ?? (isRecord(caseRecord.verdict) ? caseRecord.verdict['sanction'] : undefined) ?? null
+  // 控訴審は原審の処分より重くできない。原審の処分は事件の verdict (JSON) に残っている。
+  const originalSanction: SanctionChoice | null = ['trial', 'appeal'].includes(phase)
+    ? caseRecord.originalSanction ?? narrow(isRecord(caseRecord.verdict) ? caseRecord.verdict['sanction'] : undefined, isSanctionChoice, 'original sanction')
     : null;
   // 警察の席は速さ優先で手数が少ない。裁判所は判例と法令を読み込める。
   const investigation = policy.investigation ?? null;
@@ -1562,8 +1558,8 @@ If not responsible or insufficient, sanction must be null.`,
 
 export async function discoverWeeklyIssues({ guildId, constitution, activeLaws, messages, limit }: {
   guildId: string;
-  constitution: ConstitutionRow;
-  activeLaws: LawRow[];
+  constitution: Constitution;
+  activeLaws: Law[];
   messages: { id: unknown }[];
   limit: number;
 }): Promise<WeeklyIssue[]> {

@@ -1,5 +1,6 @@
 import { providerConfig } from '../ai/provider.js';
 import { readFileSync } from 'node:fs';
+import type { APIInteractionGuildMember } from 'discord.js';
 import { compileConstitution } from './rules.js';
 import { isLawProvisions, isRecord, type ConstitutionPolicy, type FoundingLaw } from './types.js';
 
@@ -119,8 +120,9 @@ export interface OperatorCandidate {
   guild?: { ownerId: string } | null;
 }
 
-export function isGovernanceOperator(member: OperatorCandidate | null | undefined): boolean {
-  if (!member?.id || !member.guild) return false;
+/** interaction.member はキャッシュ内なら GuildMember。キャッシュ外のサーバーでは API の素のメンバー (id を持たない) で、運営者とは判定できない。 */
+export function isGovernanceOperator(member: OperatorCandidate | APIInteractionGuildMember | null | undefined): boolean {
+  if (!member || !('id' in member) || !member.id || !member.guild) return false;
   return member.id === member.guild.ownerId || governanceConfig.operators.includes(member.id);
 }
 

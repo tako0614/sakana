@@ -8,12 +8,14 @@ import {
   SlashCommandBuilder,
   TextInputBuilder,
   TextInputStyle,
+  type APIInteractionGuildMember,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   type Guild,
+  type GuildMember,
   type InteractionReplyOptions
 } from 'discord.js';
-import { isGovernanceOperator, loadBootstrapDocuments } from './config.js';
+import { isGovernanceOperator, loadBootstrapDocuments, type BootstrapDocuments } from './config.js';
 import {
   bootstrapGovernanceGuild,
   claimGovernanceSetupSession,
@@ -49,36 +51,21 @@ import {
 import { handleGovernanceIntakeComponent } from './intake.js';
 import { syncLawSite } from './lawsite.js';
 import { ensureGovernanceUx, handleGovernanceUxInteraction, renderGovernanceOperationsPanel } from './ux.js';
+import type { SetupSession } from './types.js';
 import {
   errorMessage,
-  isCaseRow,
-  isConstitutionRow,
-  isGovernanceGuildRow,
-  isRecord,
-  isSanctionRow,
-  isSetupSessionRow,
-  isString,
-  isUnknown,
-  narrow,
-  narrowList,
-  narrowRequired,
   requireValue,
-  shape,
   type GovernanceCommand,
   type GovernanceComponentInteraction,
-  type GovernancePermissionReport,
-  type SetupSessionRow
+  type GovernancePermissionReport
 } from './types-service.js';
 
 const EPHEMERAL = MessageFlags.Ephemeral;
 const SETUP_TTL_MS = 15 * 60_000;
 const VOTE_LABELS: Record<string, string> = { yes: '賛成', no: '反対', abstain: '棄権' };
 
-const governanceGuild = (guildId: unknown) => narrow(getGovernanceGuild(guildId), isGovernanceGuildRow, 'governance guild');
-const setupSession = (value: unknown) => narrow(value, isSetupSessionRow, 'setup session');
-
 function reviewListPayload(guildId: string, userId: string, offset = 0): InteractionReplyOptions & { flags: typeof EPHEMERAL } {
-  const sanctions = narrowList(listContestableSanctions(guildId, userId), isSanctionRow, 'sanction');
+  const sanctions = listContestableSanctions(guildId, userId);
   const pageSize = 4;
   const start = Math.max(0, Math.min(Number(offset) || 0, Math.max(0, sanctions.length - 1)));
   const page = sanctions.slice(start, start + pageSize);
@@ -86,7 +73,7 @@ function reviewListPayload(guildId: string, userId: string, offset = 0): Interac
     return { content: 'いま争える即時処分はありません。', components: [], flags: EPHEMERAL };
   }
   const lines = page.map((sanction, index) => {
-    const caseRecord = narrow(getCase(sanction.case_id), isCaseRow, 'case');
+    const caseRecord = getCase(sanction.case_id);
     const type = sanction.type === 'warning' ? '警告' : sanction.type === 'restriction' ? '機能制限' : 'タイムアウト';
     return `${index + 1}. ${type}: ${String(caseRecord?.summary ?? '理由は裁判所を参照').replace(/\s+/g, ' ').slice(0, 180)}`;
   });
@@ -116,21 +103,14 @@ function requireGuild(interaction: { guildId: string | null; guild: Guild | null
   return interaction.guild;
 }
 
-function requireOperator(interaction: { member: unknown }): void {
+function requireOperator(interaction: { member: GuildMember | APIInteractionGuildMember | null }): void {
   if (!isGovernanceOperator(interaction.member)) {
     throw new Error('この操作はサーバーownerまたは設定済み運営者だけが実行できます。');
   }
 }
 
-// config.js が読む初期憲法・初期法律。プレビューの照合に本文のハッシュを使う。
-const isBootstrapDocuments = shape({ constitution: isString, policy: isUnknown, laws: isUnknown });
-
-function bootstrapDocuments(serverName: string) {
-  return narrowRequired(loadBootstrapDocuments({ serverName }), isBootstrapDocuments, 'bootstrap documents');
-}
-
-function setupHashes(documents: { constitution: string; policy?: unknown; laws?: unknown }): { constitutionHash: string; policyHash: string } {
-  return { constitutionHash: sha256(documents.constitution), policyHash: String(policyHash({ policy: documents.policy, laws: documents.laws ?? [] })) };
+function setupHashes(documents: BootstrapDocuments): { constitutionHash: string; policyHash: string } {
+  return { constitutionHash: sha256(documents.constitution), policyHash: policyHash({ policy: documents.policy, laws: documents.laws }) };
 }
 
 function setupBlockingPermissions(report: GovernancePermissionReport): string[] {
@@ -140,8 +120,8 @@ function setupBlockingPermissions(report: GovernancePermissionReport): string[] 
 
 function setupPreviewPayload(
   guild: Guild,
-  session: SetupSessionRow,
-  documents: { constitution: string; laws?: unknown },
+  session: SetupSession,
+  documents: BootstrapDocuments,
   report: GovernancePermissionReport,
   { resumed = false }: { resumed?: boolean } = {}
 ): InteractionReplyOptions {
@@ -177,7 +157,7 @@ function setupPreviewPayload(
 async function openGovernance(interaction: ChatInputCommandInteraction): Promise<void> {
   const guild = requireGuild(interaction);
   requireOperator(interaction);
-  const governance = governanceGuild(guild.id);
+  const governance = getGovernanceGuild(guild.id);
   if (governance) {
     await interaction.deferReply({ flags: EPHEMERAL });
     const ux = await ensureGovernanceUx(guild, governance);
@@ -185,27 +165,27 @@ async function openGovernance(interaction: ChatInputCommandInteraction): Promise
     return;
   }
 
-  const documents = bootstrapDocuments(guild.name);
+  const documents = loadBootstrapDocuments({ serverName: guild.name });
   const hashes = setupHashes(documents);
-  let session = setupSession(getResumableGovernanceSetup(guild.id));
+  let session = getResumableGovernanceSetup(guild.id);
   const canResume = session
     && session.constitution_hash === hashes.constitutionHash
     && session.policy_hash === hashes.policyHash;
   if (session && canResume) {
-    session = setupSession(updateGovernanceSetupSession(session.id, {
+    session = updateGovernanceSetupSession(session.id, {
       status: 'preview',
       requested_by: interaction.user.id,
       expires_at: Date.now() + SETUP_TTL_MS,
       last_error: session.last_error
-    }));
+    });
   } else {
-    session = setupSession(createGovernanceSetupSession({
+    session = createGovernanceSetupSession({
       guildId: guild.id,
       requestedBy: interaction.user.id,
       constitutionHash: hashes.constitutionHash,
       policyHash: hashes.policyHash,
       expiresAt: Date.now() + SETUP_TTL_MS
-    }));
+    });
   }
   const current = requireValue(session, '導入確認を作成できませんでした。');
   await interaction.reply(setupPreviewPayload(
@@ -220,9 +200,9 @@ async function openGovernance(interaction: ChatInputCommandInteraction): Promise
 async function executeSetup(interaction: ButtonInteraction, sessionId: string): Promise<void> {
   const guild = requireGuild(interaction);
   requireOperator(interaction);
-  const claimed = setupSession(claimGovernanceSetupSession(sessionId, interaction.user.id));
+  const claimed = claimGovernanceSetupSession(sessionId, interaction.user.id);
   if (!claimed) throw new Error('この導入確認は期限切れ、処理済み、または別の運営者が作成したものです。');
-  const documents = bootstrapDocuments(guild.name);
+  const documents = loadBootstrapDocuments({ serverName: guild.name });
   const hashes = setupHashes(documents);
   if (claimed.constitution_hash !== hashes.constitutionHash || claimed.policy_hash !== hashes.policyHash) {
     updateGovernanceSetupSession(claimed.id, { status: 'failed', last_error: 'preview hashes changed' });
@@ -239,8 +219,8 @@ async function executeSetup(interaction: ButtonInteraction, sessionId: string): 
       resources: claimed.resources,
       onProgress: (resources) => updateGovernanceSetupSession(claimed.id, { resources })
     });
-    const result: unknown = governanceGuild(guild.id)
-      ? { guild: governanceGuild(guild.id), constitution: null }
+    const bootstrapped = getGovernanceGuild(guild.id)
+      ? null
       : bootstrapGovernanceGuild({
         guildId: guild.id,
         enactedBy: interaction.user.id,
@@ -264,9 +244,9 @@ async function executeSetup(interaction: ButtonInteraction, sessionId: string): 
       warnings.push(`活動履歴の初回取込み: ${errorMessage(error)}`);
       return 0;
     });
-    const constitution = narrow(isRecord(result) ? result['constitution'] : null, isConstitutionRow, 'constitution');
+    const constitution = bootstrapped?.constitution ?? null;
     syncLawSite(guild, { verifyExisting: true });
-    const ux = await ensureGovernanceUx(guild, governanceGuild(guild.id));
+    const ux = await ensureGovernanceUx(guild, getGovernanceGuild(guild.id));
     if (constitution) {
       await postAuthorityChange(guild, ux.governance, '統治機能を開始', `初期憲法 v${constitution.version} を公開しました。`)
         .catch((error: unknown) => warnings.push(`運営変更の掲載: ${errorMessage(error)}`));
@@ -380,7 +360,7 @@ export async function handleGovernanceComponent(interaction: GovernanceComponent
     if (customId.startsWith('gov:admin')) return await handleGovernanceUxInteraction(interaction);
     if (interaction.isButton() && customId.startsWith('gov:setup:')) {
       const [, , sessionId, action] = customId.split(':');
-      const session = setupSession(getGovernanceSetupSession(sessionId));
+      const session = sessionId === undefined ? null : getGovernanceSetupSession(sessionId);
       if (!session || session.guild_id !== interaction.guildId || session.requested_by !== interaction.user.id) {
         throw new Error('この導入確認は使用できません。');
       }
@@ -444,27 +424,28 @@ export async function handleGovernanceComponent(interaction: GovernanceComponent
     await interaction.deferReply({ flags: EPHEMERAL });
     if (action === 'veto') {
       const result = await exerciseHumanVeto(interaction, String(value), id);
-      await ensureGovernanceUx(guild, governanceGuild(guild.id));
+      await ensureGovernanceUx(guild, getGovernanceGuild(guild.id));
       await interaction.editReply(`拒否権の行使を記録しました（${result.count}人）。${result.vetoed ? '成立・執行を取りやめます。' : '法律で定める必要人数への到達を待ちます。'}`);
       return true;
     }
     if (action === 'manual') {
       const [requestKey, result] = String(value).split('-');
+      if (requestKey === undefined || result === undefined) throw new Error('管理者対応の操作を読み取れません。');
       await reportManualExecution(guild, interaction.user.id, { sanctionId: id, requestKey, result });
-      await ensureGovernanceUx(guild, governanceGuild(guild.id));
+      await ensureGovernanceUx(guild, getGovernanceGuild(guild.id));
       await interaction.editReply('管理者による対応完了を記録しました。');
       return true;
     }
     if (action === 'vote') {
       await castAndPublishVote(interaction, id, String(value));
-      await ensureGovernanceUx(guild, governanceGuild(guild.id));
+      await ensureGovernanceUx(guild, getGovernanceGuild(guild.id));
       const label = VOTE_LABELS[String(value)] ?? value;
       await interaction.editReply(`「${label}」で記名投票しました。`);
       return true;
     }
     if (action === 'approve') {
       const result = await approveCase(interaction, id, String(value));
-      await ensureGovernanceUx(guild, governanceGuild(guild.id));
+      await ensureGovernanceUx(guild, getGovernanceGuild(guild.id));
       const label = value === 'approve' ? '執行を承認' : '承認しない';
       await interaction.editReply(`「${label}」を記録しました（承認 ${result.approvals}/${result.required}）。`);
       return true;

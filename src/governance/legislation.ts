@@ -34,21 +34,6 @@ import {
   type WorkflowKey
 } from './types.js';
 
-// discord.js・llm.js はまだ JS で、既定値から引数の型が狭く推論される (files = [] → never[]、
-// institution = null → null)。TS へ移るまでの境界として、ここで渡す形の型を一度だけ与える。
-// 戻り値は unknown として受け取り、下の検査関数で形を確かめる。
-type ProposalUpdateOptions = { state?: string | null; files?: { name: string; attachment: Buffer }[] };
-const postUpdate = postProposalUpdate as (guild: Guild, proposal: Proposal | null, text: string | undefined, options?: ProposalUpdateOptions) => ReturnType<typeof postProposalUpdate>;
-interface DeliberationRequest {
-  guildId: string; agenda: unknown; discussion: unknown; previousSessions: unknown; otherOpenAgenda?: { title: string; summary: string }[];
-  constitution: unknown; activeLaws: unknown; candidates: unknown; panel: unknown; allowDefer?: boolean; investigation: unknown;
-}
-const deliberate = deliberateAgendaItem as (input: DeliberationRequest) => ReturnType<typeof deliberateAgendaItem>;
-interface ConstitutionalReviewRequest {
-  guildId: string; targetType: string; targetId: number; phase: string; constitution: unknown; target: unknown; institution?: Institution | null;
-}
-const constitutionalPanel = runConstitutionalPanel as (input: ConstitutionalReviewRequest) => ReturnType<typeof runConstitutionalPanel>;
-
 function requireProposal(proposal: Proposal | null | undefined): Proposal {
   if (!proposal) throw new Error('議題の記録が見つかりません。');
   return proposal;
@@ -148,7 +133,7 @@ async function advance(guild: Guild, input: Proposal, now: number, restarts = 0)
   const currentProposal = (): Proposal => requireProposal(getProposal(proposal.id));
   const operations: Partial<Record<string, ProcedureOperation>> = {
     async parliament_agenda({ definition }) {
-      const decision = agendaDecision(await deliberate({
+      const decision = agendaDecision(await deliberateAgendaItem({
         guildId: guild.id, agenda: { title: proposal.title, summary: proposal.summary, kind: proposal.kind, origin: proposal.source, deferrals: 0 },
         constitution, discussion, previousSessions: listProposalDeliberations(proposal.id),
         activeLaws, candidates: buildLegislativeCandidates({ request: `${proposal.title}\n${proposal.summary}`,
@@ -212,7 +197,7 @@ async function advance(guild: Guild, input: Proposal, now: number, restarts = 0)
     async constitutional_panel({ state, definition }) {
       const target = currentProposal().body;
       const acting = institution(definition);
-      const result = panelResult(await constitutionalPanel({ guildId: guild.id, targetType: proposal.kind === 'amendment' ? 'amendment' : 'law',
+      const result = panelResult(await runConstitutionalPanel({ guildId: guild.id, targetType: proposal.kind === 'amendment' ? 'amendment' : 'law',
         targetId: proposal.id, phase: 'pre', constitution, target, institution: acting }), '憲法審査');
       if (result.outputs.length !== acting.seats) throw new Error('憲法審査のAI席がそろいませんでした。');
       // 必要票の定めが無ければ合憲にしない (旧来の `n >= undefined` と同じく false)。
@@ -231,7 +216,7 @@ async function advance(guild: Guild, input: Proposal, now: number, restarts = 0)
         vote = { state, targetHash, openedAt: now, deadline: now + durationMilliseconds(definition.duration), announced: false, veto };
       }
       if (!vote.announced) {
-        await postUpdate(guild, target, `## AIの採択・憲法審査が完了しました\n${target.title}\n添付の同一案について公開投票を行います。締切: <t:${Math.floor(vote.deadline / 1000)}:F>`, {
+        await postProposalUpdate(guild, target, `## AIの採択・憲法審査が完了しました\n${target.title}\n添付の同一案について公開投票を行います。締切: <t:${Math.floor(vote.deadline / 1000)}:F>`, {
           state: '投票', files: [{ name: '投票対象全文.json', attachment: Buffer.from(JSON.stringify(target.body, null, 2)) }]
         });
         vote = { ...vote, announced: true };
@@ -247,7 +232,7 @@ async function advance(guild: Guild, input: Proposal, now: number, restarts = 0)
     async law_enactment({ context }) {
       const current = currentProposal();
       let record: { kind: string; id: number };
-      await postUpdate(guild, current, `## 成立前の全文公示\n${current.title}\n採択・審査を終えた本文と実行定義を公示します。`, {
+      await postProposalUpdate(guild, current, `## 成立前の全文公示\n${current.title}\n採択・審査を終えた本文と実行定義を公示します。`, {
         files: [{ name: '法令全文.json', attachment: Buffer.from(JSON.stringify(current.body, null, 2)) }]
       });
       try {
@@ -264,7 +249,9 @@ async function advance(guild: Guild, input: Proposal, now: number, restarts = 0)
       return { outcome: 'enacted', context: { enacted: record } };
     },
     async notice({ definition }) {
-      await postUpdate(guild, getProposal(proposal.id), definition.config.text ?? procedure.mandate);
+      const text = definition.config.text ?? procedure.mandate;
+      if (text === undefined) throw new Error('通知する本文が定められていません。');
+      await postProposalUpdate(guild, requireProposal(getProposal(proposal.id)), text);
       return { outcome: 'completed' };
     }
   };
@@ -292,7 +279,7 @@ async function advance(guild: Guild, input: Proposal, now: number, restarts = 0)
     recordProposalDeliberation({ proposalId: proposal.id, revision: current.revision, outcome: decision,
       discussion, decision: { ...result.context, reasons } });
     const body = current.body;
-    if (!enacted) await postUpdate(guild, current, ['## 不採択',
+    if (!enacted) await postProposalUpdate(guild, current, ['## 不採択',
       current.title, ...reasons.map((reason) => `- ${String(reason)}`)].join('\n'), {
       state: enacted ? '成立' : '不成立',
       files: body ? [{ name: current.kind === 'amendment' ? '憲法改正案全文.json' : '法律全文.json', attachment: Buffer.from(JSON.stringify(body, null, 2)) }] : []

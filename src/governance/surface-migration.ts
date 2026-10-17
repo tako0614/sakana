@@ -43,10 +43,6 @@ export interface LegacyClassification {
   text: string;
 }
 
-// discord.js はまだ JS で、既定値 (procedureMessage = null) から引数の型が null に狭く推論される。
-// TS へ移るまでの境界として、ここで渡す形の型を一度だけ与える。
-const ensureOperationsThread = ensureGovernanceOperationsThread as (guild: Guild, governance: GovernanceGuild, procedureMessage?: unknown) => ReturnType<typeof ensureGovernanceOperationsThread>;
-
 function headingOf(content: unknown): string {
   return (String(content ?? '').split('\n', 1)[0] ?? '').replace(/^#+\s*/, '').trim();
 }
@@ -264,8 +260,7 @@ export async function applyGovernanceSurfaceMigration(guild: Guild): Promise<Sur
     status: 'running',
     detail: { phase: 'publishing', classifications: inspected.counts }
   });
-  // ux.js・discord.js はまだ JS。ここで使う戻り値の形を明示する。
-  const ux: { governance: GovernanceGuild | null; procedureMessage: unknown } = await ensureGovernanceUx(guild, inspected.governance);
+  const ux = await ensureGovernanceUx(guild, inspected.governance);
   let governance = requireGovernance(ux.governance);
   syncLawSite(guild, { verifyExisting: true });
   for (const caseRecord of listCases(guild.id, { limit: 1_000 })) {
@@ -274,7 +269,7 @@ export async function applyGovernanceSurfaceMigration(guild: Guild): Promise<Sur
   }
   governance = requireGovernance(getGovernanceGuild(guild.id));
   await syncGovernanceRecordUi(guild, governance);
-  const operations: GuildBasedChannel | null = await ensureOperationsThread(guild, governance, ux.procedureMessage);
+  const operations = await ensureGovernanceOperationsThread(guild, governance, ux.procedureMessage);
   const existingOperationMessages = new Set((await fetchAllMessages(operations)).map((message) => message.content));
 
   const allLegacyMessages = [...inspected.guideMessages, ...inspected.gazetteMessages];

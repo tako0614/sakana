@@ -5,13 +5,13 @@ import { DAY_MS, canonicalJson, sha256 } from './policy.js';
 import { closeGovernanceVote, compileConstitution, compileLegalSystem } from './rules.js';
 import { AUTHORITY_SCHEMA, EFFECTIVE_SCHEMA } from './legal-system.js';
 import { compileLegalRecovery } from './legal-recovery.js';
-import { errorText, isArray, isEffectiveLegalSystem, isLawProvisions, isProposalBody, isRecord, oneOf } from './types.js';
+import { errorText, isArray, isEffectiveLegalSystem, isLawProvisions, isProposalBody, isRecord, isWorkflowKey } from './types.js';
 import type {
   ActiveConstitution, ActiveRestriction, CompiledLegalSystem, ActiveRestrictionRow, ActivityInput, ActivityMessage, ActivityRow,
   AdministrativeAct, AdministrativeActRow, AppealRow, AuditEntry, AuditRow, CaseApprovalRow, CaseDecision,
   CaseDecisionRow, CaseEvidenceRow, CaseRecord, HumanVetoRow, CaseRow, CaseSubmissionRow, CompiledConstitution, Constitution,
   ConstitutionPolicy, ConstitutionRow, InstitutionTaskResult, DetentionRow, DiscussionMessage, FoundingLaw, GovernanceGuild,
-  GovernanceGuildRow, GovernanceRules, InstrumentRelation, InstrumentRelationRow, Intake, IntakeRow,
+  GovernanceGuildRow, GovernanceRules, Id, InstrumentRelation, InstrumentRelationRow, Intake, IntakeRow,
   InterimProtectionRow, InvestigationEvidenceRow, InvestigationStepRow, Law, LawInput, LawProvisions,
   LawPublicationRow, LawRow, LegacyMessageArchiveRow, LegalBaseline, LegalSnapshot, LegalSnapshotRow, LegalTask,
   LegalTaskRow, MentionInvestigation, MentionInvestigationRow, NotificationRow, OutboxAction, OutboxRow,
@@ -19,7 +19,7 @@ import type {
   ProposalElectorateRow, ProposalQueue, ProposalRow, ProposalVoteRow, ProposalVoterRow, QueuedInput,
   ReviewRow, SettingRow, Sanction, SanctionDefinitionRecord, SanctionDefinitionRow, SanctionRow, SetupSession, SetupSessionRow,
   StatutePublicationRow, SurfaceMigration, SurfaceMigrationRow, TrustedMutationRow, UnknownRecord, VoteSummary,
-  WorkflowContext, WorkflowEvent, WorkflowEventRow, WorkflowInstance, WorkflowInstanceRow, WorkflowKey
+  WorkflowContext, WorkflowEvent, WorkflowEventRow, WorkflowInstance, WorkflowInstanceRow
 } from './types.js';
 
 // 列の追加を判断するために、表の現在の列名を読む。
@@ -29,7 +29,6 @@ function columnNames(table: string): Set<string> {
   return new Set(rows.flatMap((row) => (isRecord(row) && typeof row.name === 'string' ? [row.name] : [])));
 }
 
-type Id = number | string;
 type ColumnSpec = [name: string, definition: string];
 interface CountRow { count: number }
 interface ShortCountRow { c: number }
@@ -3610,8 +3609,6 @@ export function listOpenCasesForLaw(lawId: Id): CaseRecord[] {
   `).all(Number(lawId)).map((row) => hydrateCase(row));
 }
 
-const WORKFLOW_KEYS: readonly WorkflowKey[] = ['law', 'constitutionalAmendment', 'criminalCase', 'constitutionalCase'];
-
 export const updateCase = db.transaction((id: Id, patch: Patch): CaseRecord | null => {
   const allowed = new Set([
     'status', 'public_thread_id', 'private_thread_id', 'defense_until', 'panel_id',
@@ -3626,7 +3623,7 @@ export const updateCase = db.transaction((id: Id, patch: Patch): CaseRecord | nu
     const status = String(normalized.status);
     const instance = requireRecord(getWorkflowInstance('case', id), '事件の手続');
     const rules = requireRecord(constitution.rules, '事件の適用法令');
-    const procedure = requireRecord(oneOf(WORKFLOW_KEYS, instance.workflow_key) ? rules.workflows[instance.workflow_key] : undefined, '事件の手続定義');
+    const procedure = requireRecord(isWorkflowKey(instance.workflow_key) ? rules.workflows[instance.workflow_key] : undefined, '事件の手続定義');
     const state = procedure.states[instance.current_state];
     const targetName = state?.on[status]
       ?? procedure.config.interruptions?.[status]

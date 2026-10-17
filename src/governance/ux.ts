@@ -14,13 +14,13 @@ import {
   type GuildMember,
   type InteractionReplyOptions,
   type Message,
-  type MessageMentionOptions,
   type ModalSubmitInteraction,
   type OverwriteType,
   type TextChannel
 } from 'discord.js';
-import { governanceCategoryName, isGovernanceOperator, parseOperationalSetting } from './config.js';
+import { governanceCategoryName, isGovernanceOperator, parseOperationalSetting, type OperationalSettingKey } from './config.js';
 import {
+  createAdministrativeAct,
   getActiveConstitution,
   getCaseSanction,
   getConstitution,
@@ -31,13 +31,16 @@ import {
   governanceNotificationStats,
   listActionFailures,
   listCaseApprovals,
+  listCases,
   listNotificationFailures,
   listProposals,
+  listSanctions,
   proposalVoteSummary,
   retryFailedActions,
   retryFailedNotifications,
   setOperationalSetting,
-  updateGovernanceGuild
+  updateGovernanceGuild,
+  writeAudit
 } from './db.js';
 import {
   GOVERNANCE_PROCEDURE_NAME,
@@ -61,95 +64,75 @@ import {
   reconcileGovernanceNotificationMessage,
   rejectGovernanceNotification
 } from './notifications.js';
+import type {
+  CaseRecord,
+  GovernanceGuild,
+  HumanAuthoritySnapshot,
+  Proposal,
+  Sanction,
+  WorkflowContext
+} from './types.js';
 import { setTrustedMember } from './service.js';
 import { policeProcedure } from './policy.js';
 import { lawSiteLink } from './lawsite.js';
 import { humanAuthorityLabel } from './human-authority.js';
 import { manualExecutionDetail } from './manual-execution.js';
 import {
-  createAdministrativeAct,
   errorMessage,
-  isApprovalContext,
-  isApprovalResult,
-  isApprovalRow,
   isBoolean,
-  isCaseRow,
-  isConstitutionRow,
-  isFailureRow,
-  isGovernanceGuildRow,
-  isNumber,
-  isProposalRow,
   isRecord,
-  isSanctionRow,
   isString,
-  isStringArray,
-  isUnknown,
-  isVoteSummary,
-  isWorkflowInstanceRow,
-  listCases,
-  listSanctions,
-  narrow,
-  narrowList,
   narrowRequired,
   optional,
-  policyOf,
+  requireRow,
   requireValue,
-  rulesOf,
   shape,
-  writeAudit,
   type ButtonRow,
-  type CaseRow,
   type GovernanceActionCard,
-  type GovernanceGuildRow,
   type GovernancePanelPayload,
   type GovernanceUxInteraction,
   type OverwriteChannel,
-  type ProposalRow,
-  type RequiredOverwrite,
-  type SanctionRow
+  type RequiredOverwrite
 } from './types-service.js';
 
 const EPHEMERAL = MessageFlags.Ephemeral;
 const ACTIVE_CASE_STATUSES = ['filing', 'police_review', 'contest_window', 'defense', 'deliberation', 'approval', 'appeal_window', 'appeal', 'execution'];
 
-const governanceGuild = (guildId: unknown) => narrow(getGovernanceGuild(guildId), isGovernanceGuildRow, 'governance guild');
-const requireGovernanceGuild = (guildId: unknown) => narrowRequired(getGovernanceGuild(guildId), isGovernanceGuildRow, 'governance guild');
-const activeConstitution = (guildId: unknown) => narrow(getActiveConstitution(guildId), isConstitutionRow, 'constitution');
-const caseSanction = (caseId: number) => narrow(getCaseSanction(caseId), isSanctionRow, 'sanction');
-const settingValue = (guildId: string, key: string): unknown => getOperationalSetting(guildId, key);
+const requireGovernanceGuild = (guildId: string) => requireRow(getGovernanceGuild(guildId), 'governance guild');
+const settingValue = (guildId: string, key: OperationalSettingKey): number => getOperationalSetting(guildId, key);
 
 function isPresent<T>(value: T | null | undefined): value is T {
   return value !== null && value !== undefined;
 }
 
-function workflowContext(subjectType: string, subjectId: number): Record<string, unknown> | undefined {
-  return narrow(getWorkflowInstance(subjectType, subjectId), isWorkflowInstanceRow, 'workflow instance')?.context;
+function workflowContext(subjectType: string, subjectId: number): WorkflowContext | undefined {
+  return getWorkflowInstance(subjectType, subjectId)?.context;
 }
 
-function proposalHandler(proposal: ProposalRow): string | null {
+function proposalHandler(proposal: Proposal): string | null {
   if (proposal.workflow_handler) return proposal.workflow_handler;
-  const constitution = narrow(getConstitution(proposal.constitution_id), isConstitutionRow, 'constitution');
+  const constitution = getConstitution(proposal.constitution_id);
   const key = proposal.kind === 'amendment' ? 'constitutionalAmendment' : 'law';
-  return rulesOf(constitution?.rules)?.workflows[key]?.states[proposal.status]?.handler ?? null;
+  return constitution?.rules?.workflows[key]?.states[proposal.status]?.handler ?? null;
 }
 
-function activeProposals(guildId: string, limit = 100): ProposalRow[] {
-  return narrowList(listProposals(guildId, { limit }), isProposalRow, 'proposal').filter((proposal) => proposalHandler(proposal) !== 'terminal');
+function activeProposals(guildId: string, limit = 100): Proposal[] {
+  return listProposals(guildId, { limit }).filter((proposal) => proposalHandler(proposal) !== 'terminal');
 }
 
-function activeCases(guildId: string, statuses: readonly string[], limit: number): CaseRow[] {
-  return narrowList(listCases(guildId, { statuses, limit }), isCaseRow, 'case');
+function activeCases(guildId: string, statuses: readonly string[], limit: number): CaseRecord[] {
+  return listCases(guildId, { statuses, limit });
 }
 
-function stateLabel(governance: GovernanceGuildRow): string {
+function stateLabel(governance: GovernanceGuild): string {
   return governance.status === 'active' ? '稼働中' : '停止中';
 }
 
-function enforcementLabel(governance: GovernanceGuildRow): string {
+function enforcementLabel(governance: GovernanceGuild): string {
   return governance.enforcement_mode === 'live' ? '実執行' : '記録のみ';
 }
 
-async function electorateLabel(guild: Guild, governance: GovernanceGuildRow): Promise<string> {
+async function electorateLabel(guild: Guild, governance: GovernanceGuild): Promise<string> {
   if (!governance.trusted_role_id) return '未設定';
   const role = guild.roles.cache.get(governance.trusted_role_id)
     ?? await guild.roles.fetch(governance.trusted_role_id).catch(() => null);
@@ -165,7 +148,7 @@ function activeCounts(guildId: string): { agenda: number; voting: number; cases:
   };
 }
 
-function workflowFailures(governance: GovernanceGuildRow): string[] {
+function workflowFailures(governance: GovernanceGuild): string[] {
   return [
     ...activeProposals(governance.guild_id)
       .filter((proposal) => proposal.last_error)
@@ -222,7 +205,7 @@ function componentsMatch(message: Message, expected: readonly ButtonRow[]): bool
   return JSON.stringify(currentJson) === JSON.stringify(expectedJson);
 }
 
-function operationsComponents(governance: GovernanceGuildRow): ButtonRow[] {
+function operationsComponents(governance: GovernanceGuild): ButtonRow[] {
   return [
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId('gov:admin:toggle_state')
@@ -245,20 +228,18 @@ function operationsComponents(governance: GovernanceGuildRow): ButtonRow[] {
   ];
 }
 
-const isNotificationStats = shape({ delivered: isNumber, suppressed: isNumber, failed: isNumber });
-
-export async function renderGovernanceOperationsPanel(guild: Guild, governance: GovernanceGuildRow): Promise<GovernancePanelPayload> {
-  const constitution = activeConstitution(guild.id);
-  const policy = policyOf(constitution?.policy);
+export async function renderGovernanceOperationsPanel(guild: Guild, governance: GovernanceGuild): Promise<GovernancePanelPayload> {
+  const constitution = getActiveConstitution(guild.id);
+  const policy = constitution?.policy;
   const permissions = governancePermissionReport(guild);
-  const failures = narrowList(listActionFailures(guild.id), isFailureRow, 'outbox failure');
+  const failures = listActionFailures(guild.id);
   const workflows = workflowFailures(governance);
   const counts = activeCounts(guild.id);
   const electorate = await electorateLabel(guild, governance);
   const electorateName = governance.trusted_role_id
     ? (guild.roles.cache.get(governance.trusted_role_id)?.name ?? '特別有権者')
     : '特別有権者';
-  const notificationStats = narrowRequired(governanceNotificationStats(guild.id), isNotificationStats, 'notification stats');
+  const notificationStats = governanceNotificationStats(guild.id);
   return {
     content: [
       `# ${guild.name} Bot技術運用`,
@@ -272,7 +253,7 @@ export async function renderGovernanceOperationsPanel(guild: Guild, governance: 
       `特別有権者: ${electorate}`,
       `国会(${policy?.autonomous ? '法律で規定' : '憲法で規定'}): ${(policy?.legislation.sessionIntervalMilliseconds ?? 0) / 3_600_000}時間ごと / 1回 ${policy?.legislation.agendaLimit ?? '?'}議題${policy?.autonomous ? '' : ` / 継続審議 ${policy?.legislation.maximumDeferrals ?? '?'}回`} / 自律起案 ${policy?.legislation.logScan ? '有効' : '無効'}${governance.last_session_at ? ` / 前回 <t:${Math.floor(Number(governance.last_session_at) / 1000)}:R>` : ''}`,
       `AI受付: 一般 ${String(settingValue(guild.id, 'general_daily_calls'))}回/日 / ${electorateName} ${String(settingValue(guild.id, 'trusted_daily_calls'))}回/日`,
-      `AI調査: 会話 ${String(settingValue(guild.id, 'investigation_conversation_limit'))}件 / 対象者 ${String(settingValue(guild.id, 'investigation_actor_limit'))}件 / サーバー ${String(settingValue(guild.id, 'investigation_guild_limit'))}件 / 最大事件 ${String(settingValue(guild.id, 'investigation_case_limit'))}件`,
+      `AI調査: 既定の遡り ${settingValue(guild.id, 'investigation_lookback_days')}日 / 最大事件 ${settingValue(guild.id, 'investigation_case_limit')}件`,
       `通知上限: 全体 ${String(settingValue(guild.id, 'notification_everyone_daily_limit'))}回 / ${electorateName} ${String(settingValue(guild.id, 'notification_trusted_daily_limit'))}回 / 当事者1人 ${String(settingValue(guild.id, 'notification_user_daily_limit'))}回（各24時間）`,
       `通知実績（24時間）: 送信 ${notificationStats.delivered} / 上限・権限で抑制 ${notificationStats.suppressed} / 失敗 ${notificationStats.failed}`,
       '',
@@ -292,14 +273,14 @@ function deadline(value: unknown, prefix = '締切'): string {
   return value ? ` / ${prefix} <t:${Math.floor(Number(value) / 1000)}:R>` : '';
 }
 
-function procedureComponents(governance: GovernanceGuildRow, supportsImmediateReview: boolean): ButtonRow[] {
+function procedureComponents(governance: GovernanceGuild, supportsImmediateReview: boolean): ButtonRow[] {
   const link = (label: string, channelId: string) => new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link)
     .setURL(`https://discord.com/channels/${governance.guild_id}/${channelId}`);
-  const lawSite: unknown = lawSiteLink(governance.guild_id);
+  const lawSite = lawSiteLink(governance.guild_id);
   const destinations = [
     link('議会', governance.parliament_forum_id),
     link('裁判所', governance.court_forum_id),
-    isString(lawSite) && lawSite ? new ButtonBuilder().setLabel('法令集').setStyle(ButtonStyle.Link).setURL(lawSite) : null,
+    lawSite ? new ButtonBuilder().setLabel('法令集').setStyle(ButtonStyle.Link).setURL(lawSite) : null,
     // 国会がいつ開かれて何を決めたかは、議題スレを個別に見なくても追えるようにする。
     governance.parliament_thread_id ? link('国会記録', governance.parliament_thread_id) : null,
     governance.operations_thread_id ? link('運営変更', governance.operations_thread_id) : null
@@ -317,13 +298,12 @@ function actionLink(guildId: string, channelId: unknown, label: string): ButtonB
     .setURL(`https://discord.com/channels/${guildId}/${String(channelId)}`);
 }
 
-function vetoOf(period: unknown): Record<string, unknown> | null {
-  const veto = isRecord(period) ? period['veto'] : undefined;
-  return isRecord(veto) ? veto : null;
+function vetoOf(period: { veto?: HumanAuthoritySnapshot | null } | null | undefined): HumanAuthoritySnapshot | null {
+  return period?.veto ?? null;
 }
 
-function voteActionComponents(guildId: string, proposal: ProposalRow): ButtonRow[] {
-  const veto = vetoOf(workflowContext('proposal', proposal.id)?.['publicVote']);
+function voteActionComponents(guildId: string, proposal: Proposal): ButtonRow[] {
+  const veto = vetoOf(workflowContext('proposal', proposal.id)?.publicVote);
   return [new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`gov:vote:${proposal.id}:yes`).setLabel('賛成').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`gov:vote:${proposal.id}:no`).setLabel('反対').setStyle(ButtonStyle.Danger),
@@ -333,8 +313,8 @@ function voteActionComponents(guildId: string, proposal: ProposalRow): ButtonRow
   )];
 }
 
-function approvalActionComponents(guildId: string, caseRecord: CaseRow): ButtonRow[] {
-  const veto = vetoOf(workflowContext('case', caseRecord.id)?.['approval']);
+function approvalActionComponents(guildId: string, caseRecord: CaseRecord): ButtonRow[] {
+  const veto = vetoOf(workflowContext('case', caseRecord.id)?.approval);
   return [new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`gov:approve:${caseRecord.id}:approve`).setLabel('執行承認').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(`gov:approve:${caseRecord.id}:reject`).setLabel('承認しない').setStyle(ButtonStyle.Danger),
@@ -347,7 +327,7 @@ const SANCTION_NAMES: Record<string, string> = {
   warning: '警告', restriction: '機能制限', timeout: 'タイムアウト', kick: 'キック', ban: 'BAN'
 };
 
-function sanctionName(sanction: Pick<SanctionRow, 'type' | 'duration_seconds'> | null | undefined): string {
+function sanctionName(sanction: Pick<Sanction, 'type' | 'duration_seconds'> | null | undefined): string {
   const name = (sanction ? SANCTION_NAMES[sanction.type] : undefined) ?? '処分';
   if (!sanction?.duration_seconds) return name;
   const seconds = Number(sanction.duration_seconds);
@@ -356,13 +336,10 @@ function sanctionName(sanction: Pick<SanctionRow, 'type' | 'duration_seconds'> |
   return `${name} ${Math.ceil(seconds / 60)}分`;
 }
 
-// notifications.js が作る通知の記述子。mention だけ本文に使い、残りはそのまま返す。
-const isNotification = shape({ mention: isString });
-
-export function renderProposalVoteAction(guild: Guild, proposal: ProposalRow): GovernanceActionCard {
-  const summary = narrowRequired(proposalVoteSummary(proposal.id), isVoteSummary, 'vote summary');
-  const notification = narrowRequired(proposalVoteNotification(guild, proposal), isNotification, 'notification');
-  const veto = vetoOf(workflowContext('proposal', proposal.id)?.['publicVote']);
+export function renderProposalVoteAction(guild: Guild, proposal: Proposal): GovernanceActionCard {
+  const summary = proposalVoteSummary(proposal.id);
+  const notification = proposalVoteNotification(guild, proposal);
+  const veto = vetoOf(workflowContext('proposal', proposal.id)?.publicVote);
   return {
     key: `vote:${proposal.id}`,
     notification,
@@ -371,7 +348,7 @@ export function renderProposalVoteAction(guild: Guild, proposal: ProposalRow): G
       `**${safeLabel(proposal.title, 180)}**`,
       `対象: ${proposal.vote_scope === 'all' ? '全員' : '特別有権者'}${deadline(proposal.stage_ends_at)}`,
       `現在: 賛成 ${summary.yes} / 反対 ${summary.no} / 棄権 ${summary.abstain}`,
-      ...(veto ? [`拒否権: ${String(humanAuthorityLabel(veto))} / 行使 ${summary.vetoCount}/${String(veto['required'])}人。拒否期間の満了まで早期成立しません。`] : []),
+      ...(veto ? [`拒否権: ${humanAuthorityLabel(veto)} / 行使 ${summary.vetoCount}/${String(veto.required)}人。拒否期間の満了まで早期成立しません。`] : []),
       '下のボタンから記名投票できます。選び直すと票が更新されます。'
     ].join('\n').slice(0, 1_900),
     components: voteActionComponents(guild.id, proposal),
@@ -379,23 +356,23 @@ export function renderProposalVoteAction(guild: Guild, proposal: ProposalRow): G
   };
 }
 
-export function renderCaseApprovalAction(guild: Guild, caseRecord: CaseRow): GovernanceActionCard {
-  const sanction = caseSanction(caseRecord.id);
-  const approval = narrow(workflowContext('case', caseRecord.id)?.['approval'], isApprovalContext, 'approval');
+export function renderCaseApprovalAction(guild: Guild, caseRecord: CaseRecord): GovernanceActionCard {
+  const sanction = requireValue(getCaseSanction(caseRecord.id), '事件の刑がありません。');
+  const approval = workflowContext('case', caseRecord.id)?.approval;
   const approved = approval
-    ? narrowRequired(legalApprovalResult(caseRecord.id), isApprovalResult, 'approval result').approvals
-    : narrowList(listCaseApprovals(caseRecord.id), isApprovalRow, 'case approval').filter((entry) => entry.decision === 'approve').length;
-  const notification = narrowRequired(caseApprovalNotification(guild, caseRecord, sanction), isNotification, 'notification');
+    ? legalApprovalResult(caseRecord.id).approvals
+    : listCaseApprovals(caseRecord.id).filter((entry) => entry.decision === 'approve').length;
+  const notification = caseApprovalNotification(guild, caseRecord, sanction);
   return {
     key: `approve:${caseRecord.id}`,
     notification,
     content: [
       notification.mention,
       `**${safeLabel(caseRecord.summary, 180)}**`,
-      approval ? `承認者: ${String(humanAuthorityLabel(approval.authority ?? approval))} / 承認期限: <t:${Math.floor(approval.deadline / 1000)}:F>${Number(approval.rejectVotes) > 0 ? ` / 拒否 ${approval.rejectVotes}票で中止` : ''}` : null,
-      approval?.veto ? `拒否権: ${String(humanAuthorityLabel(approval.veto))}の${approval.veto.required}人。拒否期間の満了まで執行しません。` : null,
+      approval ? `承認者: ${humanAuthorityLabel(approval.authority ?? approval)} / 承認期限: <t:${Math.floor(approval.deadline / 1000)}:F>${Number(approval.rejectVotes) > 0 ? ` / 拒否 ${approval.rejectVotes}票で中止` : ''}` : null,
+      approval?.veto ? `拒否権: ${humanAuthorityLabel(approval.veto)}の${approval.veto.required}人。拒否期間の満了まで執行しません。` : null,
       caseRecord.accused_id ? `対象: ${publicMemberLabel(caseRecord.accused_id)}` : null,
-      `処分: ${sanctionName(sanction)} / 承認 ${approved}/${sanction?.required_approvals ?? '?'}人`,
+      `処分: ${sanctionName(sanction)} / 承認 ${approved}/${sanction.required_approvals}人`,
       `${approval ? '開始時に承認資格を満たした構成員' : '特別有権者'}は下のボタンから記名で判断します。被申立人と申立人は承認できません。`
     ].filter(Boolean).join('\n').slice(0, 1_900),
     components: approvalActionComponents(guild.id, caseRecord),
@@ -406,20 +383,19 @@ export function renderCaseApprovalAction(guild: Guild, caseRecord: CaseRow): Gov
 // 管理者による手動執行の依頼 (execution_detail.manualRequest)。
 const isManualRequest = shape({ kind: isString, key: isString, priorExecutionReported: optional(isBoolean) });
 
-function manualRequestOf(sanction: SanctionRow) {
-  const detail: unknown = manualExecutionDetail(sanction);
-  return narrowRequired(isRecord(detail) ? detail['manualRequest'] : undefined, isManualRequest, 'manual execution request');
+function manualRequestOf(sanction: Sanction) {
+  return narrowRequired(manualExecutionDetail(sanction)['manualRequest'], isManualRequest, 'manual execution request');
 }
 
 export function renderGovernanceActionCards(guild: Guild): GovernanceActionCard[] {
   const proposals = activeProposals(guild.id, 100)
     .filter((proposal) => proposalHandler(proposal) === 'public_vote' && proposal.forum_thread_id);
   const approvals = activeCases(guild.id, ['approval'], 100)
-    .filter((caseRecord) => caseRecord.public_thread_id && caseSanction(caseRecord.id));
+    .filter((caseRecord) => caseRecord.public_thread_id && getCaseSanction(caseRecord.id));
   return [
     ...proposals.map((proposal) => renderProposalVoteAction(guild, proposal)),
     ...approvals.map((caseRecord) => renderCaseApprovalAction(guild, caseRecord)),
-    ...narrowList(listSanctions(guild.id, ['pending_manual_execution', 'pending_manual_reversal']), isSanctionRow, 'sanction').map((sanction): GovernanceActionCard => {
+    ...listSanctions(guild.id, ['pending_manual_execution', 'pending_manual_reversal']).map((sanction): GovernanceActionCard => {
       const request = manualRequestOf(sanction);
       const execute = request.kind === 'execute';
       const buttons = [new ButtonBuilder().setCustomId(`gov:manual:${sanction.id}:${request.key}-done`)
@@ -449,23 +425,6 @@ function actionCardKey(message: Message): string | null {
   return null;
 }
 
-const MENTION_TYPES = new Set(['everyone', 'roles', 'users']);
-
-// 通知を送ると決まったときだけ、その通知が許す相手 (全員・1ロール・1人) を mention させる。
-function isMentionOptions(value: unknown): value is MessageMentionOptions {
-  if (!isRecord(value)) return false;
-  const { parse, roles, users, repliedUser } = value;
-  return (parse === undefined || (Array.isArray(parse) && parse.every((type) => typeof type === 'string' && MENTION_TYPES.has(type))))
-    && (roles === undefined || isStringArray(roles))
-    && (users === undefined || isStringArray(users))
-    && (repliedUser === undefined || typeof repliedUser === 'boolean');
-}
-
-function deliveryMentions(delivery: unknown): MessageMentionOptions | null {
-  const mentions = isRecord(delivery) ? delivery['allowedMentions'] : undefined;
-  return isMentionOptions(mentions) ? mentions : null;
-}
-
 export async function syncGovernanceActionCards(guild: Guild, channel: TextChannel): Promise<number> {
   const expected = renderGovernanceActionCards(guild);
   const activeKeys = new Set(expected.map((card) => card.key));
@@ -484,15 +443,16 @@ export async function syncGovernanceActionCards(guild: Guild, channel: TextChann
     const message = messages.shift() ?? null;
     const { key: _key, notification, ...payload } = card;
     if (!message) {
-      const delivery: unknown = notification ? beginGovernanceNotification(guild, notification) : null;
+      // 通知を送ると決まったときだけ、その通知が許す相手 (全員・1ロール・1人) を mention させる。
+      const delivery = notification ? beginGovernanceNotification(guild, notification) : null;
       try {
         const sent = await channel.send({
           ...payload,
-          allowedMentions: deliveryMentions(delivery) ?? { parse: [] }
+          allowedMentions: delivery?.allowedMentions ?? { parse: [] }
         });
-        if (delivery) finishGovernanceNotification(notification, sent);
+        if (notification && delivery) finishGovernanceNotification(notification, sent);
       } catch (error) {
-        if (delivery) rejectGovernanceNotification(notification, error);
+        if (notification && delivery) rejectGovernanceNotification(notification, error);
         throw error;
       }
     } else {
@@ -512,14 +472,14 @@ export async function syncGovernanceActionCards(guild: Guild, channel: TextChann
   return expected.length;
 }
 
-export async function renderGovernanceProcedureHub(guild: Guild, governance: GovernanceGuildRow): Promise<GovernancePanelPayload> {
-  const supportsImmediateReview = Boolean(policeProcedure(activeConstitution(guild.id)?.policy));
+export async function renderGovernanceProcedureHub(guild: Guild, governance: GovernanceGuild): Promise<GovernancePanelPayload> {
+  const supportsImmediateReview = Boolean(policeProcedure(getActiveConstitution(guild.id)?.policy));
 
   const proposals = activeProposals(guild.id, 100);
   const voting = proposals.filter((proposal) => proposalHandler(proposal) === 'public_vote');
   const agenda = proposals.filter((proposal) => proposalHandler(proposal) === 'parliament_agenda');
   const approvals = activeCases(guild.id, ['approval'], 20);
-  const policy = policyOf(activeConstitution(guild.id)?.policy);
+  const policy = getActiveConstitution(guild.id)?.policy;
   const intervalMs = policy?.legislation.sessionIntervalMilliseconds ?? 0;
   const nextAt = governance.last_session_at ? Number(governance.last_session_at) + intervalMs : null;
   return {
@@ -549,8 +509,8 @@ async function fetchTrackedMessage(channel: TextChannel, id: string, prefix: str
 
 export async function ensureGovernanceUx(
   guild: Guild,
-  governance = governanceGuild(guild.id)
-): Promise<{ governance: GovernanceGuildRow; procedure: TextChannel; procedureMessage: Message }> {
+  governance = getGovernanceGuild(guild.id)
+): Promise<{ governance: GovernanceGuild; procedure: TextChannel; procedureMessage: Message }> {
   if (!governance) throw new Error('統治機能が初期化されていません。');
   let current = governance;
   const category = current.category_id ? await guild.channels.fetch(current.category_id).catch(() => null) : null;
@@ -561,7 +521,7 @@ export async function ensureGovernanceUx(
   await retireGovernanceCourtChat(guild, current);
   const court = await ensureGovernanceCourtForum(guild, current);
   if (current.court_chat_channel_id !== court.id) {
-    current = narrowRequired(updateGovernanceGuild(guild.id, { court_chat_channel_id: court.id }), isGovernanceGuildRow, 'governance guild');
+    current = requireRow(updateGovernanceGuild(guild.id, { court_chat_channel_id: court.id }), 'governance guild');
   }
 
   let procedure: GuildBasedChannel | null = current.procedure_channel_id
@@ -589,7 +549,7 @@ export async function ensureGovernanceUx(
   }
 
   if (procedure.id !== current.procedure_channel_id) {
-    current = narrowRequired(updateGovernanceGuild(guild.id, { procedure_channel_id: procedure.id }), isGovernanceGuildRow, 'governance guild');
+    current = requireRow(updateGovernanceGuild(guild.id, { procedure_channel_id: procedure.id }), 'governance guild');
   }
   let procedureMessage = await fetchTrackedMessage(procedure, current.procedure_message_id, `# ${guild.name} 手続`);
   if (!procedureMessage) {
@@ -597,7 +557,7 @@ export async function ensureGovernanceUx(
   }
   if (!procedureMessage) procedureMessage = await procedure.send(await renderGovernanceProcedureHub(guild, current));
   if (procedureMessage.id !== current.procedure_message_id) {
-    current = narrowRequired(updateGovernanceGuild(guild.id, { procedure_message_id: procedureMessage.id }), isGovernanceGuildRow, 'governance guild');
+    current = requireRow(updateGovernanceGuild(guild.id, { procedure_message_id: procedureMessage.id }), 'governance guild');
   }
   await ensureGovernanceOperationsThread(guild, current, procedureMessage);
   // 国会記録は開会時にも作られるが、案内から辿れるよう導入時に用意しておく。
@@ -613,7 +573,7 @@ export async function ensureGovernanceUx(
 }
 
 async function refreshDashboard(interaction: GovernanceUxInteraction, guild: Guild) {
-  const ux = await ensureGovernanceUx(guild, governanceGuild(interaction.guildId));
+  const ux = await ensureGovernanceUx(guild, getGovernanceGuild(guild.id));
   if (interaction.message?.content?.startsWith(`# ${guild.name} Bot技術運用`)) {
     await interaction.message.edit(await renderGovernanceOperationsPanel(guild, ux.governance)).catch(() => {});
   }
@@ -665,7 +625,7 @@ function notificationSettingsModal(guildId: string): ModalBuilder {
     );
 }
 
-function electoratePanel(governance: GovernanceGuildRow): InteractionReplyOptions {
+function electoratePanel(governance: GovernanceGuild): InteractionReplyOptions {
   const roleSelect = new RoleSelectMenuBuilder()
     .setCustomId('gov:admin_role:set')
     .setPlaceholder('特別有権者として使うロールを選択')
@@ -689,11 +649,11 @@ function electoratePanel(governance: GovernanceGuildRow): InteractionReplyOption
   };
 }
 
-function diagnostics(guild: Guild, governance: GovernanceGuildRow): { blockers: string[]; warnings: string[] } {
+function diagnostics(guild: Guild, governance: GovernanceGuild): { blockers: string[]; warnings: string[] } {
   const permission = governancePermissionReport(guild);
-  const failures = narrowList(listActionFailures(guild.id), isFailureRow, 'outbox failure');
+  const failures = listActionFailures(guild.id);
   const workflows = workflowFailures(governance);
-  const constitution = activeConstitution(guild.id);
+  const constitution = getActiveConstitution(guild.id);
   const blockers = [
     governance.status !== 'active' ? '統治機能が一時停止中です' : null,
     !constitution ? '有効な憲法がありません' : null,
@@ -717,21 +677,15 @@ function liveConfirmationModal(guild: Guild): ModalBuilder {
     ));
 }
 
-const isParsedSetting = shape({ ok: isBoolean, value: isUnknown, error: optional(isString) });
-
 /** モーダルの入力を運用値として読む。1つでも不正なら何も変えない。 */
-function parsedSettings(interaction: ModalSubmitInteraction, keys: readonly string[]): [string, unknown][] {
-  const updates: [string, unknown][] = [];
+function parsedSettings(interaction: ModalSubmitInteraction, keys: readonly string[]): [string, number][] {
+  const updates: [string, number][] = [];
   for (const key of keys) {
-    const parsed = narrowRequired(parseOperationalSetting(key, interaction.fields.getTextInputValue(key)), isParsedSetting, 'operational setting');
-    if (!parsed.ok) throw new Error(parsed.error ?? undefined);
+    const parsed = parseOperationalSetting(key, interaction.fields.getTextInputValue(key));
+    if (!parsed.ok) throw new Error(parsed.error);
     updates.push([key, parsed.value]);
   }
   return updates;
-}
-
-function parliamentOutcomes(session: unknown): unknown[] {
-  return isRecord(session) && Array.isArray(session['outcomes']) ? session['outcomes'] : [];
 }
 
 export async function handleGovernanceUxInteraction(interaction: GovernanceUxInteraction): Promise<boolean> {
@@ -740,7 +694,7 @@ export async function handleGovernanceUxInteraction(interaction: GovernanceUxInt
   requireOperator(interaction);
   // 運営者の判定はサーバーのメンバー情報で行うので、ここに来るのはサーバー内の操作だけ。
   const guild = requireValue(interaction.guild, 'サーバー内でのみ使えます。');
-  const governance = governanceGuild(interaction.guildId);
+  const governance = getGovernanceGuild(guild.id);
   if (!governance) throw new Error('統治機能が初期化されていません。');
 
   if (interaction.isModalSubmit() && customId === 'gov:admin_modal:settings') {
@@ -855,19 +809,18 @@ export async function handleGovernanceUxInteraction(interaction: GovernanceUxInt
   if (customId === 'gov:admin:parliament_now') {
     await interaction.deferReply({ flags: EPHEMERAL });
     const { runParliamentSession } = await import('./parliament.js');
-    const session: unknown = await runParliamentSession(guild, governance, Date.now(), { manual: true });
-    const outcomes = parliamentOutcomes(session);
-    const count = (decision: string) => outcomes.filter((entry) => isRecord(entry) && entry['decision'] === decision).length;
-    const agendaCount = isRecord(session) ? session['agendaCount'] : undefined;
+    const session = await runParliamentSession(guild, governance, Date.now(), { manual: true });
+    const outcomes = session?.outcomes ?? [];
+    const count = (decision: string) => outcomes.filter((entry) => entry.decision === decision).length;
     createAdministrativeAct({
       guildId: guild.id,
       kind: 'parliament_session',
       actorId: interaction.user.id,
       summary: '国会を手動で開会',
-      detail: { agendaCount: agendaCount ?? 0 }
+      detail: { agendaCount: session?.agendaCount ?? 0 }
     });
     await interaction.editReply(session
-      ? `国会を開きました。議題 ${String(agendaCount)}件（立法 ${count('legislate')} / 継続審議 ${count('defer')} / 不採択 ${count('reject')} / 失敗 ${count('error')}）。`
+      ? `国会を開きました。議題 ${session.agendaCount}件（立法 ${count('legislate')} / 継続審議 ${count('defer')} / 不採択 ${count('reject')} / 失敗 ${count('error')}）。`
       : '有効な憲法がないため開会できません。');
     await refreshDashboard(interaction, guild);
     return true;
@@ -929,8 +882,8 @@ export async function handleGovernanceUxInteraction(interaction: GovernanceUxInt
     return true;
   }
   if (customId === 'gov:admin:recovery') {
-    const failures = narrowList(listActionFailures(guild.id), isFailureRow, 'outbox failure');
-    const notificationFailures = narrowList(listNotificationFailures(guild.id), isFailureRow, 'notification failure');
+    const failures = listActionFailures(guild.id);
+    const notificationFailures = listNotificationFailures(guild.id);
     const workflows = workflowFailures(governance);
     const details = [
       ...failures.map((failure) => `Discord処理: ${failure.last_error}`),

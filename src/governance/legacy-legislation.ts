@@ -13,16 +13,6 @@ import { agendaDecision, draftBody, panelResult } from './legislation.js';
 import type { AgendaOutcome } from './parliament.js';
 import type { Proposal, ProposalBody } from './types.js';
 
-// discord.js・llm.js はまだ JS で、既定値から引数の型が狭く推論される (files = [] → never[])。
-// TS へ移るまでの境界として、ここで渡す形の型を一度だけ与える。戻り値は検査関数で確かめる。
-type ProposalUpdateOptions = { state?: string | null; files?: { name: string; attachment: Buffer }[] };
-const postUpdate = postProposalUpdate as (guild: Guild, proposal: Proposal | null, text: string, options?: ProposalUpdateOptions) => ReturnType<typeof postProposalUpdate>;
-interface DeliberationRequest {
-  guildId: string; agenda: unknown; discussion: unknown; previousSessions: unknown; otherOpenAgenda?: unknown[];
-  constitution: unknown; activeLaws: unknown; candidates: unknown; panel: unknown; allowDefer?: boolean; investigation: unknown;
-}
-const deliberate = deliberateAgendaItem as (input: DeliberationRequest) => ReturnType<typeof deliberateAgendaItem>;
-
 function requireProposal(proposal: Proposal | null | undefined): Proposal {
   if (!proposal) throw new Error('議題の記録が見つかりません。');
   return proposal;
@@ -39,7 +29,7 @@ export async function advanceLegacyLegislation(guild: Guild, input: Proposal): P
   const discussion = threadDiscussion(guild.id,proposal.forum_thread_id,0,100);
   const history = listProposalDeliberations(proposal.id);
   const migration = proposal.source === 'legal_migration' ? proposal.body?.migration : null;
-  const decision = agendaDecision(await deliberate({guildId:guild.id,
+  const decision = agendaDecision(await deliberateAgendaItem({guildId:guild.id,
     agenda:{title:proposal.title,summary:proposal.summary,kind:proposal.kind,origin:proposal.source,deferrals:proposal.deferrals},
     constitution,discussion,previousSessions:history,activeLaws:laws,
     candidates:buildLegislativeCandidates({request:proposal.summary,normalized:{title:proposal.title,summary:proposal.summary,intent:'amendment'},proposals:[],laws,constitution}),
@@ -74,14 +64,16 @@ export async function advanceLegacyLegislation(guild: Guild, input: Proposal): P
       relation_type:amendment?'amend_constitution':decision.relation,
       target_type:amendment?'constitution':target?'law':null,target_id:amendment?String(constitution.id):target?String(target.id):null,
       target_hash:amendment?constitution.content_hash:target?.content_hash??null}));
+    // 採決に必要な票数が定められていなければ、approve を空のまま渡して採択の席に止めさせる。
+    const decisionVotes=rules.panels.parliament.required['decision'];
     const adoption=panelResult(await ratifyLegislativeDraft({guildId:guild.id,proposalId:proposal.id,constitution,target:body,activeLaws:laws,
-      institution:{...rules.panels.parliament,mandate:'完成した同一の案を独立して採択する。',required:{approve:rules.panels.parliament.required.decision}}}),'採択');
+      institution:{...rules.panels.parliament,mandate:'完成した同一の案を独立して採択する。',required:decisionVotes===undefined?{}:{approve:decisionVotes}}}),'採択');
     if (adoption.verdict!=='approved') { feedback=adoption; continue; }
     const review=panelResult(await runConstitutionalPanel({guildId:guild.id,targetType:amendment?'amendment':'law',targetId:proposal.id,phase:'pre',constitution,target:body}),'憲法審査');
     if (review.outputs.length!==rules.panels.constitutional.seats) throw new Error('憲法審査のAI席がそろっていません。');
     recordProposalDeliberation({proposalId:proposal.id,revision:proposal.revision,outcome:'review',discussion,decision:{adoption,review,targetHash:sha256(canonicalJson(body))}});
     if (review.outputs.filter((entry)=>entry.verdict==='constitutional').length>=constitution.policy.judiciary.constitutionalVotesRequired) {
-      await postUpdate(guild,proposal,'AIが起草・修正・採択・憲法審査を完了しました。添付の全文を公開投票にかけます。',{
+      await postProposalUpdate(guild,proposal,'AIが起草・修正・採択・憲法審査を完了しました。添付の全文を公開投票にかけます。',{
         files:[{name:'投票対象全文.json',attachment:Buffer.from(JSON.stringify(body,null,2))}]});
       const {openProposalVote}=await import('./service.js');
       await openProposalVote(guild,proposal);
@@ -90,6 +82,6 @@ export async function advanceLegacyLegislation(guild: Guild, input: Proposal): P
     feedback=review;
   }
   updateProposal(proposal.id,{status:'rejected'});
-  await postUpdate(guild,getProposal(proposal.id),'法定の検討回数内に成立条件を満たす案を仕上げられなかったため、不採択とします。',{state:'不成立'});
+  await postProposalUpdate(guild,requireProposal(getProposal(proposal.id)),'法定の検討回数内に成立条件を満たす案を仕上げられなかったため、不採択とします。',{state:'不成立'});
   return {proposalId:proposal.id,title:proposal.title,decision:'reject'};
 }

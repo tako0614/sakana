@@ -27,6 +27,8 @@ import {
   getGovernanceIntake,
   getMentionInvestigationBySource,
   getLaw,
+  listCases,
+  listInvestigationEvidence,
   listPendingGovernanceIntakes,
   listStaleMentionInvestigations,
   listLaws,
@@ -36,7 +38,7 @@ import {
 } from './db.js';
 import { interpretJudicialRequest, screenJudicialMention } from './llm.js';
 import { actingMember, postCourtRecord, publicMemberLabel } from './discord.js';
-import { evidenceLink, investigationContextSettings } from './context.js';
+import { evidenceLink, investigationContextSettings, investigationTargets } from './context.js';
 import { investigationSummary } from './tools.js';
 import { normalizeActivityContent, sha256 } from './policy.js';
 import { governanceActionAllowed } from './restrictions.js';
@@ -47,41 +49,24 @@ import {
   fileCriminalCase,
   reserveGovernanceIntakeAttempt
 } from './service.js';
+import { idOrNull, type CaseRecord, type GovernanceGuild, type Intake, type MentionInvestigation } from './types.js';
 import {
   arrayOf,
   errorCode,
   errorMessage,
-  investigationTargets,
-  isCaseRow,
-  isConstitutionRow,
-  isGovernanceGuildRow,
-  isIntakeRow,
-  isInvestigationEvidenceRow,
-  isInvestigationRow,
-  isLawRow,
   isNumber,
   isRecord,
   isString,
   isStringArray,
-  listCases,
-  listInvestigationEvidence,
-  narrow,
-  narrowList,
-  narrowRequired,
   optional,
-  requirePolicy,
+  requireRow,
   requireValue,
-  rulesOf,
   shape,
-  type CaseRow,
   type EvidenceToRevalidate,
-  type GovernanceGuildRow,
   type GovernanceReservation,
   type IntakeResult,
-  type IntakeRow,
   type InvestigationContext,
   type InvestigationOutcome,
-  type InvestigationRow,
   type MentionMessage,
   type PanelRecord,
   type RetriedResult,
@@ -96,24 +81,27 @@ const INTAKE_TTL_MS = 30 * 60_000;
 const NO_MENTIONS: MessageMentionOptions = { parse: [], repliedUser: true };
 const PROCEDURAL_JUDICIARY = /(違憲|上訴|控訴|証拠.{0,8}(?:追加|提出)|事件.{0,8}(?:状況|状態|どうな))/u;
 
-const governanceGuild = (guildId: unknown) => narrow(getGovernanceGuild(guildId), isGovernanceGuildRow, 'governance guild');
-const caseById = (caseId: unknown) => narrow(getCase(caseId), isCaseRow, 'case');
-const lawById = (lawId: unknown) => narrow(getLaw(lawId), isLawRow, 'law');
-const activeConstitution = (guildId: unknown) => narrow(getActiveConstitution(guildId), isConstitutionRow, 'constitution');
-const investigationBySource = (messageId: unknown) => narrow(getMentionInvestigationBySource(messageId), isInvestigationRow, 'mention investigation');
+// 保存した JSON の項目 (payload / result) から引く id は、識別子の形でなければ「無い」として探さない。
+const caseById = (caseId: unknown): CaseRecord | null => getCase(idOrNull(caseId));
+const lawById = (lawId: unknown) => getLaw(idOrNull(lawId));
+
+/** メッセージのサーバーの統治設定。サーバー外 (DM) の呼びかけには無い。 */
+function governanceOf(guildId: string | null | undefined): GovernanceGuild | null {
+  return guildId ? getGovernanceGuild(guildId) : null;
+}
 
 function roleMentioned(message: MentionMessage, roleId: string): boolean {
   return Boolean(roleId && message.mentions?.roles?.has?.(roleId));
 }
 
-export function governanceMentionBranch(message: MentionMessage, governance = governanceGuild(message?.guildId)): 'judiciary' | null {
+export function governanceMentionBranch(message: MentionMessage, governance = governanceOf(message?.guildId)): 'judiciary' | null {
   // 他のAI botはコミュニティ参加者として発議できるが、統治bot自身の出力では再帰発火させない。
   if (!governance || (message?.author?.bot && message.author.id === message.client?.user?.id)) return null;
   // 立法の入口は議会Forumへの投稿。mentionで受けるのは通報と司法手続だけ。
   return roleMentioned(message, governance.judiciary_role_id) ? 'judiciary' : null;
 }
 
-function stripAddressMentions(content: unknown, governance: GovernanceGuildRow, clientId: string | undefined): string {
+function stripAddressMentions(content: unknown, governance: GovernanceGuild, clientId: string | undefined): string {
   const ids = [governance.judiciary_role_id].filter(Boolean);
   let output = String(content ?? '');
   for (const id of ids) output = output.replaceAll(`<@&${id}>`, ' ');
@@ -155,15 +143,13 @@ function sourceContent(source: Message): string {
   ].filter(Boolean).join('\n').slice(0, 8000);
 }
 
-const isDiscordRef = shape({ guildId: optional(isString), channelId: optional(isString), messageId: optional(isString) });
-
-async function fetchSourceMessage(message: MentionMessage, governance: GovernanceGuildRow): Promise<SourceEvidence | null> {
+async function fetchSourceMessage(message: MentionMessage, governance: GovernanceGuild): Promise<SourceEvidence | null> {
   let channelId: string = message.reference?.channelId ?? message.channelId;
   let messageId: string | null = message.reference?.messageId ?? null;
   if (!messageId) {
     const cleaned = stripAddressMentions(message.content, governance, message.client.user?.id);
     if (/https?:\/\/(?:\w+\.)?discord(?:app)?\.com\/channels\//i.test(cleaned)) {
-      const parsed = narrow(parseDiscordRef(cleaned), isDiscordRef, 'discord reference');
+      const parsed = parseDiscordRef(cleaned);
       if (parsed?.guildId && parsed.guildId !== message.guildId) throw new Error('別サーバーのメッセージは証拠にできません。');
       channelId = parsed?.channelId ?? channelId;
       messageId = parsed?.messageId ?? null;
@@ -254,7 +240,7 @@ async function assertEvidenceVisibleTo(guild: Guild, evidence: unknown, userIds:
   }
 }
 
-function intakeButtons(intake: IntakeRow): ActionRowBuilder<ButtonBuilder>[] {
+function intakeButtons(intake: Intake): ActionRowBuilder<ButtonBuilder>[] {
   const buttons = [
     new ButtonBuilder()
       .setCustomId(`gov:intake:${intake.id}:confirm`)
@@ -270,7 +256,7 @@ function intakeButtons(intake: IntakeRow): ActionRowBuilder<ButtonBuilder>[] {
 
 const TARGET_LABELS: Record<string, string> = { sanction: '処分', administrative_act: '行政行為' };
 
-function renderIntake(intake: IntakeRow, suffix = ''): string {
+function renderIntake(intake: Intake, suffix = ''): string {
   const payload = intake.payload;
   const pending = intake.status === 'pending' || intake.status === 'processing';
   const lines: (string | null)[] = [intake.status === 'completed' ? '## 正式受付済み' : pending ? '## 受付前の確認' : '## 受付結果', ''];
@@ -305,7 +291,7 @@ function renderIntake(intake: IntakeRow, suffix = ''): string {
   return lines.filter((line) => line !== null).join('\n').slice(0, 2000);
 }
 
-function retriedResultText(intake: IntakeRow, resultType: string, result: RetriedResult): string {
+function retriedResultText(intake: Intake, resultType: string, result: RetriedResult): string {
   if (resultType === 'case') {
     const link = result.public_thread_id ? `\n${linkToThread(intake.guild_id, result.public_thread_id)}` : '';
     return `裁判所の受付処理が完了しました。${link}`;
@@ -314,7 +300,7 @@ function retriedResultText(intake: IntakeRow, resultType: string, result: Retrie
 }
 
 export async function updateRetriedIntakeMessage(guild: Guild, resultType: string, result: RetriedResult): Promise<boolean> {
-  const intake = narrow(findGovernanceIntakeByResult(guild.id, resultType, result.id), isIntakeRow, 'intake');
+  const intake = findGovernanceIntakeByResult(guild.id, resultType, result.id);
   if (!intake?.response_message_id) return false;
   const channel = await guild.channels.fetch(intake.channel_id).catch(() => null);
   if (!channel?.isTextBased?.()) return false;
@@ -358,15 +344,15 @@ function caseIdList(value: unknown, fallback: unknown[]): unknown[] {
 }
 
 export async function updateRetriedMentionInvestigationMessage(guild: Guild, resultType: string, result: RetriedResult): Promise<boolean> {
-  const investigation = narrow(findMentionInvestigationByResult(guild.id, resultType, result.id), isInvestigationRow, 'mention investigation')
-    ?? (resultType === 'case' ? narrow(findAcceptedMentionInvestigationForCase(guild.id, result.id), isInvestigationRow, 'mention investigation') : null);
+  const investigation = findMentionInvestigationByResult(guild.id, resultType, result.id)
+    ?? (resultType === 'case' ? findAcceptedMentionInvestigationForCase(guild.id, result.id) : null);
   if (!investigation || investigation.status !== 'accepted') return false;
   if (resultType === 'case') {
     const rawScreening = investigation.result['screening'];
     const screening = isStoredScreening(rawScreening) ? rawScreening : undefined;
     const caseIds = caseIdList(investigation.result['caseIds'], [result.id]);
     const published = new Set(caseIdList(investigation.result['publishedCaseIds'], []).map(String));
-    const evidenceRows = narrowList(listInvestigationEvidence(investigation.id, 'judicial_charge'), isInvestigationEvidenceRow, 'investigation evidence');
+    const evidenceRows = listInvestigationEvidence(investigation.id, 'judicial_charge');
     for (const caseId of caseIds) {
       const currentCase = caseById(caseId);
       if (!currentCase?.public_thread_id || published.has(String(caseId))) continue;
@@ -424,11 +410,11 @@ export async function updateRetriedMentionInvestigationMessage(guild: Guild, res
 }
 
 export async function syncPendingIntakeMessages(guild: Guild): Promise<number> {
-  const governance = governanceGuild(guild.id);
-  const constitution = activeConstitution(guild.id);
+  const governance = getGovernanceGuild(guild.id);
+  const constitution = getActiveConstitution(guild.id);
   if (!governance || !constitution) return 0;
   let updatedCount = 0;
-  for (const intake of narrowList(listPendingGovernanceIntakes(guild.id), isIntakeRow, 'intake')) {
+  for (const intake of listPendingGovernanceIntakes(guild.id)) {
     if (!intake.response_message_id) continue;
     const current = intake;
     const channel = await guild.channels.fetch(current.channel_id).catch(() => null);
@@ -446,8 +432,8 @@ export async function syncPendingIntakeMessages(guild: Guild): Promise<number> {
 }
 
 async function createPreview(message: MentionMessage, branch: string, action: string, payload: Record<string, unknown>): Promise<boolean> {
-  const intake = narrowRequired(createGovernanceIntake({
-    guildId: message.guildId,
+  const intake = requireRow(createGovernanceIntake({
+    guildId: requireValue(message.guildId, 'サーバー内でのみ使えます。'),
     branch,
     action,
     requesterId: message.author.id,
@@ -455,7 +441,7 @@ async function createPreview(message: MentionMessage, branch: string, action: st
     sourceMessageId: message.id,
     payload,
     expiresAt: Date.now() + INTAKE_TTL_MS
-  }), isIntakeRow, 'intake');
+  }), 'intake');
   const response = await message.reply({
     content: renderIntake(intake),
     components: intakeButtons(intake),
@@ -480,7 +466,7 @@ const CASE_STATUS_LABELS: Record<string, string> = {
   constitutional_uncertain: '違憲判断不能', unenforceable: '執行不能'
 };
 
-function caseStatusText(caseRecord: CaseRow, guildId: string): string {
+function caseStatusText(caseRecord: CaseRecord, guildId: string): string {
   const status = CASE_STATUS_LABELS[caseRecord.status] ?? caseRecord.status;
   const law = caseRecord.law_id ? lawById(caseRecord.law_id) : null;
   const offense = law?.provisions?.offenses?.find((entry) => entry.code === caseRecord.offense_code);
@@ -506,7 +492,7 @@ function acceptedResult(error: unknown): { resultType: unknown; resultId: unknow
   return { resultType: error['accepted']['resultType'], resultId: error['accepted']['resultId'] };
 }
 
-function acceptedCaseResult(error: unknown): CaseRow | null {
+function acceptedCaseResult(error: unknown): CaseRecord | null {
   const accepted = acceptedResult(error);
   if (accepted?.resultType !== 'case') return null;
   return caseById(accepted.resultId);
@@ -535,8 +521,8 @@ function investigationLines(panel: PanelRecord, policy: unknown): string[] {
 
 async function publishJudicialScreeningRecord(
   guild: Guild,
-  investigation: InvestigationRow,
-  caseRecord: CaseRow,
+  investigation: MentionInvestigation,
+  caseRecord: CaseRecord,
   candidate: ScreeningRecordCandidate,
   evidence: readonly { messageId: string; channelId: string }[],
   panel: PanelRecord
@@ -555,7 +541,7 @@ async function publishJudicialScreeningRecord(
     )),
     candidate.reasons?.length ? `事件化の理由: ${candidate.reasons.join(' / ')}` : null,
     '',
-    ...investigationLines(panel, activeConstitution(guild.id)?.policy),
+    ...investigationLines(panel, getActiveConstitution(guild.id)?.policy),
     '',
     'これは事件を開始するための審査です。有罪・処分は成立法に基づく別の司法パネルが判断します。'
   ].filter((line) => line !== null).join('\n'));
@@ -568,12 +554,12 @@ async function runProceduralJudiciary(
   message: MentionMessage,
   request: string,
   anchor: SourceEvidence | null,
-  investigation: InvestigationRow,
+  investigation: MentionInvestigation,
   reservation: GovernanceReservation,
   member: GuildMember
 ): Promise<InvestigationOutcome> {
   const guild = requireValue(message.guild, 'サーバー内でのみ使えます。');
-  const constitution = requireValue(activeConstitution(message.guildId), '有効な憲法がありません。');
+  const constitution = requireValue(getActiveConstitution(guild.id), '有効な憲法がありません。');
   const output = await interpretJudicialRequest({
     guildId: guild.id,
     request: {
@@ -588,8 +574,8 @@ async function runProceduralJudiciary(
       } : null
     },
     constitution,
-    activeLaws: narrowList(listLaws(message.guildId), isLawRow, 'law'),
-    recentCases: narrowList(listCases(guild.id, { limit: 25 }), isCaseRow, 'case')
+    activeLaws: listLaws(guild.id),
+    recentCases: listCases(guild.id, { limit: 25 })
   });
   if (reservation.scope === 'constitutional_challenge' && output.intent !== 'constitutional_challenge') {
     const general = reserveGovernanceIntakeAttempt(member, `${message.id}:general`);
@@ -656,7 +642,7 @@ async function runAutomaticJudiciary(
   request: string,
   anchor: SourceEvidence | null,
   context: InvestigationContext,
-  investigation: InvestigationRow,
+  investigation: MentionInvestigation,
   reservation: GovernanceReservation,
   member: GuildMember
 ): Promise<InvestigationOutcome> {
@@ -666,8 +652,8 @@ async function runAutomaticJudiciary(
   const guild = requireValue(message.guild, 'サーバー内でのみ使えます。');
   // 通報は bot 名義の公式申立てになる。申立権を止められた本人の通報から事件を作らない。
   if (!governanceActionAllowed(guild.id, message.author.id, 'petition')) return { outcome: 'limited', text: PETITION_BLOCKED };
-  const constitution = requireValue(activeConstitution(message.guildId), '有効な憲法がありません。');
-  const laws = narrowList(listLaws(message.guildId), isLawRow, 'law').filter((law) => law.status === 'active');
+  const constitution = requireValue(getActiveConstitution(guild.id), '有効な憲法がありません。');
+  const laws = listLaws(guild.id).filter((law) => law.status === 'active');
   const panel = await screenJudicialMention({
     guildId: guild.id,
     request: {
@@ -681,9 +667,9 @@ async function runAutomaticJudiciary(
     },
     constitution,
     activeLaws: laws,
-    recentCases: narrowList(listCases(guild.id, { limit: 25 }), isCaseRow, 'case'),
-    panel: rulesOf(constitution.rules)?.panels?.['judicialScreening'],
-    investigation: requirePolicy(constitution.policy).investigation
+    recentCases: listCases(guild.id, { limit: 25 }),
+    panel: constitution.rules?.panels.judicialScreening,
+    investigation: constitution.policy.investigation
   });
   if (panel.outputs.length < panel.required) {
     return { outcome: 'failed_closed', text: '警察の席が必要数そろわなかったため、事件化も処分も行いませんでした。' };
@@ -714,7 +700,7 @@ async function runAutomaticJudiciary(
       candidate.offenseCode,
       ...evidence.map((row) => row.messageId).sort()
     ].join('|'))}`;
-    const duplicate = narrow(findCaseByPoliceEvent(guild.id, policeEventKey), isCaseRow, 'case');
+    const duplicate = findCaseByPoliceEvent(guild.id, policeEventKey);
     if (duplicate) {
       results.push({ caseRecord: duplicate, candidate, evidence, duplicate: true });
       continue;
@@ -797,9 +783,7 @@ async function runAutomaticJudiciary(
 }
 
 function investigationSettings(guildId: string): InvestigationContext['settings'] {
-  const settings: unknown = investigationContextSettings(guildId);
-  const caseLimit = isRecord(settings) ? settings['caseLimit'] : undefined;
-  return { caseLimit: isNumber(caseLimit) ? caseLimit : undefined };
+  return { caseLimit: investigationContextSettings(guildId).caseLimit };
 }
 
 function isRetryHinted(error: unknown): boolean {
@@ -808,9 +792,9 @@ function isRetryHinted(error: unknown): boolean {
 
 async function executeAutomaticInvestigation(
   message: MentionMessage,
-  governance: GovernanceGuildRow,
+  governance: GovernanceGuild,
   request: string,
-  investigation: InvestigationRow,
+  investigation: MentionInvestigation,
   reservation: GovernanceReservation,
   member: GuildMember,
   progress: Message | null
@@ -819,12 +803,12 @@ async function executeAutomaticInvestigation(
     const anchor = await fetchSourceMessage(message, governance);
     const context: InvestigationContext = {
       settings: investigationSettings(String(message.guildId)),
-      targetUserIds: narrowList(investigationTargets(message, anchor), isString, 'investigation target')
+      targetUserIds: investigationTargets(message, anchor)
     };
     const result = await runAutomaticJudiciary(
       message, request, anchor, context, investigation, reservation, member
     );
-    const current = investigationBySource(message.id);
+    const current = getMentionInvestigationBySource(message.id);
     const status = result.outcome === 'accepted_pending' ? 'accepted' : 'completed';
     updateMentionInvestigation(investigation.id, {
       status,
@@ -841,7 +825,7 @@ async function executeAutomaticInvestigation(
     return true;
   } catch (error) {
     console.error(`Governance ${investigation.branch} investigation failed:`, error);
-    const current = investigationBySource(message.id) ?? investigation;
+    const current = getMentionInvestigationBySource(message.id) ?? investigation;
     const retryCount = Number(current.result['retryCount'] ?? 0) + 1;
     const retryable = isRetryHinted(error)
       || /Governance model HTTP|Governance AI is busy|fetch failed|JSON|SQLITE|DiscordAPIError/i.test(errorMessage(error));
@@ -866,10 +850,10 @@ async function executeAutomaticInvestigation(
 }
 
 export async function resumePendingMentionInvestigations(guild: Guild, now = Date.now()): Promise<number> {
-  const governance = governanceGuild(guild.id);
+  const governance = getGovernanceGuild(guild.id);
   if (!governance || governance.status !== 'active') return 0;
   let resumed = 0;
-  for (const stale of narrowList(listStaleMentionInvestigations(guild.id, now - 15 * 60_000, 5), isInvestigationRow, 'mention investigation')) {
+  for (const stale of listStaleMentionInvestigations(guild.id, now - 15 * 60_000, 5)) {
     updateMentionInvestigation(stale.id, { outcome: 'resuming', last_error: null });
     const fetched = await guild.channels.fetch(stale.channel_id).catch(() => null);
     const channel = fetched?.isTextBased?.() ? fetched : null;
@@ -911,7 +895,7 @@ export async function resumePendingMentionInvestigations(guild: Guild, now = Dat
 }
 
 export async function handleGovernanceMention(message: MentionMessage): Promise<boolean> {
-  const governance = governanceGuild(message?.guildId);
+  const governance = governanceOf(message?.guildId);
   const branch = governanceMentionBranch(message, governance);
   if (!governance || !branch) return false;
   if (governance.status !== 'active') {
@@ -926,7 +910,7 @@ export async function handleGovernanceMention(message: MentionMessage): Promise<
     });
     return true;
   }
-  if (investigationBySource(message.id)) return true;
+  if (getMentionInvestigationBySource(message.id)) return true;
   const constitutional = branch === 'judiciary' && /(違憲|憲法.{0,12}(?:違反|反する)|constitutional)/i.test(request);
   const member = message.member ?? await message.guild?.members.fetch(message.author.id).catch(() => null) ?? null;
   if (!member) {
@@ -938,14 +922,14 @@ export async function handleGovernanceMention(message: MentionMessage): Promise<
     await message.reply({ content: reservationMessage(reservation), allowedMentions: NO_MENTIONS });
     return true;
   }
-  const investigation = narrowRequired(createMentionInvestigation({
-    guildId: message.guildId,
+  const investigation = requireRow(createMentionInvestigation({
+    guildId: requireValue(message.guildId, 'サーバー内でのみ使えます。'),
     branch,
     requesterId: message.author.id,
     channelId: message.channelId,
     sourceMessageId: message.id,
     requestText: request
-  }), isInvestigationRow, 'mention investigation');
+  }), 'mention investigation');
   if ('sendTyping' in message.channel) await message.channel.sendTyping().catch(() => {});
   const progress = await message.reply({
     content: '警察が公開記録と成立法を照合しています。根拠がそろった場合だけ処分または送検に移します。',
@@ -955,7 +939,7 @@ export async function handleGovernanceMention(message: MentionMessage): Promise<
   return executeAutomaticInvestigation(message, governance, request, investigation, reservation, member, progress);
 }
 
-async function executeIntake(interaction: ButtonInteraction, intake: IntakeRow): Promise<IntakeResult> {
+async function executeIntake(interaction: ButtonInteraction, intake: Intake): Promise<IntakeResult> {
   const guild = requireValue(interaction.guild, 'サーバー内でのみ使えます。');
   const member = await actingMember(interaction, guild);
   const payload = intake.payload;
@@ -1002,7 +986,7 @@ async function executeIntake(interaction: ButtonInteraction, intake: IntakeRow):
 }
 
 export async function handleGovernanceIntakeComponent(interaction: ButtonInteraction, intakeId: number, value: string | undefined): Promise<boolean> {
-  const intake = narrow(getGovernanceIntake(intakeId), isIntakeRow, 'intake');
+  const intake = getGovernanceIntake(intakeId);
   if (!intake || intake.guild_id !== interaction.guildId) {
     await interaction.reply({ content: '受付が見つかりません。', flags: MessageFlags.Ephemeral });
     return true;
@@ -1016,7 +1000,7 @@ export async function handleGovernanceIntakeComponent(interaction: ButtonInterac
     return true;
   }
   if (value === 'cancel') {
-    const updated = narrowRequired(updateGovernanceIntake(intake.id, { status: 'cancelled' }), isIntakeRow, 'intake');
+    const updated = requireRow(updateGovernanceIntake(intake.id, { status: 'cancelled' }), 'intake');
     await interaction.update({
       content: renderIntake(updated, '本人が取り消しました。正式案件にはなっていません。'),
       components: [],
@@ -1028,7 +1012,7 @@ export async function handleGovernanceIntakeComponent(interaction: ButtonInterac
     await interaction.reply({ content: '未対応の受付操作です。', flags: MessageFlags.Ephemeral });
     return true;
   }
-  const claimed = narrow(claimGovernanceIntake(intake.id, interaction.user.id), isIntakeRow, 'intake');
+  const claimed = claimGovernanceIntake(intake.id, interaction.user.id);
   if (!claimed) {
     await interaction.reply({ content: 'この受付は既に処理されています。', flags: MessageFlags.Ephemeral });
     return true;
@@ -1036,12 +1020,12 @@ export async function handleGovernanceIntakeComponent(interaction: ButtonInterac
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   try {
     const result = await executeIntake(interaction, claimed);
-    const completed = narrowRequired(updateGovernanceIntake(claimed.id, {
+    const completed = requireRow(updateGovernanceIntake(claimed.id, {
       status: 'completed',
       result_type: result.type,
       result_id: result.id,
       last_error: null
-    }), isIntakeRow, 'intake');
+    }), 'intake');
     await interaction.message.edit({
       content: renderIntake(completed, result.text),
       components: [],
@@ -1052,12 +1036,12 @@ export async function handleGovernanceIntakeComponent(interaction: ButtonInterac
     console.error(`Governance intake ${claimed.id} execution failed:`, error);
     const accepted = acceptedResult(error);
     if (accepted?.resultType && accepted.resultId) {
-      const acceptedIntake = narrowRequired(updateGovernanceIntake(claimed.id, {
+      const acceptedIntake = requireRow(updateGovernanceIntake(claimed.id, {
         status: 'completed',
         result_type: accepted.resultType,
         result_id: accepted.resultId,
         last_error: errorMessage(error).slice(0, 500)
-      }), isIntakeRow, 'intake');
+      }), 'intake');
       await interaction.message.edit({
         content: renderIntake(acceptedIntake, '受け付けました。準備ができると公開記録に表示されます。'),
         components: [],
@@ -1066,7 +1050,7 @@ export async function handleGovernanceIntakeComponent(interaction: ButtonInterac
       await interaction.editReply(errorMessage(error));
       return true;
     }
-    const failed = narrowRequired(updateGovernanceIntake(claimed.id, { status: 'failed', last_error: errorMessage(error).slice(0, 500) }), isIntakeRow, 'intake');
+    const failed = requireRow(updateGovernanceIntake(claimed.id, { status: 'failed', last_error: errorMessage(error).slice(0, 500) }), 'intake');
     await interaction.message.edit({
       content: renderIntake(failed, '受付処理に失敗しました。重複防止のため再実行はしません。内容を直して新しく呼び出してください。'),
       components: [],
@@ -1077,9 +1061,9 @@ export async function handleGovernanceIntakeComponent(interaction: ButtonInterac
   return true;
 }
 
-export async function updateExpiredIntakeMessages(client: Client, intakes: unknown): Promise<number> {
+export async function updateExpiredIntakeMessages(client: Client, intakes: readonly Intake[]): Promise<number> {
   let updated = 0;
-  for (const intake of narrowList(intakes, isIntakeRow, 'intake')) {
+  for (const intake of intakes) {
     if (!intake.response_message_id) continue;
     const channel = await client.channels.fetch(intake.channel_id).catch(() => null);
     if (!channel?.isTextBased?.()) continue;

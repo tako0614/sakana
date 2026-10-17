@@ -23,6 +23,24 @@ export function oneOf<T extends string>(values: readonly T[], value: unknown): v
   return typeof value === 'string' && (values as readonly string[]).includes(value);
 }
 
+/** SQLite の主キーや Discord の snowflake。数値でも文字列でも受け渡される識別子。 */
+export type Id = number | string;
+
+export function isId(value: unknown): value is Id {
+  return typeof value === 'number' || typeof value === 'string';
+}
+
+/** 外から来た値 (custom_id の断片・JSON の項目など) を識別子として読む。違えば何の値かを名指して止める。 */
+export function requireId(value: unknown, name: string): Id {
+  if (isId(value)) return value;
+  throw new TypeError(`${name} が識別子 (数値または文字列) ではありません。`);
+}
+
+/** 保存した JSON の項目など、あるとは限らない識別子。識別子でなければ「無い」として探さない。 */
+export function idOrNull(value: unknown): Id | null {
+  return isId(value) ? value : null;
+}
+
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -45,6 +63,13 @@ export type RestrictionPrimitive =
   | 'agent_calls_per_window' | 'block_petitions' | 'block_voting';
 export type InvestigationRole = 'police' | 'court' | 'parliament';
 export type WorkflowKey = 'law' | 'constitutionalAmendment' | 'criminalCase' | 'constitutionalCase';
+export const WORKFLOW_KEYS: readonly WorkflowKey[] = ['law', 'constitutionalAmendment', 'criminalCase', 'constitutionalCase'];
+
+/** 保存した workflow_key (文字列) を、実行規則の workflows を引ける名前として読む。 */
+export function isWorkflowKey(value: unknown): value is WorkflowKey {
+  return oneOf(WORKFLOW_KEYS, value);
+}
+
 export type DefinitionKind = 'institution' | 'procedure' | 'regulation' | 'binding';
 export type HumanScope = 'all' | 'trusted' | 'administrators' | 'operators' | 'designated';
 

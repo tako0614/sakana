@@ -4,6 +4,7 @@ import {
   isArray,
   isRecord,
   oneOf,
+  WORKFLOW_KEYS,
   type ConstitutionalAuthority,
   type DefinitionKind,
   type EffectiveLegalSystem,
@@ -302,7 +303,6 @@ const REGULATION_KEYS = ['records', 'parliament', 'investigation', 'sanctions', 
 const REQUIRED_OUTCOMES: Readonly<Record<string, readonly string[]>> = {
   ai_ratification: ['approve'], constitutional_panel: ['constitutional', 'unconstitutional'], judicial_panel: ['responsible'], police_review: ['responsible']
 };
-const WORKFLOW_ROLES: readonly WorkflowKey[] = ['law', 'constitutionalAmendment', 'criminalCase', 'constitutionalCase'];
 const WORKFLOW_OPERATIONS: Readonly<Record<WorkflowKey, readonly string[]>> = {
   law: ['parliament_agenda', 'legislation_draft', 'ai_ratification', 'constitutional_panel', 'public_vote', 'law_enactment'],
   constitutionalAmendment: ['parliament_agenda', 'legislation_draft', 'ai_ratification', 'constitutional_panel', 'public_vote', 'law_enactment'],
@@ -381,7 +381,7 @@ export function composeLegalSystem(authorityInput: unknown, laws: readonly LawIn
     law: selectProcedure('law'), constitutionalAmendment: selectProcedure('constitutionalAmendment'),
     criminalCase: selectProcedure('criminalCase'), constitutionalCase: selectProcedure('constitutionalCase')
   };
-  for (const role of WORKFLOW_ROLES) {
+  for (const role of WORKFLOW_KEYS) {
     const procedure = workflows[role];
     const operations = WORKFLOW_OPERATIONS[role];
     if (Object.values(procedure.states).some((state) => ![...operations, 'notice', 'wait', 'terminal'].includes(state.handler))) throw new Error('procedure uses an operation unavailable for its subject');

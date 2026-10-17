@@ -28,20 +28,11 @@ import { hasVisibilityClient, publicChannels as publicChannelIds } from '../arch
 import { normalizeActivityContent, sha256 } from './policy.js';
 import {
   arrayOf,
-  isActivityRow,
-  isCaseRow,
-  isConstitutionRow,
-  isDecisionRow,
-  isEvidenceRow,
-  isLawRow,
   isNumber,
   isRecord,
   isString,
-  isSubmissionRow,
   narrow,
-  narrowList,
   shape,
-  type ActivityRow,
   type InvestigationStep,
   type RecordTool,
   type RetrievedRecord,
@@ -106,8 +97,6 @@ function searchTerms(query: unknown): string[] {
     .slice(0, 8);
 }
 
-const activityRows = (value: unknown): ActivityRow[] => narrowList(value, isActivityRow, 'activity');
-
 function parseJsonText(value: string): unknown {
   return JSON.parse(value);
 }
@@ -128,7 +117,7 @@ const TOOLS: Record<string, RowTool | RecordTool> = {
     run(context, args) {
       const terms = searchTerms(args['query']);
       const limit = boundedInteger(args['limit'], 15, 1, MAXIMUM_ROWS);
-      const pool = activityRows(searchGuildActivity(context.guildId, since(context, args['days']), terms, 500));
+      const pool = searchGuildActivity(context.guildId, since(context, args['days']), terms, 500);
       return pool
         .map((row) => ({ row, score: contextRelevance(String(args['query'] ?? ''), row.content) }))
         .sort((left, right) => right.score - left.score || right.row.created_at - left.row.created_at)
@@ -149,12 +138,12 @@ const TOOLS: Record<string, RowTool | RecordTool> = {
       required: ['userId']
     },
     run(context, args) {
-      return activityRows(recentActorActivity(
+      return recentActorActivity(
         context.guildId,
         String(args['userId'] ?? ''),
         since(context, args['days']),
         boundedInteger(args['limit'], 15, 1, MAXIMUM_ROWS)
-      ));
+      );
     }
   },
   read_channel: {
@@ -170,12 +159,12 @@ const TOOLS: Record<string, RowTool | RecordTool> = {
       required: ['channelId']
     },
     run(context, args) {
-      return activityRows(recentGovernanceMessages(
+      return recentGovernanceMessages(
         context.guildId,
         since(context, args['days']),
         [String(args['channelId'] ?? '')],
         boundedInteger(args['limit'], 15, 1, MAXIMUM_ROWS)
-      ));
+      );
     }
   },
   read_context: {
@@ -191,10 +180,10 @@ const TOOLS: Record<string, RowTool | RecordTool> = {
       required: ['messageId']
     },
     run(context, args) {
-      return activityRows(activityContext(context.guildId, String(args['messageId'] ?? ''), {
+      return activityContext(context.guildId, String(args['messageId'] ?? ''), {
         before: boundedInteger(args['before'], 4, 0, 10),
         after: boundedInteger(args['after'], 4, 0, 10)
-      }));
+      });
     }
   },
   read_constitution: {
@@ -207,7 +196,7 @@ const TOOLS: Record<string, RowTool | RecordTool> = {
       required: []
     },
     run(context, args) {
-      const constitution = context.constitution ?? narrow(getActiveConstitution(context.guildId), isConstitutionRow, 'constitution');
+      const constitution = context.constitution ?? getActiveConstitution(context.guildId);
       if (!constitution) return { error: 'no active constitution' };
       const content = String(constitution.content ?? '');
       const sections = content.split(/^## /m).slice(1)
@@ -232,7 +221,7 @@ const TOOLS: Record<string, RowTool | RecordTool> = {
       required: []
     },
     run(context, args) {
-      const laws = narrowList(listLaws(context.guildId, { activeOnly: false, limit: 200 }), isLawRow, 'law');
+      const laws = listLaws(context.guildId, { activeOnly: false, limit: 200 });
       const code = String(args['code'] ?? '').trim();
       if (!code) {
         return laws.map((law) => ({
@@ -264,7 +253,7 @@ const TOOLS: Record<string, RowTool | RecordTool> = {
     },
     run(context, args) {
       const accusedId = String(args['accusedId'] ?? '').trim();
-      return narrowList(listCases(context.guildId, { limit: boundedInteger(args['limit'], 10, 1, 25) }), isCaseRow, 'case')
+      return listCases(context.guildId, { limit: boundedInteger(args['limit'], 10, 1, 25) })
         .filter((entry) => !accusedId || String(entry.accused_id) === accusedId)
         .map((entry) => ({
           id: entry.id,
@@ -291,7 +280,7 @@ const TOOLS: Record<string, RowTool | RecordTool> = {
     run(context, args) {
       const lawId = Number(args['lawId']);
       const offenseCode = String(args['offenseCode'] ?? '').trim();
-      const cases = narrowList(listCases(context.guildId, { limit: 100 }), isCaseRow, 'case')
+      const cases = listCases(context.guildId, { limit: 100 })
         .filter((entry) => Number(entry.law_id) === lawId
           && (!offenseCode || entry.offense_code === offenseCode)
           && Number(entry.id) !== Number(context.caseId ?? 0))
@@ -301,7 +290,7 @@ const TOOLS: Record<string, RowTool | RecordTool> = {
         status: entry.status,
         offenseCode: entry.offense_code,
         summary: String(entry.summary ?? '').slice(0, CONTENT_LIMIT),
-        decisions: narrowList(listCaseDecisions(entry.id), isDecisionRow, 'case decision').map((decision) => ({
+        decisions: listCaseDecisions(entry.id).map((decision) => ({
           phase: decision.phase,
           seat: decision.seat,
           verdict: decision.verdict,
@@ -322,7 +311,7 @@ const TOOLS: Record<string, RowTool | RecordTool> = {
     },
     run(context, args) {
       const caseId = Number(args['caseId'] ?? context.caseId ?? 0);
-      const caseRecord = narrow(getCase(caseId), isCaseRow, 'case');
+      const caseRecord = getCase(caseId);
       if (!caseRecord || String(caseRecord.guild_id) !== String(context.guildId)) {
         return { error: `unknown case: ${caseId}` };
       }
@@ -331,7 +320,7 @@ const TOOLS: Record<string, RowTool | RecordTool> = {
         status: caseRecord.status,
         accusedId: caseRecord.accused_id,
         summary: caseRecord.summary,
-        evidence: narrowList(listCaseEvidence(caseId), isEvidenceRow, 'case evidence').map((row) => ({
+        evidence: listCaseEvidence(caseId).map((row) => ({
           id: String(row.message_id ?? row.id),
           channelId: String(row.channel_id ?? ''),
           authorId: String(row.author_id ?? ''),
@@ -340,7 +329,7 @@ const TOOLS: Record<string, RowTool | RecordTool> = {
           at: Number(row.occurred_at ?? 0),
           conversation: row.conversation_json ? parseJsonText(row.conversation_json) : { metadata: 'legacy_incomplete' }
         })),
-        submissions: narrowList(listCurrentCaseSubmissions(caseId), isSubmissionRow, 'case submission').map((row) => ({
+        submissions: listCurrentCaseSubmissions(caseId).map((row) => ({
           authorId: row.author_id,
           kind: row.kind,
           content: String(row.content ?? '')
@@ -357,7 +346,7 @@ function reasonList(value: unknown): unknown[] {
 }
 
 // 正本は rules.js（循環importを避けるため）。ここで登録漏れ・余りを起動時に弾く。
-const implementedTools: readonly string[] = narrowList(IMPLEMENTED_TOOLS, isString, 'implemented tool');
+const implementedTools: readonly string[] = IMPLEMENTED_TOOLS;
 {
   const registered = Object.keys(TOOLS).sort().join(',');
   if (registered !== [...implementedTools].sort().join(',')) {
@@ -444,12 +433,11 @@ function parseToolArguments(rawArguments: unknown): ToolArgs | null {
 
 // 席ごとに1つ作る。retrieved はその席が実際に見たIDの台帳で、引用の検算に使う。
 export function buildToolset({ guildId, allowed, caseId = null, constitution = null, maximumOutputBytes = 10 * 1024, onStep }: ToolsetOptions): Toolset {
-  const lookback: unknown = getOperationalSetting(String(guildId), 'investigation_lookback_days');
   const context: ToolContext = {
     guildId: String(guildId),
     caseId,
     constitution,
-    defaultLookbackDays: isNumber(lookback) ? lookback : DEFAULT_LOOKBACK_DAYS
+    defaultLookbackDays: getOperationalSetting(String(guildId), 'investigation_lookback_days')
   };
   const permitted = new Set(allowed.filter((name) => name in TOOLS));
   const retrieved = new Map<string, RetrievedRecord>();
@@ -457,7 +445,7 @@ export function buildToolset({ guildId, allowed, caseId = null, constitution = n
   let spentBytes = 0;
   const pages = new Map<string, [number, number][]>();
   const record = (entry: InvestigationStep) => { trace.push(entry); onStep?.(entry); };
-  const visibleChannels = (): Set<string> => new Set(narrowList(publicChannelIds(guildId), isString, 'public channel'));
+  const visibleChannels = (): Set<string> => new Set(publicChannelIds(guildId));
   const toolset: Toolset = {
     readOnly: true,
     call(name, args) { return toolset.run(name, args); },
