@@ -57,6 +57,8 @@ import {
 } from './ratelimit.js';
 import { SilentIndicator, ThinkingIndicator, isIndicatorMessage, toolLabel, type Indicator } from './thinking.js';
 import type { AmbientJoin } from '../vex/ambient.js';
+import { nameHandling } from '../vex/call.js';
+import { vexConfig } from '../vex/config.js';
 import { AMBIENT_HINT, isPassAnswer } from '../vex/pass.js';
 import { buildToolset } from './tools.js';
 import {
@@ -166,6 +168,10 @@ export function isAgentRequest(message: Message, client: Client): boolean {
   });
 
   if (mentioned) return true;
+
+  // 名前 (vex) が出た発言をメンション扱いにする設定 (VEX_CALL=1)。相槌でも答える。
+  // judge の設定では確定にしない (判定モデルが文脈で決める: src/vex/ambient.ts)
+  if (nameHandling(message.content, vexConfig) === 'mention') return true;
 
   const repliedTo = message.reference?.messageId;
   if (!repliedTo) return false;

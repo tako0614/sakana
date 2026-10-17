@@ -20,10 +20,19 @@ const origin = (() => {
   try { return new URL(providerConfig.baseUrl).origin; } catch { return 'https://openrouter.ai'; }
 })();
 
+/**
+ * 名前 (vex) が出た発言をどう扱うか。
+ *   off     何もしない
+ *   mention メンションと同じ。確定で答える (判定モデルは使わない)
+ *   judge   判定モデルに文脈で決めさせる (確定では答えない)
+ */
+export type CallMode = 'off' | 'mention' | 'judge';
+
 export interface VexConfig {
-  /** 発言にこの名前 (英字の単語として) が出たら、呼ばれたかもしれない強い手がかりとして判定に回す。 */
+  /** 発言にこの名前 (英字の単語として) が出たときの扱いの対象。 */
   names: string[];
-  /** 名前が出た発言を判定に回す (確定では答えない。判定モデルが文脈で決める)。 */
+  callMode: CallMode;
+  /** 名前を持っている (callMode が off 以外)。プロンプトの自己紹介に使う。 */
   call: boolean;
   ambient: boolean;
   /** 自発参加してよいチャンネル。空なら自発参加はどこでもしない。 */
@@ -49,10 +58,18 @@ export interface VexConfig {
   dailyDecisionUsd: number;
 }
 
+/** VEX_CALL: judge なら文脈で判定、0/false/off/空ならオフ、それ以外 (1・true・mention) はメンション扱い。 */
+function callMode(value: string | undefined): CallMode {
+  if (String(value ?? '').toLowerCase() === 'judge') return 'judge';
+  return flag(value, false) ? 'mention' : 'off';
+}
+
 export function loadVexConfig(env: NodeJS.ProcessEnv = process.env): VexConfig {
+  const mode = callMode(env.VEX_CALL);
   return {
     names: list(env.VEX_NAMES ?? 'vex').map((name) => name.toLowerCase()),
-    call: flag(env.VEX_CALL, false),
+    callMode: mode,
+    call: mode !== 'off',
     ambient: flag(env.VEX_AMBIENT, false),
     channels: new Set(list(env.VEX_CHANNELS)),
     model: env.VEX_MODEL ?? 'perplexity/pplx-decider-flash-v1.2',

@@ -1,8 +1,8 @@
-// vex (名前が出たら文脈で判定する・呼ばれていない会話に自分から入る) の検査。
+// vex (名前が出たらメンション扱い or 文脈で判定・呼ばれていない会話に自分から入る) の検査。
 //
 // 判定モデルの API は偽のサーバーで立てる (本物は叩かない)。見ているのは次の点:
 //   - 名前の検出: 英字の単語としてだけ。コード・URL・引用・別の単語の中は呼びではない
-//   - 名前が出ても確定では答えない: 判定モデルが文脈で決める (メンションと返信は従来どおり確定)
+//   - 名前の扱いは VEX_CALL で切り替わる: mention (既定の 1) = メンション扱いで確定 / judge = 判定モデルが文脈で決める
 //   - state が、評価に使った形 (scripts/vex/questions.mjs) と同じ
 //   - 自発参加の門: 許可チャンネル・相槌/短文/返信/他人宛て/NSFW・冷却・1時間の上限・1日の費用
 //   - 閾値、静かになるまで待つ、会話が進んだら入らない、bot の発言でタイマーを捨てる
@@ -55,7 +55,7 @@ const endpoint = `http://127.0.0.1:${server.address().port}/api/alpha/decisions`
 process.env.VEX_API_URL = endpoint;
 
 const { loadVexConfig } = await import('../src/vex/config.js');
-const { isVexCall, visibleText } = await import('../src/vex/call.js');
+const { isVexCall, nameHandling, visibleText } = await import('../src/vex/call.js');
 const { buildVexState, cleanLine, VEX_QUESTIONS } = await import('../src/vex/questions.js');
 const { decide, resetDecideState } = await import('../src/vex/decide.js');
 const { AmbientJudge } = await import('../src/vex/ambient.js');
@@ -77,6 +77,10 @@ const { isAgentRequest } = await import('../src/agent/index.js');
   if (!on.call || !on.ambient || on.channels.size !== 3 || on.threshold !== 0.7) fail('env が読めていない');
   if (on.names.join() !== 'vex,ベクス') fail(`名前は小文字にして持つ: ${on.names}`);
   if (loadVexConfig({ VEX_CALL: 'off' }).call) fail('off は偽');
+  for (const [value, mode] of [[undefined, 'off'], ['', 'off'], ['0', 'off'], ['false', 'off'], ['off', 'off'], ['1', 'mention'], ['true', 'mention'], ['mention', 'mention'], ['judge', 'judge'], ['JUDGE', 'judge']]) {
+    const got = loadVexConfig({ VEX_CALL: value }).callMode;
+    if (got !== mode) fail(`VEX_CALL=${JSON.stringify(value)} は ${mode} のはず: ${got}`);
+  }
 }
 
 // --- 名前の検出 ---
@@ -93,7 +97,7 @@ const { isAgentRequest } = await import('../src/agent/index.js');
   if (visibleText('a `b` ```c``` https://x.y d').replace(/\s+/g, ' ').trim() !== 'a d') fail('コード・URL は見ない');
 }
 
-// --- 名前が出ても agent は確定では起動しない (判定モデルが決める)。メンションは従来どおり確定 ---
+// --- VEX_CALL=1 (mention): 名前が出た発言はメンションと同じに agent を起動する。judge では確定にしない ---
 
 {
   const client = { user: { id: 'bot' } };
@@ -101,12 +105,19 @@ const { isAgentRequest } = await import('../src/agent/index.js');
     guildId: 'g', content, author: { id: 'u', bot: false }, webhookId: null,
     mentions: { has: () => false }, reference: null, ...extra
   });
-  for (const text of ['vex 教えて', 'vex', 'vexにするか', 'vexちゃんおやすみ']) {
-    if (isAgentRequest(message(text), client)) fail(`名前が出ただけでは確定で起動しない: ${text}`);
-  }
+  if (!isAgentRequest(message('vex 教えて'), client)) fail('vex と呼べば起動する');
+  if (!isAgentRequest(message('vex'), client)) fail('名前だけでも起動する');
+  if (isAgentRequest(message('evex 教えて'), client)) fail('evex は呼びではない');
+  if (isAgentRequest(message('`vex` って何'), client)) fail('コードの中は呼びではない');
+  if (isAgentRequest(message('vex 教えて', { author: { id: 'u', bot: true } }), client)) fail('bot の発言では起動しない');
+  if (isAgentRequest(message('vex 教えて', { webhookId: 'w' }), client)) fail('webhook では起動しない');
+  if (isAgentRequest(message('vex 教えて', { guildId: null }), client)) fail('サーバーの外では起動しない');
   const mention = { mentions: { has: () => true } };
-  if (!isAgentRequest(message('教えて', mention), client)) fail('メンションは従来どおり確定で起動する');
-  if (isAgentRequest(message('教えて', { ...mention, author: { id: 'u', bot: true } }), client)) fail('bot の発言では起動しない');
+  if (!isAgentRequest(message('教えて', mention), client)) fail('メンションは従来どおり起動する');
+  // 設定ごとの名前の扱い (judge は確定にしない・off は何もしない)
+  const handling = (mode) => nameHandling('vex 教えて', { names: ['vex'], callMode: mode });
+  if (handling('mention') !== 'mention' || handling('judge') !== 'judge' || handling('off') !== null) fail('名前の扱い');
+  if (nameHandling('evex 教えて', { names: ['vex'], callMode: 'mention' }) !== null) fail('evex は数えない');
 }
 
 // --- 「返す価値が無い」の見分け ---
@@ -227,7 +238,7 @@ function say(channel, content, { author, bot = false, ago = 0, reference = null,
 
 function ambientConfig(overrides = {}) {
   return loadVexConfig({
-    VEX_API_URL: endpoint, VEX_CALL: '1', VEX_NAME_DELAY_MS: '30', VEX_AMBIENT: '1', VEX_CHANNELS: 'chan1 chan2 chan3 chan4 chan5 chan6 chan7 chan8 chan9',
+    VEX_API_URL: endpoint, VEX_CALL: 'judge', VEX_NAME_DELAY_MS: '30', VEX_AMBIENT: '1', VEX_CHANNELS: 'chan1 chan2 chan3 chan4 chan5 chan6 chan7 chan8 chan9',
     VEX_QUIET_MS: '40', VEX_COOLDOWN_MS: '60000', VEX_MAX_PER_HOUR: '3', VEX_THRESHOLD: '0.6', VEX_TIMEOUT_MS: '1500',
     VEX_FALLBACK_MODELS: 'fb/one', VEX_DAILY_USD: '1', ...overrides
   });
@@ -337,11 +348,13 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
   await sleep(250);
   if (api.calls.length) fail('bot・NSFW・名前が出ていない発言は、許可チャンネルの外では判定しない');
 
-  // 設定がオフなら名前が出ても判定しない
-  const off = makeJudge(ambientConfig({ VEX_CALL: '0', VEX_AMBIENT: '0', VEX_CHANNELS: '' }));
-  off.judge.observe(say(channel, 'vex どう思う？'));
-  await sleep(250);
-  if (api.calls.length || off.joins.length) fail('VEX_CALL がオフなら判定しない');
+  // オフ・メンション扱いのときは、名前が出ても判定しない (メンション扱いは isAgentRequest が確定で起動するので重ねない)
+  for (const mode of ['0', '1']) {
+    const other = makeJudge(ambientConfig({ VEX_CALL: mode, VEX_AMBIENT: '0', VEX_CHANNELS: '' }));
+    other.judge.observe(say(channel, 'vex どう思う？'));
+    await sleep(250);
+    if (api.calls.length || other.joins.length) fail(`VEX_CALL=${mode} なら判定しない`);
+  }
 
   // 判定費用の上限は掛かる / 判定が壊れたら答えない
   db.exec("DELETE FROM vex_decisions");

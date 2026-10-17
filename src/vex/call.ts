@@ -1,5 +1,5 @@
 // 「vex」と呼ばれたか。英字の単語として (evex や vexx は別物)、コード・URL・メンション・引用の中は見ない。
-import { vexConfig } from './config.js';
+import { vexConfig, type CallMode, type VexConfig } from './config.js';
 
 /** 判定の対象から外す部分 (コードブロック・インラインコード・URL・メンション・引用行) を取り除く。 */
 export function visibleText(content: string): string {
@@ -18,4 +18,10 @@ export function isVexCall(content: string, names: readonly string[] = vexConfig.
   if (names.length === 0) return false;
   const pattern = new RegExp(`(?<![A-Za-z0-9_])(?:${names.map(escape).join('|')})(?![A-Za-z0-9_])`, 'i');
   return pattern.test(visibleText(content));
+}
+
+/** この発言で名前が出ていれば、設定された扱い (mention / judge)。出ていない・オフなら null。 */
+export function nameHandling(content: string, config: Pick<VexConfig, 'names' | 'callMode'> = vexConfig): Exclude<CallMode, 'off'> | null {
+  if (config.callMode === 'off') return null;
+  return isVexCall(content, config.names) ? config.callMode : null;
 }

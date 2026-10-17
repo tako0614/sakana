@@ -8,7 +8,7 @@
 // 外へ出る口は join だけ。bot の発言・別の bot の発言が来たらタイマーを捨てる (輪を作らない)。
 // 判定が壊れても入らないだけで、明示的に「vex」と呼ばれたときの動きには関わらない。
 import { isBareAck } from '../agent/ack.js';
-import { isVexCall } from './call.js';
+import { nameHandling } from './call.js';
 import { vexConfig, type VexConfig } from './config.js';
 import { decide as decideDefault, type Decision } from './decide.js';
 import { decisionSpend, joinedInChannel, recordVex, type VexRecord } from './ledger.js';
@@ -101,7 +101,7 @@ export class AmbientJudge {
    */
   observe(message: VexMessage): void {
     if (!message.guildId) return;
-    const named = this.config.call && isVexCall(message.content, this.config.names);
+    const named = nameHandling(message.content, this.config) === 'judge';
     if (named && this.worthJudging(message, true)) {
       // 続く発言や bot の発言では捨てない: 呼ばれた発言は、会話が進んでも判定する。
       // 自発参加の判定とは重ねない (同じ発言に 2 回入らない)
