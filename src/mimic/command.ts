@@ -233,9 +233,9 @@ export const mimicCommands: Command[] = [
 
         try {
           // その人が選んでいる世代で生成する。deepseek のままだと自作モデルが
-          // 使われないので、既定は evex に落とす
+          // 使われないので、既定は evex-3.5 に落とす
           const chosen = engineFor(interaction.user.id, interaction.guildId);
-          const engine = isSelfHosted(chosen) ? chosen : 'evex';
+          const engine = isSelfHosted(chosen) ? chosen : 'evex-3.5';
           const { text, how } = await impersonate(targetId, {
             guildId: interaction.guildId,
             channelScope: { mode: 'include', ids: [interaction.channelId] },

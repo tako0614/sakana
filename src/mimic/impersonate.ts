@@ -51,7 +51,7 @@ const MAX_TRIES = Number(process.env.MIMIC_MAX_TRIES ?? 3);
  * 一度も見ていない入力を受け取り、例外を出さずに静かに崩れる (evex-1 に <|a|> を
  * 渡して実際に壊した)。既定は推論サーバーの申告から判定し、env で上書きできる。
  */
-export async function mimicFormat(engine = 'evex'): Promise<'plain' | 'tokens'> {
+export async function mimicFormat(engine = 'evex-3.5'): Promise<'plain' | 'tokens'> {
   const { format } = endpointFor(engine);
   if (format === 'plain' || format === 'tokens') return format;
 
@@ -62,7 +62,7 @@ export async function mimicFormat(engine = 'evex'): Promise<'plain' | 'tokens'> 
 }
 
 /** その人の話者トークンが使えるか (上位48人 かつ 独自トークンの世代)。 */
-export async function canUseToken(userId: string, engine = 'evex'): Promise<boolean> {
+export async function canUseToken(userId: string, engine = 'evex-3.5'): Promise<boolean> {
   if (await mimicFormat(engine) !== 'tokens') return false;
 
   const scheme = await roleScheme(engine);
@@ -154,7 +154,7 @@ function plainPrompt(
  */
 export async function impersonate(
   userId: string,
-  { guildId = null, channelScope = null, topic = null, channelId = null, askerId = null, engine = 'evex' }: ImpersonateOptions = {}
+  { guildId = null, channelScope = null, topic = null, channelId = null, askerId = null, engine = 'evex-3.5' }: ImpersonateOptions = {}
 ): Promise<{ text: string | null; how: ImpersonateHow }> {
   if (hasOptedOut(userId)) {
     return { text: null, how: 'opted-out' };

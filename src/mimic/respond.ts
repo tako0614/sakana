@@ -290,7 +290,7 @@ function plainRequest(messages: readonly MimicTurn[], { wanted, channelId, selfI
  */
 export async function buildMimicPrompt(
   messages: readonly MimicTurn[],
-  { wanted = null, engine = 'evex', channelId = null, selfId = null }: {
+  { wanted = null, engine = 'evex-3.5', channelId = null, selfId = null }: {
     wanted?: string | null; engine?: string; channelId?: string | null; selfId?: string | null;
   } = {}
 ): Promise<MimicPrompt> {
@@ -352,7 +352,7 @@ function toTurn(entry: TurnSource): MimicTurn {
 export async function handleMimicRequest(
   message: Message,
   client: Client,
-  { recent = [], chain = [], engine = 'evex', remember = null, selfId = null }: {
+  { recent = [], chain = [], engine = 'evex-3.5', remember = null, selfId = null }: {
     recent?: readonly TurnSource[];
     chain?: readonly TurnSource[];
     engine?: string;

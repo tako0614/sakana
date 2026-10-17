@@ -284,14 +284,24 @@ try {
   if (!ENGINES.deepseek) fail('deepseek (v4.1-flash) は選択肢にある');
   if (!ENGINES[DEFAULT_ENGINE]) fail('既定のエンジンが ENGINES に無い');
 
-  if (!setEngine(USER, 'evex', TEST_GUILD)) fail('evex を選べない');
-  if (engineFor(USER, TEST_GUILD) !== 'evex') fail('選択が保存されていない');
+  if (!setEngine(USER, 'evex-3.5', TEST_GUILD)) fail('evex-3.5 を選べない');
+  if (engineFor(USER, TEST_GUILD) !== 'evex-3.5') fail('選択が保存されていない');
+
+  // 廃止した自作モデルを選んでいた人 (保存された行も、いま選ぼうとした値も) は evex-3.5 に読み替える
+  for (const retired of ['evex', 'evex-1', 'evex-3', 'evex-4.1', 'evex-5.3', 'evex-ft', 'evex-ft-3']) {
+    db.prepare('INSERT OR REPLACE INTO agent_engine (guild_id, user_id, engine, updated_at) VALUES (?, ?, ?, ?)').run(TEST_GUILD, USER, retired, Date.now());
+    if (engineFor(USER, TEST_GUILD) !== 'evex-3.5') fail(`${retired} を選んでいた人は evex-3.5 に読み替える`);
+    if (ENGINES[retired]) fail(`${retired} は選択肢に無い`);
+  }
+  db.prepare('INSERT OR REPLACE INTO agent_engine (guild_id, user_id, engine, updated_at) VALUES (?, ?, ?, ?)').run(TEST_GUILD, USER, 'evex-3.5', Date.now());
+  if (Object.keys(ENGINES).filter((key) => key.startsWith('evex')).join() !== 'evex-3.5') fail('自作モデルは evex-3.5 だけ残る');
+  if (!isSelfHosted('evex-3.5') || isSelfHosted('evex-5.3') || isSelfHosted('evex')) fail('推論サーバーの名簿は evex-3.5 だけ');
 
   // 他人には影響しない (自分のぶんだけ)
   if (engineFor('check-model-other', TEST_GUILD) !== DEFAULT_ENGINE) fail('選択が他人に漏れている');
 
   if (setEngine(USER, 'gpt-9', TEST_GUILD)) fail('知らないエンジンを受け付けてはいけない');
-  if (engineFor(USER, TEST_GUILD) !== 'evex') fail('無効な指定で既存の選択を壊してはいけない');
+  if (engineFor(USER, TEST_GUILD) !== 'evex-3.5') fail('無効な指定で既存の選択を壊してはいけない');
 
   // 選べる自作モデルは全部 127.0.0.1 に回らないといけない。
   //

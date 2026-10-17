@@ -60,13 +60,13 @@ try {
       'an empty include scope must not read every channel');
   });
   await check('model and persona preferences stay in one guild', () => {
-    setEngine('shared-user', 'evex', 'guild-a');
+    setEngine('shared-user', 'evex-3.5', 'guild-a');
     setPersona('shared-user', 'target-a', 'guild-a');
     assert.equal(engineFor('shared-user', 'guild-b'), DEFAULT_ENGINE);
     assert.equal(personaFor('shared-user', 'guild-b'), null);
     assert.deepEqual(personaCounts('guild-b'), []);
-    assert.equal(setEngine('another-user', 'evex', 'guild-b'), true, 'model availability is not restricted by guild');
-    assert.equal(engineFor('another-user', 'guild-b'), 'evex');
+    assert.equal(setEngine('another-user', 'evex-3.5', 'guild-b'), true, 'model availability is not restricted by guild');
+    assert.equal(engineFor('another-user', 'guild-b'), 'evex-3.5');
   });
   await check('same run ID cannot resume another guild checkpoint', async () => {
     const options = { guildId: 'guild-a', runId: 'same-local-id', system: 's', userContent: 'u',
