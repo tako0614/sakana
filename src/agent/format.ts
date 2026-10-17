@@ -125,20 +125,24 @@ export function messageLink(entry: ResolvedRef | null | undefined): string | nul
 
 const MAX_EPISODE_URLS = 3;
 
+// 出典の目印。文の終わりに小さなリンクとして置く (ChatGPT の出典のように、文中に)。
+// ラベルは丸数字 1 文字。URL は <> で囲んで、Discord にプレビューを出させない。
+const CIRCLED = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳';
+const sourceMark = (no: number): string => (no >= 1 && no <= CIRCLED.length ? (CIRCLED[no - 1] as string) : String(no));
+const sourceLink = (no: number, url: string): string => `[${sourceMark(no)}](<${url}>)`;
+
 /**
- * モデルが書いた [3] を本文から取り除き、URL だけを末尾にまとめる。
+ * モデルが書いた [3] (発言の番号) と [e12] (記憶の出来事) を、文中の出典リンク ① ② … に直す。
  *
- * 番号はモデルに「どの発言を根拠にしたか」を書かせるための仕組みで、読む人には要らない。
- * 本文に残すと地の文に括弧の数字が散るので消す。URL は加工せずそのまま並べる
- * (Discord のプレビューもそのまま出る)。
+ * 番号はモデルに「どの発言を根拠にしたか」を書かせるための仕組みで、そのまま見せると地の文に括弧の数字が散る。
+ * 出典は、その文の終わりに小さなリンクとして置く。番号 (①②) は本文での初出順で、同じ出典は同じ番号を使う。
  *
- * 以前ここで [3] を生の URL に差し替えて本文に埋めていた。「生の URL なら Discord が
- * 元の発言をプレビューしてくれる」という前提だったが、実際に出るのはチャンネル名だけで、
- * 代わりに 88 文字の URL が1文ごとに挟まって本文が読めなくなっていた。
+ * 経緯: 最初は [3] を生の URL に差し替えて本文に埋めていた。88 文字の URL が1文ごとに挟まって読めなかったので、
+ * 末尾の subtext (`-# url url`) にまとめた。今度は masked link ([①](<url>)) にして、本文の中で短く出す。
  *
- * 載せるのはモデルが実際に書いた番号ぶんだけ。refs にはモデルに見せた全メッセージが
- * 入っているので、全部並べると数百行になる。
- * 引けなかった番号は本文から消すだけで、末尾には出さない (リンク切れを作らない)。
+ * 引けなかった番号は本文から消すだけ (リンク切れを作らない)。ただし `[2024] の話ね` のように、
+ * 数字の括弧が引用とは限らないので、発言の番号として引けないものは触らない。
+ * [e12] は episodeUrl で実在を確かめられたものだけリンクにする (最初の3件まで)。
  */
 export function expandCitations(
   text: unknown,
@@ -151,60 +155,51 @@ export function expandCitations(
   } = {}
 ): string {
   const raw = String(text ?? '');
-  const urls: string[] = [];
-  const seen = new Set<number>();
-  const episodeUrls: string[] = [];
+  const numbers = new Map<string, number>();
+  const episodeUrls = new Set<string>();
+  const numberOf = (url: string): number => {
+    let no = numbers.get(url);
+    if (no === undefined) { no = numbers.size + 1; numbers.set(url, no); }
+    return no;
+  };
 
-  // 直前の空白ごと食う。番号を抜いた跡に空白が残ると句点の前が空く。
-  // 全角スペースも食う (日本語で書かせているので混ざる)。
-  //
-  // 空白の連なりは先頭からしか試さない (否定の後読み)。これが無いと、番号の続かない
-  // 長い空白の列で開始位置ごとに列の端まで読み直し、文字数の2乗で時間がかかる
-  // (回答はモデルが書くので、入力として長さを抑えられない)。一致する箇所は変わらない。
-  const body = raw.replace(/(?<![ \t　])[ \t　]*\[(\d{1,4})\]/g, (match: string, digits: string, offset: number) => {
-    const ref = Number(digits);
-    const entry = refs.get(ref);
-    const url = messageLink(entry);
+  // 直前の空白ごと食う。番号を抜いた跡に空白が残ると句点の前が空く。全角スペースも食う (日本語で書かせているので混ざる)。
+  // 空白の連なりは先頭からしか試さない (否定の後読み)。これが無いと、番号の続かない長い空白の列で
+  // 開始位置ごとに列の端まで読み直し、文字数の2乗で時間がかかる (回答はモデルが書くので、長さを抑えられない)。
+  const body = raw.replace(/(?<![ \t　])[ \t　]*\[(\d{1,4}|e\d{1,9}(?:[ \t]*[,、][ \t]*e\d{1,9})*)\]/gi,
+    (match: string, group: string, offset: number) => {
+      const spaced = /^[ \t　]/.test(match);
+      if (/^\d+$/.test(group)) {
+        const entry = refs.get(Number(group));
+        const url = messageLink(entry);
 
-    // 自分の発言は根拠にならない (プロンプトで禁じても flash 系は番号を付けた)。番号だけ消す
-    if (url && selfId && String(entry?.authorId) === String(selfId)) return '';
+        // 自分の発言は根拠にならない (プロンプトで禁じても flash 系は番号を付けた)。番号だけ消す
+        if (url && selfId && String(entry?.authorId) === String(selfId)) return '';
+        // 引けない番号は触らない
+        if (!url) return match;
+        // `items[1]` のような添字も引用ではない。引用は必ず語の区切りに来るので、
+        // 空白で始まっていないのに直前が識別子の文字なら添字とみなす。
+        if (!spaced && /[\w.)\]]/.test(raw[offset - 1] ?? '')) return match;
+        return sourceLink(numberOf(url), url);
+      }
 
-    // 引けない番号は触らない。無条件に消していたら `[2024] の話ね` が
-    // `の話ね` になっていた (数字の括弧は引用とは限らない)。
-    if (!url) return match;
+      // 記憶の出来事 ([e3214] / [e3214, e11489])。`items[e1]` のような添字は触らない。
+      // `[e1][e2]` と続けて書くことはあるので `]` は数えない。
+      if (!spaced && /[\w.)]/.test(raw[offset - 1] ?? '')) return match;
+      const links: string[] = [];
+      for (const id of group.match(/\d+/g) ?? []) {
+        let url: string | null = null;
+        try { url = episodeUrl?.(Number(id)) ?? null; } catch { url = null; }
+        if (!url) continue;
+        if (!episodeUrls.has(url) && episodeUrls.size >= MAX_EPISODE_URLS) continue;
+        episodeUrls.add(url);
+        links.push(sourceLink(numberOf(url), url));
+      }
+      return links.join('');
+    });
 
-    // `items[1]` のような添字も引用ではない。引用は必ず語の区切りに来るので、
-    // 空白で始まっていないのに直前が識別子の文字なら添字とみなす。
-    if (!/^[ \t　]/.test(match) && /[\w.)\]]/.test(raw[offset - 1] ?? '')) return match;
-
-    if (!seen.has(ref)) {
-      seen.add(ref);
-      urls.push(url);
-    }
-
-    return '';
-  });
-
-  // 記憶の出来事の番号 ([e3214] / [e3214, e11489])。内部の記号で、読む人には「謎の文字列」になる。
-  // 本文からは消し、サイトがあって実在する出来事なら URL を末尾に足す (最初の3件まで)。
-  // 空白の連なりの扱いは上と同じ (先頭からだけ試す)。
-  const text2 = body.replace(/(?<![ \t　])[ \t　]*\[(e\d{1,9}(?:[ \t]*[,、][ \t]*e\d{1,9})*)\]/gi, (match: string, group: string, offset: number) => {
-    // `items[e1]` のような添字は番号ではない (上と同じ見分け方。`[e1][e2]` と続けて書くことはあるので `]` は数えない)
-    if (!/^[ \t　]/.test(match) && /[\w.)]/.test(body[offset - 1] ?? '')) return match;
-    for (const id of group.match(/\d+/g) ?? []) {
-      let url: string | null = null;
-      try { url = episodeUrl?.(Number(id)) ?? null; } catch { url = null; }
-      if (url && !episodeUrls.includes(url) && episodeUrls.length < MAX_EPISODE_URLS) episodeUrls.push(url);
-    }
-    return '';
-  });
-
-  // どのモデルが書いたかは毎回出す。引用があるときは同じ subtext に混ぜる
-  // (行を2本にすると会話の邪魔になる)。
-  const tail = [label, ...urls, ...episodeUrls].filter(Boolean);
-  if (tail.length === 0) return text2.trim();
-
-  return `${text2.trim()}\n\n-# ${tail.join(' ')}`;
+  // どのモデルが書いたかは毎回出す (出典は文中にあるので、末尾はこれだけ)
+  return label ? `${body.trim()}\n\n-# ${label}` : body.trim();
 }
 
 function collapse(text: unknown): string {
@@ -492,7 +487,15 @@ export function chunkForDiscord(text: unknown, limit = 1900, maxChunks = 3): str
     const room = limit - prefix.length - 4;
     const window = rest.slice(0, room);
     const cut = Math.max(window.lastIndexOf('\n\n'), window.lastIndexOf('\n'));
-    const at = cut > room * 0.5 ? cut : room;
+    let at = cut > room * 0.5 ? cut : room;
+    // 出典リンク `[①](<url>)` の途中で切ると、どちらのメッセージでも生の文字になる。リンクの手前で切る
+    if (at === room) {
+      const open = window.lastIndexOf('](<');
+      if (open >= 0 && window.indexOf('>)', open) === -1) {
+        const start = window.lastIndexOf('[', open);
+        if (start > room * 0.3) at = start;
+      }
+    }
 
     let piece = prefix + rest.slice(0, at).trim();
     rest = rest.slice(at).trim();

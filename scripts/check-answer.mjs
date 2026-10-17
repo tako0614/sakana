@@ -23,66 +23,73 @@ function tableOf(count) {
   return refs;
 }
 
+const msgUrl = (i) => `https://discord.com/channels/g1/c1/10000000000000000${i}`;
+const link = (no, url) => `[${no}](<${url}>)`;
+
 {
+  // 出典は文の終わりに小さなリンクとして置く (番号 [1] は本文から消え、生の URL も末尾の一覧も出ない)
   const refs = tableOf(3);
   const out = expandCitations('4月に書いてる [1]。7月には通してる [2]。', refs);
-  const [body, ...rest] = out.split('\n\n');
+  if (out !== `4月に書いてる${link('①', msgUrl(1))}。7月には通してる${link('②', msgUrl(2))}。`) fail(`文中のリンクになっていない: ${JSON.stringify(out)}`);
+  if (/\[\d+\]/.test(out)) fail(`本文に番号が残っている: ${out}`);
+  if (out.includes('-#')) fail(`ラベルが無ければ末尾は足さない: ${out}`);
+  // URL は <> で囲む (Discord にプレビューを出させない)
+  if (out.replace(/\]\(<[^>]+>\)/g, '').includes('discord.com')) fail(`生の URL が本文に出ている: ${out}`);
+  // 引用していない3件目は出ない
+  if (out.includes(msgUrl(3))) fail(`引用していない URL が出ている: ${out}`);
+}
 
-  if (body.includes('discord.com')) fail(`本文に生 URL が出ている: ${body}`);
-  // 番号は読む人には要らない。本文から消す
-  if (/\[\d+\]/.test(body)) fail(`本文に番号が残っている: ${body}`);
-  // 番号を抜いた跡に空白を残さない
-  if (body !== '4月に書いてる。7月には通してる。') fail(`本文の詰め方が違う: ${JSON.stringify(body)}`);
+{
+  // 番号は本文での初出順 (refs の登録順ではない)
+  const out = expandCitations('まず [3]、次に [1]。', tableOf(3));
+  if (out !== `まず${link('①', msgUrl(3))}、次に${link('②', msgUrl(1))}。`) fail(`初出順になっていない: ${JSON.stringify(out)}`);
+}
 
-  const footer = rest.join('\n\n');
-  if (!footer.startsWith('-# ')) fail(`末尾が subtext になっていない: ${footer}`);
-  // URL は加工しない (<> で囲まない・番号を付けない)
-  if (footer.includes('<') || footer.includes('[')) fail(`URL を加工している: ${footer}`);
-  if (!/^-# https:\/\/discord\.com\/channels\/g1\/c1\/\d+ https:\/\/\S+$/.test(footer)) {
-    fail(`末尾の形が違う: ${footer}`);
+{
+  // 同じ出典は、何度書いても同じ番号
+  const out = expandCitations('[1] と書いて、また [1]。', tableOf(1));
+  if (out !== `${link('①', msgUrl(1))} と書いて、また${link('①', msgUrl(1))}。`.replace(/^(\S+) と/, '$1 と')) {
+    // 行頭の引用は前に空白が無いので、そのまま置く
+    if (out !== `${link('①', msgUrl(1))} と書いて、また${link('①', msgUrl(1))}。`) fail(`同じ出典は同じ番号: ${JSON.stringify(out)}`);
   }
-  // 引用していない3件目は載せない (refs にはモデルに見せた全件が入っている)
-  if (footer.split(' ').length !== 3) fail(`引用していない URL が出ている: ${footer}`);
 }
 
 {
-  // 初出順。本文の登場順で並ぶこと (refs の登録順ではない)
-  const footer = expandCitations('まず [3]、次に [1]。', tableOf(3)).split('-# ')[1];
-  const [first, second] = footer.split(' ');
-  if (!first.endsWith('3') || !second.endsWith('1')) fail(`初出順になっていない: ${footer}`);
-}
-
-{
-  // 同じ番号を2回書いても末尾は1つ
-  const footer = expandCitations('[1] と書いて、また [1]。', tableOf(1)).split('-# ')[1];
-  if (footer.split(' ').length !== 1) fail(`重複している: ${footer}`);
+  // 20 を超えたら丸数字ではなく普通の数字
+  const refs = tableOf(22);
+  const text = Array.from({ length: 22 }, (_, i) => `文${i + 1} [${i + 1}]。`).join('');
+  const out = expandCitations(text, refs);
+  if (!out.includes('[⑳](<') || !out.includes('[21](<') || !out.includes('[22](<')) fail(`21 以降は数字: ${out.slice(-160)}`);
 }
 
 {
   // 引けない番号は触らない。無条件に消していたら `[2024] の話ね` が `の話ね` になった
   const out = expandCitations('よく分からん [99]。', tableOf(2));
   if (!out.includes('[99]')) fail(`引けない番号は残す: ${out}`);
-  if (out.includes('-#')) fail(`引けない番号だけなら末尾を足さない: ${out}`);
 
   const year = expandCitations('[2024] の話ね', tableOf(2));
   if (year !== '[2024] の話ね') fail(`数字の括弧を引用と誤らない: ${JSON.stringify(year)}`);
 }
 
 {
-  // 記憶の出来事の番号 [e3214] は読む人には謎の文字列。本文から消し、実在する出来事は URL にして末尾へ足す
+  // 記憶の出来事の番号 [e3214] も文中の出典リンクになる。実在する出来事だけ (最初の3件まで)
   const known = new Set([3214, 11489, 5]);
   const episodeUrl = (id) => (known.has(id) ? `https://wiki.test/1/e/${id}` : null);
   const opts = { episodeUrl };
   const refs = tableOf(2);
+  const ep = (id) => `https://wiki.test/1/e/${id}`;
 
   const one = expandCitations('「近所の子供攫うぞ」— 煽り口の定番 [e3214]。', refs, opts);
-  if (one !== '「近所の子供攫うぞ」— 煽り口の定番。\n\n-# https://wiki.test/1/e/3214') fail(`[e3214] は消して URL にする: ${JSON.stringify(one)}`);
+  if (one !== `「近所の子供攫うぞ」— 煽り口の定番${link('①', ep(3214))}。`) fail(`[e3214] は文中のリンクにする: ${JSON.stringify(one)}`);
 
+  // 空白の前に置いた番号は、空白ごと消えてリンクが直前の語に付く (A[①] B[②][③] C[①]。ではなく、元の空白は残る)
   const many = expandCitations('A [e3214] B [e11489, e5] C [e3214]。', refs, opts);
-  if (many !== 'A B C。\n\n-# https://wiki.test/1/e/3214 https://wiki.test/1/e/11489 https://wiki.test/1/e/5') fail(`複数・重複: ${JSON.stringify(many)}`);
+  const wantMany = `A${link('①', ep(3214))} B${link('②', ep(11489))}${link('③', ep(5))} C${link('①', ep(3214))}。`;
+  if (many.replace(/ /g, '') !== wantMany.replace(/ /g, '')) fail(`複数・重複: ${JSON.stringify(many)}`);
 
   const capped = expandCitations('x [e3214][e11489][e5][e3214]', refs, { episodeUrl: (id) => `https://wiki.test/1/e/${id}` });
-  if ((capped.match(/https:/g) ?? []).length !== 3) fail(`URL は3件まで: ${JSON.stringify(capped)}`);
+  const distinct = new Set(capped.match(/https:\/\/wiki\.test\/1\/e\/\d+/g) ?? []);
+  if (distinct.size !== 3) fail(`出来事のリンクは3件まで: ${JSON.stringify(capped)}`);
 
   // 実在しない番号 (作り話)・サイトが無いとき・失敗したときは、消すだけ (リンク切れを作らない)
   const ghost = expandCitations('ほんとだよ [e99999]。', refs, opts);
@@ -92,9 +99,9 @@ function tableOf(count) {
   const boom = expandCitations('定番 [e3214]。', refs, { episodeUrl: () => { throw new Error('db'); } });
   if (boom !== '定番。') fail(`調べに失敗しても答えは出す: ${JSON.stringify(boom)}`);
 
-  // 発言の番号 [1] と同居できる。[e1] は発言の番号 [1] と取り違えない
+  // 発言の番号 [1] と同居できる。番号は出典の初出順にまとめて振る。[e1] は発言の番号 [1] と取り違えない
   const both = expandCitations('これは [1]。あれは [e3214]。', tableOf(1), opts);
-  if (!both.startsWith('これは。あれは。') || !both.includes('discord.com/channels') || !both.includes('https://wiki.test/1/e/3214')) fail(`両方の引用: ${JSON.stringify(both)}`);
+  if (both !== `これは${link('①', msgUrl(1))}。あれは${link('②', ep(3214))}。`) fail(`両方の引用: ${JSON.stringify(both)}`);
 
   // 出来事の番号に見えないものは触らない
   for (const plain of ['[error] が出た', 'e3214 は番号', '[e] だけ', '[e12abc]', 'items[e1]']) {
@@ -107,27 +114,25 @@ function tableOf(count) {
   const refs = tableOf(3);
   const idx = expandCitations('配列は items[1] が先頭だよ', refs);
   if (idx !== '配列は items[1] が先頭だよ') fail(`添字を壊してはいけない: ${JSON.stringify(idx)}`);
-  if (idx.includes('-#')) fail('添字を引用として拾ってはいけない');
 
   // 空白で区切られていれば引用として扱う
   const cited = expandCitations('根拠はこれ [1]。', refs);
-  if (cited.split('\n')[0] !== '根拠はこれ。') fail(`空白区切りは引用: ${JSON.stringify(cited)}`);
+  if (cited !== `根拠はこれ${link('①', msgUrl(1))}。`) fail(`空白区切りは引用: ${JSON.stringify(cited)}`);
   // 行頭・括弧のあとも引用
   for (const t of ['[1] と言ってる', '「[1]」と書いてる']) {
-    if (!expandCitations(t, refs).includes('-#')) fail(`引用として拾えていない: ${t}`);
+    if (!expandCitations(t, refs).includes('](<')) fail(`引用として拾えていない: ${t}`);
   }
 }
 
 {
-  // 引用0件のときに空行だけ増やさない
+  // 引用0件のときに本文を変えない
   const plain = 'ログに出てないから分からん。';
   if (expandCitations(plain, tableOf(2)) !== plain) fail('引用0件で本文を変えてはいけない');
   if (expandCitations('', tableOf(1)) !== '') fail('空文字はそのまま');
 }
 
 {
-  // どのモデルが書いたかは毎回出す。引用があるときは同じ subtext に混ぜる
-  // (行を2本にすると会話の邪魔になる)。
+  // どのモデルが書いたかは毎回、末尾の subtext に出す (出典は文中にあるので、末尾はこれだけ)
   const refs = tableOf(2);
   // 自分の発言を指す番号は根拠にならないので、番号ごと消してリンクも出さない
   {
@@ -137,24 +142,37 @@ function tableOf(count) {
     const cited = expandCitations('前に言った通り [1]。さばも書いてる [2]。', selfRefs, { label: 'm', selfId: 'bot' });
     if (cited.includes('111111111111111111')) fail('自分の発言へのリンクを出してはいけない: ' + cited);
     if (!cited.includes('222222222222222222')) fail('他人の発言へのリンクは残す: ' + cited);
+    if (!cited.includes('[①](<https://discord.com/channels/g/c/222222222222222222>)')) fail('自分の番号を飛ばして ① から振る: ' + cited);
     if (/\[1\]/.test(cited)) fail('自分の発言の番号は本文から消す: ' + cited);
   }
   const withUrls = expandCitations('4月に書いてる [1]。', refs, { label: 'deepseek v4 flash' });
-  const footer = withUrls.split('-# ')[1];
-  if (!footer.startsWith('deepseek v4 flash ')) fail(`モデル名が先頭に来ていない: ${footer}`);
-  if (!footer.includes('discord.com')) fail(`引用が消えている: ${footer}`);
-  if ((withUrls.match(/-#/g) ?? []).length !== 1) fail('subtext は1行にまとめる');
+  if (withUrls !== `4月に書いてる${link('①', msgUrl(1))}。\n\n-# deepseek v4 flash`) fail(`文中のリンク + 末尾はモデル名だけ: ${JSON.stringify(withUrls)}`);
+  if ((withUrls.match(/-#/g) ?? []).length !== 1) fail('subtext は1行');
 
   // 引用が無くてもモデル名は出す
   const bare = expandCitations('ログに出てないから分からん。', refs, { label: 'evex-1' });
   if (!bare.endsWith('-# evex-1')) fail(`引用0件でもモデル名を出す: ${bare}`);
 
-  // ラベルを渡さなければ従来どおり (末尾は URL だけ / 引用0件なら足さない)
+  // ラベルを渡さなければ末尾は足さない
   const plain = expandCitations('分からん。', refs);
-  if (plain.includes('-#')) fail(`ラベルも引用も無いなら末尾を足さない: ${plain}`);
+  if (plain.includes('-#')) fail(`ラベルが無ければ末尾を足さない: ${plain}`);
 }
 
-console.log('citations ok (本文に番号も URL も残らない / 末尾は素の URL)');
+{
+  // 長い返信を割るとき、出典リンクの途中では切らない (どちらのメッセージでも生の文字になる)
+  const { chunkForDiscord } = await import('../src/agent/format.js');
+  const url = 'https://discord.com/channels/1255359848644608035/1437420093259907175/1560816229005000815';
+  const text = `${'あ'.repeat(1880)}[①](<${url}>)${'い'.repeat(300)}`;
+  const chunks = chunkForDiscord(text, 1900);
+  if (chunks.length < 2) fail('割れていない');
+  for (const chunk of chunks) {
+    const opens = (chunk.match(/\]\(</g) ?? []).length;
+    const closes = (chunk.match(/>\)/g) ?? []).length;
+    if (opens !== closes) fail(`リンクが割れている: ${JSON.stringify(chunk.slice(-120))}`);
+  }
+}
+
+console.log('citations ok (出典は文中の小さなリンク ① ② … / 同じ出典は同じ番号 / 末尾はモデル名だけ)');
 
 // --- system プロンプト ---
 
