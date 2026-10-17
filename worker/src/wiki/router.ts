@@ -1,24 +1,29 @@
 import {
-  authConfigured, currentSession, defaultAuthDeps, finishLink, finishLogin, isPublicAccess, linkConfigured, loginAvailable, loginRedirect, logoutResponse, memoryGuild,
-  safeNext, type AuthDeps
+  authConfigured, currentSession, defaultAuthDeps, finishLink, finishLogin, isPublicAccess, linkConfigured, loginAvailable, loginRedirect, logoutResponse,
+  memoryGuilds, type AuthDeps
 } from './auth.ts';
 import type { SafeHtml } from './html.ts';
 import { handleIngest } from './ingest.ts';
 import { layout } from './layout.ts';
+import { GUILD_ID, makeLinks, type Links } from './links.ts';
+import { scanReferences } from './markdown.ts';
 import * as store from './store.ts';
 import type { Env, NodeRow, Session } from './types.ts';
 import {
   articleView, episodeView, homeView, loginView, messageView, monthView, referencesOf, searchView, timelineIndexView, treeNav,
   type ArticleData, type Page, type TimelineData
 } from './views.ts';
-import { scanReferences, wikiHref } from './markdown.ts';
 
-// 記憶の本の URL と、gate (ログイン) と、画面ごとの読み出し。
-//   /wiki            トップ            /wiki/<path>   記事 (?tab=timeline|links&kind=&order=&page=&cp=)
-//   /e/<id>          出来事            /t, /t/YYYY-MM 年表
-//   /s?q=            検索              /random        ランダムなページ
-//   /auth/login|callback|logout        /v1/memory/*   bot からの取り込み (Bearer)
+// 記憶の本の URL と、gate (入場) と、画面ごとの読み出し。サーバーごとに URL を分ける:
+//   /<サーバーID>/wiki           トップ            /<サーバーID>/wiki/<path>   記事 (?tab=timeline|links&kind=&order=&page=&cp=)
+//   /<サーバーID>/e/<id>         出来事            /<サーバーID>/t, /t/YYYY-MM 年表
+//   /<サーバーID>/s?q=           検索              /<サーバーID>/random        ランダムなページ
+//   /<サーバーID>/auth/logout    ログアウト
+//   /auth/link  /auth/login  /auth/callback   入場 (サーバーはリンクの署名・state の中にある)
+//   /v1/memory/*                 bot からの取り込み (Bearer。サーバーは本文の guildId)
+// URL のサーバーが MEMORY_GUILD_IDS に無ければ、中身を何も見せずに 404。cookie もサーバーごと。
 // 法令集 ('/', '/law/…', '/v1/laws') はここでは扱わない (null を返して既存の処理へ)。
+// サーバーの付かない旧い URL (/wiki …) は、見せているサーバーが1つのときだけそこへ転送する。
 
 export interface Deps {
   auth: AuthDeps;
@@ -35,15 +40,24 @@ const SECURITY_HEADERS: Record<string, string> = {
   'cache-control': 'private, no-store'
 };
 
-function respond(page: Page, ctx: { user: Session | null; query?: string; lawsHref?: string }): Response {
+interface Context {
+  user: Session | null;
+  links?: Links;
+  query?: string;
+}
+
+function respond(page: Page, ctx: Context): Response {
   const body: SafeHtml = layout({
     title: page.title, description: page.description, main: page.main, rail: page.rail, nav: page.nav, narrow: page.narrow,
-    user: ctx.user, query: ctx.query, lawsHref: ctx.lawsHref
+    user: ctx.user, query: ctx.query, links: ctx.links
   });
   return new Response(body.value, { status: page.status ?? 200, headers: { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS } });
 }
 
 const redirect = (location: string): Response => new Response(null, { status: 302, headers: { location, 'cache-control': 'no-store' } });
+
+/** 見せていないサーバーの URL。サーバーがあるかどうかも、中身も出さない。 */
+const notFound = (): Response => respond(messageView('見つかりません', 'そのページはありません。', { status: 404 }), { user: null });
 
 const positive = (value: string | null, fallback = 1): number => {
   const parsed = Number(value);
@@ -61,44 +75,57 @@ function decodePath(segments: string): string | null {
 export async function handleWiki(request: Request, env: Env, deps: Deps = defaultDeps): Promise<Response | null> {
   const url = new URL(request.url);
   const path = url.pathname;
+  const guilds = memoryGuilds(env);
 
   if (path.startsWith('/v1/memory/')) return handleIngest(request, env, deps.now());
 
-  if (path.startsWith('/auth/')) {
-    if (path === '/auth/logout') return logoutResponse(request);
-    if (path === '/auth/link') {
-      const result = await finishLink(request, env, deps.now());
-      if (result.ok) return result.response;
-      return respond(messageView('入れませんでした', result.reason, { status: result.status }), { user: null });
-    }
+  // ---- サーバーの付かない入口 ----
+  if (path === '/auth/link') {
+    const result = await finishLink(request, env, deps.now());
+    if (result.ok) return result.response;
+    return respond(messageView('入れませんでした', result.reason, { status: result.status }), { user: null });
+  }
+  if (path === '/auth/login' || path === '/auth/callback') {
     if (!authConfigured(env)) return respond(messageView('ログインの設定がありません', 'このサイトでは Discord ログインは使えません。Discord で /memory url を使うと、ログインリンクが出ます。', { status: 503 }), { user: null });
-    if (path === '/auth/login') return loginRedirect(request, env, deps.auth);
-    if (path === '/auth/callback') {
-      const result = await finishLogin(request, env, deps.auth);
-      if (result.ok) return result.response;
-      return respond(messageView('ログインできませんでした', result.reason, { status: result.status, link: { href: '/wiki', label: 'もう一度試す' } }), { user: null });
+    if (path === '/auth/login') {
+      const guild = url.searchParams.get('g') ?? '';
+      return guilds.includes(guild) ? loginRedirect(request, env, guild, deps.auth) : notFound();
     }
-    return null;
+    const result = await finishLogin(request, env, deps.auth);
+    if (result.ok) return result.response;
+    return respond(messageView('ログインできませんでした', result.reason, { status: result.status }), { user: null });
   }
 
-  const isWiki = path === '/wiki' || path.startsWith('/wiki/') || path.startsWith('/e/') || path === '/t' || path.startsWith('/t/') || path === '/s' || path === '/random';
+  // 旧い URL (サーバーなし): 見せているサーバーが1つだけなら、そこへ
+  if (/^\/(?:wiki|e|t|s|random)(?:\/.*)?$/.test(path)) {
+    const only = guilds.length === 1 ? guilds[0] : null;
+    return only ? redirect(`/${only}${path}${url.search}`) : notFound();
+  }
+
+  // ---- /<サーバーID>/… ----
+  const match = /^\/(\d{5,25})(\/.*)?$/.exec(path);
+  if (!match?.[1] || !GUILD_ID.test(match[1])) return null;
+  const guild = match[1];
+  const rest = match[2] ?? '';
+  if (!guilds.includes(guild)) return notFound();
+  const links = makeLinks(guild);
+  if (rest === '' || rest === '/') return redirect(links.home);
+  if (rest === '/auth/logout') return logoutResponse(request, guild);
+
+  const isWiki = rest === '/wiki' || rest.startsWith('/wiki/') || rest.startsWith('/e/') || rest === '/t' || rest.startsWith('/t/') || rest === '/s' || rest === '/random';
   if (!isWiki) return null;
   if (request.method !== 'GET' && request.method !== 'HEAD') return new Response('method not allowed', { status: 405, headers: { allow: 'GET, HEAD' } });
 
-  const guild = memoryGuild(env);
-  const lawsHref = guild ? `/?guild=${encodeURIComponent(guild)}` : undefined;
-  if (!guild) return respond(messageView('設定がありません', '表示するサーバーが設定されていません。', { status: 503 }), { user: null });
-
-  // gate: 公開 (MEMORY_ACCESS=public) でなければ、サーバーのメンバーとしてログインした人だけ
+  // gate: 公開 (MEMORY_ACCESS=public) でなければ、このサーバーのメンバーとして入った人だけ
   let user: Session | null = null;
   if (!isPublicAccess(env)) {
     if (!loginAvailable(env)) {
-      return respond(messageView('まだ公開されていません', '記憶の本は、ログインの設定が済むまで閉じています。', { status: 503 }), { user: null, lawsHref });
+      return respond(messageView('まだ公開されていません', '記憶の本は、ログインの設定が済むまで閉じています。', { status: 503 }), { user: null, links });
     }
-    user = await currentSession(request, env, deps.now());
-    if (!user) return respond(loginView(safeNext(`${url.pathname}${url.search}`), { oauth: authConfigured(env), link: linkConfigured(env) }), { user: null, lawsHref });
+    user = await currentSession(request, env, guild, deps.now());
+    if (!user) return respond(loginView(`${url.pathname}${url.search}`, { oauth: authConfigured(env), link: linkConfigured(env) }, links), { user: null, links });
   }
-  const ctx = { user, lawsHref };
+  const ctx: Context = { user, links };
   const db = env.LAWS;
 
   const nav = async (current: string): Promise<SafeHtml> => {
@@ -107,30 +134,30 @@ export async function handleWiki(request: Request, env: Env, deps: Deps = defaul
     const parts = current ? current.split('/') : [];
     const open = parts.map((_, index) => parts.slice(0, index + 1).join('/'));
     const lists = await Promise.all(open.map((entry) => store.childrenOf(db, guild, entry, 40)));
-    return treeNav(tops, new Map(open.map((entry, index) => [entry, lists[index] ?? []])), current);
+    return treeNav(tops, new Map(open.map((entry, index) => [entry, lists[index] ?? []])), current, links);
   };
 
   try {
-    if (path === '/random') {
+    if (rest === '/random') {
       const target = await store.randomPath(db, guild);
-      return redirect(target ? wikiHref(target) : '/wiki');
+      return redirect(target ? links.wiki(target) : links.home);
     }
 
-    if (path === '/s') {
+    if (rest === '/s') {
       const query = (url.searchParams.get('q') ?? '').trim().slice(0, 100);
       const [nodes, episodes, navigation] = await Promise.all([store.searchNodes(db, guild, query), store.searchEpisodes(db, guild, query), nav('')]);
-      return respond(searchView(query, nodes, episodes, navigation), { ...ctx, query });
+      return respond(searchView(query, nodes, episodes, navigation, links), { ...ctx, query });
     }
 
-    if (path === '/t') {
+    if (rest === '/t') {
       const [months, navigation] = await Promise.all([store.monthCounts(db, guild), nav('')]);
-      return respond(timelineIndexView(months, navigation), ctx);
+      return respond(timelineIndexView(months, navigation, links), ctx);
     }
 
-    const month = /^\/t\/(\d{4}-\d{2})\/?$/.exec(path);
+    const month = /^\/t\/(\d{4}-\d{2})\/?$/.exec(rest);
     if (month?.[1]) {
       const key = month[1];
-      if (!store.monthRange(key)) return respond(messageView('見つかりません', 'その月は指定できません。', { status: 404, link: { href: '/t', label: '年表へ' } }), ctx);
+      if (!store.monthRange(key)) return respond(messageView('見つかりません', 'その月は指定できません。', { status: 404, link: { href: links.timeline, label: '年表へ' } }), ctx);
       const kind = (url.searchParams.get('kind') ?? '').slice(0, 40);
       const perPage = 100;
       const monthPage = positive(url.searchParams.get('page'));
@@ -143,45 +170,44 @@ export async function handleWiki(request: Request, env: Env, deps: Deps = defaul
         month: key, rows: result.rows, total: result.total, page: monthPage, perPage, kind, kinds,
         prev: index > 0 ? keys[index - 1] ?? null : index === -1 ? keys.filter((entry) => entry < key).at(-1) ?? null : null,
         next: index >= 0 ? keys[index + 1] ?? null : keys.find((entry) => entry > key) ?? null,
-        nav: navigation
+        nav: navigation, links
       }), ctx);
     }
 
-    const episodePath = /^\/e\/(\d{1,12})\/?$/.exec(path);
+    const episodePath = /^\/e\/(\d{1,12})\/?$/.exec(rest);
     if (episodePath?.[1]) {
       const id = Number(episodePath[1]);
       const ep = await store.getEpisode(db, guild, id);
       const navigation = await nav('');
-      if (!ep) return respond(messageView('見つかりません', `出来事 ${id} は記憶の本にありません。`, { status: 404, nav: navigation, link: { href: '/wiki', label: 'トップへ' } }), ctx);
+      if (!ep) return respond(messageView('見つかりません', `出来事 ${id} は記憶の本にありません。`, { status: 404, nav: navigation, link: { href: links.home, label: 'トップへ' } }), ctx);
       const [quotes, nodes, neighbors] = await Promise.all([store.quotesOf(db, guild, id), store.episodeNodes(db, guild, id), store.episodeNeighbors(db, guild, id)]);
-      return respond(episodeView({ guildId: guild, ep, quotes, nodes, before: neighbors.before, after: neighbors.after, nav: navigation }), ctx);
+      return respond(episodeView({ guildId: guild, ep, quotes, nodes, before: neighbors.before, after: neighbors.after, nav: navigation, links }), ctx);
     }
 
-    if (path === '/wiki' || path === '/wiki/') {
+    if (rest === '/wiki' || rest === '/wiki/') {
       const [root, stats, tops, recent, popular, updated, months] = await Promise.all([
         store.getNode(db, guild, ''), store.siteStats(db, guild), store.topLevels(db, guild), store.recentEpisodes(db, guild, 8),
         store.popularNodes(db, guild, 8), store.recentNodes(db, guild, 6), store.monthCounts(db, guild)
       ]);
-      const links = root?.body ? scanReferences(root.body).paths : [];
-      const known = new Map((await store.nodesByPaths(db, guild, links)).map((node) => [node.path, node]));
-      return respond(homeView({ root, stats, tops, recent, popular, updated, months, nodeNames: known }), ctx);
+      const referenced = root?.body ? scanReferences(root.body).paths : [];
+      const known = new Map((await store.nodesByPaths(db, guild, referenced)).map((node) => [node.path, node]));
+      return respond(homeView({ root, stats, tops, recent, popular, updated, months, nodeNames: known, links }), ctx);
     }
 
-    const wiki = /^\/wiki\/(.+)$/.exec(path);
+    const wiki = /^\/wiki\/(.+)$/.exec(rest);
     if (wiki?.[1]) {
       const nodePath = decodePath(wiki[1]);
       if (!nodePath) return respond(messageView('見つかりません', 'ページの指定が正しくありません。', { status: 400 }), ctx);
       const node = await store.getNode(db, guild, nodePath);
       if (!node) {
         const guess = await store.guessNode(db, guild, nodePath);
-        if (guess) return redirect(wikiHref(guess.path));
+        if (guess) return redirect(links.wiki(guess.path));
         const name = nodePath.split('/').at(-1) ?? nodePath;
         return respond(messageView('まだこのページはありません', `「${nodePath}」は記憶の本にありません。名前が違うか、まだ作られていないページです。`, {
-          status: 404, nav: await nav(''), link: { href: `/s?q=${encodeURIComponent(name)}`, label: `「${name}」を検索` }
+          status: 404, nav: await nav(''), link: { href: `${links.search}?q=${encodeURIComponent(name)}`, label: `「${name}」を検索` }
         }), ctx);
       }
-      const page = await articlePage(db, guild, node, url, nav);
-      return respond(page, ctx);
+      return respond(await articlePage(db, guild, node, url, nav, links), ctx);
     }
   } catch (error) {
     console.error('wiki failed:', error);
@@ -190,7 +216,7 @@ export async function handleWiki(request: Request, env: Env, deps: Deps = defaul
   return null;
 }
 
-async function articlePage(database: D1Database, guildId: string, node: NodeRow, requestUrl: URL, nav: (current: string) => Promise<SafeHtml>): Promise<Page> {
+async function articlePage(database: D1Database, guildId: string, node: NodeRow, requestUrl: URL, nav: (current: string) => Promise<SafeHtml>, links: Links): Promise<Page> {
   const tabParam = requestUrl.searchParams.get('tab');
   const tab: ArticleData['tab'] = tabParam === 'timeline' || tabParam === 'links' ? tabParam : 'article';
   const childPerPage = 48;
@@ -216,7 +242,6 @@ async function articlePage(database: D1Database, guildId: string, node: NodeRow,
   ]);
   return articleView({
     node, ancestors, children, childPage, childPerPage, neighbors, recent, tab, timeline,
-    cited: new Map(cited.map((ep) => [ep.id, ep])), known: new Map(known.map((entry) => [entry.path, entry])), nav: navigation
+    cited: new Map(cited.map((ep) => [ep.id, ep])), known: new Map(known.map((entry) => [entry.path, entry])), nav: navigation, links
   });
-
 }

@@ -139,9 +139,11 @@ try {
       timestamp: '2024-01-01T00:00:00.000Z', author: { id: 'author-1', username: 'someone' } }];
     const visible = hit('200000000000000001', 'public-a', 'VISIBLE_HIT');
     const hidden = hit('200000000000000002', 'private-a', 'HIDDEN_HIT');
-    const run = (groups, limit) => runSearch(
+    // 出力には「いま観測した時刻」(observedAt、ミリ秒) が入る。2回の実行が1ミリ秒ずれるだけで文字列が変わり、
+    // 比較が確率で落ちていた (2026-10-17)。比べたいのは隠れた側の有無なので、時刻だけ外して比べる
+    const run = async (groups, limit) => String(await runSearch(
       toolCtx([publicChannel, privateChannel], { client: { user: { id: 'bot' }, rest: { get: async () => ({ messages: groups }) } } }),
-      { query: 'sentinel', limit }, { archiveAvailable: false, semanticAvailable: false });
+      { query: 'sentinel', limit }, { archiveAvailable: false, semanticAvailable: false })).replace(/"observedAt":\d+/g, '"observedAt":0');
     const mixed = await run([visible, hidden], 2);
     assert.match(mixed, /VISIBLE_HIT/);
     assert.doesNotMatch(mixed, /HIDDEN_HIT|読めない|除外|除いた/);

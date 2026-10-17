@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import Database from 'better-sqlite3';
 import 'dotenv/config';
+import { siteGuilds } from '../src/memory/site.js';
 
 // 記憶の本を公開サイト (Worker + D1) へ送る。builder の後に timer から動かす (deploy/sakana-memory-site.*)。
 //
@@ -14,7 +15,8 @@ import 'dotenv/config';
 // 設定 (未設定なら何もしない。開発機では設定しなくてよい):
 //   MEMORY_SITE_URL    サイトの origin。無ければ GOVERNANCE_LAW_API_URL (法令集と同じ Worker)
 //   MEMORY_SITE_TOKEN  Bearer トークン。無ければ GOVERNANCE_LAW_API_TOKEN
-//   MEMORY_TREE_GUILD  送るサーバー
+//   MEMORY_SITE_GUILDS 送るサーバー (カンマ区切り。無ければ MEMORY_TREE_GUILD)。サーバーごとに別々に送る。
+//                      Worker の MEMORY_GUILD_IDS に無いサーバーはサイトが受け取らない
 //
 // 引用 (出来事の根拠の発言の原文) は、全員に見えるチャンネルのものだけを送る:
 //   公開チャンネルの控え − /memory include で足した (@everyone に見えない) チャンネル − NSFW っぽい名前のチャンネル。
@@ -403,40 +405,53 @@ function parseArgs(argv: string[]): Record<string, string | true> {
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  const guildId = String(args.guild ?? process.env.MEMORY_TREE_GUILD ?? '');
+  // 送るサーバー: --guild、無ければ MEMORY_SITE_GUILDS (無ければ MEMORY_TREE_GUILD)。サーバーごとに別々に送る
+  const guilds = typeof args.guild === 'string' ? [args.guild] : siteGuilds();
   const url = process.env.MEMORY_SITE_URL ?? process.env.GOVERNANCE_LAW_API_URL ?? '';
   const token = process.env.MEMORY_SITE_TOKEN ?? process.env.GOVERNANCE_LAW_API_TOKEN ?? '';
-  if (!guildId) throw new Error('MEMORY_TREE_GUILD (または --guild) が要ります');
+  if (guilds.length === 0) throw new Error('MEMORY_TREE_GUILD / MEMORY_SITE_GUILDS (または --guild) が要ります');
 
-  let snapshot: Snapshot;
-  if (typeof args.from === 'string') {
-    snapshot = JSON.parse(readFileSync(args.from, 'utf8')) as Snapshot;
-  } else {
-    const memory = new Database(process.env.MEMORY_DB_PATH ?? 'memory.sqlite', { readonly: true, fileMustExist: true });
-    const archive = new Database(process.env.ARCHIVE_DB_PATH ?? 'archive.sqlite', { readonly: true, fileMustExist: true });
-    memory.pragma('busy_timeout = 30000');
-    archive.pragma('busy_timeout = 30000');
-    try {
-      // builder が書いている最中でも、1つの時点の記憶を読む (読み取りトランザクション)
-      snapshot = memory.transaction(() => buildSnapshot(memory, archive, guildId)).deferred();
-    } finally {
-      memory.close();
-      archive.close();
+  const fromFile = typeof args.from === 'string' ? args.from : null;
+  const outFile = typeof args.out === 'string' ? args.out : null;
+  if ((fromFile || outFile) && guilds.length !== 1) throw new Error('--from / --out は --guild で1つのサーバーを指定してください');
+  const memory = fromFile ? null : new Database(process.env.MEMORY_DB_PATH ?? 'memory.sqlite', { readonly: true, fileMustExist: true });
+  const archive = fromFile ? null : new Database(process.env.ARCHIVE_DB_PATH ?? 'archive.sqlite', { readonly: true, fileMustExist: true });
+  memory?.pragma('busy_timeout = 30000');
+  archive?.pragma('busy_timeout = 30000');
+  try {
+    for (const guildId of guilds) {
+      let snapshot: Snapshot;
+      if (fromFile) {
+        snapshot = JSON.parse(readFileSync(fromFile, 'utf8')) as Snapshot;
+      } else if (memory && archive) {
+        // builder が書いている最中でも、1つの時点の記憶を読む (読み取りトランザクション)
+        snapshot = memory.transaction(() => buildSnapshot(memory, archive, guildId)).deferred();
+      } else {
+        continue;
+      }
+      console.log(`[${guildId}] snapshot: ${snapshot.nodes.length} pages, ${snapshot.episodes.length} episodes, ${snapshot.episodes.reduce((sum, episode) => sum + episode.quotes.length, 0)} quotes`);
+      if (outFile) {
+        writeFileSync(outFile, JSON.stringify(snapshot));
+        console.log(`wrote ${outFile}`);
+        continue;
+      }
+      // 記憶の無いサーバーは送らない (サイトの一覧に空のサーバーを作らない)
+      if (snapshot.nodes.length === 0) {
+        console.log(`[${guildId}] 記憶がまだ無いので送りません。`);
+        continue;
+      }
+      if (!url || !token) {
+        console.log('MEMORY_SITE_URL / MEMORY_SITE_TOKEN (または GOVERNANCE_LAW_API_URL / _TOKEN) が未設定なので、送りません。');
+        return;
+      }
+      const started = Date.now();
+      const result = await syncSite(snapshot, { url, token, guildId, dryRun: args['dry-run'] === true, log: (line) => console.log(`[${guildId}] ${line}`) });
+      console.log(`[${guildId}] ${args['dry-run'] === true ? 'would send' : 'sent'}: ${JSON.stringify(result)} (${((Date.now() - started) / 1000).toFixed(1)}s)`);
     }
+  } finally {
+    memory?.close();
+    archive?.close();
   }
-  console.log(`snapshot: ${snapshot.nodes.length} pages, ${snapshot.episodes.length} episodes, ${snapshot.episodes.reduce((sum, episode) => sum + episode.quotes.length, 0)} quotes`);
-  if (typeof args.out === 'string') {
-    writeFileSync(args.out, JSON.stringify(snapshot));
-    console.log(`wrote ${args.out}`);
-    return;
-  }
-  if (!url || !token) {
-    console.log('MEMORY_SITE_URL / MEMORY_SITE_TOKEN (または GOVERNANCE_LAW_API_URL / _TOKEN) が未設定なので、送りません。');
-    return;
-  }
-  const started = Date.now();
-  const result = await syncSite(snapshot, { url, token, guildId, dryRun: args['dry-run'] === true, log: (line) => console.log(line) });
-  console.log(`${args['dry-run'] === true ? 'would send' : 'sent'}: ${JSON.stringify(result)} (${((Date.now() - started) / 1000).toFixed(1)}s)`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

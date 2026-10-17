@@ -10,8 +10,9 @@ import { ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, type User }
 // 設定が揃っているときだけ出す (サイトを配備する前に URL だけが出て「not found」になった、2026-10-17):
 //   MEMORY_SITE_PUBLIC_URL    サイトの origin (https のみ。開発の localhost を除く)
 //   MEMORY_SITE_LINK_SECRET   署名の鍵 (16文字以上)
-// 案内するのは、サイトが見せるサーバー (builder が記憶を作り、サイトへ送るサーバー = MEMORY_TREE_GUILD) だけ。
-// 別のサーバーでは、そのサーバーのページを確かめても、別のサーバーのサイトへ案内してしまうので、出さない。
+// サイトはサーバーごとに URL を分ける (/<サーバーID>/wiki/…)。案内するのは、サイトに載せているサーバー
+// (MEMORY_SITE_GUILDS、無ければ builder が記憶を作る MEMORY_TREE_GUILD。Worker の MEMORY_GUILD_IDS と同じ一覧) だけ。
+// 載せていないサーバーでは、リンクもボタンも出さない。
 
 export type SiteTarget =
   | { kind: 'home' }
@@ -30,10 +31,10 @@ export function siteOrigin(env: NodeJS.ProcessEnv = process.env): string | null 
   }
 }
 
-/** サイトが見せるサーバー。 */
-export function siteGuild(env: NodeJS.ProcessEnv = process.env): string | null {
-  const id = (env.MEMORY_SITE_GUILD ?? env.MEMORY_TREE_GUILD ?? '').trim();
-  return /^\d+$/.test(id) ? id : null;
+/** サイトに載せているサーバー (カンマ・空白区切り)。 */
+export function siteGuilds(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = env.MEMORY_SITE_GUILDS ?? env.MEMORY_SITE_GUILD ?? env.MEMORY_TREE_GUILD ?? '';
+  return [...new Set(raw.split(/[\s,]+/).filter((id) => /^\d{5,25}$/.test(id)))];
 }
 
 export interface SiteConfig {
@@ -46,17 +47,17 @@ export interface SiteConfig {
 export function siteConfigFor(guildId: string, env: NodeJS.ProcessEnv = process.env): SiteConfig | null {
   const origin = siteOrigin(env);
   const secret = (env.MEMORY_SITE_LINK_SECRET ?? '').trim();
-  return origin && secret.length >= 16 && siteGuild(env) === guildId ? { origin, secret, guildId } : null;
+  return origin && secret.length >= 16 && siteGuilds(env).includes(guildId) ? { origin, secret, guildId } : null;
 }
 
-/** サイトの中のパス。パスの区切りは / のまま、各部分だけ percent-encode する。 */
-export function sitePath(target: SiteTarget): string {
-  if (target.kind === 'episode') return `/e/${target.id}`;
-  if (target.kind === 'page') return `/wiki/${target.path.split('/').filter(Boolean).map(encodeURIComponent).join('/')}`;
-  return '/wiki';
+/** サイトの中のパス (/<サーバーID>/…)。パスの区切りは / のまま、各部分だけ percent-encode する。 */
+export function sitePath(guildId: string, target: SiteTarget): string {
+  if (target.kind === 'episode') return `/${guildId}/e/${target.id}`;
+  if (target.kind === 'page') return `/${guildId}/wiki/${target.path.split('/').filter(Boolean).map(encodeURIComponent).join('/')}`;
+  return `/${guildId}/wiki`;
 }
 
-export const siteUrl = (origin: string, target: SiteTarget): string => `${origin}${sitePath(target)}`;
+export const siteUrl = (origin: string, guildId: string, target: SiteTarget): string => `${origin}${sitePath(guildId, target)}`;
 
 /** 'e12' / 'E12' / '12' → 12。それ以外は null。 */
 export function parseEpisodeId(text: string): number | null {
@@ -90,7 +91,7 @@ export function mintLoginToken(config: SiteConfig, user: LinkUser, now = Date.no
 
 /** その人専用のログインリンク。開くと cookie が渡り、next (サイトの中のパス) へ進む。 */
 export function siteLoginUrl(config: SiteConfig, user: LinkUser, target: SiteTarget, now = Date.now()): string {
-  const query = new URLSearchParams({ t: mintLoginToken(config, user, now), next: sitePath(target) });
+  const query = new URLSearchParams({ t: mintLoginToken(config, user, now), next: sitePath(config.guildId, target) });
   return `${config.origin}/auth/link?${query.toString()}`;
 }
 

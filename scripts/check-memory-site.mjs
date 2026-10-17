@@ -102,7 +102,7 @@ const first = snapshot.episodes.find((episode) => episode.id === e1);
 // ---- 送る -------------------------------------------------------------------------
 const TOKEN = 'site-token';
 const d1 = createD1();
-const env = { LAWS: d1, GOVERNANCE_LAW_API_TOKEN: TOKEN, MEMORY_GUILD_ID: GUILD, MEMORY_ACCESS: 'public' };
+const env = { LAWS: d1, GOVERNANCE_LAW_API_TOKEN: TOKEN, MEMORY_GUILD_IDS: GUILD, MEMORY_ACCESS: 'public' };
 const requests = [];
 const fetchImpl = async (input, init) => {
   const url = new URL(String(input));
@@ -165,7 +165,7 @@ const options = { url: 'https://site.test', token: TOKEN, guildId: GUILD, fetchI
 
 // ---- サイトに出る ----------------------------------------------------------------------
 {
-  const page = await handleWiki(new Request('https://wiki.test/e/' + e1), env);
+  const page = await handleWiki(new Request(`https://wiki.test/${GUILD}/e/${e1}`), env);
   const text = await page.text();
   assert.match(text, /bot 作るぞ @ユーザー/, 'the public quote shows');
   assert.ok(!text.includes('運営だけ') && !text.includes('成人向け'), 'the gated quotes never reach a page');

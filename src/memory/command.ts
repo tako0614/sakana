@@ -92,6 +92,10 @@ async function replyWithSiteUrl(interaction: ChatInputCommandInteraction, guildI
     await refuse('このサーバーの記憶の本のサイトはまだありません。');
     return;
   }
+  if (!hasMemory(guildId)) {
+    await refuse('このサーバーの記憶の本はまだできていません。');
+    return;
+  }
   const { getEpisode, getNode } = await import('./store.js');
   const idText = interaction.options.getString('id');
   const pathText = (interaction.options.getString('path') ?? '').replace(/^\/+|\/+$/g, '').trim();

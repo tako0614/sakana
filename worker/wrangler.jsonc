@@ -5,15 +5,17 @@
   "compatibility_date": "2026-08-13",
   "send_metrics": false,
   "observability": { "enabled": true },
-  // 法令集は公開ページなのでworkers.devで出す。版ごとのpreview URLは増やさない。
+  // 法令集は公開ページ。正式なドメインは sakana.takos.jp (takos.jp の zone に Worker のカスタムドメインとして付く。DNS と証明書は Cloudflare が作る)。
+  // workers.dev も残す: bot が法令・記憶を押し込む先 (GOVERNANCE_LAW_API_URL) と、これまでの URL をそのまま使えるように。版ごとのpreview URLは増やさない。
   "workers_dev": true,
   "preview_urls": false,
+  "routes": [{ "pattern": "sakana.takos.jp", "custom_domain": true }],
   // 記憶の本 (/wiki) は、このサーバーのメンバーだけに見せる (既定は閉じている)。
-  //   MEMORY_GUILD_ID                     見せるサーバー
+  //   MEMORY_GUILD_IDS                    見せるサーバー (カンマ区切り。URL は /<サーバーID>/wiki。ここに無いサーバーの URL は 404)
   //   MEMORY_ACCESS                       'members' (既定) | 'public'
   //   secret: SESSION_SECRET (cookie の署名) / MEMORY_LINK_SECRET (bot のログインリンクの署名。bot の MEMORY_SITE_LINK_SECRET と同じ)
   //   任意: DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET (「Discord でログイン」。OAuth2 > Redirects に https://<このサイト>/auth/callback)
-  "vars": { "MEMORY_GUILD_ID": "1255359848644608035", "MEMORY_ACCESS": "members" },
+  "vars": { "MEMORY_GUILD_IDS": "1255359848644608035", "MEMORY_ACCESS": "members" },
   "d1_databases": [
     {
       "binding": "LAWS",

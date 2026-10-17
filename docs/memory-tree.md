@@ -117,7 +117,7 @@ Discord からは `/memory` で見る・止める。返事は本人にだけ見�
 |`include` / `exclude`|@everyone が見られないチャンネルを入れる・外す|管理者|
 |`category list` / `add` / `remove`|最上位の一覧・追加 (`from` で昇格)・削除 (中身は others へ)|管理者|
 |`explore`|記憶の本をメニューでたどって読む。ページはパンくず・本文 (リンクは太字の名前)・子ページ (20件ずつ)・つながり・最近の出来事。出来事は種類・日付・チャンネル・決め台詞の引用・根拠の発言へのリンク・前後の出来事。🕒 年表 (古い順に10件ずつ)、🔍 探す (入力欄)。📢 みんなに見せる で今の画面をチャンネルに出し、出したメッセージは誰が押しても全員の画面が変わる (一緒にたどる)。🔎 自分で開く で押した人にだけ同じ画面を開く。NSFW チャンネルの出来事は NSFW のチャンネルでだけ共有できる|誰でも|
-|`url`|記憶の本のサイトへの入り口を、あなただけに返す (10分だけ有効・1回だけ開けるログインリンク。開くとあなたとしてログインする)。`path:people/たこ` でそのページ、`id:e12` でその出来事、空ならトップ。`explore` の画面の「🌐 サイトで開く」も同じ (押した人にだけ返る)。`MEMORY_SITE_PUBLIC_URL` と `MEMORY_SITE_LINK_SECRET` が揃っていて、`MEMORY_TREE_GUILD` のサーバーでだけ出る|誰でも|
+|`url`|記憶の本のサイトへの入り口を、あなただけに返す (10分だけ有効・1回だけ開けるログインリンク。開くとあなたとしてログインする)。`path:people/たこ` でそのページ、`id:e12` でその出来事、空ならトップ。`explore` の画面の「🌐 サイトで開く」も同じ (押した人にだけ返る)。`MEMORY_SITE_PUBLIC_URL` と `MEMORY_SITE_LINK_SECRET` が揃っていて、サイトに載せているサーバー (`MEMORY_SITE_GUILDS`、無ければ `MEMORY_TREE_GUILD`) で記憶の本があるときだけ出る|誰でも|
 |`show` / `search` / `episode`|ページ・検索・出来事と根拠の発言 (リンク付き)|誰でも|
 
 builder を直接操作するとき (TypeScript なので tsx を通す):
@@ -147,7 +147,7 @@ provider の当たり外れ: OpenRouter は同じモデルを複数の provider 
 ## サイト (wiki)
 
 記憶の本は Discord の中 (`/memory explore`) のほかに、法令集と同じ Cloudflare Worker (`worker/`) の `/wiki` で、
-wiki として読めます (サーバーのメンバーだけ。Discord で `/memory url` を使うと入り口のリンクが出る)。ページは記事、出来事は年表と出来事のページ、
+wiki として読めます (サーバーごとに `/<サーバーID>/wiki`。そのサーバーのメンバーだけ。Discord で `/memory url` を使うと入り口のリンクが出る)。ページは記事、出来事は年表と出来事のページ、
 本文の `[[リンク]]` は wiki のリンク、`[e12]` は脚注の番号 (その出来事のページへ直接飛ぶ) になります。
 
 - 送り方: `scripts/memory-site-sync.ts` (systemd `sakana-memory-site.timer`、10分おき) が memory.sqlite を読み、

@@ -20,6 +20,8 @@ export interface RenderContext {
   citeNumber(episodeId: number): number | null;
   /** [n] のリンク先と、マウスを載せたときの説明 (無ければページ内の出典欄 #ref-n) */
   citeLink?(episodeId: number): { href: string; title: string } | null;
+  /** [[path]] の href。無ければ /wiki/<path> (サーバーの付かない素の形。テスト用) */
+  wikiHref?(path: string): string;
   /** 見出しと出典の id の接頭辞 (1ページに複数の本文を出すときに id を重ねない) */
   idPrefix?: string;
 }
@@ -81,9 +83,10 @@ export function renderInline(text: string, context: RenderContext, citations: Se
       const { path, label } = wikiTarget(match[1]);
       const hit = path ? context.resolvePath(path) : null;
       const shown = label ?? hit?.name ?? path.split('/').at(-1) ?? path;
+      const href = context.wikiHref ?? wikiHref;
       out += hit
-        ? `<a class="wl" href="${esc(wikiHref(hit.path))}">${esc(shown)}</a>`
-        : `<a class="wl missing" href="${esc(wikiHref(path))}" title="まだページがありません">${esc(shown)}</a>`;
+        ? `<a class="wl" href="${esc(href(hit.path))}">${esc(shown)}</a>`
+        : `<a class="wl missing" href="${esc(href(path))}" title="まだページがありません">${esc(shown)}</a>`;
     } else if (match[2] !== undefined) {
       const id = Number(match[2]);
       const number = context.citeNumber(id);

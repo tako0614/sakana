@@ -159,7 +159,7 @@ assert.match(embedText(search.calls[1][1]), /統治機能を作った/);
 // 設定 (MEMORY_SITE_PUBLIC_URL と MEMORY_SITE_LINK_SECRET) が揃っていて、サイトが見せるサーバー (MEMORY_TREE_GUILD) でだけ出す
 const { verifyLinkToken } = await import('../worker/src/wiki/auth.ts');
 {
-  const keys = ['MEMORY_SITE_PUBLIC_URL', 'MEMORY_SITE_LINK_SECRET', 'GOVERNANCE_LAW_SITE_URL', 'MEMORY_TREE_GUILD', 'MEMORY_SITE_GUILD'];
+  const keys = ['MEMORY_SITE_PUBLIC_URL', 'MEMORY_SITE_LINK_SECRET', 'GOVERNANCE_LAW_SITE_URL', 'MEMORY_TREE_GUILD', 'MEMORY_SITE_GUILD', 'MEMORY_SITE_GUILDS'];
   const savedEnv = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   for (const key of keys) delete process.env[key];
   process.env.MEMORY_TREE_GUILD = GUILD;
@@ -198,25 +198,32 @@ const { verifyLinkToken } = await import('../worker/src/wiki/auth.ts');
   assert.match(homeReply.content, /1回だけ開けます/);
   const homeUrl = new URL(linkOf(homeReply));
   assert.equal(homeUrl.origin + homeUrl.pathname, 'https://wiki.example.test/auth/link');
-  assert.equal(homeUrl.searchParams.get('next'), '/wiki');
+  assert.equal(homeUrl.searchParams.get('next'), `/${GUILD}/wiki`);
   const claims = await verifyLinkToken(homeUrl.searchParams.get('t'), SECRET, GUILD, Date.now());
   assert.ok(claims, 'the Worker accepts what the bot made');
   assert.deepEqual([claims.uid, claims.name, claims.g], ['u1', 'tako', GUILD], 'it names the person who asked and this server');
   assert.equal(await verifyLinkToken(homeUrl.searchParams.get('t'), SECRET, '910000000000000999', Date.now()), null, 'and not another server');
   assert.notEqual(new URL(linkOf(await ask())).searchParams.get('t'), homeUrl.searchParams.get('t'), 'every link is different (one-time)');
 
-  // 別のサーバーでは、リンクを出さない (サイトが見せるのは MEMORY_TREE_GUILD のサーバーだけ)
-  assert.ok(refused(await ask({}, { guildId: '910000000000000999' })), 'another server gets no link to this server\'s site');
+  // サイトに載せていないサーバーでは、リンクを出さない。載せているが記憶の本がまだ無いサーバーも出さない
+  assert.ok(refused(await ask({}, { guildId: '910000000000000999' })), 'a server the site does not list gets no link');
   process.env.MEMORY_TREE_GUILD = '910000000000000999';
-  assert.ok(refused(await ask()), 'and this server gets none when the site shows a different one');
+  assert.ok(refused(await ask()), 'and this server gets none when the site lists only another one');
   process.env.MEMORY_TREE_GUILD = GUILD;
+  process.env.MEMORY_SITE_GUILDS = `${GUILD} 910000000000000999`;
+  const noBook = await ask({}, { guildId: '910000000000000999' });
+  assert.ok(refused(noBook) && /まだできていません/.test(noBook.content), 'a listed server without a book gets no link either');
+  assert.ok(linkOf(await ask()), 'the listed server with a book still gets one');
+  const listed = new URL(linkOf(await ask()));
+  assert.equal(listed.searchParams.get('next'), `/${GUILD}/wiki`, 'the link points into this server\'s own path');
+  delete process.env.MEMORY_SITE_GUILDS;
 
   const page = await ask({ path: '/people/たこ/' });
-  assert.equal(new URL(linkOf(page)).searchParams.get('next'), '/wiki/people/%E3%81%9F%E3%81%93', 'a page link encodes each part');
+  assert.equal(new URL(linkOf(page)).searchParams.get('next'), `/${GUILD}/wiki/people/%E3%81%9F%E3%81%93`, 'a page link encodes each part');
   assert.match(page.content, /people\/たこ — sakana の作者/);
   assert.ok(refused(await ask({ path: 'people/いない' })), 'an unknown page is refused');
   const byEpisode = await ask({ id: `E${episode}` });
-  assert.equal(new URL(linkOf(byEpisode)).searchParams.get('next'), `/e/${episode}`, 'an episode link');
+  assert.equal(new URL(linkOf(byEpisode)).searchParams.get('next'), `/${GUILD}/e/${episode}`, 'an episode link');
   assert.match(byEpisode.content, /統治機能を作った/);
   for (const bad of ['e99999', 'abc', '1; DROP']) assert.ok(refused(await ask({ id: bad })), `an unknown episode (${bad}) is refused`);
   const mentions = await ask({ path: '@everyone <@&1>' });
@@ -328,7 +335,7 @@ assert.deepEqual(siteButtons(episodeJson).map((b) => b.custom_id), [`memx:site:e
   const reply = pressed.replies[0];
   assert.equal(reply.flags, MessageFlags.Ephemeral, 'the link goes only to whoever pressed');
   const url = new URL(reply.components[0].toJSON().components[0].url);
-  assert.equal(url.searchParams.get('next'), '/wiki/people/%E3%81%9F%E3%81%93');
+  assert.equal(url.searchParams.get('next'), `/${GUILD}/wiki/people/%E3%81%9F%E3%81%93`);
   const claims = await verifyLinkToken(url.searchParams.get('t'), 'link-secret-0123456789abcdef', GUILD, Date.now());
   assert.equal(claims?.uid, 'u1');
   const gone = click({ customId: 'memx:site:n:999999', allowReply: true });

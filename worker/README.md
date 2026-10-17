@@ -79,13 +79,13 @@ bot側は `GOVERNANCE_LAW_API_URL`（このWorkerのorigin）、`GOVERNANCE_LAW_
 
 | path | 内容 |
 |---|---|
-| `/wiki` | トップ (分類・出来事の多さ・最近の出来事・よく話題になるページ) |
-| `/wiki/<path>` | 記事。本文の `[[リンク]]`、出典の `[数字]` (その出来事のページへ)、目次、子ページ、関連ページ。`?tab=timeline` で年表 (種類の絞り込み・古い順)、`?tab=links` でつながり |
-| `/e/<id>` | 出来事。種類・日付・チャンネル・決め台詞の引用・根拠の発言 (Discord へのリンクつき)・前後の出来事 |
-| `/t`, `/t/YYYY-MM` | 年表 (月ごとの多さが色で分かる) / その月の出来事を日ごとに |
-| `/s?q=` | 検索 (ページと出来事。3文字以上は文中も探し、短い語は名前と説明から) |
-| `/random` | ランダムなページ |
-| `/auth/link`, `/auth/logout` (`/auth/login`, `/auth/callback`) | bot のログインリンク / ログアウト (任意で Discord OAuth2) |
+| `/<サーバーID>/wiki` | トップ (分類・出来事の多さ・最近の出来事・よく話題になるページ) |
+| `/<サーバーID>/wiki/<path>` | 記事。本文の `[[リンク]]`、出典の `[数字]` (その出来事のページへ)、目次、子ページ、関連ページ。`?tab=timeline` で年表 (種類の絞り込み・古い順)、`?tab=links` でつながり |
+| `/<サーバーID>/e/<id>` | 出来事。種類・日付・チャンネル・決め台詞の引用・根拠の発言 (Discord へのリンクつき)・前後の出来事 |
+| `/<サーバーID>/t`, `/t/YYYY-MM` | 年表 (月ごとの多さが色で分かる) / その月の出来事を日ごとに |
+| `/<サーバーID>/s?q=` | 検索 (ページと出来事。3文字以上は文中も探し、短い語は名前と説明から) |
+| `/<サーバーID>/random` | ランダムなページ |
+| `/auth/link` (`/auth/login`, `/auth/callback`), `/<サーバーID>/auth/logout` | bot のログインリンク (サーバーはリンクの署名の中) / ログアウト (任意で Discord OAuth2) |
 | `/v1/memory/*` | bot からの取り込み (Bearer)。`hashes` / `batch` / `prune` / `finish` |
 
 画面は Worker が D1 から組み立てます (JavaScript なし。分類の木は `<details>`、スマホのメニューはチェックボックス)。
@@ -106,8 +106,13 @@ CSP は `default-src 'none'` です。型検査は `npx tsc -p tsconfig.json` (s
   (`/memory include` で足したチャンネル・名前に nsfw などを含むチャンネル・消された発言は送らない)。
   送らなかった発言は件数だけ出し、「見られるチャンネルが限られている発言 n 件は載せていません」と表示します。
 - ページの本文と要約は、メンバー全員が読める前提です (`/memory include` した内容も、本文には入ります)。
-- **1つのサーバーだけ**: サイトが見せるのは `MEMORY_GUILD_ID` のサーバーだけです (bot 側の `MEMORY_TREE_GUILD` と同じ)。
-  別のサーバーでは `/memory url` もボタンも出ません。
+- **サーバーごとに分ける**: URL は `/<サーバーID>/wiki/…`。見せるサーバーは `MEMORY_GUILD_IDS` (カンマ区切り) に書いたものだけで、
+  一覧に無い ID の URL は、そのサーバーがあるかも教えずに 404 です。データ (D1 の `guild_id`)・cookie (名前 `sk_session_<サーバーID>`・
+  送られるパス `/<サーバーID>`)・入場 (リンクの署名と cookie の中のサーバー)・取り込みのどれも、サーバーをまたいで混ざりません
+  (同じ ID・同じパスで別の内容を入れて確かめています: `scripts/check-wiki.mjs`)。サーバーの付かない旧い URL (`/wiki` など) は、
+  見せているサーバーが1つのときだけそこへ転送します。
+- **サーバーを足す**: `wrangler.jsonc` の `MEMORY_GUILD_IDS` に ID を足して配備し、bot の `.env` の `MEMORY_SITE_GUILDS` にも足します
+  (builder がそのサーバーの記憶を作り終えていること。記憶の無いサーバーは送りません)。
 
 ### 配備
 
@@ -120,7 +125,7 @@ openssl rand -base64 32 | tee /tmp/link-secret | npx wrangler secret put MEMORY_
 npm run deploy
 ```
 
-`wrangler.jsonc` の `vars` で `MEMORY_GUILD_ID` (見せるサーバー) と `MEMORY_ACCESS` を決めています。
+`wrangler.jsonc` の `vars` で `MEMORY_GUILD_IDS` (見せるサーバー) と `MEMORY_ACCESS` を決めています。
 書き込みの Bearer は法令集と同じ `GOVERNANCE_LAW_API_TOKEN` です。
 
 bot 側 (builder の後に差分だけ送り、入り口を出す):
@@ -140,11 +145,11 @@ tsx scripts/memory-site-sync.ts --dry-run          # 何件送るか (送らな�
 
 ```bash
 cd worker
-printf 'GOVERNANCE_LAW_API_TOKEN=dev-token\nMEMORY_ACCESS=public\n' > .dev.vars    # コミットしない
+printf 'GOVERNANCE_LAW_API_TOKEN=dev-token\nMEMORY_ACCESS=public\nMEMORY_GUILD_IDS=<id>\n' > .dev.vars    # コミットしない
 npm run migrate:local && npx wrangler dev --local --port 8799
 # 別の端末で: 実データの写しを作って (本番では --out)、手元へ送る
-MEMORY_SITE_URL=http://127.0.0.1:8799 MEMORY_SITE_TOKEN=dev-token MEMORY_TREE_GUILD=<id> tsx scripts/memory-site-sync.ts [--from snapshot.json]
-open http://127.0.0.1:8799/wiki
+MEMORY_SITE_URL=http://127.0.0.1:8799 MEMORY_SITE_TOKEN=dev-token MEMORY_SITE_GUILDS=<id> tsx scripts/memory-site-sync.ts [--from snapshot.json]
+open http://127.0.0.1:8799/<サーバーID>/wiki
 ```
 
 検査は `tsx scripts/check-wiki.mjs` (escape・取り込み・検索・ログイン・gate・全画面) と

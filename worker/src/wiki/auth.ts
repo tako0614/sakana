@@ -1,3 +1,4 @@
+import { GUILD_ID } from './links.ts';
 import type { Env, Session } from './types.ts';
 
 // 記憶の本を読めるのは、このサーバーのメンバーだけにする。入り方は2つ:
@@ -7,8 +8,9 @@ import type { Env, Session } from './types.ts';
 //   2. Discord OAuth2 (identify + guilds): 設定してあれば「Discord でログイン」ボタンも出す。
 // どちらも署名つきの session cookie を渡す。OAuth のアクセストークンはその場で使い捨てて保存しない。
 
-const SESSION_COOKIE = 'sk_session';
 const STATE_COOKIE = 'sk_state';
+// cookie はサーバーごと (名前も、送られるパスも分ける): あるサーバーの入場が別のサーバーのページに効かないように
+const sessionCookieName = (guild: string): string => `sk_session_${guild}`;
 const SESSION_SECONDS = 7 * 24 * 3600;
 const DISCORD_API = 'https://discord.com/api/v10';
 const encoder = new TextEncoder();
@@ -54,8 +56,8 @@ export async function signSession(session: Session, secret: string): Promise<str
 
 function isSession(value: unknown): value is Session {
   if (typeof value !== 'object' || value === null) return false;
-  const { uid, name, avatar, exp } = value as Record<string, unknown>;
-  return typeof uid === 'string' && typeof name === 'string' && (avatar === null || typeof avatar === 'string') && typeof exp === 'number';
+  const { g, uid, name, avatar, exp } = value as Record<string, unknown>;
+  return typeof g === 'string' && typeof uid === 'string' && typeof name === 'string' && (avatar === null || typeof avatar === 'string') && typeof exp === 'number';
 }
 
 /** 署名と期限を確かめる。壊れていれば null。署名の比較は subtle.verify (定数時間)。 */
@@ -92,11 +94,15 @@ function setCookie(url: URL, name: string, value: string, options: { maxAge: num
 
 // ---- 設定 -------------------------------------------------------------------
 
-export const memoryGuild = (env: Env): string => (env.MEMORY_GUILD_ID ?? env.DEFAULT_GUILD_ID ?? '').trim();
+/** 記憶の本を見せるサーバー。URL の /<サーバーID> がこの一覧にあるものだけ開く (無ければ 404)。 */
+export function memoryGuilds(env: Env): string[] {
+  const raw = `${env.MEMORY_GUILD_IDS ?? ''} ${env.MEMORY_GUILD_ID ?? ''} ${env.DEFAULT_GUILD_ID ?? ''}`;
+  return [...new Set(raw.split(/[\s,]+/).filter((id) => GUILD_ID.test(id)))];
+}
 export const isPublicAccess = (env: Env): boolean => env.MEMORY_ACCESS === 'public';
 
 /** cookie を発行・確認できる (どの入り方にも必要) */
-export const sessionConfigured = (env: Env): boolean => Boolean(env.SESSION_SECRET && memoryGuild(env));
+export const sessionConfigured = (env: Env): boolean => Boolean(env.SESSION_SECRET) && memoryGuilds(env).length > 0;
 
 /** Discord OAuth でログインできる */
 export function authConfigured(env: Env): boolean {
@@ -109,27 +115,29 @@ export const linkConfigured = (env: Env): boolean => Boolean(env.MEMORY_LINK_SEC
 /** 入る手段が1つでもある (無ければ wiki は閉じたまま) */
 export const loginAvailable = (env: Env): boolean => authConfigured(env) || linkConfigured(env);
 
-/** ログイン後に戻る先。同じサイトの中の絶対パスだけ (//evil.example や \ を弾く)。 */
-export function safeNext(next: string | null | undefined): string {
+/** ログイン後に戻る先。そのサーバーの中の絶対パスだけ (//evil.example・\・別のサーバーのパスを弾く)。 */
+export function safeNext(next: string | null | undefined, guild: string): string {
   const value = next ?? '';
-  return /^\/(?![/\\])[^\u0000-\u001f\\]*$/.test(value) && value.length <= 300 ? value : '/wiki';
+  const inside = value.startsWith(`/${guild}/`) || value === `/${guild}`;
+  return inside && /^\/(?![/\\])[^\u0000-\u001f\\]*$/.test(value) && value.length <= 300 ? value : `/${guild}/wiki`;
 }
 
 /** Location ヘッダーは ASCII だけ。日本語や空白は %XX にする (すでにある %XX はそのまま)。 */
 export const asciiLocation = (path: string): string => path.replace(/[^\u0021-\u007e]/gu, (character) => encodeURIComponent(character));
 
-export async function currentSession(request: Request, env: Env, now = Date.now()): Promise<Session | null> {
+export async function currentSession(request: Request, env: Env, guild: string, now = Date.now()): Promise<Session | null> {
   if (!env.SESSION_SECRET) return null;
-  const token = readCookie(request, SESSION_COOKIE);
-  return token ? verifySession(token, env.SESSION_SECRET, now) : null;
+  const token = readCookie(request, sessionCookieName(guild));
+  const session = token ? await verifySession(token, env.SESSION_SECRET, now) : null;
+  return session?.g === guild ? session : null;   // cookie の名前とパスで分けた上で、中身のサーバーも確かめる
 }
 
 // ---- OAuth ------------------------------------------------------------------
 
-export function loginRedirect(request: Request, env: Env, deps: AuthDeps = defaultAuthDeps): Response {
+export function loginRedirect(request: Request, env: Env, guild: string, deps: AuthDeps = defaultAuthDeps): Response {
   const url = new URL(request.url);
   const state = toBase64Url(deps.random(16));
-  const next = safeNext(url.searchParams.get('next'));
+  const next = safeNext(url.searchParams.get('next'), guild);
   const authorize = new URL('https://discord.com/oauth2/authorize');
   authorize.search = new URLSearchParams({
     client_id: env.DISCORD_CLIENT_ID ?? '',
@@ -143,7 +151,7 @@ export function loginRedirect(request: Request, env: Env, deps: AuthDeps = defau
     status: 302,
     headers: {
       location: authorize.toString(),
-      'set-cookie': setCookie(url, STATE_COOKIE, `${state}:${encodeURIComponent(next)}`, { maxAge: 600, path: '/auth' }),
+      'set-cookie': setCookie(url, STATE_COOKIE, `${state}:${guild}:${encodeURIComponent(next)}`, { maxAge: 600, path: '/auth' }),
       'cache-control': 'no-store'
     }
   });
@@ -170,12 +178,12 @@ export async function finishLogin(request: Request, env: Env, deps: AuthDeps = d
   const code = url.searchParams.get('code');
   const state = url.searchParams.get('state');
   const saved = readCookie(request, STATE_COOKIE);
-  const [savedState = '', savedNext = ''] = (saved ?? '').split(':');
+  const [savedState = '', savedGuild = '', savedNext = ''] = (saved ?? '').split(':');
   if (url.searchParams.get('error')) return { ok: false, reason: 'ログインがキャンセルされました。', status: 400 };
   if (!code || !state || !saved || state !== savedState) {
     return { ok: false, reason: 'ログインの確認に失敗しました (期限切れか、別のタブで始めた可能性があります)。もう一度お試しください。', status: 400 };
   }
-  if (!authConfigured(env)) return { ok: false, reason: 'ログインの設定が済んでいません。', status: 503 };
+  if (!authConfigured(env) || !memoryGuilds(env).includes(savedGuild)) return { ok: false, reason: 'ログインの設定が済んでいません。', status: 503 };
 
   let accessToken: string | null;
   try {
@@ -215,18 +223,19 @@ export async function finishLogin(request: Request, env: Env, deps: AuthDeps = d
 
   const uid = stringField(user, 'id');
   if (!uid || !Array.isArray(guilds)) return { ok: false, reason: 'Discord から正しい応答が返りませんでした。', status: 502 };
-  const member = guilds.some((entry) => stringField(entry, 'id') === memoryGuild(env));
+  const member = guilds.some((entry) => stringField(entry, 'id') === savedGuild);
   if (!member) return { ok: false, reason: 'このサーバーのメンバーではないようです。サーバーに参加してからもう一度お試しください。', status: 403 };
 
   const session: Session = {
+    g: savedGuild,
     uid,
     name: (stringField(user, 'global_name') ?? stringField(user, 'username') ?? uid).slice(0, 40),
     avatar: stringField(user, 'avatar'),
     exp: Math.floor(deps.now() / 1000) + SESSION_SECONDS
   };
   const token = await signSession(session, env.SESSION_SECRET ?? '');
-  const headersOut = new Headers({ location: asciiLocation(safeNext(decodeURIComponentSafe(savedNext))), 'cache-control': 'no-store' });
-  headersOut.append('set-cookie', setCookie(url, SESSION_COOKIE, token, { maxAge: SESSION_SECONDS, path: '/' }));
+  const headersOut = new Headers({ location: asciiLocation(safeNext(decodeURIComponentSafe(savedNext), savedGuild)), 'cache-control': 'no-store' });
+  headersOut.append('set-cookie', setCookie(url, sessionCookieName(savedGuild), token, { maxAge: SESSION_SECONDS, path: `/${savedGuild}` }));
   headersOut.append('set-cookie', setCookie(url, STATE_COOKIE, '', { maxAge: 0, path: '/auth' }));
   return { ok: true, response: new Response(null, { status: 302, headers: headersOut }) };
 }
@@ -262,7 +271,7 @@ function isLinkClaims(value: unknown): value is LinkClaims {
 }
 
 /** 署名・サーバー・期限を確かめる。1回限りの確認 (jti) は finishLink で行う。 */
-export async function verifyLinkToken(token: string, secret: string, guild: string, now: number): Promise<LinkClaims | null> {
+export async function verifyLinkToken(token: string, secret: string, guilds: string | readonly string[], now: number): Promise<LinkClaims | null> {
   const [payload, signature] = token.split('.');
   if (!payload || !signature) return null;
   const signatureBytes = fromBase64Url(signature);
@@ -273,8 +282,8 @@ export async function verifyLinkToken(token: string, secret: string, guild: stri
   if (!bytes) return null;
   try {
     const claims: unknown = JSON.parse(new TextDecoder().decode(bytes));
-    // 発行から 10 分以内・このサーバー宛て・未来すぎる発行時刻 (時計のずれ以上) は受け取らない
-    return isLinkClaims(claims) && claims.g === guild && claims.exp * 1000 > now && claims.iat * 1000 <= now + 60_000 && claims.exp - claims.iat <= 900 ? claims : null;
+    // 発行から 10 分以内・見せているサーバー宛て・未来すぎる発行時刻 (時計のずれ以上) は受け取らない
+    return isLinkClaims(claims) && (typeof guilds === 'string' ? [guilds] : guilds).includes(claims.g) && claims.exp * 1000 > now && claims.iat * 1000 <= now + 60_000 && claims.exp - claims.iat <= 900 ? claims : null;
   } catch {
     return null;
   }
@@ -284,7 +293,7 @@ export async function verifyLinkToken(token: string, secret: string, guild: stri
 export async function finishLink(request: Request, env: Env, now = Date.now()): Promise<{ ok: true; response: Response } | { ok: false; reason: string; status: number }> {
   if (!linkConfigured(env)) return { ok: false, reason: 'このサイトではログインリンクが設定されていません。', status: 503 };
   const url = new URL(request.url);
-  const claims = await verifyLinkToken(url.searchParams.get('t') ?? '', env.MEMORY_LINK_SECRET ?? '', memoryGuild(env), now);
+  const claims = await verifyLinkToken(url.searchParams.get('t') ?? '', env.MEMORY_LINK_SECRET ?? '', memoryGuilds(env), now);
   if (!claims) return { ok: false, reason: 'このリンクは使えません (期限切れか、別のサーバーのものです)。Discord でもう一度 /memory url を使ってください。', status: 400 };
   // 1回限り: 使った jti を D1 に残し、同じリンクの2回目は断る。古い記録 (期限の2倍を過ぎたもの) はここで掃除する
   const [, inserted] = await env.LAWS.batch([
@@ -294,16 +303,16 @@ export async function finishLink(request: Request, env: Env, now = Date.now()): 
   if (!inserted || (inserted.meta?.changes ?? 0) !== 1) {
     return { ok: false, reason: 'このリンクはもう使われています。Discord でもう一度 /memory url を使ってください。', status: 400 };
   }
-  const session: Session = { uid: claims.uid, name: claims.name.slice(0, 40), avatar: claims.avatar, exp: Math.floor(now / 1000) + SESSION_SECONDS };
-  const headers = new Headers({ location: asciiLocation(safeNext(url.searchParams.get('next'))), 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' });
-  headers.append('set-cookie', setCookie(url, SESSION_COOKIE, await signSession(session, env.SESSION_SECRET ?? ''), { maxAge: SESSION_SECONDS, path: '/' }));
+  const session: Session = { g: claims.g, uid: claims.uid, name: claims.name.slice(0, 40), avatar: claims.avatar, exp: Math.floor(now / 1000) + SESSION_SECONDS };
+  const headers = new Headers({ location: asciiLocation(safeNext(url.searchParams.get('next'), claims.g)), 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' });
+  headers.append('set-cookie', setCookie(url, sessionCookieName(claims.g), await signSession(session, env.SESSION_SECRET ?? ''), { maxAge: SESSION_SECONDS, path: `/${claims.g}` }));
   return { ok: true, response: new Response(null, { status: 302, headers }) };
 }
 
-export function logoutResponse(request: Request): Response {
+export function logoutResponse(request: Request, guild: string): Response {
   const url = new URL(request.url);
   return new Response(null, {
     status: 302,
-    headers: { location: '/wiki', 'set-cookie': setCookie(url, SESSION_COOKIE, '', { maxAge: 0, path: '/' }), 'cache-control': 'no-store' }
+    headers: { location: `/${guild}/wiki`, 'set-cookie': setCookie(url, sessionCookieName(guild), '', { maxAge: 0, path: `/${guild}` }), 'cache-control': 'no-store' }
   });
 }

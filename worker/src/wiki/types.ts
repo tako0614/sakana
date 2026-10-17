@@ -4,7 +4,9 @@ export interface Env {
   LAWS: D1Database;
   GOVERNANCE_LAW_API_TOKEN?: string;
   DEFAULT_GUILD_ID?: string;
-  /** wiki を見せるサーバー。ログインでもこのサーバーのメンバーかを確かめる */
+  /** wiki を見せるサーバー (カンマ・空白区切り)。URL の /<サーバーID> がこの一覧に無ければ 404。サーバーごとにメンバーかを確かめる */
+  MEMORY_GUILD_IDS?: string;
+  /** 旧: 1つだけ見せるとき (MEMORY_GUILD_IDS に足して扱う) */
   MEMORY_GUILD_ID?: string;
   /** 'members' (既定: Discord ログインとサーバーのメンバー確認が要る) | 'public' (誰でも) */
   MEMORY_ACCESS?: string;
@@ -115,6 +117,8 @@ export interface EpisodePayload {
 }
 
 export interface Session {
+  /** どのサーバーの入場か。cookie はサーバーごとだが、確かめ直す */
+  g: string;
   uid: string;
   name: string;
   avatar: string | null;

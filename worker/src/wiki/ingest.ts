@@ -1,3 +1,5 @@
+import { memoryGuilds } from './auth.ts';
+import { GUILD_ID } from './links.ts';
 import type { EpisodePayload, Env, NodePayload } from './types.ts';
 
 // bot (builder の後に動く memory-site-sync) から記憶の本を受け取る口。
@@ -212,9 +214,11 @@ async function readJson(request: Request): Promise<Rec> {
   }
 }
 
-function guildOf(value: unknown): string {
+/** 送ってよいのは、サイトが見せているサーバー (MEMORY_GUILD_IDS) だけ。 */
+function guildOf(value: unknown, env: Env): string {
   const guild = str(value, 'guildId', 32);
-  if (!/^\d+$/.test(guild)) throw new BadRequest('guildId が不正です');
+  if (!GUILD_ID.test(guild)) throw new BadRequest('guildId が不正です');
+  if (!memoryGuilds(env).includes(guild)) throw new BadRequest('このサーバーはサイトに載せていません');
   return guild;
 }
 
@@ -223,7 +227,7 @@ export async function handleIngest(request: Request, env: Env, now = Date.now())
   const url = new URL(request.url);
   try {
     if (request.method === 'GET' && url.pathname === '/v1/memory/hashes') {
-      const guild = guildOf(url.searchParams.get('guild'));
+      const guild = guildOf(url.searchParams.get('guild'), env);
       const [nodes, episodes] = await Promise.all([
         env.LAWS.prepare('SELECT id, content_hash AS hash FROM memory_nodes WHERE guild_id = ?1').bind(guild).all<{ id: number; hash: string }>(),
         env.LAWS.prepare('SELECT id, content_hash AS hash FROM memory_episodes WHERE guild_id = ?1').bind(guild).all<{ id: number; hash: string }>()
@@ -233,7 +237,7 @@ export async function handleIngest(request: Request, env: Env, now = Date.now())
     }
     if (request.method !== 'POST') return json({ error: 'method not allowed' }, 405);
     const body = await readJson(request);
-    const guild = guildOf(body.guildId);
+    const guild = guildOf(body.guildId, env);
     if (url.pathname === '/v1/memory/batch') {
       const nodes = array(body.nodes ?? [], 'nodes', MAX_ITEMS).map(parseNode);
       const episodes = array(body.episodes ?? [], 'episodes', MAX_ITEMS).map(parseEpisode);

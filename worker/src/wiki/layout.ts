@@ -1,4 +1,5 @@
 import { SafeHtml, html, raw } from './html.ts';
+import type { Links } from './links.ts';
 import type { Session } from './types.ts';
 
 // 記憶の本の枠 (ヘッダー・左の木・右の欄・フッター) と CSS。画面ごとの中身は views.ts。
@@ -34,14 +35,14 @@ export interface LayoutOptions {
   rail?: SafeHtml;
   user?: Session | null;
   query?: string;
-  /** 法令集へのリンク先 (guild つき) */
-  lawsHref?: string;
+  /** このサーバーの URL (ヘッダーのリンクと検索の送り先)。サーバーが決まらない画面 (ログイン前の案内など) では無い */
+  links?: Links;
   /** ログインなどのように左右の欄が要らない画面 */
   narrow?: boolean;
 }
 
 export function layout(options: LayoutOptions): SafeHtml {
-  const { title, main, nav, rail, user, query = '', narrow = false } = options;
+  const { title, main, nav, rail, user, query = '', narrow = false, links } = options;
   const avatar = user?.avatar ? `https://cdn.discordapp.com/avatars/${user.uid}/${user.avatar}.png?size=64` : null;
   return html`<!doctype html>
 <html lang="ja">
@@ -58,15 +59,15 @@ ${options.description ? html`<meta name="description" content="${options.descrip
 <header class="top">
   <div class="top-in">
     ${nav ? html`<label class="burger" for="navtoggle" title="分類を開く">☰<span class="sr">分類</span></label>` : ''}
-    <a class="brand" href="/wiki"><span class="logo">📖</span><span>記憶の本</span></a>
-    <nav class="topnav" aria-label="サイト">
-      <a href="/wiki">ページ</a><a href="/t">年表</a><a href="/random">ランダム</a>${options.lawsHref ? html`<a href="${options.lawsHref}">法令集</a>` : ''}
+    <a class="brand" href="${links?.home ?? '/'}"><span class="logo">📖</span><span>記憶の本</span></a>
+    ${links ? html`<nav class="topnav" aria-label="サイト">
+      <a href="${links.home}">ページ</a><a href="${links.timeline}">年表</a><a href="${links.random}">ランダム</a><a href="${links.laws}">法令集</a>
     </nav>
-    <form class="search" action="/s" method="get" role="search">
+    <form class="search" action="${links.search}" method="get" role="search">
       <input type="search" name="q" value="${query}" placeholder="人・もの・ネタ・出来事を探す" aria-label="検索" autocomplete="off" maxlength="100">
       <button type="submit">検索</button>
-    </form>
-    ${user ? html`<div class="user">${avatar ? html`<img src="${avatar}" alt="" width="24" height="24">` : ''}<span class="uname">${user.name}</span><a href="/auth/logout">ログアウト</a></div>` : ''}
+    </form>` : ''}
+    ${user && links ? html`<div class="user">${avatar ? html`<img src="${avatar}" alt="" width="24" height="24">` : ''}<span class="uname">${user.name}</span><a href="${links.logout}">ログアウト</a></div>` : ''}
   </div>
 </header>
 ${nav ? html`<input type="checkbox" id="navtoggle" class="navtoggle" aria-hidden="true">` : ''}
