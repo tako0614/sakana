@@ -260,7 +260,7 @@ try {
   if (DEFAULT_ENGINE !== 'glm') fail('既定のエンジンは glm');
   // deepseek は廃止。選んでいた人は既定へ読み替える (黙って別物に落ちない)
   db.prepare('INSERT OR REPLACE INTO agent_engine (guild_id, user_id, engine, updated_at) VALUES (?, ?, ?, ?)').run(TEST_GUILD, USER, 'deepseek', Date.now());
-  if (engineFor(USER, TEST_GUILD) !== 'ling') fail('deepseek を選んでいた人は ling に読み替える');
+  if (engineFor(USER, TEST_GUILD) !== DEFAULT_ENGINE) fail('deepseek を選んでいた人は既定のエージェントに読み替える');
   clear();
   for (const key of ['ling', 'glm', 'qwen']) {
     if (!ENGINES[key] || !isAgentEngine(key)) fail(`${key} を会話 agent として選べない`);
