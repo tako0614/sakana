@@ -175,7 +175,7 @@ if (!/search/.test(first)) {
 
 console.log('web search ok (閲覧のみでも search / プロンプトに使う場面)');
 
-// --- 話しかけてきた人 ---
+// --- 依頼者 ---
 //
 // 見出し行の末尾に埋めていたら、直前の会話の話題の人と混同されて
 // 第三者の話を二人称で書かれた。独立した行であることを固定する。
@@ -203,11 +203,12 @@ const userContentOf = (over = {}) => buildUserContent({
 
 {
   const content = userContentOf();
-  const caller = content.split('\n').find((line) => line.includes('話しかけてきた'));
-  if (!caller) fail('話しかけてきた人の行が無い');
+  const caller = content.split('\n').find((line) => line.includes('依頼者:'));
+  if (!caller) fail('依頼者の行が無い');
   if (caller.includes('サーバー:') || caller.includes('チャンネル:')) {
-    fail(`話しかけてきた人が見出し行に埋まっている: ${caller}`);
+    fail(`依頼者が見出し行に埋まっている: ${caller}`);
   }
+  if (content.includes('話しかけてき')) fail('「話しかけてきた」をモデルが口にする (経緯の前置きになる)');
   if (!caller.includes('さば') || !caller.includes('999888777666555444')) {
     fail(`表示名と ID の両方が要る (ID が無いと author に渡せない): ${caller}`);
   }

@@ -25,6 +25,7 @@ import { isBareAck } from './ack.js';
 import { governance, type GovernanceReservation } from './boundary.js';
 import { closeBrowserSandbox } from './browser.js';
 import { failureNotice } from './failure.js';
+import { stripAddressNarration } from './narration.js';
 import { agentConfig, agentEnabled } from './config.js';
 import {
   RefTable,
@@ -526,7 +527,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
     // 文字列でなければ回答として使わない
     const text = typeof result.text === 'string' ? result.text.trim() : '';
     const answer = text
-      ? expandCitations(text, refs, { label: modelLabel(model), selfId: client.user.id })
+      ? expandCitations(stripAddressNarration(text, member.displayName), refs, { label: modelLabel(model), selfId: client.user.id })
       : 'うまく答えをまとめられませんでした。条件を絞ってもう一度聞いてください。';
 
     // 撮ったのに貼れないときは黙らない (画像が出ている前提で読まれる)
