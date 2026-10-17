@@ -3,7 +3,7 @@ import { lawSiteLink } from '../governance/lawsite.js';
 import { governance as records, type AdministrativeAct, type CaseRecord, type Proposal } from './boundary.js';
 import type { AgentContext, ToolArgs, ToolDefinition } from './types.js';
 
-type GovernanceContext = Pick<AgentContext, 'guild' | 'member'>;
+type GovernanceContext = Pick<AgentContext, 'guild' | 'member' | 'viewer'>;
 
 /** 正本の記録に共通する部分。id とサーバーで引き当てる。 */
 interface GuildRecord {
@@ -74,7 +74,7 @@ function lawDescription(entry: CaseRecord): string | null {
 
 function requireVisible(ctx: GovernanceContext, channelId: string, label: string): void {
   const channel = ctx.guild.channels?.cache?.get?.(channelId);
-  if (!channel?.permissionsFor?.(ctx.member)?.has(PermissionFlagsBits.ViewChannel)) {
+  if (!channel?.permissionsFor?.(ctx.viewer ?? ctx.member)?.has(PermissionFlagsBits.ViewChannel)) {
     throw new Error(`${label}は呼び出した人に閲覧権限がないため読めません。`);
   }
 }

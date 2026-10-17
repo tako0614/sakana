@@ -1,0 +1,106 @@
+# vex: 会話に入るかどうかを判定モデルで決める
+
+bot が「vex」と呼ばれたら答える (名前呼び)、呼ばれていない会話でも役に立つときだけ自分から入る (自発参加)。
+どちらも環境変数で、既定はオフ。`.env.example` の「vex」の節にある。
+
+## 動き
+
+```
+人の発言 ─ メンション/返信/名前呼び ─────────────→ agent (これまでどおり)
+        └ それ以外 → チャンネルごとのタイマーを張り直す
+                     │ VEX_QUIET_MS (90 秒) 静かだった
+                     ▼
+       門 (許可チャンネル・話せる・冷却・1時間の上限・判定費用の1日の上限)
+                     ▼
+       判定モデル → 「入る」の確率 p ≥ VEX_THRESHOLD (0.6)
+                     ▼
+       もう一度、最後の発言が自分の見ていたものか確かめる
+                     ▼
+       agent が「呼ばれていない。役に立つ一言だけ」の前置きで走る
+                     ▼
+       返す価値が無ければ (skip) → 送らない / 送る直前にも会話が進んでいないか確かめる
+```
+
+- 名前呼び (`VEX_CALL`): 発言に `vex` が英字の単語として含まれれば、メンションと同じ扱い。`evex`・`vexx`・`vex2`、
+  コード・URL・引用行・メンションの中は呼びではない。相槌でも答える (呼ばれているので)。
+- 自発参加 (`VEX_AMBIENT` + `VEX_CHANNELS`): 判定に回さない発言 = bot / webhook・6 文字未満・相槌だけ・返信 (特定の相手との会話)・
+  他の人へのメンション・NSFW チャンネル。bot (自分を含む) の発言が来たらタイマーは捨てる (自分の発言で輪を作らない)。
+- 自発参加の agent は、最後に発言した人の `/model` や上限を使わない (既定のエンジン、専用の利用者 ID `vex-ambient` で数える)。
+  経過表示は出さず、上限・失敗・(skip) は黙って終える。返信の ping は付けない。
+- 判定が全部失敗したら入らない (名前呼びは判定を使わないので影響しない)。モデルは並べておき、429/5xx/時間切れで次へ回す。
+  一度失敗したモデルは 60 秒飛ばす。
+- 台帳 `vex_decisions` (メイン DB): 判定ごとに時刻・チャンネル・発言・モデル・p・費用・遅さ・どうしたか。
+  `action`: joined (入ると決めた。冷却と上限はこれを数える) / below (閾値未満) / skipped (門で止めた。note に cooldown・hourly_cap・daily_budget・cannot_speak) /
+  error / moved_on (会話が進んだ。note に before_decision・after_decision・before_send) / sent / passed ((skip))。
+
+```sql
+-- 閾値を決め直すための材料: p の分布と、入った結果
+SELECT ROUND(p, 1) AS p, action, COUNT(*) FROM vex_decisions WHERE p IS NOT NULL GROUP BY 1, 2 ORDER BY 1;
+```
+
+## 判定モデル (Decisions API)
+
+文章を作らず、`state` (会話) と型つきの質問を渡すと、はい/いいえの確率を 1 回で返す。
+OpenRouter の `POST /api/alpha/decisions`:
+
+```json
+{ "model": "perplexity/pplx-decider-flash-v1.2",
+  "state": { "conversation": "alice: ...\nbob: ..." },
+  "questions": { "join": { "type": "noul", "instructions": "...", "criteria": { "true": "...", "false": "..." } } } }
+```
+
+返りは `answers.join.noul` (「はい」の確率) と `usage` (`input_tokens`・`cost`)。出力トークンは無料。質問の基準は `instructions` ではなく
+`criteria` (はい/いいえの説明) に書く形がいちばん良かった (`src/vex/questions.ts`)。
+
+| モデル | 入力 100 万トークン | 手書き 30 件の AUC |
+|---|---|---|
+| perplexity/pplx-decider-flash-v1.2 (既定) | $0.01 | 1.0 |
+| typesafe/jev-1.14 | $0.042 | 1.0 |
+| inception/mercury-decide:free | $0 | 約 0.97 |
+| respan/span-02 | $0.01 | 約 0.97 |
+| liquid/d1 | $0.02 | 約 0.97 |
+
+`solar-decide-flash` は 0.45 で除外。往復 0.4〜0.6 秒、429 はときどき出る。
+
+### 費用
+
+1 回 (6 件の会話、約 300 トークン) で約 $0.000003。実測では 45 チャンネル・1日 576 発言を全部判定しても月 $0.4 前後
+(文脈 20 件で約 $0.6、100 件で約 $1.6)。400 場面の評価は $0.0012。VEX_DAILY_USD (既定 $0.05/日) で止まる。
+入って答える agent のぶんは別 (`user_daily_usd` の枠に `vex-ambient` として数える)。
+
+### 精度 (実際の会話)
+
+公開チャンネルの 400 場面 (直接呼ばれた / 暗黙に質問があった / 静かだった / 普通に続いた) を弱ラベルにして、
+pplx-decider-flash-v1.2、state は直近 6 件:
+
+- AUC 0.843。暗黙の「入る」と「会話が続いた」だけで見ると 0.894
+- 呼ばれた場面を除いた自発参加の場面だけだと AUC 0.769。閾値ごとの割合 (その場面のうち入る率 / 適合率 / 再現率):
+
+| 閾値 | 入る率 | 適合率 | 再現率 |
+|---|---|---|---|
+| 0.4 | 29% | 0.58 | 0.51 |
+| 0.5 | 11% | 0.67 | - |
+| 0.6 | 5% | 0.81 | 0.13 |
+| 0.7 | 1.75% (7 件) | 1.0 | - |
+
+弱ラベルには雑音が多い (最後の発言が `@vex ...` なのに「会話が続いた」など) ので、実際の精度はこれより良い方向にぶれる。
+閾値 0.6 は「ほとんど外さないが、控えめ」。本番では台帳を見て調整する。
+
+ローカルの d1-3B Q4_K_M (CPU) は AUC 0.73〜0.75 で、暗黙と会話の区別がほぼつかなかった。CPU は 1 リクエスト 1〜3.4 秒。使わない。
+
+## 評価用スクリプト (`scripts/vex/`)
+
+データは開発機の中だけ (リポジトリに入れない)。
+
+- `export-situations.mjs`: 本番のアーカイブから、全員に見える公開チャンネルの場面を読み取りで書き出す
+- `sanity.mjs`: 手書きの日本語 30 件
+- `jev-api.mjs`: Decisions API で評価する。実際の発言を第三者に送るので、手書き以外は `--yes-send-real-messages 1` が要る
+- `eval.mjs` / `latency.mjs`: ローカルの llama-server (`/v1/systemone`) 用
+- `questions.mjs`: 評価に使った state と質問。`src/vex/questions.ts` と同じ形か `scripts/check-vex.mjs` が照合する
+
+## 本番に入れる手順
+
+1. `VEX_CALL=1` だけ入れる (判定モデルは使わない。費用は通常の agent と同じ)。
+2. 自発参加は、テストチャンネル 1 つだけ `VEX_CHANNELS` に入れて `VEX_AMBIENT=1`。1 日 `vex_decisions` と実際の発言を読み、
+   誤って入った率・入らなかった率を見てから広げる。
+3. 止めるときは `VEX_AMBIENT=0` (再起動)。

@@ -3,7 +3,7 @@
 // 実行時の値は持たない (import type だけで読む)。外 (Discord / モデル / DB) から来る値は
 // ここの型を名乗る前に必ず確かめる。確かめる関数もここに置く。
 
-import type { Client, Guild, GuildMember, GuildTextBasedChannel } from 'discord.js';
+import type { Client, Guild, GuildMember, GuildTextBasedChannel, Role } from 'discord.js';
 import type { ChannelScope } from '../archive/types.js';
 import type { MessageStructure } from '../conversation/message.js';
 import type { RefTable } from './format.js';
@@ -78,6 +78,11 @@ export interface AgentContext {
   guild: Guild;
   channel: GuildTextBasedChannel;
   member: GuildMember;
+  /**
+   * チャンネルを読める権限の主体。省略なら member (依頼した人の目で見る)。
+   * 自発参加は誰かの依頼ではないので @everyone にして、全員に見えるものだけを読む。
+   */
+  viewer?: GuildMember | Role;
   me: GuildMember;
   refs: RefTable;
   screenshots: Buffer[];

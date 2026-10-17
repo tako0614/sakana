@@ -63,7 +63,23 @@ export interface IndicatorChannel {
   send(options: MessageCreateOptions): Promise<Message>;
 }
 
-export class ThinkingIndicator {
+/** 経過表示として agent が使う口。 */
+export interface Indicator {
+  readonly messageId: string | null;
+  start(): Promise<void>;
+  setStatus(status: string): void;
+  stop(): Promise<void>;
+}
+
+/** 何も出さない経過表示。自発参加は、入るかどうかも分からないうちに「考え中」を見せない。 */
+export class SilentIndicator implements Indicator {
+  readonly messageId = null;
+  async start(): Promise<void> {}
+  setStatus(): void {}
+  async stop(): Promise<void> {}
+}
+
+export class ThinkingIndicator implements Indicator {
   channel: IndicatorChannel;
   startedAt: number;
   message: Message | null;

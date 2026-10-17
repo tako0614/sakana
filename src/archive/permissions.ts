@@ -97,12 +97,23 @@ interface ChannelScopeRow {
  * 見えないチャンネルの中身が検索から漏れないようにするための要。
  */
 export function getChannelScope(guild: Guild, member: GuildMember): ChannelScope {
+  return scopeFor(guild, member, canManageIndex(member));
+}
+
+/**
+ * 全員 (@everyone) に見えるチャンネルだけのスコープ。
+ * 誰の依頼でもない場面 (自発参加) では、最後に発言した人の権限で読ませない。
+ */
+export function getPublicChannelScope(guild: Guild): ChannelScope {
+  return scopeFor(guild, guild.roles.everyone, false);
+}
+
+function scopeFor(guild: Guild, member: GuildMember | Role, includeDeleted: boolean): ChannelScope {
   const allowed = new Set<string>();
   const allowedParents = new Set<string>();
   // 消えたチャンネルは誰の権限でも判定できないので既定では落とす。
   // ただし管理者には見せられるようにする (長く運用したサーバーだと、
   // 整理で消したチャンネルに古い発言がまとまって入っていることがある)。
-  const includeDeleted = canManageIndex(member);
 
   for (const channel of guild.channels.cache.values()) {
     if (!MESSAGE_CHANNEL_TYPES.has(channel.type) && !THREAD_CONTAINER_TYPES.has(channel.type)) {

@@ -31,6 +31,8 @@ import {
   syncLiveReactions
 } from './archive/indexer.js';
 import { handleAgentRequest, isAgentRequest } from './agent/index.js';
+import { canBotSpeak } from './archive/permissions.js';
+import { AmbientJudge, type VexMessage } from './vex/ambient.js';
 import { agentEnabled } from './agent/config.js';
 import { sweepStaleIndicators } from './agent/indicators.js';
 import { pruneCalls } from './agent/ratelimit.js';
@@ -289,6 +291,19 @@ async function handleGuildMemberAdd(member: GuildMember): Promise<void> {
 
 const textCooldowns = new Map<string, number>(); // guildId-userId -> timestamp
 
+// 呼ばれていない会話に自分から入るかどうかの判定 (VEX_AMBIENT と VEX_CHANNELS が揃ったときだけ動く)。
+// 人の発言のたびにタイマーを張り直し、静かになったら判定する。bot の発言が来たら捨てる。
+const ambientJudge = new AmbientJudge({
+  selfId: () => client.user?.id ?? null,
+  canSpeak: async (message) => {
+    const guild = client.guilds.cache.get(message.guildId ?? '');
+    const me = guild?.members.me ?? await guild?.members.fetchMe().catch(() => null);
+    const channel = guild?.channels.cache.get(message.channelId);
+    return Boolean(me && channel && canBotSpeak(channel as never, me));
+  },
+  join: (message, join) => handleAgentRequest(message as unknown as Message<true>, client as Client<true>, { ambient: join })
+});
+
 client.on(Events.MessageCreate, async (message) => {
   try {
     await handleMessageCreate(message);
@@ -308,6 +323,8 @@ async function handleMessageCreate(message: Message): Promise<void> {
   indexLiveMessage(message);
 
   if (message.author.bot) {
+    // 会話が動いた。自発参加の判定を待っていたら捨てる (自分の発言で輪を作らない)
+    ambientJudge.cancel(message.channelId);
     // AIだけのコミュニティではbotの通常会話も立法上の事実資料になる。
     // 統治面の公式投稿はrecordGovernanceMessage側で除外し、botを自動処罰の対象にはしない。
     if (governanceConfig.enabled) {
@@ -356,10 +373,15 @@ async function handleMessageCreate(message: Message): Promise<void> {
 
   // @bot と直接メンションされたら AI エージェントに渡す。
   if (isAgentRequest(message, client)) {
+    // 呼ばれたので、自発参加の判定は要らない
+    ambientJudge.cancel(message.channelId);
     // メッセージは接続後にしか届かないので、message.client は ready 済み (Client<true>) の同じ client
     await handleAgentRequest(message, message.client);
     return;
   }
+
+  // 呼ばれていない発言。静かになったら、入るべきか判定する (非同期、失敗しても何も起きない)
+  ambientJudge.observe(message as unknown as VexMessage);
 
   if (message.author.username !== ossTargetUsername) {
     return;

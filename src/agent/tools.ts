@@ -257,7 +257,7 @@ export interface ChannelDescription {
  * 「どこに話が溜まっているか」を知るための道具なので、入れ物で数えるのが正しい。
  */
 export function describeChannels(
-  ctx: Pick<AgentContext, 'guild' | 'member'>,
+  ctx: Pick<AgentContext, 'guild' | 'member' | 'viewer'>,
   { limit = 30, filter = null }: { limit?: number; filter?: unknown } = {}
 ): ChannelDescription | null {
   // 自分の発言数と、ぶら下がっているスレッドの発言数を分けて持つ
@@ -296,7 +296,7 @@ export function describeChannels(
     // フォーラム / メディアは自分では発言を持たないが、投稿の置き場なので出す。
     const holdsMessages = MESSAGE_CHANNEL_TYPES.has(channel.type) && !isThreadType(channel.type);
     if (!holdsMessages && !isForumType(channel.type)) continue;
-    if (!canRead(channel, ctx.member)) continue;
+    if (!canRead(channel, ctx.viewer ?? ctx.member)) continue;
 
     if (needle && !channel.name?.toLowerCase().includes(needle)) {
       hiddenByFilter += 1;
@@ -403,11 +403,11 @@ function listChannels(ctx: AgentContext, args: ToolArgs): string {
 }
 
 /** 実行者に見えないチャンネルは、ツール経由でも絶対に見せない。 */
-function assertReadable<T extends GuildBasedChannel>(ctx: Pick<AgentContext, 'guild' | 'member'>, channel: T | null | undefined): T {
+function assertReadable<T extends GuildBasedChannel>(ctx: Pick<AgentContext, 'guild' | 'member' | 'viewer'>, channel: T | null | undefined): T {
   if (!channel) throw new Error('そのチャンネルは見つかりませんでした。');
   const owner = channel.guildId ?? channel.guild?.id;
   if (owner && String(owner) !== String(ctx.guild.id)) throw new Error('別サーバーのチャンネルは読めません。');
-  if (!canRead(channel, ctx.member)) {
+  if (!canRead(channel, ctx.viewer ?? ctx.member)) {
     throw new Error('そのチャンネルは呼び出した人に閲覧権限がないので読めません。');
   }
   return channel;
@@ -1086,7 +1086,7 @@ function pickHits(data: unknown): RawMessage[] {
  */
 function canSeeHit(ctx: AgentContext, channelId: string): boolean {
   const cached = ctx.guild.channels.cache.get(channelId);
-  if (cached) return canRead(cached, ctx.member);
+  if (cached) return canRead(cached, ctx.viewer ?? ctx.member);
 
   try {
     const row = archiveDb
@@ -1097,7 +1097,7 @@ function canSeeHit(ctx: AgentContext, channelId: string): boolean {
 
     if (!row?.is_thread || row.is_private || !row.parent_id) return false;
     const parent = ctx.guild.channels.cache.get(row.parent_id);
-    return parent ? canRead(parent, ctx.member) : false;
+    return parent ? canRead(parent, ctx.viewer ?? ctx.member) : false;
   } catch {
     return false;
   }
@@ -1631,7 +1631,7 @@ async function listThreadContainer(ctx: AgentContext, container: GuildBasedChann
     const active = await threadManager?.fetchActive?.().catch(() => null);
     // fetchActive は権限を見ずに全部返す。非公開スレッドなど、呼んだ人に読めないものは出さない。
     const threads = [...(active?.threads?.values() ?? [])]
-      .filter((thread) => canRead(thread, ctx.member))
+      .filter((thread) => canRead(thread, ctx.viewer ?? ctx.member))
       .slice(0, limit);
 
     if (threads.length === 0) return `#${container.name} には読める${label}がありませんでした。`;

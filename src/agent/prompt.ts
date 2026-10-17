@@ -4,6 +4,7 @@
 // (引数の意味や使える値) は重複させず、schema では表せない「順序」と
 // 「間違えやすい判断」だけを書く。使えないツールの説明も載せない。
 
+import { vexConfig } from '../vex/config.js';
 import { memoryRootPrompt } from '../memory/tool.js';
 import { agentConfig } from './config.js';
 import { formatMessages, shortTime, type RefTable } from './format.js';
@@ -179,6 +180,7 @@ export function buildUserContent({ ctx, prompt, extras, recent, replyChain, requ
     head.push(
       `このサーバーでのあなたの表示名は ${selfName} (ID ${selfId ?? '不明'})。`
         + '本文中でこの名前や ID で呼ばれているのは自分のこと。'
+        + (vexConfig.call ? '「vex」とも呼ばれる (これも自分のこと)。' : '')
     );
   }
 

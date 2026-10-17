@@ -16,7 +16,7 @@ import {
   type MessageMentionOptions,
   type MessageReplyOptions
 } from 'discord.js';
-import { canBotAttach, canBotSpeak, canManageIndex, getChannelScope } from '../archive/permissions.js';
+import { canBotAttach, canBotSpeak, canManageIndex, getChannelScope, getPublicChannelScope } from '../archive/permissions.js';
 import { meaningReader, recallWithMeaning, type RecallParts } from '../memory/recall.js';
 import { siteConfigFor, siteUrl } from '../memory/site.js';
 import { getEpisode } from '../memory/store.js';
@@ -55,7 +55,11 @@ import {
   type Reservation,
   type TokenUsage
 } from './ratelimit.js';
-import { ThinkingIndicator, isIndicatorMessage, toolLabel } from './thinking.js';
+import { SilentIndicator, ThinkingIndicator, isIndicatorMessage, toolLabel, type Indicator } from './thinking.js';
+import type { AmbientJoin } from '../vex/ambient.js';
+import { isVexCall } from '../vex/call.js';
+import { vexConfig } from '../vex/config.js';
+import { AMBIENT_HINT, isPassAnswer } from '../vex/pass.js';
 import { buildToolset } from './tools.js';
 import {
   errorCode,
@@ -69,6 +73,9 @@ import {
 // 本文中のメンション (@everyone / @here / ロール / ユーザー) は一切通知にしない。
 // ユーザーやモデルの文章がそのまま届く場所なので、parse を空にして明示する。
 const NO_MENTIONS: MessageMentionOptions = { parse: [], repliedUser: false };
+
+/** 自発参加の費用を数える利用者 ID。人の ID と衝突しない。 */
+const AMBIENT_PAYER = 'vex-ambient';
 
 // 回答の1通目だけ、聞いた人に通知を出す。
 //
@@ -161,6 +168,9 @@ export function isAgentRequest(message: Message, client: Client): boolean {
   });
 
   if (mentioned) return true;
+
+  // 名前 (vex) で呼ばれた。メンションと同じ扱いで、相槌でも答える。
+  if (vexConfig.call && isVexCall(message.content)) return true;
 
   const repliedTo = message.reference?.messageId;
   if (!repliedTo) return false;
@@ -331,11 +341,23 @@ export async function fetchReplyChain(message: Message<true>, channelName?: stri
   return Object.assign(chain.reverse(), { referenceState: state });
 }
 
-export async function handleAgentRequest(message: Message<true>, client: Client<true>): Promise<void> {
+/**
+ * options.ambient があるときは「呼ばれていない会話に自分から入る」場合 (src/vex/ambient.ts)。
+ * 依頼者は最後に発言した人だが、その人が頼んだわけではないので、
+ *   - その人の /model や上限は使わない (既定のエンジン、専用の利用者 ID で数える)
+ *   - 経過表示は出さない。上限・失敗・「返す価値が無い」は黙って終える (エラー文も出さない)
+ *   - 送る直前に会話が進んでいたら送らない
+ */
+export async function handleAgentRequest(
+  message: Message<true>,
+  client: Client<true>,
+  options: { ambient?: AmbientJoin } = {}
+): Promise<void> {
+  const ambient = options.ambient;
   const guild = message.guild;
   const member = message.member ?? await guild.members.fetch(message.author.id).catch(() => null);
 
-  if (!member) return;
+  if (!member) { ambient?.report('failed'); return; }
 
   // /model で自作モデルを選んでいる人はそちらへ回す。
   //
@@ -344,7 +366,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
   // ドル換算の上限に混ぜると請求と乖離するから。
   const governanceTopic = Boolean(governance.getGovernanceGuild(guild.id))
     && isGovernanceAgentTopic(message.content);
-  const chosen = engineFor(message.author.id, guild.id);
+  const chosen = ambient ? DEFAULT_AGENT_ENGINE : engineFor(message.author.id, guild.id);
   // 会話 agent のモデルはその人が /model で選んだもの (ling / glm / qwen / deepseek / mimo)。
   // 自作モデルを選んでいる人が統治の話をしたときは既定のモデルで答える
   const model = agentModelFor(isAgentEngine(chosen) ? chosen : DEFAULT_AGENT_ENGINE);
@@ -381,28 +403,33 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
     console.warn(
       `Skipping an agent request in #${message.channel?.name ?? message.channelId}: the bot cannot speak there.`
     );
+    ambient?.report('failed');
     return;
   }
 
   // 統治サーバーではManageGuildを自動的な信頼根拠にしない。指定されたtrusted roleは
   // 回数枠だけを増やし、ブラウザ操作権や司法・立法権限とは結び付けない。
-  const attempt = governance.reserveGovernanceAgentAttempt(member, message.id);
+  // 自発参加は誰かの依頼ではないので、人ごとの試行枠は使わない
+  const attempt = ambient ? ({ ok: true, governed: false } as const) : governance.reserveGovernanceAgentAttempt(member, message.id);
   if (!attempt.ok) {
     await replyOrSend(message, { content: attemptLimitMessage(attempt), allowedMentions: NO_MENTIONS });
     return;
   }
-  const admin = !attempt.governed && canManageIndex(member);
+  const admin = !ambient && !attempt.governed && canManageIndex(member);
+  // 自発参加の費用は専用の利用者として数える (人の枠を食わず、1日の上限で全体の費用が止まる)
+  const payer = ambient ? AMBIENT_PAYER : message.author.id;
 
   const reservation = reserveCall({
     guildId: guild.id,
     channelId: message.channelId,
-    userId: message.author.id,
+    userId: payer,
     admin,
     skipUserLimit: attempt.governed
   });
 
   if (!reservation.ok) {
-    await replyOrSend(message, { content: limitMessage(reservation), allowedMentions: NO_MENTIONS });
+    if (ambient) ambient.report('failed');
+    else await replyOrSend(message, { content: limitMessage(reservation), allowedMentions: NO_MENTIONS });
     return;
   }
 
@@ -415,7 +442,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
   // 時間で畳むと「払ったのに謝り文だけ返す」ことになる (実際にそうなっていた)。
   // 応答が来ないソケットは llm.js が1回ごとに畳む。
   let finished = false;
-  let indicator: ThinkingIndicator | null = null;
+  let indicator: Indicator | null = null;
   let ctx: AgentContext | null = null;
 
   // 例外や中断でも、この呼び出しで新たに使ったぶんは残す。
@@ -435,10 +462,12 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
       me,
       refs,
       screenshots: [],
-      channelScope: getChannelScope(guild, member),
+      // 自発参加は誰の依頼でもないので、全員に見えるものだけを読む (最後に発言した人の権限は使わない)
+      channelScope: ambient ? getPublicChannelScope(guild) : getChannelScope(guild, member),
+      ...(ambient ? { viewer: guild.roles.everyone } : {}),
       // ブラウザを操作できるかは人 (ID の許可リスト) だけで決まる。モデルの出力や
       // 会話の中身からは変えられない。
-      browserFull: canUseFullBrowser(member),
+      browserFull: !ambient && canUseFullBrowser(member),
       // 添付できないだけなら本文は出せるので実行は止めない。撮ったのに貼れない
       // ときだけ、その旨を回答に添える (黙って落とすと撮れたつもりで話が進む)。
       canAttach: canBotAttach(message.channel, me),
@@ -450,7 +479,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
 
     // 経過表示を出しておく。この先の準備 (ブラウザの生存確認や
     // 直近メッセージの取得) にも時間がかかるので、一番先に出す。
-    const thinking = new ThinkingIndicator(message.channel);
+    const thinking: Indicator = ambient ? new SilentIndicator() : new ThinkingIndicator(message.channel);
     indicator = thinking;
     await thinking.start();
 
@@ -475,11 +504,13 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
 
     const system = buildSystemPrompt(runContext, toolset);
     const request = stripMention(message.content, client.user.id);
+    // 自発参加では、依頼の代わりに「呼ばれていない」ことを伝える前置きを付ける (想起や検索は発言そのもので行う)
+    const prompt = ambient ? `${AMBIENT_HINT}\n${request}` : request;
     // 呼ばれたときの想起: 名前の照合 + 意味の近い記憶 (間に合わなければ名前だけ)
     const recalled = toolset.memoryAvailable ? await recallSafely(guild.id, request, replyChain, recent) : null;
     const userContent = buildUserContent({
       ctx: runContext,
-      prompt: request,
+      prompt,
       // 依頼に貼られた画像・埋め込み・スタンプ。中身は読めないが、存在を
       // 伝えないと「これ何？」に対して直近の会話の話をしてしまう。
       extras: describeExtras(message),
@@ -511,7 +542,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
       // 管理者は残りが Infinity なので、暴走ガードだけが効く。
       budget: Math.min(
         usdToBudget(getTunable('request_usd')),
-        remainingFor(message.author.id, admin, { skipUserLimit: attempt.governed })
+        remainingFor(payer, admin, { skipUserLimit: attempt.governed })
       ),
       // 時間の壁。トークンが余っていても、同時実行の枠を何時間も押さえさせない。
       // 超えてもツールが外れるだけなので、答えはその場の材料で必ず書かれる。
@@ -538,6 +569,11 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
     // text は runtime が provider の content をそのまま返したもの (空でないことだけ確かめてある)。
     // 文字列でなければ回答として使わない
     const text = typeof result.text === 'string' ? result.text.trim() : '';
+    // 自発参加で返す価値が無いと判断した (または何も書けなかった) ときは何も送らない
+    if (ambient && (!text || isPassAnswer(text))) {
+      ambient.report('passed');
+      return;
+    }
     const answer = text
       ? expandCitations(softenUnverifiedQuotes(stripAddressNarration(dropRestartedAnswer(text), member.displayName), result.observed), refs, {
         label: modelLabel(model), selfId: client.user.id, episodeUrl: (id) => memoryEpisodeUrl(guild.id, id)
@@ -552,6 +588,12 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
         : answer
     );
 
+    // 送る直前にもう一度。調べている間に誰かが話し始めていたら割り込まない
+    if (ambient && !(await ambient.stillLatest().catch(() => false))) {
+      ambient.report('moved_on');
+      return;
+    }
+
     const files = runContext.canAttach
       ? runContext.screenshots.map(
         (buffer, index) => new AttachmentBuilder(buffer, { name: `screenshot-${index + 1}.png` })
@@ -563,7 +605,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
         content: chunk,
         // 1通目だけ聞いた人に通知する。2通目以降で鳴らすと同じ答えで2回鳴る。
         // モデルの文章に @everyone / ロールが入っていても、どちらも parse が空なので通知にならない。
-        allowedMentions: index === 0 ? PING_ASKER : NO_MENTIONS,
+        allowedMentions: index === 0 && !ambient ? PING_ASKER : NO_MENTIONS,
         // 添付は最後のメッセージにまとめてつける
         ...(index === chunks.length - 1 && files.length > 0 ? { files } : {})
       };
@@ -575,6 +617,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
       // これへのリプライを会話の続きとして受け付ける
       rememberOwnReply(sent?.id, reservation.id);
     }
+    ambient?.report('sent');
   } catch (error) {
     console.error('Agent request failed:', error);
 
@@ -585,10 +628,13 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
     // エラー文を出す前に経過表示を片付ける
     await indicator?.stop();
 
-    await replyOrSend(message, {
-      content: failureNotice(NOTICE_ERROR, error),
-      allowedMentions: NO_MENTIONS
-    });
+    if (ambient) ambient.report('failed');
+    else {
+      await replyOrSend(message, {
+        content: failureNotice(NOTICE_ERROR, error),
+        allowedMentions: NO_MENTIONS
+      });
+    }
   } finally {
     // 取りこぼしの保険。stop() は何度呼んでも安全。
     await indicator?.stop();
