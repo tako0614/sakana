@@ -7,7 +7,7 @@ botは差分だけをHTTPで押し込み、公開ページとJSONはこのWorker
 
 ## いまの配置
 
-- Worker: `https://sakana-laws.shoutatomiyama0614.workers.dev`
+- Worker: `https://sakana.takos.jp` (カスタムドメイン。`wrangler.jsonc` の `routes`)。`https://sakana-laws.shoutatomiyama0614.workers.dev` も残していて、bot が法令・記憶を押し込む先 (`GOVERNANCE_LAW_API_URL`) はこちら。
 - D1: `sakana-laws` (`a7a062b4-750f-46bd-b1b6-1663e6537efe`, APAC) — `0001_init.sql` 適用済み。
   沿革を並べるための`root_id`を足したので、`npm run migrate`で`0002_root_id.sql`を当てます。
   既存行の`root_id`は自分自身になりますが、botが再起動時に全件を押し直すと正しい系列に揃います

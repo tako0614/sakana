@@ -21,7 +21,7 @@ Dream運用 (廃止。git 履歴を参照)に、Ling 3.0 Flashによる全履歴
 - 今回のバックアップ: `/root/sakana/backups/before-20260911T012405Z`。SQLiteのオンラインバックアップによるアーカイブ約1.47GBと、切替前のservice定義を保持。前回の停止中DBバックアップは `/root/sakana/backups/before-20260910T192754Z`。
 - Atomはサーバー内のSQLite。新しい外部DB・GPU・推論モデルは追加していない。
 - 模倣モデルの利用先にサーバー制約はない。会話の原文・記憶・実行記録・個人設定はサーバー単位で扱う。
-- 法律サイト: https://sakana-laws.shoutatomiyama0614.workers.dev 。Worker版 `0e0f8fb1-c7e8-4ee7-8b5d-5ae27f4b5e08`。
+- 法律サイトと記憶の本: https://sakana.takos.jp (workers.dev の `https://sakana-laws.shoutatomiyama0614.workers.dev` も同じ Worker)。記憶の本は `/<サーバーID>/wiki`。Worker版は `wrangler deploy` のたびに変わる。
 
 ## 初回履歴移行
 
