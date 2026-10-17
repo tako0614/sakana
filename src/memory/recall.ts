@@ -153,17 +153,19 @@ export async function recallWithMeaning(guildId: string,
 }
 
 /**
- * 考えている途中の想起 (runtime が往復ごとに呼ぶ)。いま調べていること (道具の結果) と依頼から、
- * まだ出していない記憶だけを足す。最初の往復 (道具の結果がまだ無い) は、呼ばれたときの想起が済んでいるので何も足さない。
+ * 考えている途中の想起 (runtime が往復ごとに呼ぶ)。依頼と、モデルが直前に考えていたこと (CoT)、いま調べていること
+ * (道具の結果) から、まだ出していない記憶だけを足す。最初の往復 (道具の結果がまだ無い) は、呼ばれたときの想起が済んでいるので何も足さない。
+ * 思考は provider が文章で返したときだけ (暗号化されたものは読めない) で、無ければ依頼と道具の結果で引く。
  */
 export function meaningReader(guildId: string, seed: { request: string; shown?: RecallParts | undefined }):
-  (query: { observations: string[] }) => Promise<{ text: string } | null> {
+  (query: { observations: string[]; reasoning?: string | undefined }) => Promise<{ text: string } | null> {
   const paths = new Set(seed.shown?.paths);
   const episodeIds = new Set(seed.shown?.episodeIds);
-  return async ({ observations }) => {
+  return async ({ observations, reasoning }) => {
     if (observations.length === 0) return null;
-    const noticed = observations.map((observation) => observation.replace(/^tool:[^:]*:\s*/, '').slice(0, 500));
-    const query = [seed.request.slice(0, 400), ...noticed].join('\n').slice(0, 1400);
+    // 手がかりは、依頼 → モデル自身が直前に考えていたこと (CoT。読めるときだけ) → 道具が返した内容、の順
+    const noticed = observations.map((observation) => observation.replace(/^tool:[^:]*:\s*/, '').slice(0, 300));
+    const query = [seed.request.slice(0, 300), ...(reasoning ? [reasoning.slice(-600)] : []), ...noticed].join('\n').slice(0, 1600);
     const meaning = await meaningOf(guildId, query, { nodeLimit: 2, episodeLimit: 2, excludePaths: paths, excludeEpisodes: episodeIds, timeoutMs: 2000 });
     const lines = meaningLines(meaning);
     if (lines.length === 0 || !meaning) return null;

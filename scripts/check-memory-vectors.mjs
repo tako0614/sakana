@@ -137,6 +137,13 @@ assert.ok(noticed?.text.includes('調べている内容に近い記憶'), 'what 
 assert.match(noticed.text, /people\/さば|Rust と Go/);
 const repeated = await read({ observations: ['tool:search: さば: Rust 最高と言いながら Go も書く。昼はカップ麺'] });
 assert.ok(!repeated || !/people\/さば/.test(repeated.text), 'what was already shown is not shown again');
+// モデルが直前に考えていたこと (CoT) も手がかりになる: 道具の結果が曖昧でも、考えていた中身で引ける
+const queries = [];
+vectors.setEmbedder(async (texts, kind) => { if (kind === 'query') queries.push(texts[0]); return fakeEmbed(texts); });
+const withThought = await meaningReader(GUILD, { request: '誰の話？' })({ observations: ['tool:search: (ヒットなし)'], reasoning: '自分のPRはレビューを飛ばしたというダブスタの話を探している' });
+assert.ok(queries.at(-1).includes('ダブスタの話を探している'), 'the thinking text is part of the recall query');
+assert.ok(queries.at(-1).indexOf('誰の話？') < queries.at(-1).indexOf('ダブスタ') && queries.at(-1).indexOf('ダブスタ') < queries.at(-1).indexOf('ヒットなし'), 'order: request, then thinking, then tool results');
+assert.ok(withThought === null || /ダブスタ|レビュー/.test(withThought.text));
 vectors.setEmbedder(async () => { throw new Error('worker down'); });
 assert.equal(await meaningReader(GUILD, { request: 'x' })({ observations: ['tool:search: レビュー'] }), null, 'a failing worker adds nothing');
 vectors.setEmbedder(fakeEmbed);

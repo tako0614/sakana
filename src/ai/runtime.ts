@@ -191,6 +191,27 @@ function memoryFocusThought(state: AgentState): string | undefined {
   return thought || undefined;
 }
 
+/**
+ * モデル自身が直前に考えていたこと (CoT)。provider が思考を返したときだけ。
+ * 道具を呼んだ往復の assistant メッセージに、思考の文章 (reasoning) か、その細目 (reasoning_details の text / summary) が残っている。
+ * 暗号化された思考 (中身が読めないもの) は使えないので無い扱い。いちばん新しい1件だけ。
+ */
+function latestReasoning(state: AgentState): string | undefined {
+  for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+    const entry = state.messages[index];
+    if (!entry || entry.role !== 'assistant') continue;
+    const direct = typeof entry.reasoning === 'string' ? entry.reasoning : '';
+    const detailed = arrayOf(entry.reasoning_details)
+      .map((detail) => (isRecord(detail) ? String(detail.text ?? detail.summary ?? '') : ''))
+      .filter(Boolean).join('\n');
+    const text = (direct || detailed).replace(/\s+/g, ' ').trim();
+    if (text) return text.slice(-1500);
+    // 思考の無い往復を飛ばして古い思考を使うと、いまの関心とずれる
+    return undefined;
+  }
+  return undefined;
+}
+
 function memoryObservations(state: AgentState): string[] {
   return state.messages.filter((entry) => entry.role === 'tool' && entry.toolName !== 'memory_focus')
     .slice(-2).map((entry) => `tool:${String(entry.toolName || 'unknown')}: ${String(entry.content ?? '').slice(0, 2000)}`);
@@ -213,7 +234,7 @@ export interface AgentToolset {
 export interface AgentMemory {
   assertCurrent?: (delivery?: MemoryDelivery) => unknown;
   recordUse?: (refs: string[], meta: { eventId: string }) => unknown;
-  read?: (query: { context: string; thought: string | undefined; observations: string[] }) => unknown;
+  read?: (query: { context: string; thought: string | undefined; observations: string[]; reasoning?: string | undefined }) => unknown;
 }
 
 /** provider への1回の依頼。戻り値は provider の応答 (choices / usage)。 */
@@ -485,7 +506,7 @@ export async function runAgent({ guildId, system, userContent, toolset = { defin
         // memory_focus call only adds a one-shot retrieval hint below; it never
         // replaces the current task context.
         context: liveMemoryContext(state),
-        thought: memoryFocusThought(state), observations: memoryObservations(state) });
+        thought: memoryFocusThought(state), observations: memoryObservations(state), reasoning: latestReasoning(state) });
       const recalledText = isRecord(recalled) ? recalled.text : undefined;
       if (stepsUsed() >= maximumSteps || toolset.exhausted?.()) { state.phase = 'final'; final = true; }
       const messages = state.messages.map(providerMessage);

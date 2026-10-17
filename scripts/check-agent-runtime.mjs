@@ -223,6 +223,28 @@ try {
   assert.equal(toolAccounted.size, 3,
     'automatic memory and the retained memory tool body are deduped per successful provider round');
 
+  // 考えている途中の想起は、モデルが直前に考えたこと (CoT) も手がかりに受け取る
+  {
+    const seen = [];
+    let rounds = 0;
+    const reasoningOptions = { guildId: 'g', runId: 'reasoning-recall', system: 's', userContent: 'u',
+      toolset: { readOnly: true, definitions: [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object' } } }], call: async () => 'looked up' },
+      memory: { read: async (query) => { seen.push({ reasoning: query.reasoning, observations: query.observations.length }); return null; } },
+      request: async () => {
+        rounds += 1;
+        if (rounds === 1) return { choices: [{ message: { content: '', reasoning: 'さかなの過去の事件を探したい。\n\nまず検索する', tool_calls: [{ id: 'l1', function: { name: 'lookup', arguments: '{}' } }] } }] };
+        if (rounds === 2) return { choices: [{ message: { content: '', reasoning_details: [{ type: 'reasoning.text', text: '結果に出た DB 削除の件を掘る' }, { type: 'reasoning.encrypted', data: 'xxxx' }], tool_calls: [{ id: 'l2', function: { name: 'lookup', arguments: '{}' } }] } }] };
+        if (rounds === 3) return { choices: [{ message: { content: '', reasoning_details: [{ type: 'reasoning.encrypted', data: 'only-encrypted' }], tool_calls: [{ id: 'l3', function: { name: 'lookup', arguments: '{}' } }] } }] };
+        return { choices: [{ message: { content: 'done' } }] };
+      } };
+    await runAgent(reasoningOptions);
+    assert.equal(seen[0].reasoning, undefined, 'before the first model call there is no thinking yet');
+    assert.equal(seen[1].reasoning, 'さかなの過去の事件を探したい。 まず検索する', 'the previous round\'s thinking text is handed to the recall');
+    assert.equal(seen[2].reasoning, '結果に出た DB 削除の件を掘る', 'reasoning details with text are used; encrypted ones are skipped');
+    assert.equal(seen[3].reasoning, undefined, 'unreadable (encrypted-only) thinking is simply absent');
+    assert.ok(seen[1].observations > 0);
+  }
+
   const generationInputs=[];
   let generationRequests=0;
   const generationOptions={guildId:'g',runId:'host-generation-input',system:'s',userContent:'current context',reuseCompleted:true,
