@@ -137,7 +137,7 @@ const { isAgentRequest } = await import('../src/agent/index.js');
     idle_minutes: 1.5, minutes_since_vex: 3
   }, { messages: 99 });
   if (mine !== theirs) fail(`state が評価の形と違う:\n${mine}\n---\n${theirs}`);
-  if (JSON.stringify(VEX_QUESTIONS.join) !== JSON.stringify(QUESTION_SETS.api.join)) fail('質問が評価した形 (api) と違う');
+  if (JSON.stringify(VEX_QUESTIONS.join) !== JSON.stringify(QUESTION_SETS.about.join)) fail('質問が評価した形 (about) と違う');
   if (!/vex は 3 分前に発言した/.test(mine) || !/最後の発言から 1.5 分/.test(mine)) fail(`補足の行: ${mine}`);
   if (/発言した/.test(buildVexState(lines, { sinceVexMinutes: 9 }))) fail('5 分以上前なら書かない');
 }

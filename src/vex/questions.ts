@@ -1,5 +1,6 @@
 // 判定モデルに渡す state と質問。評価 (scripts/vex/eval.mjs・jev-api.mjs) と同じ形にしてある。
 // 実際の会話 400 場面で、基準を criteria (はい/いいえの説明) に置く形が一番良かった (docs/vex.md)。
+// 「vex・bot・AI が話題」のときも入る版 (scripts/vex/questions.mjs の about)。質問・頼みごとだけの版 (api) は雑談の流れで入れなかった。
 
 export interface VexLine {
   author: string;
@@ -42,8 +43,9 @@ export const VEX_QUESTIONS = {
     type: 'noul' as const,
     instructions: 'この会話に、Discord の常連 AI「vex」が今返事をするべきか。',
     criteria: {
-      true: 'vex が呼ばれている (@vex)・だれも答えていない質問や頼みごとがある・事実の間違いを正せる・vex が役に立てることが明らかにある。',
-      false: '人どうしの雑談・独り言・感想・別の人宛て・すでに誰かが答えている・vex が直前に話したばかり。'
+      true: 'vex が呼ばれている。または vex・bot・AI のことが話題になっている (褒める・けなす・不具合や機能の話)。'
+        + 'だれも答えていない質問や頼みごと・事実や技術の間違いに vex が答えられる。',
+      false: '人どうしの個人的なやりとり (誕生日・挨拶・内輪ネタ)・独り言・すでに誰かが答えている・vex が直前に話したばかり。'
     }
   }
 } as const;
