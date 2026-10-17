@@ -46,13 +46,13 @@ const countStmt = db.prepare<[string]>('SELECT engine, COUNT(*) n FROM agent_eng
  */
 export const ENGINES: Record<string, EngineInfo> = {
   // 道具を持ったエージェント (検索・read・web・記憶・引用)。モデルだけが違う
-  ling: {
-    label: AGENT_ENGINES.ling,
-    summary: '検索・read・web・記憶・引用つきのエージェント (既定)。いちばん安い'
-  },
   glm: {
     label: AGENT_ENGINES.glm,
-    summary: '同じエージェントを glm-5.3-flash で。ling より少し高いが、日付や固有名に強い'
+    summary: '検索・read・web・記憶・引用つきのエージェント (既定)。日本語と道具の使い方が安定していて、日付や固有名に強い'
+  },
+  ling: {
+    label: AGENT_ENGINES.ling,
+    summary: '同じエージェントを ling-3.0-flash で。いちばん安いが、glm よりぶれやすい'
   },
   qwen: {
     label: AGENT_ENGINES.qwen,
@@ -149,7 +149,7 @@ export function engineInfo(engine: unknown): EngineInfo | null {
 // **消したエンジンの読み替え先。**選択は DB に残るので、名前を消しただけだと
 // `ENGINES[row.engine]` が undefined になって**黙って既定に落ちる**。
 // 選び直しを強いるのも筋が違うので、後継に読み替える
-// deepseek は 2026-10-15 に廃止 (OpenRouter の安いモデルへ)。選んでいた人は既定の ling へ
+// deepseek は 2026-10-15 に廃止 (OpenRouter の安いモデルへ)。選んでいた人は既定のエージェントへ
 const RENAMED: Record<string, string> = { 'evex-5.2-a': 'evex-5.2', 'evex-5.2-b': 'evex-5.2', deepseek: DEFAULT_AGENT_ENGINE };
 
 function renamed(engine: string): string {

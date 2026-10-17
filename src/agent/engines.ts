@@ -1,7 +1,8 @@
 // 会話 agent のモデル。/model で人ごとに選ぶ (自作の evex 系とは別の、道具を持つエージェント)。
 //
 // 2026-10-15 に DeepSeek v4 flash を外し、OpenRouter の安いモデル3つにした。
-// 既定は ling (いちばん安い)。glm は日付・固有名に強く (記憶の比較で最良)、qwen はその間。
+// 既定は glm (2026-10-17 に ling から変更: 日本語と、検索してから答える道具の使い方が安定している。
+// 日付・固有名にも強く、記憶の比較で最良)。ling はいちばん安く、qwen はその間。
 export const AGENT_ENGINES = {
   ling: process.env.AGENT_MODEL_LING || 'inclusionai/ling-3.0-flash',
   glm: process.env.AGENT_MODEL_GLM || 'z-ai/glm-5.3-flash',
@@ -10,7 +11,7 @@ export const AGENT_ENGINES = {
 
 export type AgentEngine = keyof typeof AGENT_ENGINES;
 
-export const DEFAULT_AGENT_ENGINE: AgentEngine = 'ling';
+export const DEFAULT_AGENT_ENGINE: AgentEngine = 'glm';
 
 export const isAgentEngine = (engine: unknown): engine is AgentEngine => (
   typeof engine === 'string' && Object.hasOwn(AGENT_ENGINES, engine)

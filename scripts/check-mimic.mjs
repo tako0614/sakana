@@ -256,8 +256,8 @@ const clear = () => db.prepare('DELETE FROM agent_engine WHERE user_id = ?').run
 
 clear();
 try {
-  if (engineFor(USER, TEST_GUILD) !== DEFAULT_ENGINE) fail('既定は ling');
-  if (DEFAULT_ENGINE !== 'ling') fail('既定のエンジンは ling');
+  if (engineFor(USER, TEST_GUILD) !== DEFAULT_ENGINE) fail('既定は glm');
+  if (DEFAULT_ENGINE !== 'glm') fail('既定のエンジンは glm');
   // deepseek は廃止。選んでいた人は既定へ読み替える (黙って別物に落ちない)
   db.prepare('INSERT OR REPLACE INTO agent_engine (guild_id, user_id, engine, updated_at) VALUES (?, ?, ?, ?)').run(TEST_GUILD, USER, 'deepseek', Date.now());
   if (engineFor(USER, TEST_GUILD) !== 'ling') fail('deepseek を選んでいた人は ling に読み替える');
