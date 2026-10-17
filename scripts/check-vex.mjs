@@ -1,7 +1,8 @@
-// vex (名前で呼ばれたら動く・呼ばれていない会話に自分から入る) の検査。
+// vex (名前が出たら文脈で判定する・呼ばれていない会話に自分から入る) の検査。
 //
 // 判定モデルの API は偽のサーバーで立てる (本物は叩かない)。見ているのは次の点:
 //   - 名前の検出: 英字の単語としてだけ。コード・URL・引用・別の単語の中は呼びではない
+//   - 名前が出ても確定では答えない: 判定モデルが文脈で決める (メンションと返信は従来どおり確定)
 //   - state が、評価に使った形 (scripts/vex/questions.mjs) と同じ
 //   - 自発参加の門: 許可チャンネル・相槌/短文/返信/他人宛て/NSFW・冷却・1時間の上限・1日の費用
 //   - 閾値、静かになるまで待つ、会話が進んだら入らない、bot の発言でタイマーを捨てる
@@ -67,6 +68,7 @@ const { isAgentRequest } = await import('../src/agent/index.js');
 {
   const off = loadVexConfig({});
   if (off.call || off.ambient) fail('vex は既定でオフ');
+  if (off.nameThreshold !== 0.45 || off.nameDelayMs !== 2000) fail(`名前が出たときの既定: ${off.nameThreshold} / ${off.nameDelayMs}`);
   if (off.channels.size !== 0) fail('許可チャンネルは既定で空');
   if (off.model !== 'perplexity/pplx-decider-flash-v1.2') fail(`既定のモデル: ${off.model}`);
   if (off.threshold !== 0.6 || off.contextMessages !== 6) fail('閾値は 0.6、文脈は 6 件 (評価した値)');
@@ -91,7 +93,7 @@ const { isAgentRequest } = await import('../src/agent/index.js');
   if (visibleText('a `b` ```c``` https://x.y d').replace(/\s+/g, ' ').trim() !== 'a d') fail('コード・URL は見ない');
 }
 
-// --- 呼び名で agent が起動する (メンションと同じ扱い) ---
+// --- 名前が出ても agent は確定では起動しない (判定モデルが決める)。メンションは従来どおり確定 ---
 
 {
   const client = { user: { id: 'bot' } };
@@ -99,12 +101,12 @@ const { isAgentRequest } = await import('../src/agent/index.js');
     guildId: 'g', content, author: { id: 'u', bot: false }, webhookId: null,
     mentions: { has: () => false }, reference: null, ...extra
   });
-  if (!isAgentRequest(message('vex 教えて'), client)) fail('vex と呼べば起動する');
-  if (!isAgentRequest(message('vex'), client)) fail('名前だけでも起動する');
-  if (isAgentRequest(message('evex 教えて'), client)) fail('evex は呼びではない');
-  if (isAgentRequest(message('vex 教えて', { author: { id: 'u', bot: true } }), client)) fail('bot の発言では起動しない');
-  if (isAgentRequest(message('vex 教えて', { webhookId: 'w' }), client)) fail('webhook では起動しない');
-  if (isAgentRequest(message('vex 教えて', { guildId: null }), client)) fail('サーバーの外では起動しない');
+  for (const text of ['vex 教えて', 'vex', 'vexにするか', 'vexちゃんおやすみ']) {
+    if (isAgentRequest(message(text), client)) fail(`名前が出ただけでは確定で起動しない: ${text}`);
+  }
+  const mention = { mentions: { has: () => true } };
+  if (!isAgentRequest(message('教えて', mention), client)) fail('メンションは従来どおり確定で起動する');
+  if (isAgentRequest(message('教えて', { ...mention, author: { id: 'u', bot: true } }), client)) fail('bot の発言では起動しない');
 }
 
 // --- 「返す価値が無い」の見分け ---
@@ -202,7 +204,10 @@ function makeChannel(id, { name = 'chat', nsfw = false } = {}) {
   const channel = {
     id, name, nsfw, store,
     messages: {
-      fetch: async ({ limit }) => new Map(store.slice(-limit).map((entry) => [entry.id, entry]))
+      fetch: async ({ limit, before }) => {
+        const upto = before ? store.filter((entry) => BigInt(entry.id) < BigInt(before)) : store;
+        return new Map(upto.slice(-limit).map((entry) => [entry.id, entry]));
+      }
     }
   };
   return channel;
@@ -222,7 +227,7 @@ function say(channel, content, { author, bot = false, ago = 0, reference = null,
 
 function ambientConfig(overrides = {}) {
   return loadVexConfig({
-    VEX_API_URL: endpoint, VEX_AMBIENT: '1', VEX_CHANNELS: 'chan1 chan2 chan3 chan4 chan5 chan6 chan7 chan8 chan9',
+    VEX_API_URL: endpoint, VEX_CALL: '1', VEX_NAME_DELAY_MS: '30', VEX_AMBIENT: '1', VEX_CHANNELS: 'chan1 chan2 chan3 chan4 chan5 chan6 chan7 chan8 chan9',
     VEX_QUIET_MS: '40', VEX_COOLDOWN_MS: '60000', VEX_MAX_PER_HOUR: '3', VEX_THRESHOLD: '0.6', VEX_TIMEOUT_MS: '1500',
     VEX_FALLBACK_MODELS: 'fb/one', VEX_DAILY_USD: '1', ...overrides
   });
@@ -284,6 +289,78 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
   if (!(await joins[0].join.stillLatest())) fail('関係ない発言が 1 件増えただけなら送ってよい');
   say(channel, 'それはこう書けばいいよ', { reference: { messageId: asked.id } });
   if (await joins[0].join.stillLatest()) fail('答えが付いたら送らない');
+}
+
+{
+  // 名前が出た発言: 確定では答えず判定モデルが決める。許可チャンネルの外でも、冷却や 1 時間の上限があっても、後から発言が来ても判定する
+  db.exec("DELETE FROM vex_decisions");
+  resetDecideState(); api.calls.length = 0;
+  const config = ambientConfig({ VEX_AMBIENT: '0', VEX_CHANNELS: '' });
+  if (config.ambient) fail('設定');
+  const { judge, joins } = makeJudge(config);
+
+  // p が高い → 答える (join は null = 普通の依頼として)。その発言までを見せる
+  api.respond = () => ({ status: 200, p: 0.7 });
+  const channel = makeChannel('free-channel');
+  say(channel, '今日は寒いね', { ago: 2 });
+  const called = say(channel, 'vexちゃんおやすみ');
+  judge.observe(called);
+  const later = say(channel, 'この発言は呼ばれたあとに来た');
+  judge.observe(later);
+  judge.cancel('free-channel');
+  await sleep(250);
+  if (joins.length !== 1 || joins[0].message.id !== called.id || joins[0].join !== null) fail(`名前が出たら判定して答える: ${joins.length}`);
+  const state = api.calls.at(-1).body.state.conversation;
+  if (!state.includes('vexちゃんおやすみ') || state.includes('呼ばれたあとに来た')) fail(`その発言までを見せる: ${state}`);
+  if (actions('free-channel') !== 'joined:named') fail(`台帳: ${actions('free-channel')}`);
+  // 続けて呼んでも冷却は掛からない
+  judge.observe(say(channel, 'vex どう思う？'));
+  await sleep(250);
+  if (joins.length !== 2) fail('名前が出た発言に冷却は掛けない');
+
+  // 名前が出ても p が低ければ答えない (文脈で決める)。閾値は名前用
+  for (const [p, expectJoin] of [[0.44, false], [0.45, true]]) {
+    const before = joins.length;
+    api.respond = () => ({ status: 200, p });
+    judge.observe(say(channel, 'vexにするか'));
+    await sleep(250);
+    if ((joins.length - before === 1) !== expectJoin) fail(`名前が出たときの閾値 p=${p}`);
+  }
+  if (!actions('free-channel').endsWith('below:named,joined:named')) fail(`台帳: ${actions('free-channel')}`);
+
+  // 名前が出ていても判定に回さない発言 / 名前が出ていない発言 (許可チャンネルの外)
+  api.calls.length = 0;
+  judge.observe(say(channel, 'vex が言ってた', { bot: true }));
+  judge.observe(say(makeChannel('x', { nsfw: true }), 'vex どう思う？'));
+  judge.observe(say(channel, 'evex どう思う？'));
+  judge.observe(say(channel, 'これってどうなってるの？誰か分かる人いる？'));
+  await sleep(250);
+  if (api.calls.length) fail('bot・NSFW・名前が出ていない発言は、許可チャンネルの外では判定しない');
+
+  // 設定がオフなら名前が出ても判定しない
+  const off = makeJudge(ambientConfig({ VEX_CALL: '0', VEX_AMBIENT: '0', VEX_CHANNELS: '' }));
+  off.judge.observe(say(channel, 'vex どう思う？'));
+  await sleep(250);
+  if (api.calls.length || off.joins.length) fail('VEX_CALL がオフなら判定しない');
+
+  // 判定費用の上限は掛かる / 判定が壊れたら答えない
+  db.exec("DELETE FROM vex_decisions");
+  api.respond = () => ({ status: 200, p: 0.9, cost: 0.2 });
+  const budget = makeJudge(ambientConfig({ VEX_AMBIENT: '0', VEX_CHANNELS: '', VEX_DAILY_USD: '0.1' }));
+  budget.judge.observe(say(channel, 'vex どう思う？'));
+  await sleep(250);
+  budget.judge.observe(say(channel, 'vex もう一回'));
+  await sleep(250);
+  if (budget.joins.length !== 1 || !actions('free-channel').endsWith('joined:named,skipped:daily_budget')) fail(`費用の上限: ${actions('free-channel')}`);
+
+  // 許可チャンネルでは、名前が出た発言を名前として 1 回だけ扱う (自発参加と重ねない)
+  db.exec("DELETE FROM vex_decisions");
+  resetDecideState(); api.calls.length = 0;
+  api.respond = () => ({ status: 200, p: 0.9 });
+  const both = makeJudge(ambientConfig());
+  both.judge.observe(say(makeChannel('chan1'), 'vex これって誰か答えられる？'));
+  await sleep(300);
+  if (both.joins.length !== 1 || both.joins[0].join !== null || api.calls.length !== 1) fail(`名前と自発参加を重ねない: joins=${both.joins.length} calls=${api.calls.length}`);
 }
 
 {

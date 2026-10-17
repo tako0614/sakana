@@ -301,7 +301,7 @@ const ambientJudge = new AmbientJudge({
     const channel = guild?.channels.cache.get(message.channelId);
     return Boolean(me && channel && canBotSpeak(channel as never, me));
   },
-  join: (message, join) => handleAgentRequest(message as unknown as Message<true>, client as Client<true>, { ambient: join })
+  join: (message, join) => handleAgentRequest(message as unknown as Message<true>, client as Client<true>, join ? { ambient: join } : {})
 });
 
 client.on(Events.MessageCreate, async (message) => {

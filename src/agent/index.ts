@@ -57,8 +57,6 @@ import {
 } from './ratelimit.js';
 import { SilentIndicator, ThinkingIndicator, isIndicatorMessage, toolLabel, type Indicator } from './thinking.js';
 import type { AmbientJoin } from '../vex/ambient.js';
-import { isVexCall } from '../vex/call.js';
-import { vexConfig } from '../vex/config.js';
 import { AMBIENT_HINT, isPassAnswer } from '../vex/pass.js';
 import { buildToolset } from './tools.js';
 import {
@@ -168,9 +166,6 @@ export function isAgentRequest(message: Message, client: Client): boolean {
   });
 
   if (mentioned) return true;
-
-  // 名前 (vex) で呼ばれた。メンションと同じ扱いで、相槌でも答える。
-  if (vexConfig.call && isVexCall(message.content)) return true;
 
   const repliedTo = message.reference?.messageId;
   if (!repliedTo) return false;

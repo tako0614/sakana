@@ -21,8 +21,9 @@ const origin = (() => {
 })();
 
 export interface VexConfig {
-  /** 発言にこの名前 (英字の単語として) が出たら呼ばれたとみなす。 */
+  /** 発言にこの名前 (英字の単語として) が出たら、呼ばれたかもしれない強い手がかりとして判定に回す。 */
   names: string[];
+  /** 名前が出た発言を判定に回す (確定では答えない。判定モデルが文脈で決める)。 */
   call: boolean;
   ambient: boolean;
   /** 自発参加してよいチャンネル。空なら自発参加はどこでもしない。 */
@@ -33,6 +34,10 @@ export interface VexConfig {
   apiKey: string;
   /** 判定の確率がこれ以上なら入る。 */
   threshold: number;
+  /** 名前が出た発言の閾値。名前は呼ばれている強い手がかりなので、自発参加より低い。 */
+  nameThreshold: number;
+  /** 名前が出てから判定するまでの待ち (ms)。続けて書かれる発言を拾うだけで、静かになるまでは待たない。 */
+  nameDelayMs: number;
   /** 最後の発言からこれだけ静かになったら判定する (ms)。 */
   quietMs: number;
   /** 同じチャンネルで、入ったあとこれだけ空ける (ms)。 */
@@ -55,6 +60,8 @@ export function loadVexConfig(env: NodeJS.ProcessEnv = process.env): VexConfig {
     endpoint: env.VEX_API_URL ?? `${origin}/api/alpha/decisions`,
     apiKey: providerConfig.apiKey,
     threshold: number(env.VEX_THRESHOLD, 0.6),
+    nameThreshold: number(env.VEX_NAME_THRESHOLD, 0.45),
+    nameDelayMs: number(env.VEX_NAME_DELAY_MS, 2000),
     quietMs: number(env.VEX_QUIET_MS, 90_000),
     cooldownMs: number(env.VEX_COOLDOWN_MS, 15 * 60_000),
     maxPerHour: number(env.VEX_MAX_PER_HOUR, 3),
