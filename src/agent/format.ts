@@ -122,6 +122,8 @@ export function messageLink(entry: ResolvedRef | null | undefined): string | nul
   return `https://discord.com/channels/${entry.guildId}/${entry.channelId}/${entry.messageId}`;
 }
 
+const MAX_EPISODE_URLS = 3;
+
 /**
  * モデルが書いた [3] を本文から取り除き、URL だけを末尾にまとめる。
  *
@@ -140,11 +142,17 @@ export function messageLink(entry: ResolvedRef | null | undefined): string | nul
 export function expandCitations(
   text: unknown,
   refs: RefTable,
-  { label = null, selfId = null }: { label?: string | null; selfId?: string | null } = {}
+  { label = null, selfId = null, episodeUrl = null }: {
+    label?: string | null;
+    selfId?: string | null;
+    /** 記憶の出来事 (e12) の URL。サイトが無い・そんな出来事は無いなら null (番号は消すだけ) */
+    episodeUrl?: ((id: number) => string | null) | null;
+  } = {}
 ): string {
   const raw = String(text ?? '');
   const urls: string[] = [];
   const seen = new Set<number>();
+  const episodeUrls: string[] = [];
 
   // 直前の空白ごと食う。番号を抜いた跡に空白が残ると句点の前が空く。
   // 全角スペースも食う (日本語で書かせているので混ざる)。
@@ -176,12 +184,26 @@ export function expandCitations(
     return '';
   });
 
+  // 記憶の出来事の番号 ([e3214] / [e3214, e11489])。内部の記号で、読む人には「謎の文字列」になる。
+  // 本文からは消し、サイトがあって実在する出来事なら URL を末尾に足す (最初の3件まで)。
+  // 空白の連なりの扱いは上と同じ (先頭からだけ試す)。
+  const text2 = body.replace(/(?<![ \t　])[ \t　]*\[(e\d{1,9}(?:[ \t]*[,、][ \t]*e\d{1,9})*)\]/gi, (match: string, group: string, offset: number) => {
+    // `items[e1]` のような添字は番号ではない (上と同じ見分け方。`[e1][e2]` と続けて書くことはあるので `]` は数えない)
+    if (!/^[ \t　]/.test(match) && /[\w.)]/.test(body[offset - 1] ?? '')) return match;
+    for (const id of group.match(/\d+/g) ?? []) {
+      let url: string | null = null;
+      try { url = episodeUrl?.(Number(id)) ?? null; } catch { url = null; }
+      if (url && !episodeUrls.includes(url) && episodeUrls.length < MAX_EPISODE_URLS) episodeUrls.push(url);
+    }
+    return '';
+  });
+
   // どのモデルが書いたかは毎回出す。引用があるときは同じ subtext に混ぜる
   // (行を2本にすると会話の邪魔になる)。
-  const tail = [label, ...urls].filter(Boolean);
-  if (tail.length === 0) return body.trim();
+  const tail = [label, ...urls, ...episodeUrls].filter(Boolean);
+  if (tail.length === 0) return text2.trim();
 
-  return `${body.trim()}\n\n-# ${tail.join(' ')}`;
+  return `${text2.trim()}\n\n-# ${tail.join(' ')}`;
 }
 
 function collapse(text: unknown): string {

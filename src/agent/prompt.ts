@@ -161,7 +161,9 @@ export function buildSystemPrompt(ctx: PromptContext, toolset: ToolAvailability)
   if (toolset.memoryAvailable) {
     lines.push(
       '- このサーバーの人・作っているもの・過去の出来事・用語は、まず「記憶」と入力の「思い出したこと」を見て、'
-        + '足りなければ `memory` でページ・つながり・出来事をたどる。言い切る・引用するときは `memory` の episode か search / read で元の発言を確かめる。'
+        + '足りなければ `memory` でページ・つながり・出来事をたどる。言い切る・引用するときは `memory` の episode か search / read で元の発言を確かめる。',
+      // e12 のような出来事の番号は内部の記号。答えに書くと、読む人には意味の分からない文字列になる (2026-10-17)。
+      '- 出来事の番号 (e12 など) は答えに書かない。根拠は発言の番号 `[n]` で示すか、言葉で書く。'
     );
   }
 

@@ -69,6 +69,40 @@ function tableOf(count) {
 }
 
 {
+  // 記憶の出来事の番号 [e3214] は読む人には謎の文字列。本文から消し、実在する出来事は URL にして末尾へ足す
+  const known = new Set([3214, 11489, 5]);
+  const episodeUrl = (id) => (known.has(id) ? `https://wiki.test/1/e/${id}` : null);
+  const opts = { episodeUrl };
+  const refs = tableOf(2);
+
+  const one = expandCitations('「近所の子供攫うぞ」— 煽り口の定番 [e3214]。', refs, opts);
+  if (one !== '「近所の子供攫うぞ」— 煽り口の定番。\n\n-# https://wiki.test/1/e/3214') fail(`[e3214] は消して URL にする: ${JSON.stringify(one)}`);
+
+  const many = expandCitations('A [e3214] B [e11489, e5] C [e3214]。', refs, opts);
+  if (many !== 'A B C。\n\n-# https://wiki.test/1/e/3214 https://wiki.test/1/e/11489 https://wiki.test/1/e/5') fail(`複数・重複: ${JSON.stringify(many)}`);
+
+  const capped = expandCitations('x [e3214][e11489][e5][e3214]', refs, { episodeUrl: (id) => `https://wiki.test/1/e/${id}` });
+  if ((capped.match(/https:/g) ?? []).length !== 3) fail(`URL は3件まで: ${JSON.stringify(capped)}`);
+
+  // 実在しない番号 (作り話)・サイトが無いとき・失敗したときは、消すだけ (リンク切れを作らない)
+  const ghost = expandCitations('ほんとだよ [e99999]。', refs, opts);
+  if (ghost !== 'ほんとだよ。') fail(`実在しない出来事は消すだけ: ${JSON.stringify(ghost)}`);
+  const none = expandCitations('定番 [e3214]。', refs);
+  if (none !== '定番。') fail(`サイトが無ければ消すだけ: ${JSON.stringify(none)}`);
+  const boom = expandCitations('定番 [e3214]。', refs, { episodeUrl: () => { throw new Error('db'); } });
+  if (boom !== '定番。') fail(`調べに失敗しても答えは出す: ${JSON.stringify(boom)}`);
+
+  // 発言の番号 [1] と同居できる。[e1] は発言の番号 [1] と取り違えない
+  const both = expandCitations('これは [1]。あれは [e3214]。', tableOf(1), opts);
+  if (!both.startsWith('これは。あれは。') || !both.includes('discord.com/channels') || !both.includes('https://wiki.test/1/e/3214')) fail(`両方の引用: ${JSON.stringify(both)}`);
+
+  // 出来事の番号に見えないものは触らない
+  for (const plain of ['[error] が出た', 'e3214 は番号', '[e] だけ', '[e12abc]', 'items[e1]']) {
+    if (expandCitations(plain, refs, opts) !== plain) fail(`触らない: ${plain}`);
+  }
+}
+
+{
   // 添字は引用ではない。引用は語の区切りに来るので空白の有無で見分ける
   const refs = tableOf(3);
   const idx = expandCitations('配列は items[1] が先頭だよ', refs);

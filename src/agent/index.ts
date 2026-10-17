@@ -18,6 +18,8 @@ import {
 } from 'discord.js';
 import { canBotAttach, canBotSpeak, canManageIndex, getChannelScope } from '../archive/permissions.js';
 import { recallFor } from '../memory/recall.js';
+import { siteConfigFor, siteUrl } from '../memory/site.js';
+import { getEpisode } from '../memory/store.js';
 import { isSelfHosted } from '../mimic/client.js';
 import { engineFor } from '../mimic/prefs.js';
 import { handleMimicRequest } from '../mimic/respond.js';
@@ -527,7 +529,9 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
     // 文字列でなければ回答として使わない
     const text = typeof result.text === 'string' ? result.text.trim() : '';
     const answer = text
-      ? expandCitations(stripAddressNarration(text, member.displayName), refs, { label: modelLabel(model), selfId: client.user.id })
+      ? expandCitations(stripAddressNarration(text, member.displayName), refs, {
+        label: modelLabel(model), selfId: client.user.id, episodeUrl: (id) => memoryEpisodeUrl(guild.id, id)
+      })
       : 'うまく答えをまとめられませんでした。条件を絞ってもう一度聞いてください。';
 
     // 撮ったのに貼れないときは黙らない (画像が出ている前提で読まれる)
@@ -581,6 +585,13 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
     // 隔離タブは実行ごとに捨てる。残すと次の人が中身を読める。
     if (ctx) await closeBrowserSandbox(ctx).catch(() => {});
   }
+}
+
+/** 記憶の出来事 (e12) の URL。サイトが無いサーバー・実在しない番号 (モデルの作り話) は null。 */
+function memoryEpisodeUrl(guildId: string, id: number): string | null {
+  const config = siteConfigFor(guildId);
+  if (!config || !Number.isSafeInteger(id) || id <= 0) return null;
+  return getEpisode(guildId, id) ? siteUrl(config.origin, guildId, { kind: 'episode', id }) : null;
 }
 
 /**
