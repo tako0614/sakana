@@ -24,6 +24,7 @@ import { handleMimicRequest } from '../mimic/respond.js';
 import { isBareAck } from './ack.js';
 import { governance, type GovernanceReservation } from './boundary.js';
 import { closeBrowserSandbox } from './browser.js';
+import { failureNotice } from './failure.js';
 import { agentConfig, agentEnabled } from './config.js';
 import {
   RefTable,
@@ -570,7 +571,7 @@ export async function handleAgentRequest(message: Message<true>, client: Client<
     await indicator?.stop();
 
     await replyOrSend(message, {
-      content: `${NOTICE_ERROR}。しばらくしてからもう一度試してください。`,
+      content: failureNotice(NOTICE_ERROR, error),
       allowedMentions: NO_MENTIONS
     });
   } finally {
