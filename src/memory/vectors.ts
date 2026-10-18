@@ -266,6 +266,55 @@ export async function embedQuery(text: string, { timeoutMs = 3000 }: { timeoutMs
   }
 }
 
+/** 埋め込みモデルが読めるのは 384 トークン (日本語で 500 字ほど)。それより長い文は後ろが切れるので、質問は短い断片ごとに分けて渡す。 */
+const SEGMENT_CHARS = 500;
+
+/**
+ * 複数の質問文を、1 回の呼び出しでまとめてベクトルにする。timeoutMs で見切る (null)。
+ * 戻りは入力と同じ順で、空の文は null。モデルが眠っているときは embedQuery と同じに見切る。
+ */
+export async function embedQueries(texts: readonly string[], { timeoutMs = 3000 }: { timeoutMs?: number } = {}): Promise<(Float32Array | null)[] | null> {
+  const clean = texts.map((text) => text.replace(/\s+/g, ' ').trim().slice(0, SEGMENT_CHARS));
+  const wanted = clean.map((text, index) => ({ text, index })).filter((entry) => entry.text);
+  if (wanted.length === 0 || !embedConfig.enabled || isDisabled()) return null;
+  const real = embedder === defaultEmbed;
+  const cold = real && workerInfo() === null;
+  if (cold) {
+    prewarm();
+    if (Date.now() < coldUntil) return null;
+  }
+  const work = embedder(wanted.map((entry) => entry.text), 'query').then((reply) => {
+    const out: (Float32Array | null)[] = clean.map(() => null);
+    wanted.forEach((entry, position) => { out[entry.index] = decode(reply.vectors[position] ?? '', reply.dim); });
+    return out;
+  }, () => null);
+  let timer: NodeJS.Timeout | undefined;
+  let timedOut = false;
+  const limit = new Promise<null>((resolve) => { timer = setTimeout(() => { timedOut = true; resolve(null); }, timeoutMs); });
+  try {
+    return await Promise.race([work, limit]);
+  } finally {
+    clearTimeout(timer);
+    if (cold && timedOut) coldUntil = Date.now() + COLD_SKIP_MS;
+  }
+}
+
+/** 質問の 1 本。penalty は、弱い手がかり (直前の会話など) のスコアから引く値。 */
+export interface QuerySegment { text: string; penalty?: number }
+
+/** 複数の質問のそれぞれで引き、同じものはいちばん高いスコア (penalty を引いたあと) を採って、近い順に並べる。 */
+function nearestOfAny(guildId: string, kind: Kind, queries: readonly { vector: Float32Array; penalty: number }[],
+  { limit, exclude }: { limit: number; exclude?: ReadonlySet<number> | undefined }): VectorHit[] {
+  const best = new Map<number, number>();
+  for (const { vector, penalty } of queries) {
+    for (const hit of nearest(guildId, kind, vector, { limit, ...(exclude ? { exclude } : {}) })) {
+      const score = hit.score - penalty;
+      if (score > (best.get(hit.id) ?? -Infinity)) best.set(hit.id, score);
+    }
+  }
+  return [...best].map(([id, score]) => ({ id, score })).sort((a, b) => b.score - a.score).slice(0, limit);
+}
+
 export interface MeaningNode { path: string; summary: string; score: number }
 export interface MeaningEpisode { id: number; kind: string; title: string; atMs: number; score: number }
 /** ページの中の1つの知識 (まとめた断片なら、その中で質問にいちばん近い行を line に)。episodeIds は根拠の出来事 (開くと原文までたどれる)。 */
@@ -286,15 +335,25 @@ const chunkFloor = Number(process.env.MEMORY_CHUNK_FLOOR ?? 0.865);
 /** 1ページから出す節の上限 (同じページの似た節で枠を埋めない)。 */
 const CHUNKS_PER_PAGE = 2;
 
-/** 文に意味が近いページ・出来事・ページの中の1つの知識。ベクトルが無い・間に合わない・近いものが無ければ null。 */
-export async function meaningOf(guildId: string, text: string,
+/**
+ * 文に意味が近いページ・出来事・ページの中の1つの知識。ベクトルが無い・間に合わない・近いものが無ければ null。
+ * 質問は 1 つの文でも、複数の断片 (依頼・直前の会話・思考・道具の結果) でもよい。断片は別々に埋め込んで、いちばん近いものを採る
+ * (1 本につなぐと、埋め込みが読める 500 字ほどを超えた後ろが切れる)。
+ */
+export async function meaningOf(guildId: string, input: string | readonly QuerySegment[],
   { nodeLimit = 2, episodeLimit = 3, chunkLimit = 3, excludePaths, excludeEpisodes, excludeChunks, timeoutMs = 3000 }: {
     nodeLimit?: number; episodeLimit?: number; chunkLimit?: number; excludePaths?: ReadonlySet<string>; excludeEpisodes?: ReadonlySet<number>;
     excludeChunks?: ReadonlySet<number>; timeoutMs?: number;
   } = {}): Promise<Meaning | null> {
   if (!hasVectors(guildId)) return null;
-  const query = await embedQuery(text, { timeoutMs });
-  if (!query) return null;
+  const segments: QuerySegment[] = typeof input === 'string' ? [{ text: input }] : [...input];
+  const embedded = segments.length === 1 && typeof input === 'string'
+    ? [await embedQuery(input, { timeoutMs })]
+    : await embedQueries(segments.map((segment) => segment.text), { timeoutMs });
+  const queries = (embedded ?? []).flatMap((vector, index) => (vector ? [{ vector, penalty: segments[index]?.penalty ?? 0 }] : []));
+  if (queries.length === 0) return null;
+  // 出す行の頭を、質問のどこにいちばん重なる行にするかの手がかり
+  const text = segments.map((segment) => segment.text).join('\n');
   const db = memoryDb();
 
   const skipNodes = new Set<number>();
@@ -309,8 +368,8 @@ export async function meaningOf(guildId: string, text: string,
     return hits.filter((hit) => hit.score >= floor && hit.score >= best - gap);
   };
   // 根 (全体の概要) は常に何かに近いので出さない
-  const nodeHits = pick(nearest(guildId, 'node', query, { limit: nodeLimit + 1, exclude: skipNodes })).slice(0, nodeLimit);
-  const episodeHits = pick(nearest(guildId, 'episode', query, { limit: episodeLimit + 2, exclude: excludeEpisodes ? new Set(excludeEpisodes) : undefined })).slice(0, episodeLimit);
+  const nodeHits = pick(nearestOfAny(guildId, 'node', queries, { limit: nodeLimit + 1, exclude: skipNodes })).slice(0, nodeLimit);
+  const episodeHits = pick(nearestOfAny(guildId, 'episode', queries, { limit: episodeLimit + 2, exclude: excludeEpisodes ? new Set(excludeEpisodes) : undefined })).slice(0, episodeLimit);
 
   const nodes: MeaningNode[] = [];
   for (const hit of nodeHits) {
@@ -327,7 +386,7 @@ export async function meaningOf(guildId: string, text: string,
   // 1位との差と下限で絞り、同じページからは CHUNKS_PER_PAGE 節まで
   const chunks: MeaningChunk[] = [];
   if (chunkLimit > 0) {
-    const raw = nearest(guildId, 'chunk', query, { limit: chunkLimit * 8, exclude: excludeChunks ? new Set(excludeChunks) : undefined });
+    const raw = nearestOfAny(guildId, 'chunk', queries, { limit: chunkLimit * 8, exclude: excludeChunks ? new Set(excludeChunks) : undefined });
     const best = raw[0]?.score ?? 0;
     const perPage = new Map<string, number>();
     const sections = new Map<string, MeaningChunk>();

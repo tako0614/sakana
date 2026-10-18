@@ -17,7 +17,7 @@ import {
   type MessageReplyOptions
 } from 'discord.js';
 import { canBotAttach, canBotSpeak, canManageIndex, getChannelScope, getPublicChannelScope } from '../archive/permissions.js';
-import { meaningReader, recallWithMeaning, type RecallParts } from '../memory/recall.js';
+import { conversationText, meaningReader, recallWithMeaning, type RecallParts } from '../memory/recall.js';
 import { siteConfigFor, siteUrl } from '../memory/site.js';
 import { getEpisode } from '../memory/store.js';
 import { isSelfHosted } from '../mimic/client.js';
@@ -508,7 +508,9 @@ export async function handleAgentRequest(
     // 自発参加では、依頼の代わりに「呼ばれていない」ことを伝える前置きを付ける (想起や検索は発言そのもので行う)
     const prompt = ambient ? `${AMBIENT_HINT}\n${request}` : request;
     // 呼ばれたときの想起: 名前の照合 + 意味の近い記憶 (間に合わなければ名前だけ)
-    const recalled = toolset.memoryAvailable ? await recallSafely(guild.id, request, replyChain, recent) : null;
+    // 直前の会話 (LLM に見せている会話文。system は含めない) も意味検索の手がかりにする
+    const conversation = conversationText(recent);
+    const recalled = toolset.memoryAvailable ? await recallSafely(guild.id, request, replyChain, recent, conversation) : null;
     const userContent = buildUserContent({
       ctx: runContext,
       prompt,
@@ -527,7 +529,7 @@ export async function handleAgentRequest(
       model,
       guildId: guild.id,
       // 考えている途中の想起: 往復ごとに、いま調べていることに近い記憶のうち、まだ出していないものを足す
-      ...(toolset.memoryAvailable ? { memory: { read: meaningReader(guild.id, { request, shown: recalled ?? undefined }) } } : {}),
+      ...(toolset.memoryAvailable ? { memory: { read: meaningReader(guild.id, { request, shown: recalled ?? undefined, conversation }) } } : {}),
       // Discord input identity survives a process restart, so an unfinished
       // run resumes from its checkpoint instead of starting over. Completed
       // runs still use the runtime's default reuseCompleted=false behavior if
@@ -655,11 +657,12 @@ function memoryEpisodeUrl(guildId: string, id: number): string | null {
  * 依頼と返信先を強い手がかり、直近の会話を弱い手がかりにして思い出す。
  * 記憶が読めなくても会話は止めない。
  */
-async function recallSafely(guildId: string, request: string, replyChain: AgentMessage[], recent: AgentMessage[]): Promise<RecallParts | null> {
+async function recallSafely(guildId: string, request: string, replyChain: AgentMessage[], recent: AgentMessage[], conversation: string): Promise<RecallParts | null> {
   try {
     return await recallWithMeaning(guildId, {
       request: [request, ...replyChain.map((entry) => entry.content ?? '')].join('\n'),
-      context: recent.slice(-10).map((entry) => entry.content ?? '').join('\n')
+      context: recent.slice(-10).map((entry) => entry.content ?? '').join('\n'),
+      conversation
     });
   } catch (error) {
     console.error('Memory recall failed:', error);

@@ -2,7 +2,7 @@ import {
   episodesFor, getNode, linkedPages, nodeNames, recentEpisodesFor, searchEpisodes, searchNodes, sharedEpisodes,
   type NodeName
 } from './store.js';
-import { meaningOf, type Meaning, type MeaningChunk } from './vectors.js';
+import { meaningOf, type Meaning, type MeaningChunk, type QuerySegment } from './vectors.js';
 
 // 思い出す。会話に出た名前や言葉を手がかりに、関係するページと出来事を数件だけ引く。
 // 同期の recallFor は名前・別名の照合 + 全文検索。手がかりから1段だけ
@@ -164,13 +164,39 @@ function remember(shown: RecallParts, meaning: Meaning): void {
 }
 
 /**
+ * 直前の会話を意味検索の手がかりにするか (MEMORY_CONVERSATION_CLUE=1 で有効。既定はオフ)。
+ * 本番の #雑談 で測ったところ (docs/memory-chunks.md)、会話文を埋め込むと、記憶に関係があるかどうかにかかわらず 1 位が 0.88〜0.91 に
+ * 集まり (発言者の名前を外しても 0.88 前後)、スコアで選り分けられない。「あの9.9は…」のように話題が会話にある依頼は引けるが、
+ * 記憶と関係ない雑談では的外れが増える。話題が会話にある依頼は、モデルが memory_focus で言い直すほうが確かなので、既定では使わない。
+ */
+const conversationClue = (): boolean => !['', '0', 'false', 'no', 'off'].includes(String(process.env.MEMORY_CONVERSATION_CLUE ?? '').toLowerCase());
+/** 有効にしたとき、直前の会話の手がかりが依頼より弱い分。 */
+const CONVERSATION_PENALTY = Number(process.env.MEMORY_CONVERSATION_PENALTY ?? 0.01);
+
+/**
+ * 直前の会話 (LLM に見せている会話文のうち、依頼の前の数発言) を、想起の手がかりの 1 本の文にする。
+ * 「名前: 本文」を古い順に並べ、URL・メンションを除き、長ければ近い (後ろの) ほうを残す。system プロンプトは含めない。
+ * 「あの件どうなった？」「それって誰？」のように、話題が依頼文でなく直前の会話にあるときに効く。
+ */
+export function conversationText(messages: readonly { authorName?: string | undefined; content?: string | undefined }[], { limit = 6, chars = 500 }: { limit?: number; chars?: number } = {}): string {
+  const lines = messages.slice(-limit).flatMap((message) => {
+    const body = String(message.content ?? '').replace(/https?:\/\/\S+/g, '').replace(/<[@#&!]*\d+>/g, '').replace(/\s+/g, ' ').trim();
+    return body ? [`${message.authorName ?? ''}: ${body}`] : [];
+  });
+  const text = lines.join('\n');
+  return text.length > chars ? text.slice(-chars) : text;
+}
+
+/**
  * 呼ばれたときの想起: 名前の照合に、意味の近い記憶を足す。
+ * conversation (直前の会話) があれば、依頼とは別の手がかりとして足す (少し弱く)。
  * 質問側の埋め込みが間に合わない・ベクトルが無いときは、名前の想起だけを返す (遅くしない)。
  */
 export async function recallWithMeaning(guildId: string,
-  { request = '', context = '', maxChars = 2400, timeoutMs = 3000 }: { request?: string; context?: string; maxChars?: number; timeoutMs?: number } = {}): Promise<RecallParts> {
+  { request = '', context = '', conversation = '', maxChars = 2400, timeoutMs = 3000 }: { request?: string; context?: string; conversation?: string; maxChars?: number; timeoutMs?: number } = {}): Promise<RecallParts> {
   const parts = recallParts(guildId, { request, context, maxChars: 1800 });
-  const meaning = await meaningOf(guildId, request, { excludePaths: parts.paths, excludeEpisodes: parts.episodeIds, excludeChunks: parts.chunkIds, timeoutMs });
+  const query: string | QuerySegment[] = conversation.trim() && conversationClue() ? [{ text: request }, { text: conversation, penalty: CONVERSATION_PENALTY }] : request;
+  const meaning = await meaningOf(guildId, query, { excludePaths: parts.paths, excludeEpisodes: parts.episodeIds, excludeChunks: parts.chunkIds, timeoutMs });
   const lines = meaningLines(meaning);
   if (lines.length === 0 || !meaning) return parts;
   const head = parts.text || '思い出したこと (記憶の見出しだけ。中身は memory ツールで path / episode を開いて読む):';
@@ -198,16 +224,28 @@ const union = <T>(...sets: ReadonlySet<T>[]): Set<T> => new Set(sets.flatMap((se
  * 前の往復で出した指し先も出し直す (往復ごとの想起はその往復にしか付かず、入力にはもう残っていない)。
  * 焦点が無い往復は、途中で出したものを繰り返さない。入力に残っている開始時の想起 (seed.shown) は、どちらでも出さない。
  */
-export function meaningReader(guildId: string, seed: { request: string; shown?: RecallParts | undefined }):
+export function meaningReader(guildId: string, seed: { request: string; shown?: RecallParts | undefined; conversation?: string | undefined }):
   (query: { observations: string[]; reasoning?: string | undefined; thought?: string | undefined }) => Promise<{ text: string } | null> {
   const start: RecallParts = { text: '', paths: new Set(seed.shown?.paths), episodeIds: new Set(seed.shown?.episodeIds), chunkIds: new Set(seed.shown?.chunkIds) };
   const mid: RecallParts = { text: '', paths: new Set(), episodeIds: new Set(), chunkIds: new Set() };
   return async ({ observations, reasoning, thought }) => {
     const focus = focusOf(thought);
     if (observations.length === 0 && !focus) return null;
-    // 手がかりは、(焦点) → 依頼 → モデル自身が直前に考えていたこと (CoT。読めるときだけ) → 道具が返した内容、の順
+    // 既定: 手がかりを順につないで 1 本の質問にする。(焦点) → 依頼 → モデル自身が直前に考えていたこと (CoT。読めるときだけ) → 道具が返した内容。
+    // 埋め込みが読めるのは 500 字ほどなので、実際に効くのは前のほう (焦点・依頼・思考の頭) で、後ろの道具の結果は切れる。
+    // 道具の結果を別に埋め込むと、7〜9 割が下限を超えて毎往復の想起が的外れで埋まるので (docs/memory-chunks.md)、そうしていない。
     const noticed = observations.map((observation) => observation.replace(/^tool:[^:]*:\s*/, '').slice(0, 300));
-    const query = [...(focus ? [focus] : []), seed.request.slice(0, 300), ...(reasoning ? [reasoning.slice(-600)] : []), ...noticed].join('\n').slice(0, 1600);
+    const chained = [...(focus ? [focus] : []), seed.request.slice(0, 300), ...(reasoning ? [reasoning.slice(-600)] : []), ...noticed].join('\n').slice(0, 1600);
+    // 直前の会話の手がかりを有効にしたときだけ、別々に埋め込んでいちばん近いものを採る (会話は少し弱く)
+    const query: string | QuerySegment[] = seed.conversation?.trim() && conversationClue()
+      ? [
+        ...(focus ? [{ text: focus }] : []),
+        { text: seed.request.slice(0, 300) },
+        { text: seed.conversation, penalty: CONVERSATION_PENALTY },
+        ...(reasoning ? [{ text: reasoning.slice(-600) }] : []),
+        ...noticed.map((text) => ({ text }))
+      ]
+      : chained;
     // 焦点があるときは、途中で出したものも出し直す (その往復にしか付いていなかったので、もう入力に無い)
     const skip = focus ? start : { paths: union(start.paths, mid.paths), episodeIds: union(start.episodeIds, mid.episodeIds), chunkIds: union(start.chunkIds, mid.chunkIds) };
     const meaning = await meaningOf(guildId, query, { nodeLimit: 2, episodeLimit: 2, chunkLimit: 2, excludePaths: skip.paths, excludeEpisodes: skip.episodeIds, excludeChunks: skip.chunkIds, timeoutMs: 2000 });
