@@ -8,6 +8,16 @@ export interface Env {
   MEMORY_GUILD_IDS?: string;
   /** 旧: 1つだけ見せるとき (MEMORY_GUILD_IDS に足して扱う) */
   MEMORY_GUILD_ID?: string;
+  /** 'members' (既定: Discord ログインとサーバーのメンバー確認が要る) | 'public' (誰でも) */
+  MEMORY_ACCESS?: string;
+  /** ログインの入口になる正式な origin (例 https://sakana.takos.jp)。Discord の Redirects にはここの /auth/callback を登録する。別の入口 (workers.dev) から来た人はこちらへ転送する */
+  MEMORY_SITE_ORIGIN?: string;
+  /** Discord アプリの ID (公開してよい)。OAuth2 > Redirects に https://<このサイト>/auth/callback を登録する */
+  DISCORD_CLIENT_ID?: string;
+  /** secret */
+  DISCORD_CLIENT_SECRET?: string;
+  /** secret: cookie の署名の鍵 */
+  SESSION_SECRET?: string;
 }
 
 export interface NodeRow {
@@ -109,3 +119,11 @@ export interface EpisodePayload {
   contentHash: string;
 }
 
+export interface Session {
+  /** どのサーバーの入場か。cookie はサーバーごとだが、確かめ直す */
+  g: string;
+  uid: string;
+  name: string;
+  avatar: string | null;
+  exp: number;
+}

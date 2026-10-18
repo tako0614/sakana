@@ -1,50 +1,62 @@
+import {
+  authConfigured, currentSession, defaultAuthDeps, finishLogin, isPublicAccess, loginRedirect, logoutResponse, siteOrigin, type AuthDeps
+} from './auth.ts';
 import type { SafeHtml } from './html.ts';
 import { handleIngest } from './ingest.ts';
 import { layout } from './layout.ts';
 import { GUILD_ID, makeLinks, memoryGuilds, type Links } from './links.ts';
 import { scanReferences } from './markdown.ts';
 import * as store from './store.ts';
-import type { Env, NodeRow } from './types.ts';
+import type { Env, NodeRow, Session } from './types.ts';
 import {
-  articleView, episodeView, homeView, messageView, monthView, referencesOf, searchView, timelineIndexView, treeNav,
+  articleView, episodeView, homeView, loginView, messageView, monthView, referencesOf, searchView, timelineIndexView, treeNav,
   type ArticleData, type Page, type TimelineData
 } from './views.ts';
 
-// 記憶の URL と、画面ごとの読み出し。誰でも読める公開のサイト (ログインは無い)。サーバーごとに URL を分ける:
+// 記憶の URL と、gate (入場) と、画面ごとの読み出し。既定では、Discord でログインしたそのサーバーのメンバーだけが読める
+// (MEMORY_ACCESS=public なら誰でも)。サーバーごとに URL を分ける:
 //   /<サーバーID>/wiki           トップ            /<サーバーID>/wiki/<path>   記事 (?tab=timeline|links&kind=&order=&page=&cp=)
 //   /<サーバーID>/e/<id>         出来事            /<サーバーID>/t, /t/YYYY-MM 年表
 //   /<サーバーID>/s?q=           検索              /<サーバーID>/random        ランダムなページ
+//   /<サーバーID>/auth/logout    ログアウト
+//   /auth/login  /auth/callback  Discord ログイン (サーバーは query と state の中にある)
 //   /v1/memory/*                 bot からの取り込み (Bearer。サーバーは本文の guildId)
-// URL のサーバーが MEMORY_GUILD_IDS に無ければ、中身を何も見せずに 404。
-// 以前のログインリンク (/auth/…) は Discord に残っているので、開かれたら記憶のトップへ送る。
+// URL のサーバーが MEMORY_GUILD_IDS に無ければ、中身を何も見せずに 404。cookie もサーバーごと。
+// 以前の bot のログインリンク (/auth/link) は Discord に残っているので、開かれたら記憶のトップ (ログイン画面) へ送る。
 // 法令集 ('/', '/law/…', '/v1/laws') はここでは扱わない (null を返して既存の処理へ)。
 // サーバーの付かない旧い URL (/wiki …) は、見せているサーバーが1つのときだけそこへ転送する。
 
 export interface Deps {
+  auth: AuthDeps;
   now(): number;
 }
 
-export const defaultDeps: Deps = { now: () => Date.now() };
+export const defaultDeps: Deps = { auth: defaultAuthDeps, now: () => Date.now() };
 
 const SECURITY_HEADERS: Record<string, string> = {
   'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; img-src https://cdn.discordapp.com data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
   'x-content-type-options': 'nosniff',
   'referrer-policy': 'same-origin',
-  'x-frame-options': 'DENY',
-  'cache-control': 'public, max-age=60'
+  'x-frame-options': 'DENY'
 };
 
+/** 閉じている間は、人ごとの中身を共有キャッシュに残さない。誰でも読める設定のときだけ、短くキャッシュする。 */
+const PRIVATE = 'private, no-store';
+const PUBLIC = 'public, max-age=60';
+
 interface Context {
+  user?: Session | null;
   links?: Links;
   query?: string;
+  cache?: string;
 }
 
 function respond(page: Page, ctx: Context): Response {
   const body: SafeHtml = layout({
     title: page.title, description: page.description, main: page.main, rail: page.rail, nav: page.nav, narrow: page.narrow,
-    query: ctx.query, links: ctx.links
+    user: ctx.user, query: ctx.query, links: ctx.links
   });
-  return new Response(body.value, { status: page.status ?? 200, headers: { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS } });
+  return new Response(body.value, { status: page.status ?? 200, headers: { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS, 'cache-control': ctx.cache ?? PRIVATE } });
 }
 
 const redirect = (location: string): Response => new Response(null, { status: 302, headers: { location, 'cache-control': 'no-store' } });
@@ -72,10 +84,21 @@ export async function handleWiki(request: Request, env: Env, deps: Deps = defaul
 
   if (path.startsWith('/v1/memory/')) return handleIngest(request, env, deps.now());
 
-  // 以前のログインリンク (サーバーなし): 見せているサーバーが1つだけならそのトップへ
-  if (path === '/auth/link' || path === '/auth/login' || path === '/auth/callback') {
+  // ---- サーバーの付かない入口 ----
+  // 以前の bot のログインリンク: 見せているサーバーが1つだけならそのトップ (ログイン画面) へ
+  if (path === '/auth/link') {
     const only = guilds.length === 1 ? guilds[0] : null;
     return only ? redirect(makeLinks(only).home) : notFound();
+  }
+  if (path === '/auth/login' || path === '/auth/callback') {
+    if (!authConfigured(env)) return respond(messageView('ログインの設定がありません', 'このサイトでは Discord ログインがまだ使えません。', { status: 503 }), {});
+    if (path === '/auth/login') {
+      const guild = url.searchParams.get('g') ?? '';
+      return guilds.includes(guild) ? loginRedirect(request, env, guild, deps.auth) : notFound();
+    }
+    const result = await finishLogin(request, env, deps.auth);
+    if (result.ok) return result.response;
+    return respond(messageView('ログインできませんでした', result.reason, { status: result.status }), {});
   }
 
   // 旧い URL (サーバーなし): 見せているサーバーが1つだけなら、そこへ
@@ -92,13 +115,25 @@ export async function handleWiki(request: Request, env: Env, deps: Deps = defaul
   if (!guilds.includes(guild)) return notFound();
   const links = makeLinks(guild);
   if (rest === '' || rest === '/') return redirect(links.home);
-  if (rest === '/auth/logout') return redirect(links.home);
+  if (rest === '/auth/logout') return logoutResponse(request, guild);
 
   const isWiki = rest === '/wiki' || rest.startsWith('/wiki/') || rest.startsWith('/e/') || rest === '/t' || rest.startsWith('/t/') || rest === '/s' || rest === '/random';
   if (!isWiki) return null;
   if (request.method !== 'GET' && request.method !== 'HEAD') return new Response('method not allowed', { status: 405, headers: { allow: 'GET, HEAD' } });
 
-  const ctx: Context = { links };
+  // gate: 誰でも読める設定 (MEMORY_ACCESS=public) でなければ、このサーバーのメンバーとしてログインした人だけ
+  let user: Session | null = null;
+  if (!isPublicAccess(env)) {
+    // 入口が決まっていて (MEMORY_SITE_ORIGIN)、別の入口 (workers.dev など) から来たら、そちらへ転送する: cookie も Discord の戻り先もそこにしか無い
+    const origin = siteOrigin(env, url);
+    if (origin !== url.origin) return redirect(`${origin}${url.pathname}${url.search}`);
+    if (!authConfigured(env)) {
+      return respond(messageView('まだ公開されていません', '記憶は、Discord ログインの設定が済むまで閉じています。', { status: 503 }), { links });
+    }
+    user = await currentSession(request, env, guild, deps.now());
+    if (!user) return respond(loginView(`${url.pathname}${url.search}`, links), { links });
+  }
+  const ctx: Context = { user, links, cache: isPublicAccess(env) ? PUBLIC : PRIVATE };
   const db = env.LAWS;
 
   const nav = async (current: string): Promise<SafeHtml> => {

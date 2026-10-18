@@ -1,5 +1,6 @@
 import { SafeHtml, html, raw } from './html.ts';
 import type { Links } from './links.ts';
+import type { Session } from './types.ts';
 
 // 記憶の枠 (ヘッダー・左のナビと分類の木・右の欄・フッター) と CSS。画面ごとの中身は views.ts。
 // 見た目は素直な wiki: 白い紙・青いリンク・細い罫線だけ。カードも色付きの札も絵文字も使わない。
@@ -13,6 +14,7 @@ export interface LayoutOptions {
   nav?: SafeHtml;
   /** 右の欄 (情報欄・目次) */
   rail?: SafeHtml;
+  user?: Session | null;
   query?: string;
   /** このサーバーの URL (ヘッダーのリンクと検索の送り先)。サーバーが決まらない画面では無い */
   links?: Links;
@@ -21,7 +23,8 @@ export interface LayoutOptions {
 }
 
 export function layout(options: LayoutOptions): SafeHtml {
-  const { title, main, nav, rail, query = '', narrow = false, links } = options;
+  const { title, main, nav, rail, user, query = '', narrow = false, links } = options;
+  const avatar = user?.avatar ? `https://cdn.discordapp.com/avatars/${user.uid}/${user.avatar}.png?size=64` : null;
   const side = links || nav;
   return html`<!doctype html>
 <html lang="ja">
@@ -42,6 +45,7 @@ ${options.description ? html`<meta name="description" content="${options.descrip
     <input type="search" name="q" value="${query}" placeholder="記憶を検索" aria-label="検索" autocomplete="off" maxlength="100">
     <button type="submit">検索</button>
   </form>` : ''}
+  ${user && links ? html`<div class="user">${avatar ? html`<img src="${avatar}" alt="" width="22" height="22">` : ''}<span class="uname">${user.name}</span><a href="${links.logout}">ログアウト</a></div>` : ''}
 </header>
 ${side ? html`<input type="checkbox" id="navtoggle" class="navtoggle" aria-hidden="true">` : ''}
 <div class="shell${narrow ? ' narrow' : ''}${rail ? ' has-rail' : ''}${side ? ' has-nav' : ''}">
@@ -98,6 +102,9 @@ small, .muted { color: var(--muted); }
 .brand { font-size: 1.15rem; font-weight: 700; color: var(--ink); letter-spacing: .02em; }
 .brand:hover { text-decoration: none; }
 .search { display: flex; margin-left: auto; width: min(22rem, 60vw); }
+.user { display: flex; align-items: center; gap: .5rem; font-size: .82rem; color: var(--muted); white-space: nowrap; }
+.user img { border-radius: 50%; }
+.user .uname { max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
 .search input { flex: 1; min-width: 0; font: inherit; font-size: .9rem; padding: .3rem .6rem; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-right: 0; border-radius: 3px 0 0 3px; }
 .search input:focus { outline: 2px solid var(--link); outline-offset: -1px; background: var(--bg); }
 .search button { font: inherit; font-size: .85rem; padding: .3rem .8rem; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 0 3px 3px 0; cursor: pointer; }
@@ -243,6 +250,7 @@ details > summary small { margin-left: .4rem; }
 }
 @media (max-width: 760px) {
   .top { padding: 0 .8rem; gap: .7rem; }
+  .user .uname { display: none; }
   .burger { display: block; }
   .shell, .shell.has-nav, .shell.has-nav.has-rail { grid-template-columns: minmax(0, 1fr); padding: 0 .8rem; }
   .sidebar { display: none; position: static; max-height: none; border-bottom: 1px solid var(--soft); margin-bottom: .5rem; }

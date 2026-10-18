@@ -74,7 +74,8 @@ bot側は `GOVERNANCE_LAW_API_URL`（このWorkerのorigin）、`GOVERNANCE_LAW_
 ## 記憶 (wiki)
 
 法令集と同じ Worker に、記憶 (bot が会話を読んでまとめた人・もの・ネタ・出来事) を wiki として出しています。
-法令集も記憶も**誰でも読める公開サイト**で、ログインはありません (Discord で `/memory url` を使うとリンクが出ます)。
+法令集は誰でも読める公開サイトです。記憶は、**Discord でログインした、そのサーバーのメンバーだけ**が読めます
+(Discord で `/memory url` を使うとリンクが出ます。ログインの設定が揃うまでは `MEMORY_ACCESS=public` で公開のまま、下の「ログイン」を参照)。
 検索エンジンには `noindex` を出しています (人物の紹介や発言の引用が入るため。見つけてもらう場ではなく、リンクで渡す場として使う)。
 
 | path | 内容 |
@@ -85,7 +86,9 @@ bot側は `GOVERNANCE_LAW_API_URL`（このWorkerのorigin）、`GOVERNANCE_LAW_
 | `/<サーバーID>/t`, `/t/YYYY-MM` | 年表 (月ごとの多さが色で分かる) / その月の出来事を日ごとに |
 | `/<サーバーID>/s?q=` | 検索 (ページと出来事。3文字以上は文中も探し、短い語は名前と説明から) |
 | `/<サーバーID>/random` | ランダムなページ |
-| `/auth/link` など | 以前のログインリンク。開かれたら記憶のトップへ転送 |
+| `/auth/login?g=<サーバーID>` → Discord → `/auth/callback` | Discord ログイン (`identify` と `guilds`。メンバーかを確かめて cookie を渡す) |
+| `/<サーバーID>/auth/logout` | ログアウト |
+| `/auth/link` | 以前の bot のログインリンク。開かれたら記憶のトップ (ログイン画面) へ転送 |
 | `/v1/memory/*` | bot からの取り込み (Bearer)。`hashes` / `batch` / `prune` / `finish` |
 
 画面は Worker が D1 から組み立てます (JavaScript なし。分類の木は `<details>`、スマホのメニューはチェックボックス)。
@@ -94,18 +97,33 @@ CSP は `default-src 'none'` です。型検査は `npx tsc -p tsconfig.json` (s
 
 ### 見せる範囲
 
-- **誰でも読める**: ログイン・cookie・署名の鍵はありません。見せるサーバーは `MEMORY_GUILD_IDS` に書いたものだけで、一覧に無い ID の URL は
-  そのサーバーがあるかも教えずに 404 です。
+- **メンバーだけ**: `MEMORY_ACCESS` が `public` でなければ、Discord でログインして、そのサーバーに入っていると確かめられた人だけ。
+  見せるサーバーは `MEMORY_GUILD_IDS` に書いたものだけで、一覧に無い ID の URL はそのサーバーがあるかも教えずに 404 です。
+  ログインの設定が揃っていなければ、何も見せずに閉じます (503)。共有キャッシュには残さない (`cache-control: private, no-store`)。
 - **引用**: 出来事の根拠の発言の原文は、全員に見えるチャンネルのものだけをサイトへ送ります
   (`/memory include` で足したチャンネル・名前に nsfw などを含むチャンネル・消された発言は送らない)。
   送らなかった発言は件数だけ出し、「見られるチャンネルが限られている発言 n 件は載せていません」と表示します。
-- ページの本文と要約は、公開される前提です (`/memory include` した内容も、本文には入ります)。人物ページには会話から読み取った
+- ページの本文と要約は、サーバーのメンバーに見せる前提です (`/memory include` した内容も、本文には入ります)。人物ページには会話から読み取った
   自己申告 (学校・身長体重など) が入りうるので、載せたくない内容は builder の入力 (チャンネルの公開範囲・`/memory include`) 側で止めてください。
 - **サーバーごとに分ける**: URL は `/<サーバーID>/wiki/…`。データ (D1 の `guild_id`)・リンク・検索・取り込みのどれも、
   サーバーをまたいで混ざりません (同じ ID・同じパスで別の内容を入れて確かめています: `scripts/check-wiki.mjs`)。
   サーバーの付かない旧い URL (`/wiki` など) は、見せているサーバーが1つのときだけそこへ転送します。
 - **サーバーを足す**: `wrangler.jsonc` の `MEMORY_GUILD_IDS` に ID を足して配備し、bot の `.env` の `MEMORY_SITE_GUILDS` にも足します
   (builder がそのサーバーの記憶を作り終えていること。記憶の無いサーバーは送りません)。
+
+### ログイン (Discord OAuth)
+
+- 仕組み: `/auth/login` が Discord (`identify guilds`) へ送り、`/auth/callback` で戻る。state を cookie と突き合わせ、ユーザーの
+  サーバー一覧に対象サーバーがあるときだけ、署名つき cookie (`sk_session_<サーバーID>`、7 日、`Path=/<サーバーID>`、HttpOnly、Secure、SameSite=Lax) を渡す。
+  OAuth のアクセストークンはその場で失効させて保存しない。メッセージもフレンドも読まない。cookie は中にサーバー ID を持ち (署名の中)、
+  別のサーバーの URL では使えない。ログイン後の戻り先はそのサーバーの中の絶対パスだけ。
+- 入口は `MEMORY_SITE_ORIGIN` (正式な origin) 1 つ。別の入口 (workers.dev) から来た人はそちらへ転送する (cookie も Discord の戻り先もそこにしか無い)。
+- 設定 (Discord の Developer Portal → アプリ → OAuth2):
+  1. **Redirects** に `https://sakana.takos.jp/auth/callback` を登録する。
+  2. **Client Secret** を Worker の secret にする: `cd worker && npx wrangler secret put DISCORD_CLIENT_SECRET`。
+  3. `DISCORD_CLIENT_ID` は bot と同じアプリの ID (`wrangler.jsonc` の `vars`、公開してよい)。
+  4. `SESSION_SECRET` はランダムな文字列 (`npx wrangler secret put SESSION_SECRET`)。変えると全員がログインし直しになる。
+  5. 揃ったら `wrangler.jsonc` の `MEMORY_ACCESS` を `members` にして配備する (`public` の間は誰でも読める)。
 
 ### 配備
 

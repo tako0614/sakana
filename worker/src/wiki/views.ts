@@ -424,6 +424,19 @@ export function searchView(query: string, nodes: NodeHit[], episodes: EpisodeHit
 
 // ---- メッセージ ---------------------------------------------------------------
 
+/** ログインしていない人に出す画面。メンバーだけが読める。 */
+export function loginView(next: string, links: Links): Page {
+  return {
+    title: 'ログイン - 記憶',
+    narrow: true,
+    status: 401,
+    main: html`<section class="msg"><h1>記憶</h1>
+    <p>サーバーの人のことや会話がまとまっているので、このサーバーのメンバーだけが読めます。</p>
+    <p><a href="/auth/login${qs({ g: links.guild, next })}">Discord でログイン</a></p>
+    <p><small>ユーザー名と、このサーバーに入っているかを確かめるだけです。メッセージやフレンドは見ません。</small></p></section>`
+  };
+}
+
 export function messageView(title: string, message: string, options: { status?: number; link?: { href: string; label: string }; nav?: SafeHtml } = {}): Page {
   return {
     title: `${title} - 記憶`,

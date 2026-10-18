@@ -155,7 +155,7 @@ const search = interaction({ sub: 'search', admin: false, options: { query: '統
 await memoryCommand.execute(search);
 assert.match(embedText(search.calls[1][1]), /統治機能を作った/);
 
-// url: 記憶のサイト (誰でも読める。ログインは無い) へのリンクを、押した人にだけ返す。存在しないものも本人にだけ断る。
+// url: 記憶のサイト (サーバーのメンバーだけが Discord ログインで読める) へのリンクを、押した人にだけ返す。存在しないものも本人にだけ断る。
 // 設定 (MEMORY_SITE_PUBLIC_URL) があり、サイトが見せるサーバー (MEMORY_TREE_GUILD) でだけ出す
 {
   const keys = ['MEMORY_SITE_PUBLIC_URL', 'GOVERNANCE_LAW_SITE_URL', 'MEMORY_TREE_GUILD', 'MEMORY_SITE_GUILD', 'MEMORY_SITE_GUILDS'];

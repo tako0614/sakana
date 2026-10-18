@@ -2,7 +2,7 @@ import { ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } from 'disc
 
 // 記憶のサイト (worker/ の /wiki) への入り口。/memory url と explore の「サイトで開く」が使う。
 //
-// サイトは誰でも読める公開サイト (ログインは無い)。リンクはただの URL。
+// サイトは Discord でログインした、そのサーバーのメンバーだけが読める (MEMORY_ACCESS=public の間は誰でも。worker/README.md)。リンクはただの URL。
 //
 // 設定が揃っているときだけ出す (サイトを配備する前に URL だけが出て「not found」になった、2026-10-17):
 //   MEMORY_SITE_PUBLIC_URL    サイトの origin (https のみ。開発の localhost を除く)
