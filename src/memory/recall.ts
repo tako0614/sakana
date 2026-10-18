@@ -2,7 +2,7 @@ import {
   episodesFor, getNode, linkedPages, nodeNames, recentEpisodesFor, searchEpisodes, searchNodes, sharedEpisodes,
   type NodeName
 } from './store.js';
-import { meaningOf, type Meaning, type MeaningChunk, type QuerySegment } from './vectors.js';
+import { embedQuery, hasVectors, meaningOf, scoresFor, type Meaning, type MeaningChunk, type QuerySegment } from './vectors.js';
 
 // 思い出す。会話に出た名前や言葉を手がかりに、関係するページと出来事を数件だけ引く。
 // 同期の recallFor は名前・別名の照合 + 全文検索。手がかりから1段だけ
@@ -76,12 +76,22 @@ export function recallFor(guildId: string,
   return recallParts(guildId, { request, context, maxChars }).text;
 }
 
+/**
+ * 直近の会話に出てくる名前のページを、どれだけ手がかりにするか。0 なら使わない。
+ * 本番の実行記録 (2026-10-18、29 件) では、0.4 にしていたせいで、依頼に名前が無いと直近の会話の常連 (t3tra・たこ・さかな)
+ * のページと、そのページのいつもの上位の出来事が毎回出て (28 件)、依頼と関係のない話を持ち出す元になっていた。
+ */
+const CONTEXT_WEIGHT = Number(process.env.MEMORY_RECALL_CONTEXT_WEIGHT ?? 0);
+
+/** ページに出す出来事の候補を、依頼に近い順に絞る。渡さなければ、ページの重要度順の上位 2 件 (従来どおり)。 */
+export type EpisodeRanker = <T extends { id: number }>(episodes: T[]) => T[];
+
 export function recallParts(guildId: string,
-  { request = '', context = '', maxChars = 1800 }: { request?: string; context?: string; maxChars?: number } = {}): RecallParts {
+  { request = '', context = '', maxChars = 1800, rank }: { request?: string; context?: string; maxChars?: number; rank?: EpisodeRanker } = {}): RecallParts {
   const scores = new Map<string, number>();
   const add = (path: string, value: number): void => { scores.set(path, (scores.get(path) ?? 0) + value); };
   for (const { path, score } of matchPages(guildId, request)) add(path, score);
-  for (const { path, score } of matchPages(guildId, context, { limit: 6 })) add(path, score * 0.4);
+  if (CONTEXT_WEIGHT > 0) for (const { path, score } of matchPages(guildId, context, { limit: 6 })) add(path, score * CONTEXT_WEIGHT);
 
   const terms = termsOf(request).join(' ');
   if (terms) {
@@ -99,7 +109,7 @@ export function recallParts(guildId: string,
     if (!node) continue;
     // 見出しだけ。中身 (説明・本文) は入れない: 読みたければ memory ツールで path / episode を開く
     lines.push(`- [[${path}]]`);
-    const episodes = episodesFor(guildId, path, 2).filter((episode) => !shown.has(episode.id));
+    const episodes = (rank ? rank(episodesFor(guildId, path, 16)) : episodesFor(guildId, path, 2)).filter((episode) => !shown.has(episode.id)).slice(0, 2);
     for (const episode of episodes) {
       shown.add(episode.id);
       lines.push(`  e${episode.id} ${date(episode.at_ms)}${episode.kind ? ` [${episode.kind}]` : ''} ${episode.title}`);
@@ -108,7 +118,7 @@ export function recallParts(guildId: string,
   // 2つ以上思い出したら、その間で起きたこと (複数のページをまたぐ出来事)
   const [firstPage, secondPage] = pages;
   if (firstPage !== undefined && secondPage !== undefined) {
-    const shared = sharedEpisodes(guildId, firstPage, secondPage, 3).filter((episode) => !shown.has(episode.id));
+    const shared = (rank ? rank(sharedEpisodes(guildId, firstPage, secondPage, 12)) : sharedEpisodes(guildId, firstPage, secondPage, 3)).filter((episode) => !shown.has(episode.id)).slice(0, 3);
     if (shared.length > 0) {
       lines.push(`- [[${firstPage}]] と [[${secondPage}]] の両方が関わった出来事:`);
       for (const episode of shared) { shown.add(episode.id); lines.push(`  e${episode.id} ${date(episode.at_ms)} ${episode.title}`); }
@@ -171,6 +181,8 @@ function remember(shown: RecallParts, meaning: Meaning): void {
  */
 const conversationClue = (): boolean => !['', '0', 'false', 'no', 'off'].includes(String(process.env.MEMORY_CONVERSATION_CLUE ?? '').toLowerCase());
 /** 有効にしたとき、直前の会話の手がかりが依頼より弱い分。 */
+/** 名前で見つけたページの出来事を出す、依頼への近さの下限 (意味で引く出来事の下限と同じ)。 */
+const PAGE_EPISODE_FLOOR = Number(process.env.MEMORY_PAGE_EPISODE_FLOOR ?? process.env.MEMORY_RECALL_FLOOR ?? 0.85);
 const CONVERSATION_PENALTY = Number(process.env.MEMORY_CONVERSATION_PENALTY ?? 0.01);
 
 /**
@@ -194,9 +206,19 @@ export function conversationText(messages: readonly { authorName?: string | unde
  */
 export async function recallWithMeaning(guildId: string,
   { request = '', context = '', conversation = '', maxChars = 2400, timeoutMs = 3000 }: { request?: string; context?: string; conversation?: string; maxChars?: number; timeoutMs?: number } = {}): Promise<RecallParts> {
-  const parts = recallParts(guildId, { request, context, maxChars: 1800 });
+  // 名前で見つけたページの出来事は、重要度順でなく依頼に近い順に選ぶ (近いものが無ければ見出しだけ)。
+  // 質問側の埋め込みが間に合わない・ベクトルが無いときは、従来の重要度順。
+  const vector = hasVectors(guildId) && request.trim() ? await embedQuery(request, { timeoutMs }) : null;
+  const rank: EpisodeRanker | undefined = vector
+    ? (episodes) => {
+      const near = scoresFor(guildId, 'episode', vector, episodes.map((episode) => episode.id));
+      return episodes.filter((episode) => (near.get(episode.id) ?? 0) >= PAGE_EPISODE_FLOOR)
+        .sort((a, b) => (near.get(b.id) ?? 0) - (near.get(a.id) ?? 0));
+    }
+    : undefined;
+  const parts = recallParts(guildId, { request, context, maxChars: 1800, ...(rank ? { rank } : {}) });
   const query: string | QuerySegment[] = conversation.trim() && conversationClue() ? [{ text: request }, { text: conversation, penalty: CONVERSATION_PENALTY }] : request;
-  const meaning = await meaningOf(guildId, query, { excludePaths: parts.paths, excludeEpisodes: parts.episodeIds, excludeChunks: parts.chunkIds, timeoutMs });
+  const meaning = await meaningOf(guildId, query, { excludePaths: parts.paths, excludeEpisodes: parts.episodeIds, excludeChunks: parts.chunkIds, timeoutMs, queryVector: typeof query === 'string' ? vector : null });
   const lines = meaningLines(meaning);
   if (lines.length === 0 || !meaning) return parts;
   const head = parts.text || '思い出したこと (記憶の見出しだけ。中身は memory ツールで path / episode を開いて読む):';

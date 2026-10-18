@@ -236,6 +236,23 @@ export function nearest(guildId: string, kind: Kind, query: Float32Array, { limi
   return hits.sort((a, b) => b.score - a.score).slice(0, limit);
 }
 
+/** 指定した id だけの、質問への近さ。ベクトルが無い id は含まれない。 */
+export function scoresFor(guildId: string, kind: Kind, query: Float32Array, ids: readonly number[]): Map<number, number> {
+  const scores = new Map<number, number>();
+  const matrix = matrixFor(guildId, kind);
+  if (!matrix || matrix.dim !== query.length || ids.length === 0) return scores;
+  const wanted = new Set(ids);
+  for (let row = 0; row < matrix.ids.length; row += 1) {
+    const id = matrix.ids[row] as number;
+    if (!wanted.has(id)) continue;
+    let score = 0;
+    const base = row * matrix.dim;
+    for (let index = 0; index < matrix.dim; index += 1) score += (matrix.values[base + index] ?? 0) * (query[index] ?? 0);
+    scores.set(id, score);
+  }
+  return scores;
+}
+
 /**
  * 質問文をベクトルにする。timeoutMs で見切る (null)。モデルが眠っていたら起こしておく。
  * 見切った後も読み込みは裏で続くので、次の往復には間に合う。
@@ -341,14 +358,16 @@ const CHUNKS_PER_PAGE = 2;
  * (1 本につなぐと、埋め込みが読める 500 字ほどを超えた後ろが切れる)。
  */
 export async function meaningOf(guildId: string, input: string | readonly QuerySegment[],
-  { nodeLimit = 2, episodeLimit = 3, chunkLimit = 3, excludePaths, excludeEpisodes, excludeChunks, timeoutMs = 3000 }: {
+  { nodeLimit = 2, episodeLimit = 3, chunkLimit = 3, excludePaths, excludeEpisodes, excludeChunks, timeoutMs = 3000, queryVector }: {
     nodeLimit?: number; episodeLimit?: number; chunkLimit?: number; excludePaths?: ReadonlySet<string>; excludeEpisodes?: ReadonlySet<number>;
     excludeChunks?: ReadonlySet<number>; timeoutMs?: number;
+    /** 質問が 1 つの文のとき、呼び出し側で埋め込み済みのベクトル (同じ文を二度埋め込まない)。 */
+    queryVector?: Float32Array | null;
   } = {}): Promise<Meaning | null> {
   if (!hasVectors(guildId)) return null;
   const segments: QuerySegment[] = typeof input === 'string' ? [{ text: input }] : [...input];
   const embedded = segments.length === 1 && typeof input === 'string'
-    ? [await embedQuery(input, { timeoutMs })]
+    ? [queryVector ?? await embedQuery(input, { timeoutMs })]
     : await embedQueries(segments.map((segment) => segment.text), { timeoutMs });
   const queries = (embedded ?? []).flatMap((vector, index) => (vector ? [{ vector, penalty: segments[index]?.penalty ?? 0 }] : []));
   if (queries.length === 0) return null;

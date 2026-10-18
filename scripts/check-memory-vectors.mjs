@@ -297,6 +297,15 @@ assert.equal(fallback.text, named, 'without meaning the name-based recall comes 
 vectors.setEmbedder(fakeEmbed);
 assert.equal((await recallWithMeaning('920000000000000999', { request })).text, '', 'a server without memory recalls nothing');
 
+// 直近の会話に出てくる名前だけでは、ページを引かない (依頼に名前が無いと、会話の常連のページと、そのいつもの上位の出来事が毎回出ていた)
+assert.equal(recallFor(GUILD, { request: 'おはよう', context: 'さばが昼にカップ麺を食べた。たこのPRの話' }), '', 'names only in the surrounding chat are not a clue');
+// 名前で見つけたページの出来事は、渡された選び方 (依頼に近い順) に従う。近いものが無ければ見出しだけ
+const bareHeading = recallLib.recallParts(GUILD, { request: 'たこって誰', rank: () => [] });
+assert.match(bareHeading.text, /\[\[people\/たこ\]\]/, 'the page is still listed');
+assert.ok(!/^ {2}e\d+/m.test(bareHeading.text) && bareHeading.episodeIds.size === 0, 'with nothing near enough, no episode lines');
+const pickedEpisode = recallLib.recallParts(GUILD, { request: 'たこって誰', rank: (episodes) => episodes.filter((entry) => entry.id === e1) });
+assert.ok(pickedEpisode.episodeIds.has(e1), 'the ranker chooses which episodes are shown');
+
 // ---- 考えている途中の想起 ------------------------------------------------------
 const read = meaningReader(GUILD, { request: 'さばって何者？', shown: undefined });
 assert.equal(await read({ observations: [] }), null, 'the first round is covered by the start-of-run recall');
