@@ -33,12 +33,17 @@ export const agentModelFor = (engine: unknown): string => (
 /**
  * モデルごとの provider の指定。OpenRouter の「安い順」は fp4 の provider (OpenInference など) を先に選ぶので、
  * deepseek は fp8 に絞る (`AGENT_DEEPSEEK_QUANTIZATIONS=` と空にすると絞らない。複数ならカンマ区切り)。
+ * それだけだと fp8 の中でも遅い provider (InferenceNet は 1 往復 17 秒) に半分以上回るので、
+ * 速くて安い DeepInfra を先に試す (`AGENT_DEEPSEEK_PROVIDERS`、カンマ区切り、空で指定なし)。ここが落ちたら他の fp8 に回る。
  * 選んだモデル本体の回し先だけに掛け、混んだときの回し先 (別のモデル) には掛けない。
  */
-export function agentProviderPrefs(model: string): { quantizations?: string[] } {
+export function agentProviderPrefs(model: string): { quantizations?: string[]; order?: string[] } {
   if (model !== AGENT_ENGINES.deepseek) return {};
-  const quantizations = (process.env.AGENT_DEEPSEEK_QUANTIZATIONS ?? 'fp8').split(',').map((value) => value.trim()).filter(Boolean);
-  return quantizations.length ? { quantizations } : {};
+  const list = (name: string, fallback: string): string[] =>
+    (process.env[name] ?? fallback).split(',').map((value) => value.trim()).filter(Boolean);
+  const quantizations = list('AGENT_DEEPSEEK_QUANTIZATIONS', 'fp8');
+  const order = list('AGENT_DEEPSEEK_PROVIDERS', 'DeepInfra');
+  return { ...(quantizations.length ? { quantizations } : {}), ...(order.length ? { order } : {}) };
 }
 
 // 混んだときの回し先の優先順 (出来が良くて安いもの)。deepseek は価格が一段上なので入れない。

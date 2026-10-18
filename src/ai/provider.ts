@@ -297,8 +297,8 @@ export interface RequestModelOptions {
   beforeSend?: () => unknown;
   ignoreProviders?: readonly string[];
   maxPrice?: MaxPrice | null;
-  /** OpenRouter の provider 指定 (量子化の絞り込み)。最初のモデルへの要求だけに付け、回し先のモデルには付けない。 */
-  providerPrefs?: { quantizations?: readonly string[] };
+  /** OpenRouter の provider 指定 (量子化の絞り込み・先に試す provider)。最初のモデルへの要求だけに付け、回し先のモデルには付けない。 */
+  providerPrefs?: { quantizations?: readonly string[]; order?: readonly string[] };
 }
 
 /** 応答の choices[0] を確かめて形を決める。message が無ければ投げる。 */
@@ -356,6 +356,7 @@ export async function requestModel({ model = providerConfig.model,fallbackModels
             body:JSON.stringify({ model:route,messages,stream:false,max_tokens:maxOutputTokens,
               provider:{sort:'price',require_parameters:true,allow_fallbacks:true,
                 ...(routeIndex === 0 && providerPrefs.quantizations?.length ? {quantizations:providerPrefs.quantizations} : {}),
+                ...(routeIndex === 0 && providerPrefs.order?.length ? {order:providerPrefs.order} : {}),
                 ...(ignoreProviders.length ? {ignore:ignoreProviders} : {}),
                 ...(reservation.capped || maxPrice ? {max_price:priceCap(reservation,maxPrice)} : {})},
               ...(tools?.length ? {tools,tool_choice:'auto'} : {}),

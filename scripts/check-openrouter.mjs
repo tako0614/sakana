@@ -56,9 +56,13 @@ try{
   const {agentProviderPrefs,AGENT_ENGINES,DEFAULT_AGENT_ENGINE}=await import('../src/agent/engines.js');
   await requestModel({...job,messages:[{role:'user',content:'write'}],providerPrefs:{quantizations:['fp8']}});
   assert.deepEqual(requests.at(-1).provider.quantizations,['fp8'],'a quantization preference reaches the first route');
+  await requestModel({...job,messages:[{role:'user',content:'write'}],providerPrefs:{order:['DeepInfra']}});
+  assert.deepEqual(requests.at(-1).provider.order,['DeepInfra'],'a provider to try first reaches the first route');
+  assert.equal(requests.at(-1).provider.allow_fallbacks,true,'and the others stay available');
   await requestModel({...job,messages:[{role:'user',content:'write'}]});
   assert.equal(requests.at(-1).provider.quantizations,undefined,'no preference, no filter');
-  assert.deepEqual(agentProviderPrefs(AGENT_ENGINES.deepseek),{quantizations:['fp8']});
+  assert.equal(requests.at(-1).provider.order,undefined);
+  assert.deepEqual(agentProviderPrefs(AGENT_ENGINES.deepseek),{quantizations:['fp8'],order:['DeepInfra']});
   assert.deepEqual(agentProviderPrefs(AGENT_ENGINES.glm),{},'other models are routed as before');
   assert.equal(DEFAULT_AGENT_ENGINE,'deepseek');
   mode='outage';
