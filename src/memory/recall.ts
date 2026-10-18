@@ -194,9 +194,9 @@ const union = <T>(...sets: ReadonlySet<T>[]): Set<T> => new Set(sets.flatMap((se
  * 思考は provider が文章で返したときだけ (暗号化されたものは読めない) で、無ければ依頼と道具の結果で引く。
  *
  * モデルが memory_focus で「いま思い出したいこと」を示したら、それを最優先の手がかりにして選び直す (想起は受動のまま、向きだけ変える)。
- * 焦点は次に変えるまで残るので、示している間は毎回の往復で同じ指し先を出す (往復ごとの想起はその往復にしか付かないため、
- * 出した行を除くと、焦点を示したのに次の往復で消えてしまう)。焦点が無いときは、途中で出したものは繰り返さない。
- * 入力に残っている開始時の想起 (seed.shown) は、どちらでも出さない。
+ * 焦点は runtime が次の 1 回のモデル呼び出しにだけ使い、応答が返ったら捨てる (one-shot)。モデルが明示的に選び直したのだから、
+ * 前の往復で出した指し先も出し直す (往復ごとの想起はその往復にしか付かず、入力にはもう残っていない)。
+ * 焦点が無い往復は、途中で出したものを繰り返さない。入力に残っている開始時の想起 (seed.shown) は、どちらでも出さない。
  */
 export function meaningReader(guildId: string, seed: { request: string; shown?: RecallParts | undefined }):
   (query: { observations: string[]; reasoning?: string | undefined; thought?: string | undefined }) => Promise<{ text: string } | null> {
@@ -208,7 +208,7 @@ export function meaningReader(guildId: string, seed: { request: string; shown?: 
     // 手がかりは、(焦点) → 依頼 → モデル自身が直前に考えていたこと (CoT。読めるときだけ) → 道具が返した内容、の順
     const noticed = observations.map((observation) => observation.replace(/^tool:[^:]*:\s*/, '').slice(0, 300));
     const query = [...(focus ? [focus] : []), seed.request.slice(0, 300), ...(reasoning ? [reasoning.slice(-600)] : []), ...noticed].join('\n').slice(0, 1600);
-    // 焦点があるときは、途中で出したものも出し直す (消えているので)
+    // 焦点があるときは、途中で出したものも出し直す (その往復にしか付いていなかったので、もう入力に無い)
     const skip = focus ? start : { paths: union(start.paths, mid.paths), episodeIds: union(start.episodeIds, mid.episodeIds), chunkIds: union(start.chunkIds, mid.chunkIds) };
     const meaning = await meaningOf(guildId, query, { nodeLimit: 2, episodeLimit: 2, chunkLimit: 2, excludePaths: skip.paths, excludeEpisodes: skip.episodeIds, excludeChunks: skip.chunkIds, timeoutMs: 2000 });
     const lines = meaningLines(meaning);

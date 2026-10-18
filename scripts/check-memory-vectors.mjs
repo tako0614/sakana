@@ -328,9 +328,9 @@ vectors.setEmbedder(fakeEmbed);
   assert.match(focused.text, /ダブスタ|たこ/);
   assert.ok(!queries.at(-1).includes('memory_focus.'), 'the labels are stripped from the query');
   assert.ok(queries.at(-1).startsWith('レビューの話 たこが自分のPR'), 'the focus leads the query, ahead of the request');
-  // 往復ごとの想起はその往復にしか付かない。焦点を示している間は、同じ指し先を毎回出す
+  // 往復ごとの想起はその往復にしか付かない (runtime は焦点を 1 回で捨てる)。明示的に選び直したら、前の往復で出した指し先も出し直す
   const again = await reader({ observations: [], thought: focus });
-  assert.ok(again && /ダブスタ|たこ/.test(again.text), 'while the focus stays, the pointers come back every round');
+  assert.ok(again && /ダブスタ|たこ/.test(again.text), 'a new explicit focus brings back pointers shown in an earlier round (they are no longer in the input)');
   // 焦点が無い往復は、出したものを繰り返さない
   const plain = await reader({ observations: ['tool:search: たこ レビュー 飛ばした'] });
   assert.ok(!plain || !/\[\[topics\/ダブスタ\]\]|\[\[people\/たこ\]\]/.test(plain.text), 'without a focus, what was shown is not shown again');
