@@ -278,10 +278,11 @@ export interface Meaning { nodes: MeaningNode[]; episodes: MeaningEpisode[]; chu
 // 下限 0.85 で「何も似ていない質問」は何も出さない。上位は 0.01〜0.02 差で団子になるので、差は 0.02。
 const gap = Number(process.env.MEMORY_RECALL_GAP ?? 0.02);
 const floor = Number(process.env.MEMORY_RECALL_FLOOR ?? 0.85);
-// 断片 (ページの中の1つの知識) は、ページより具体的なぶん、関係のある質問でスコアが高く出る。値は実データで決めた (docs/memory-chunks.md):
-// 1 位のスコアが 0.89 未満だと「1 位のページが正解」は 2 割弱、0.90 以上で約 5 割。雑談 300 件では 0.885 以上が約 3 割、0.90 以上が 1 割弱。
-const chunkGap = Number(process.env.MEMORY_CHUNK_GAP ?? 0.015);
-const chunkFloor = Number(process.env.MEMORY_CHUNK_FLOOR ?? 0.885);
+// 断片 (ページの中の1つの知識) の下限と差。実データの短い質問で決めた (本番、2026-10-18、docs/memory-chunks.md):
+// 関係のある質問 10 件の 1 位は 0.861〜0.915、関係のない質問 8 件の 1 位は 0.805〜0.853 (「おはよう」だけ名前の一致で 0.873)。
+// 長い文 (出来事の要約) を質問にした測定では 0.89 未満の正解率が低かったが、実際の質問は短く、スコアが低めに出る。
+const chunkGap = Number(process.env.MEMORY_CHUNK_GAP ?? 0.02);
+const chunkFloor = Number(process.env.MEMORY_CHUNK_FLOOR ?? 0.865);
 /** 1ページから出す節の上限 (同じページの似た節で枠を埋めない)。 */
 const CHUNKS_PER_PAGE = 2;
 
