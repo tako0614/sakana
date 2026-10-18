@@ -297,6 +297,8 @@ export interface RequestModelOptions {
   beforeSend?: () => unknown;
   ignoreProviders?: readonly string[];
   maxPrice?: MaxPrice | null;
+  /** OpenRouter の provider 指定 (量子化の絞り込み)。最初のモデルへの要求だけに付け、回し先のモデルには付けない。 */
+  providerPrefs?: { quantizations?: readonly string[] };
 }
 
 /** 応答の choices[0] を確かめて形を決める。message が無ければ投げる。 */
@@ -313,7 +315,7 @@ function modelResponse(data: JsonRecord & { usage: ModelUsage }): ModelResponse 
 export async function requestModel({ model = providerConfig.model,fallbackModels = [],fallbackStatuses,messages,tools,jsonOnly = false,
   maxOutputTokens = 8000,timeoutMs = 120000,deadlineAt = Infinity,reasoning,temperature,
   guildId = null,role = 'chat',runId = null,retries = 0,budgetId = null,consumeRequest,beforeSend,ignoreProviders = [],
-  maxPrice = null }: RequestModelOptions): Promise<ModelResponse> {
+  maxPrice = null,providerPrefs = {} }: RequestModelOptions): Promise<ModelResponse> {
   if (!providerConfig.apiKey) throw new Error('OPENROUTER_API_KEY is not configured');
   if (!Number.isInteger(retries) || retries < 0) throw new Error('retries must be a nonnegative integer');
   const routes = validateRoutes(model,fallbackModels);
@@ -353,6 +355,7 @@ export async function requestModel({ model = providerConfig.model,fallbackModels
             headers:{'content-type':'application/json',authorization:`Bearer ${providerConfig.apiKey}`},
             body:JSON.stringify({ model:route,messages,stream:false,max_tokens:maxOutputTokens,
               provider:{sort:'price',require_parameters:true,allow_fallbacks:true,
+                ...(routeIndex === 0 && providerPrefs.quantizations?.length ? {quantizations:providerPrefs.quantizations} : {}),
                 ...(ignoreProviders.length ? {ignore:ignoreProviders} : {}),
                 ...(reservation.capped || maxPrice ? {max_price:priceCap(reservation,maxPrice)} : {})},
               ...(tools?.length ? {tools,tool_choice:'auto'} : {}),

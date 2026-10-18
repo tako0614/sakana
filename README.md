@@ -306,7 +306,7 @@ system prompt は毎ターン送り直すので短さがそのまま費用です
 
 ### モデルとトークン
 
-OpenRouter の安いモデルを人ごとに `/model` で選びます。既定は `glm` (`z-ai/glm-5.3-flash`、2026-10-17 に ling から変更)、ほかに `ling` (`inclusionai/ling-3.0-flash`、いちばん安い)、`qwen` (`qwen/qwen3.8-flash`)、`deepseek` (`deepseek/deepseek-v4.1-flash-1017`)、`mimo` (`xiaomi/mimo-v2.6-flash`)。思考は `reasoning.effort=medium` です (flash 系は `high` だと考えるだけで分単位になる)。2026-10-15 に DeepSeek v4 flash から切り替えました。
+OpenRouter の安いモデルを人ごとに `/model` で選びます。既定は `deepseek` (`deepseek/deepseek-v4.1-flash-1017`、2026-10-18 に glm から変更。fp8 の provider に絞る。`AGENT_DEEPSEEK_QUANTIZATIONS` で変えられ、空にすると絞らない)、ほかに `glm` (`z-ai/glm-5.3-flash`)、`ling` (`inclusionai/ling-3.0-flash`、いちばん安い)、`qwen` (`qwen/qwen3.8-flash`)、`mimo` (`xiaomi/mimo-v2.6-flash`)。思考は `AGENT_REASONING_EFFORT` (本番は `high`、2026-10-18 に medium から変更)。同じ依頼で比べると medium は 13 件中 3 件しか調べに行かず、high は 7 件調べに行った (xhigh は high と変わらない)。1 往復は deepseek で約 7 秒、glm で約 14 秒 (最大 30 秒台) で、分単位にはならなかった。2026-10-15 に DeepSeek v4 flash から切り替えました。
 
 トークンを使わないための作りが何点かあります。
 

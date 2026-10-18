@@ -267,8 +267,8 @@ const clear = () => db.prepare('DELETE FROM agent_engine WHERE user_id = ?').run
 
 clear();
 try {
-  if (engineFor(USER, TEST_GUILD) !== DEFAULT_ENGINE) fail('既定は glm');
-  if (DEFAULT_ENGINE !== 'glm') fail('既定のエンジンは glm');
+  if (engineFor(USER, TEST_GUILD) !== DEFAULT_ENGINE) fail('既定は deepseek');
+  if (DEFAULT_ENGINE !== 'deepseek') fail('既定のエンジンは deepseek');
   // deepseek は 2026-10-15 に廃止したが v4.1-flash で復活した。選んでいた人はそのまま deepseek (黙って別物に落ちない)
   db.prepare('INSERT OR REPLACE INTO agent_engine (guild_id, user_id, engine, updated_at) VALUES (?, ?, ?, ?)').run(TEST_GUILD, USER, 'deepseek', Date.now());
   if (engineFor(USER, TEST_GUILD) !== 'deepseek') fail('deepseek は v4.1-flash で復活したので、選んでいた人はそのまま deepseek');
