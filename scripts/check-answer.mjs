@@ -116,6 +116,18 @@ const link = (no, url) => `[${no}](<${url}>)`;
   const idx = expandCitations('配列は items[1] が先頭だよ', refs);
   if (idx !== '配列は items[1] が先頭だよ') fail(`添字を壊してはいけない: ${JSON.stringify(idx)}`);
 
+  // 出典が続くとき ([1][2]) は2つ目も引用 (前は `]` の直後を添字とみなして、生の [2] が残った)。添字の連なりは触らない
+  const run = expandCitations('これが根拠 [1][2]。', refs);
+  if (/\[\d\]/.test(run) || (run.match(/\]\(<https/g) ?? []).length !== 2) fail(`続く出典を両方リンクにする: ${JSON.stringify(run)}`);
+  const grid = expandCitations('配列は grid[1][2] の順', refs);
+  if (grid !== '配列は grid[1][2] の順') fail(`添字の連なりは壊さない: ${JSON.stringify(grid)}`);
+
+  // モデルが自分で書いた出典の一覧 (行頭の [n] や [e12] が並ぶ末尾) は落とす。一覧の印が無関係な発言へのリンクになっていた
+  const list = expandCitations('本文だよ [1]。\n\n[1] people/たまね — 盗撮エース高 [2]\n[3] e11837 — 共テ代拒否', refs);
+  if (list !== `本文だよ${link('①', msgUrl(1))}。`) fail(`自作の出典一覧は落とす: ${JSON.stringify(list)}`);
+  const only = expandCitations('[1] と言ってる', refs);
+  if (!only.includes('](<')) fail(`本文が無いなら行頭の出典は残す: ${JSON.stringify(only)}`);
+
   // 空白で区切られていれば引用として扱う
   const cited = expandCitations('根拠はこれ [1]。', refs);
   if (cited !== `根拠はこれ${link('①', msgUrl(1))}。`) fail(`空白区切りは引用: ${JSON.stringify(cited)}`);

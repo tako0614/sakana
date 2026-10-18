@@ -163,6 +163,27 @@ export function stripTrailingSubtext(text: string): string {
   return end === 0 ? text : lines.slice(0, end).join('\n');
 }
 
+/**
+ * モデルが自分で書いた出典の一覧 (`[1] people/… — …` の行が末尾に並ぶもの) を落とす。
+ * 出典は文の終わりに付ける決まりで、行頭の `[1]` は一覧の見出しの印にすぎない。そのまま変換すると、
+ * 一覧の印が無関係な発言へのリンクになり、行の中身は内部の名前 (ページのパス・出来事の番号) の羅列になる。
+ */
+const FOOTNOTE_LINE = /^[ \t　]*(?:[-*・]\s*)?\[(?:\d{1,4}|e\d{1,9})\][ \t　]*\S/i;
+export function dropFootnoteList(text: string): string {
+  const lines = text.split('\n');
+  let end = lines.length;
+  const tail: number[] = [];
+  while (end > 0) {
+    const line = String(lines[end - 1]);
+    if (line.trim() === '' || SUBTEXT_LINE.test(line)) { end -= 1; continue; }
+    if (FOOTNOTE_LINE.test(line)) { tail.push(end - 1); end -= 1; continue; }
+    break;
+  }
+  if (!tail.length || end === 0) return text;
+  const drop = new Set(tail);
+  return lines.filter((_, index) => !drop.has(index)).join('\n');
+}
+
 export function expandCitations(
   text: unknown,
   refs: RefTable,
@@ -173,9 +194,11 @@ export function expandCitations(
     episodeUrl?: ((id: number) => string | null) | null;
   } = {}
 ): string {
-  const raw = String(text ?? '');
+  const raw = dropFootnoteList(String(text ?? ''));
   const numbers = new Map<string, number>();
   const episodeUrls = new Set<string>();
+  /** 出典として変換した括弧の終わりの位置。続けて書かれた出典 (`[3][43]`) の2つ目を見分ける */
+  const converted = new Set<number>();
   const numberOf = (url: string): number => {
     let no = numbers.get(url);
     if (no === undefined) { no = numbers.size + 1; numbers.set(url, no); }
@@ -193,18 +216,22 @@ export function expandCitations(
         const url = messageLink(entry);
 
         // 自分の発言は根拠にならない (プロンプトで禁じても flash 系は番号を付けた)。番号だけ消す
-        if (url && selfId && String(entry?.authorId) === String(selfId)) return '';
+        if (url && selfId && String(entry?.authorId) === String(selfId)) { converted.add(offset + match.length); return ''; }
         // 引けない番号は触らない
         if (!url) return match;
         // `items[1]` のような添字も引用ではない。引用は必ず語の区切りに来るので、
         // 空白で始まっていないのに直前が識別子の文字なら添字とみなす。
-        if (!spaced && /[\w.)\]]/.test(raw[offset - 1] ?? '')) return match;
+        // ただし `[3][43]` のように出典が続くときは、直前の `]` が (出典として変換した) 閉じ括弧なので添字ではない。
+        // 変換していない括弧の直後 (`grid[1][2]`) は、これまでどおり添字。
+        if (!spaced && /[\w.)\]]/.test(raw[offset - 1] ?? '') && !converted.has(offset)) return match;
+        converted.add(offset + match.length);
         return sourceLink(numberOf(url), url);
       }
 
       // 記憶の出来事 ([e3214] / [e3214, e11489])。`items[e1]` のような添字は触らない。
       // `[e1][e2]` と続けて書くことはあるので `]` は数えない。
       if (!spaced && /[\w.)]/.test(raw[offset - 1] ?? '')) return match;
+      converted.add(offset + match.length);
       const links: string[] = [];
       for (const id of group.match(/\d+/g) ?? []) {
         let url: string | null = null;

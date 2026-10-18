@@ -34,7 +34,7 @@ assert.match(coach('search', { author: 'y', query: 'x' }, '1 件ヒット'), /�
 assert.equal(coach('read', { at: 1 }, 'ok'), 'ok', 'another tool is not a repeat');
 
 // ---- lookup: 事実を聞いているか ---------------------------------------------------
-for (const asking of ['Amex2190について教えて', 'さかなのやらかしエピ教えて', 'たこって誰？', '<@123> 恋人疑惑のある人探して', 'えだまめっていつ参加した', '昔の話して']) {
+for (const asking of ['Rayの弱み掘り返して', 'えだまめの黒歴史ある？', 'Amex2190について教えて', 'さかなのやらかしエピ教えて', 'たこって誰？', '<@123> 恋人疑惑のある人探して', 'えだまめっていつ参加した', '昔の話して']) {
   assert.ok(lookupAdvised(asking), asking);
 }
 for (const chat of ['なんか面白いことないの', 'ころすよ', 'どっちのがいい？', 'おはよう', 'うける', 'はい']) {
