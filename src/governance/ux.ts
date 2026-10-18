@@ -501,7 +501,8 @@ export async function renderGovernanceProcedureHub(guild: Guild, governance: Gov
 async function fetchTrackedMessage(channel: TextChannel, id: string, prefix: string): Promise<Message | null> {
   if (id) {
     const message = await channel.messages.fetch(id).catch(() => null);
-    if (message) return message;
+    // 別のアプリ (bot の作り直し前) が書いた投稿は、編集も操作の受け取りもできない。使わずに探し直す。
+    if (message && message.author.id === channel.client.user.id) return message;
   }
   const recent = await channel.messages.fetch({ limit: 50 }).catch(() => null);
   return recent?.find((message) => message.author.id === channel.client.user.id && message.content.startsWith(prefix)) ?? null;
