@@ -1,8 +1,8 @@
-// 記憶 (ページと出来事) の意味ベクトル。
+// 記憶 (ページ・出来事・ページの中の1つの知識) の意味ベクトル。
 //
 // 名前の照合 (recall.ts) と全文検索は、言葉が一致しないと引けない。「レビューを飛ばした」話から
-// 「ダブスタ」のページを思い出すには、意味で引く必要がある。ここでは、ページと出来事の短い文を
-// ローカルの埋め込み (会話のログと同じ e5-small、src/embed) でベクトルにして memory.sqlite に持ち、
+// 「ダブスタ」のページを思い出すには、意味で引く必要がある。ここでは、ページと出来事の短い文と、
+// ページの本文を 1 行ずつに割った断片 (chunks.ts) を、ローカルの埋め込み (会話のログと同じ e5-small、src/embed) でベクトルにして memory.sqlite に持ち、
 // 想起 (呼ばれたとき・考えている途中) と memory ツールの検索から近い順に引く。
 //
 // 重い処理は bot の中の1か所 (index.ts の定期実行) だけ。builder は別プロセスで、Python を起こさない。
@@ -12,9 +12,10 @@
 import { createHash } from 'node:crypto';
 import { embedConfig } from '../embed/config.js';
 import { embedTexts, isDisabled, prewarm, workerInfo } from '../embed/worker.js';
+import { bestLine, chunkText, syncChunks } from './chunks.js';
 import { memoryDb } from './store.js';
 
-type Kind = 'node' | 'episode';
+type Kind = 'node' | 'episode' | 'chunk';
 type EmbedFn = (texts: readonly string[], kind: 'passage' | 'query') => Promise<{ dim: number; vectors: string[] }>;
 
 const defaultEmbed: EmbedFn = async (texts, kind) => {
@@ -74,6 +75,12 @@ function itemsOf(guildId: string): Item[] {
     const text = episodeText(episode);
     items.push({ kind: 'episode', id: episode.id, text, hash: hashOf(text) });
   }
+  // ページの中の1つの知識 (syncChunks が本文から作った表)。ページ名と節が付くので、誰の何の話かが残る
+  for (const chunk of db.prepare<[string], { id: number; path: string; heading: string; text: string; aliases: string }>(
+    'SELECT c.id, c.path, c.heading, c.text, n.aliases FROM memory_chunks c JOIN nodes n ON n.id = c.node_id WHERE c.guild_id = ?').all(guildId)) {
+    const text = chunkText(chunk.path, parseAliases(chunk.aliases), chunk.heading, chunk.text);
+    items.push({ kind: 'chunk', id: chunk.id, text, hash: hashOf(text) });
+  }
   return items;
 }
 
@@ -116,6 +123,8 @@ export async function syncMemoryVectors(guildId: string,
   syncing = true;
   try {
     const db = memoryDb();
+    // 先に本文から断片の表を作り直す (builder が書き直したぶんだけ変わる。SQL だけで済む)
+    syncChunks(guildId);
     const items = itemsOf(guildId);
     const stored = new Map<string, string>();
     for (const row of db.prepare<[string, string], { kind: string; id: number; text_hash: string }>(
@@ -259,7 +268,9 @@ export async function embedQuery(text: string, { timeoutMs = 3000 }: { timeoutMs
 
 export interface MeaningNode { path: string; summary: string; score: number }
 export interface MeaningEpisode { id: number; kind: string; title: string; atMs: number; score: number }
-export interface Meaning { nodes: MeaningNode[]; episodes: MeaningEpisode[] }
+/** ページの中の1つの知識 (まとめた断片なら、その中で質問にいちばん近い行を line に)。episodeIds は根拠の出来事 (開くと原文までたどれる)。 */
+export interface MeaningChunk { id: number; path: string; heading: string; text: string; line: string; episodeIds: number[]; score: number; /** 同じ節で、ほかにも当たった断片の数。 */ more: number }
+export interface Meaning { nodes: MeaningNode[]; episodes: MeaningEpisode[]; chunks: MeaningChunk[] }
 
 // 1位からこれ以上離れたものは捨てる。e5 は無関係な文どうしでも高い値が出るので、順位と1位との差でも絞る。
 // 本番の実データで測った (2026-10-17、ページ 4,242 件・出来事 11,917 件): 関係のある質問の1位は 0.87〜0.91、
@@ -267,11 +278,18 @@ export interface Meaning { nodes: MeaningNode[]; episodes: MeaningEpisode[] }
 // 下限 0.85 で「何も似ていない質問」は何も出さない。上位は 0.01〜0.02 差で団子になるので、差は 0.02。
 const gap = Number(process.env.MEMORY_RECALL_GAP ?? 0.02);
 const floor = Number(process.env.MEMORY_RECALL_FLOOR ?? 0.85);
+// 断片 (ページの中の1つの知識) は、ページより具体的なぶん、関係のある質問でスコアが高く出る。値は実データで決めた (docs/memory-chunks.md):
+// 1 位のスコアが 0.89 未満だと「1 位のページが正解」は 2 割弱、0.90 以上で約 5 割。雑談 300 件では 0.885 以上が約 3 割、0.90 以上が 1 割弱。
+const chunkGap = Number(process.env.MEMORY_CHUNK_GAP ?? 0.015);
+const chunkFloor = Number(process.env.MEMORY_CHUNK_FLOOR ?? 0.885);
+/** 1ページから出す節の上限 (同じページの似た節で枠を埋めない)。 */
+const CHUNKS_PER_PAGE = 2;
 
-/** 文に意味が近いページと出来事。ベクトルが無い・間に合わない・近いものが無ければ null。 */
+/** 文に意味が近いページ・出来事・ページの中の1つの知識。ベクトルが無い・間に合わない・近いものが無ければ null。 */
 export async function meaningOf(guildId: string, text: string,
-  { nodeLimit = 2, episodeLimit = 3, excludePaths, excludeEpisodes, timeoutMs = 3000 }: {
-    nodeLimit?: number; episodeLimit?: number; excludePaths?: ReadonlySet<string>; excludeEpisodes?: ReadonlySet<number>; timeoutMs?: number;
+  { nodeLimit = 2, episodeLimit = 3, chunkLimit = 3, excludePaths, excludeEpisodes, excludeChunks, timeoutMs = 3000 }: {
+    nodeLimit?: number; episodeLimit?: number; chunkLimit?: number; excludePaths?: ReadonlySet<string>; excludeEpisodes?: ReadonlySet<number>;
+    excludeChunks?: ReadonlySet<number>; timeoutMs?: number;
   } = {}): Promise<Meaning | null> {
   if (!hasVectors(guildId)) return null;
   const query = await embedQuery(text, { timeoutMs });
@@ -303,5 +321,29 @@ export async function meaningOf(guildId: string, text: string,
     const row = db.prepare<[number], { id: number; kind: string; title: string; at_ms: number }>('SELECT id, kind, title, at_ms FROM episodes WHERE id = ?').get(hit.id);
     if (row) episodes.push({ id: row.id, kind: row.kind, title: row.title, atMs: row.at_ms, score: hit.score });
   }
-  return nodes.length || episodes.length ? { nodes, episodes } : null;
+
+  // 断片: 探すのは 1 行ずつ (いちばん当たる) が、出すのは節ごと。同じ節で当たった行は、いちばん近い 1 件にまとめて「ほか N 件」と数える。
+  // 1位との差と下限で絞り、同じページからは CHUNKS_PER_PAGE 節まで
+  const chunks: MeaningChunk[] = [];
+  if (chunkLimit > 0) {
+    const raw = nearest(guildId, 'chunk', query, { limit: chunkLimit * 8, exclude: excludeChunks ? new Set(excludeChunks) : undefined });
+    const best = raw[0]?.score ?? 0;
+    const perPage = new Map<string, number>();
+    const sections = new Map<string, MeaningChunk>();
+    for (const hit of raw) {
+      if (hit.score < chunkFloor || hit.score < best - chunkGap) continue;
+      const row = db.prepare<[number], { id: number; path: string; heading: string; text: string; cites: string }>('SELECT id, path, heading, text, cites FROM memory_chunks WHERE id = ?').get(hit.id);
+      if (!row || !row.path) continue;
+      const section = sections.get(`${row.path}\u0000${row.heading}`);
+      if (section) { section.more += 1; continue; }
+      if (chunks.length >= chunkLimit || (perPage.get(row.path) ?? 0) >= CHUNKS_PER_PAGE) continue;
+      perPage.set(row.path, (perPage.get(row.path) ?? 0) + 1);
+      let episodeIds: number[] = [];
+      try { episodeIds = (JSON.parse(row.cites) as unknown[]).filter((id): id is number => typeof id === 'number'); } catch { /* 出典なし */ }
+      const chunk: MeaningChunk = { id: row.id, path: row.path, heading: row.heading, text: row.text, line: bestLine(row.text, text), episodeIds, score: hit.score, more: 0 };
+      chunks.push(chunk);
+      sections.set(`${row.path}\u0000${row.heading}`, chunk);
+    }
+  }
+  return nodes.length || episodes.length || chunks.length ? { nodes, episodes, chunks } : null;
 }

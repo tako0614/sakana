@@ -1,5 +1,6 @@
-// 記憶 (ページと出来事) の意味ベクトルと、それを使う想起の検証 (npm run check から tsx で呼ぶ)。
+// 記憶 (ページ・出来事・ページの中の1つの知識) の意味ベクトルと、それを使う想起の検証 (npm run check から tsx で呼ぶ)。
 //   - 変わったものだけ振り直す / 消えたものは消す / 同じ内容は2度振らない
+//   - 本文を 1 行 = 1 つの知識に割る (見出しの引き継ぎ・長い行・出典番号) / 書き直しても同じ文は引き継ぐ / 節だけ開ける
 //   - 近い順に引ける / 除外が効く / 間に合わなければ null (遅くしない)
 //   - 呼ばれたときの想起は、名前の照合に意味の近い記憶を足す (重複しない)。失敗しても名前の想起は返る
 //   - 考えている途中の想起は、まだ出していない記憶だけを足す
@@ -12,10 +13,14 @@ import assert from 'node:assert/strict';
 
 process.env.MEMORY_RECALL_FLOOR = '0.05';
 process.env.MEMORY_RECALL_GAP = '0.5';
+process.env.MEMORY_CHUNK_FLOOR = '0.05';
+process.env.MEMORY_CHUNK_GAP = '0.5';
+process.env.MEMORY_CHUNK_CHARS = '0';   // 1 行ずつ。まとめる大きさは、あとで切り替えて試す
 const store = await import('../src/memory/store.js');
 const vectors = await import('../src/memory/vectors.js');
-const { recallFor, recallWithMeaning, meaningReader } = await import('../src/memory/recall.js');
-const { runMemoryToolWithMeaning } = await import('../src/memory/tool.js');
+const { recallFor, recallWithMeaning, meaningReader, meaningLines } = await import('../src/memory/recall.js');
+const { runMemoryToolWithMeaning, runMemoryTool } = await import('../src/memory/tool.js');
+const chunkLib = await import('../src/memory/chunks.js');
 
 const DIM = 256;
 const fakeVector = (text) => {
@@ -52,11 +57,65 @@ const e2 = episode('Rust と Go の論争', 'さばが Rust 最高と言った�
 const e3 = episode('昼食はカップ麺', 'さばは昼にいつもカップ麺を食べている', '近況');
 store.linkEpisodeNodes(GUILD, e1, ['people/たこ', 'topics/ダブスタ'], at);
 
+// ---- 本文を 1 つの知識に割る ----------------------------------------------------
+{
+  const body = [
+    'えだまめの開発持論。',
+    '',
+    '## 開発スタイル',
+    '- TODO駆動開発 (TODO.mdにタスクリストを書く) を推奨 (2026-02-20) [e11]',
+    '- 「テストしてても失敗する時はする」が持論。[[people/さば|さば]] も同意 [e12, e13]',
+    '短い',
+    '### ランタイム',
+    '- bun 警戒 → Node.js 派に転換 (2026-10) [e14]',
+    '## 道具',
+    '1. エディタは cursor と windsurf の二刀流で、契約も迷っている [e15]'
+  ].join('\n');
+  const pieces = chunkLib.splitPieces(body);
+  assert.deepEqual(pieces.map((piece) => piece.heading), ['', '開発スタイル', '開発スタイル', '開発スタイル › ランタイム', '道具'], 'headings carry down and nest; short lines are dropped');
+  assert.equal(pieces[1].text, 'TODO駆動開発 (TODO.mdにタスクリストを書く) を推奨 (2026-02-20)', 'bullet marks and [e..] are removed');
+  assert.deepEqual(pieces[1].cites, [11]);
+  assert.deepEqual(pieces[2].cites, [12, 13], 'a group of citations is kept');
+  assert.match(pieces[2].text, /さば も同意$/, '[[path|label]] becomes the label');
+  assert.equal(pieces[4].text.startsWith('エディタは'), true, 'numbered items are stripped too');
+  assert.equal(chunkLib.splitPieces('- **gitty**: API Client を公開 (2026-01) [e1]')[0].text, 'gitty: API Client を公開 (2026-01)', 'bold marks are dropped');
+  assert.equal(chunkLib.splitPieces('- bigint の `2n ** 10000n` を即答した話 [e1]')[0].text.includes('2n ** 10000n'), true, 'a power operator in code is not a bold mark');
+
+  const long = `${'あ'.repeat(180)}。${'い'.repeat(180)}。 [e1]`;
+  const parts = chunkLib.splitPieces(`- ${long}`);
+  assert.equal(parts.length, 2, 'a line over the limit is split at a sentence end');
+  assert.ok(parts.every((piece) => piece.text.length <= 300), 'every piece fits the limit');
+  assert.deepEqual(parts.map((piece) => piece.cites), [[], [1]], 'citations stay with the sentence they follow');
+
+  // まとめる: 同じ節の隣り合う行を上限までひとつにする。節をまたがない。根拠は合わせる
+  const packed = chunkLib.packPieces(pieces, 200);
+  assert.deepEqual(packed.map((piece) => piece.heading), ['', '開発スタイル', '開発スタイル › ランタイム', '道具'], 'lines of one section are packed; a heading change starts a new piece');
+  assert.equal(packed[1].text.split('\n').length, 2, 'two lines of the same section become one piece');
+  assert.deepEqual(packed[1].cites, [11, 12, 13], 'citations are merged');
+  assert.equal(chunkLib.packPieces(pieces, 50).length, pieces.length, 'a small limit leaves each line alone');
+  assert.equal(chunkLib.bestLine('TODO駆動開発を推奨した\n昼はカップ麺を食べる', '昼ごはんはカップ麺'), '昼はカップ麺を食べる', 'the line that overlaps the question most');
+  assert.equal(chunkLib.bestLine('一行だけ', 'なんでも'), '一行だけ');
+
+  assert.equal(chunkLib.sectionOf(body, '開発スタイル').includes('TODO駆動開発'), true);
+  assert.equal(chunkLib.sectionOf(body, '開発スタイル').includes('bun 警戒'), true, 'pointing at a parent heading includes its children');
+  assert.equal(chunkLib.sectionOf(body, '開発スタイル').includes('エディタ'), false, 'a section ends at the next heading of the same level');
+  assert.equal(chunkLib.sectionOf(body, 'ランタイム').trim().split('\n').length, 2, 'the last part of a nested heading works');
+  assert.equal(chunkLib.sectionOf(body, '開発スタイル › ランタイム').includes('bun'), true, 'so does the whole path');
+  assert.equal(chunkLib.sectionOf(body, 'そんな節はない'), null);
+  assert.deepEqual(chunkLib.headingsOf(body), ['開発スタイル', '開発スタイル › ランタイム', '道具']);
+  assert.match(chunkLib.chunkText('people/たこ', ['tako'], '立場', 'Rust 推し'), /^people\/たこ \(tako\)\n立場: Rust 推し$/, 'the page name leads the embedded text');
+}
+
 // ---- 振る -------------------------------------------------------------------
 assert.equal(vectors.hasVectors(GUILD), false, 'nothing is embedded before the first sync');
 const first = await vectors.syncMemoryVectors(GUILD, { sleepMs: 0, batchSize: 4 });
-const live = store.memoryDb().prepare('SELECT (SELECT COUNT(*) FROM nodes WHERE guild_id = ? AND (summary <> \'\' OR body <> \'\')) + (SELECT COUNT(*) FROM episodes WHERE guild_id = ?) AS n').get(GUILD, GUILD).n;
-assert.equal(first.embedded, live, 'every page with content and every episode is embedded');
+// 振る対象の数: 中身のあるページ + 出来事 + 断片 (本文の 1 行ずつ)
+const liveCount = () => store.memoryDb().prepare('SELECT (SELECT COUNT(*) FROM nodes WHERE guild_id = ? AND (summary <> \'\' OR body <> \'\')) + (SELECT COUNT(*) FROM episodes WHERE guild_id = ?) + (SELECT COUNT(*) FROM memory_chunks WHERE guild_id = ?) AS n').get(GUILD, GUILD, GUILD).n;
+const live = liveCount();
+assert.equal(first.embedded, live, 'every page with content, every episode and every line of a page is embedded');
+const chunkRows = store.memoryDb().prepare('SELECT path FROM memory_chunks WHERE guild_id = ?').all(GUILD);
+assert.equal(chunkRows.length, 3, 'one line each from the three pages with a body');
+assert.ok(!chunkRows.some((row) => row.path === ''), 'the root overview is not split into lines');
 assert.equal(first.remaining, 0);
 assert.equal(vectors.hasVectors(GUILD), true);
 
@@ -66,7 +125,7 @@ assert.deepEqual([again.embedded, again.removed, embeddedTexts], [0, 0, 0], 'unc
 
 store.writePage(GUILD, 'people/さば', { summary: 'Rust が好きで、昼はカップ麺の開発者', body: 'Rust 最高と言いながら Go も書く [e2]' });
 const changed = await vectors.syncMemoryVectors(GUILD, { sleepMs: 0 });
-assert.deepEqual([changed.embedded, changed.removed], [1, 0], 'only the rewritten page is embedded again');
+assert.deepEqual([changed.embedded, changed.removed], [2, 1], 'the rewritten page and its rewritten line are embedded again; the old line loses its vector');
 
 store.memoryDb().prepare('DELETE FROM episodes WHERE id = ?').run(e3);
 const removed = await vectors.syncMemoryVectors(GUILD, { sleepMs: 0 });
@@ -79,7 +138,7 @@ assert.equal(resumed.embedded, 2, 'missing vectors are filled in on the next run
 // 別のモデルで振られたものは使わず、振り直す
 store.memoryDb().prepare("UPDATE memory_vectors SET model = 'other-model' WHERE guild_id = ?").run(GUILD);
 assert.equal(vectors.hasVectors(GUILD), false, 'vectors of another model are not used');
-assert.equal((await vectors.syncMemoryVectors(GUILD, { sleepMs: 0 })).embedded, live - 1, 'and are embedded again');
+assert.equal((await vectors.syncMemoryVectors(GUILD, { sleepMs: 0 })).embedded, liveCount(), 'and are embedded again');
 // 壊れたベクトル (次元が足りない・NaN) は保存しない
 vectors.setEmbedder(async (texts) => ({ dim: DIM, vectors: texts.map(() => Buffer.from('xx').toString('base64')) }));
 store.writePage(GUILD, 'people/さば', { summary: '更新', body: '別の内容' });
@@ -87,6 +146,35 @@ const broken = await vectors.syncMemoryVectors(GUILD, { sleepMs: 0 });
 assert.deepEqual([broken.embedded, broken.remaining], [0, 1], 'a broken vector is not stored and stays pending');
 vectors.setEmbedder(fakeEmbed);
 assert.equal((await vectors.syncMemoryVectors(GUILD, { sleepMs: 0 })).embedded, 1);
+
+// ---- 断片 (ページの中の1つの知識) ------------------------------------------------
+page('projects/まぐろbot', 'ホームページ付きの bot', ['## 実装', '- Hono の素の client を魔改造して作った [e1]', '- セッション検証は guard 方式にする予定 [e2]', '## 運営', '- 荒らし対策でレート制限を入れた [e2]'].join('\n'));
+const afterAdd = await vectors.syncMemoryVectors(GUILD, { sleepMs: 0 });
+assert.equal(afterAdd.embedded, 4, 'the new page and its three lines');
+const lineRows = () => store.memoryDb().prepare("SELECT id, heading, text, cites FROM memory_chunks WHERE path = 'projects/まぐろbot' ORDER BY ord").all();
+const before = lineRows();
+assert.deepEqual(before.map((row) => row.heading), ['実装', '実装', '運営']);
+assert.deepEqual(JSON.parse(before[0].cites), [1]);
+
+// 書き直しても同じ文は引き継ぐ (id もベクトルも)。消えた文は消え、増えた文だけ振る
+page('projects/まぐろbot', 'ホームページ付きの bot', ['## 実装', '- Hono の素の client を魔改造して作った [e1]', '- ログインは OAuth にする計画 [e1]', '## 運営', '- 荒らし対策でレート制限を入れた [e2]'].join('\n'));
+const resync = chunkLib.syncChunks(GUILD);
+assert.deepEqual(resync, { added: 1, removed: 1, kept: 2 + (await (async () => store.memoryDb().prepare("SELECT COUNT(*) n FROM memory_chunks WHERE path <> 'projects/まぐろbot'").get().n)()) });
+const after = lineRows();
+assert.equal(after[0].id, before[0].id, 'an unchanged line keeps its id');
+assert.equal(after[2].id, before[2].id, 'even when it moves');
+assert.ok(!after.some((row) => row.id === before[1].id), 'a line that disappeared is gone');
+const rewrittenSync = await vectors.syncMemoryVectors(GUILD, { sleepMs: 0 });
+assert.deepEqual([rewrittenSync.embedded, rewrittenSync.removed], [2, 1], 'the page and the one new line are embedded; the vanished line loses its vector');
+
+// まだ統合していない新しい知識 (pending) も断片になる。節は「新しい知識」
+store.memoryDb().prepare("UPDATE nodes SET pending = ? WHERE guild_id = ? AND path = 'projects/まぐろbot'").run('- 2026-10 から管理画面も作り始めた [e3]\n', GUILD);
+chunkLib.syncChunks(GUILD);
+assert.ok(lineRows().some((row) => row.heading === '新しい知識' && /管理画面/.test(row.text)), 'unmerged knowledge is searchable before the builder merges it');
+store.memoryDb().prepare("UPDATE nodes SET pending = '' WHERE guild_id = ? AND path = 'projects/まぐろbot'").run(GUILD);
+chunkLib.syncChunks(GUILD);
+await vectors.syncMemoryVectors(GUILD, { sleepMs: 0 });
+assert.ok(!lineRows().some((row) => row.heading === '新しい知識'), 'and goes away when merged');
 
 // ---- 引く -------------------------------------------------------------------
 const query = await vectors.embedQuery('自分のPRはレビューを飛ばしていた');
@@ -103,6 +191,84 @@ assert.ok(meaning.episodes.some((entry) => entry.id === e1));
 assert.ok(!meaning.nodes.some((node) => node.path === ''), 'the root is never recalled');
 const notAgain = await vectors.meaningOf(GUILD, '自分のPRはレビューを飛ばしていた', { excludePaths: new Set(['topics/ダブスタ', 'people/たこ']), excludeEpisodes: new Set([e1]) });
 assert.ok(!notAgain?.nodes.some((node) => ['topics/ダブスタ', 'people/たこ'].includes(node.path)), 'pages already shown are not returned');
+
+// 断片: 本文の中の具体的な話に届く。ページと節と根拠の出来事が付く
+{
+  const chunkQuery = await vectors.embedQuery('Hono の client を魔改造した話');
+  const top = vectors.nearest(GUILD, 'chunk', chunkQuery, { limit: 3 });
+  const row = store.memoryDb().prepare('SELECT path, text FROM memory_chunks WHERE id = ?').get(top[0].id);
+  assert.equal(row.path, 'projects/まぐろbot');
+  assert.match(row.text, /魔改造/, 'the line that says it is the nearest chunk');
+
+  const found = await vectors.meaningOf(GUILD, 'Honoのclientを魔改造した話');
+  const chunk = found.chunks.find((entry) => /魔改造/.test(entry.text));
+  assert.ok(chunk, 'the meaning search returns the line');
+  assert.deepEqual([chunk.path, chunk.heading, chunk.episodeIds], ['projects/まぐろbot', '実装', [1]], 'page, section and the evidence episode come with it');
+  const wide = await vectors.meaningOf(GUILD, 'まぐろbot の実装と運営', { chunkLimit: 5 });
+  assert.ok(wide.chunks.filter((entry) => entry.path === 'projects/まぐろbot').length <= 2, 'at most two sections from one page');
+  // 探すのは 1 行ずつだが、出すのは節ごと: 同じ節で当たった行は 1 件にまとめ、ほかの数を添える
+  const sections = wide.chunks.filter((entry) => entry.path === 'projects/まぐろbot');
+  assert.equal(new Set(sections.map((entry) => entry.heading)).size, sections.length, 'one entry per section');
+  const impl = sections.find((entry) => entry.heading === '実装');
+  assert.ok(impl && impl.more === 1, 'the other matching line of the same section is counted, not listed');
+  assert.match(meaningLines(wide).find((text) => text.includes('§実装')), /\(同じ節にほか 1 件\)/, 'the recall line says so');
+  const skipped = await vectors.meaningOf(GUILD, 'Honoのclientを魔改造した話', { excludeChunks: new Set([chunk.id]) });
+  assert.ok(!skipped?.chunks.some((entry) => entry.id === chunk.id), 'a line already shown is not returned again');
+  assert.equal((await vectors.meaningOf(GUILD, 'Honoのclientを魔改造した話', { chunkLimit: 0 }))?.chunks.length ?? 0, 0, 'chunkLimit 0 turns lines off');
+
+  const lines = meaningLines(found);
+  const line = lines.find((text) => /魔改造/.test(text));
+  assert.match(line, /^ {2}\[\[projects\/まぐろbot\]\] §実装 — Hono の素の client を魔改造して作った e1$/, 'a line shows the page, the section, the head of the fact and its evidence');
+  assert.ok(!lines.some((text) => text === '  [[projects/まぐろbot]]'), 'a page that has a line is not listed twice');
+  assert.ok(line.length < 140, 'a recall line is a pointer, not the body');
+
+  // 呼ばれたときの想起: 出した断片は控え、あとの想起で繰り返さない
+  const shown = await recallWithMeaning(GUILD, { request: 'まぐろbotの client を魔改造したのってどうなった？' });
+  assert.match(shown.text, /§実装 — Hono の素の client/);
+  assert.ok(shown.chunkIds.size > 0 && shown.paths.has('projects/まぐろbot') && shown.episodeIds.has(1), 'what was shown is remembered');
+  const next = await meaningReader(GUILD, { request: 'まぐろbotの client を魔改造したのってどうなった？', shown })({ observations: ['tool:search: Hono の client を魔改造して作った'] });
+  assert.ok(!next || !/魔改造/.test(next.text), 'a line shown at the start is not shown again while thinking');
+}
+
+// memory ツール: 節だけ開ける / 見つからなければ節の一覧
+{
+  const ctx = { guildId: GUILD };
+  const opened = runMemoryTool(ctx, { path: 'projects/まぐろbot', section: '実装' });
+  assert.match(opened, /^# projects\/まぐろbot § 実装/);
+  assert.match(opened, /魔改造/);
+  assert.ok(!opened.includes('荒らし対策'), 'only the requested section');
+  const missing = runMemoryTool(ctx, { path: 'projects/まぐろbot', section: 'ない節' });
+  assert.match(missing, /節「ない節」はありません/);
+  assert.match(missing, /節: 実装 \/ 運営/, 'the list of sections is offered');
+  assert.match(runMemoryTool(ctx, { path: 'projects/まぐろbot' }), /荒らし対策/, 'without section the whole page opens');
+  store.memoryDb().prepare("UPDATE nodes SET pending = ? WHERE guild_id = ? AND path = 'projects/まぐろbot'").run('- 2026-10 から管理画面も作り始めた [e3]\n', GUILD);
+  assert.match(runMemoryTool(ctx, { path: 'projects/まぐろbot', section: '新しい知識' }), /管理画面/, 'the unmerged knowledge is a section too');
+  store.memoryDb().prepare("UPDATE nodes SET pending = '' WHERE guild_id = ? AND path = 'projects/まぐろbot'").run(GUILD);
+  const searched = await runMemoryToolWithMeaning(ctx, { query: 'Hono の client を魔改造した話' });
+  assert.match(searched, /§実装 — Hono の素の client/, 'a search by meaning shows the matching line');
+}
+
+// 断片の大きさを変える (MEMORY_CHUNK_CHARS): 同じ節の隣り合う行をまとめる。変えると作り直し、振り直す
+{
+  process.env.MEMORY_CHUNK_CHARS = '300';
+  const packedSync = chunkLib.syncChunks(GUILD);
+  assert.ok(packedSync.added > 0 && packedSync.removed > 0, 'changing the size rebuilds the chunks');
+  const packedRows = lineRows();
+  assert.equal(packedRows.length, 2, 'the two lines of 実装 become one piece; 運営 stays');
+  assert.equal(packedRows[0].text.split('\n').length, 2);
+  assert.deepEqual(JSON.parse(packedRows[0].cites), [1]);
+  await vectors.syncMemoryVectors(GUILD, { sleepMs: 0 });
+  const found = await vectors.meaningOf(GUILD, 'ログインを OAuth にする計画はどうなった');
+  const chunk = found.chunks.find((entry) => entry.path === 'projects/まぐろbot' && entry.heading === '実装');
+  assert.ok(chunk, 'the packed piece is found');
+  assert.match(chunk.text, /魔改造[\s\S]*OAuth/, 'the piece holds both lines');
+  assert.equal(chunk.line, 'ログインは OAuth にする計画', 'the line that matched is the one shown');
+  assert.match(meaningLines(found).find((text) => text.includes('§実装')), /§実装 — ログインは OAuth にする計画 e1$/, 'the recall line shows the matching line, not the first');
+  process.env.MEMORY_CHUNK_CHARS = '0';
+  chunkLib.syncChunks(GUILD);
+  await vectors.syncMemoryVectors(GUILD, { sleepMs: 0 });
+  assert.equal(lineRows().length, 3, 'and back to one line each');
+}
 
 // 間に合わなければ null (遅くしない)
 vectors.setEmbedder(() => new Promise(() => {}));
@@ -121,7 +287,8 @@ assert.match(named, /\[\[people\/たこ\]\]/, 'the name matches the page');
 const both = await recallWithMeaning(GUILD, { request });
 assert.match(both.text, /意味が近い記憶/);
 assert.match(both.text, /\[\[topics\/ダブスタ\]\]/, 'a page whose name is not in the sentence is recalled by meaning');
-assert.equal(both.text.match(/\[\[people\/たこ\]\]/g).length, 1, 'a page found by name is not listed again');
+assert.equal(both.text.match(/^- \[\[people\/たこ\]\]$/gm).length, 1, 'a page found by name is listed once as a page');
+assert.ok(!/^ {2}\[\[people\/たこ\]\]$/m.test(both.text), 'and is not repeated as a bare page in the meaning section (a line of it, with its section, may follow)');
 assert.ok(both.paths.has('topics/ダブスタ') && both.paths.has('people/たこ'));
 vectors.setEmbedder(async () => { throw new Error('worker down'); });
 const fallback = await recallWithMeaning(GUILD, { request });
@@ -160,4 +327,4 @@ assert.equal(await runMemoryToolWithMeaning(ctx, { path: 'people/たこ' }), (aw
 vectors.setEmbedder(async () => { throw new Error('worker down'); });
 assert.equal(await runMemoryToolWithMeaning(ctx, { query: 'レビュー' }), (await import('../src/memory/tool.js')).runMemoryTool(ctx, { query: 'レビュー' }), 'a failing worker returns the plain result');
 
-console.log('memory vectors ok (差分だけ振る / 消えたら消す / 別モデルは使わない / 近い順 / 間に合わなければ null / 想起は名前 + 意味で重複しない / 考え中は未出のものだけ / memory ツール)');
+console.log('memory vectors ok (差分だけ振る / 消えたら消す / 別モデルは使わない / 近い順 / 間に合わなければ null / 想起は名前 + 意味で重複しない / 考え中は未出のものだけ / memory ツール / 本文を1行ずつに割る・書き直しても引き継ぐ・節だけ開く)');

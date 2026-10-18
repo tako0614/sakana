@@ -307,11 +307,27 @@ export function memoryDb(): Database.Database {
 
     CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
-    -- ページと出来事の意味ベクトル (vectors.ts)。想起と memory ツールの意味検索が使う。
+    -- ページの本文を「1行 = 1つの知識」に割った断片 (chunks.ts)。意味検索の最小の単位で、
+    -- ベクトルは memory_vectors に kind = 'chunk'、id = この id で持つ。builder ではなく bot の定期実行が作る。
+    -- 本文の書き直しで同じ文が残れば、hash が同じなので id もベクトルも引き継ぐ。
+    CREATE TABLE IF NOT EXISTS memory_chunks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,   -- 消えた id は再利用しない (出したものの控えが別の中身を指さないように)
+      guild_id TEXT NOT NULL,
+      node_id INTEGER NOT NULL,
+      path TEXT NOT NULL,
+      ord INTEGER NOT NULL,            -- ページの中の順
+      heading TEXT NOT NULL DEFAULT '', -- 節の見出し (入れ子は ' › ' でつなぐ)
+      text TEXT NOT NULL,              -- 出典番号とリンクの記号を外した1つの知識
+      cites TEXT NOT NULL DEFAULT '[]', -- 根拠の出来事の番号 (JSON)
+      hash TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_chunks_node ON memory_chunks (guild_id, node_id);
+
+    -- ページと出来事と断片の意味ベクトル (vectors.ts)。想起と memory ツールの意味検索が使う。
     -- text_hash が変わったものだけ振り直す。model は埋め込みモデル名 (別モデルのベクトルは使わない)。
     CREATE TABLE IF NOT EXISTS memory_vectors (
       guild_id TEXT NOT NULL,
-      kind TEXT NOT NULL,              -- 'node' | 'episode'
+      kind TEXT NOT NULL,              -- 'node' | 'episode' | 'chunk'
       id INTEGER NOT NULL,
       model TEXT NOT NULL,
       text_hash TEXT NOT NULL,
@@ -977,7 +993,7 @@ export function includedChannels(guildId: string): string[] {
 export function resetTree(guildId: string): void {
   const d = memoryDb();
   d.transaction(() => {
-    for (const table of ['nodes', 'segments', 'cursors', 'links', 'episode_nodes', 'episode_links']) {
+    for (const table of ['nodes', 'segments', 'cursors', 'links', 'episode_nodes', 'episode_links', 'memory_chunks']) {
       d.prepare(`DELETE FROM ${table} WHERE guild_id = ?`).run(guildId);
     }
     d.prepare('DELETE FROM episodes WHERE guild_id = ?').run(guildId);

@@ -4,6 +4,7 @@ import {
   topLevels, episodesFor, getEpisode, getNode, hasTree, linkedPages, listChildren, loadPublicChannels, nameOf,
   normalizePath, searchEpisodes, searchNodes, sharedEpisodes, type MemoryNode
 } from './store.js';
+import { headingsOf, sectionOf } from './chunks.js';
 import { meaningLines } from './recall.js';
 import { scopeAllows, type ChannelScope, type QuoteFilter } from './types.js';
 import { meaningOf, type Meaning } from './vectors.js';
@@ -49,6 +50,7 @@ export interface MemoryToolArgs {
   with?: unknown;
   query?: unknown;
   episode?: unknown;
+  section?: unknown;
 }
 
 export const memoryToolDefinition: ToolDefinition = {
@@ -56,11 +58,13 @@ export const memoryToolDefinition: ToolDefinition = {
   function: {
     name: 'memory',
     description: '記憶 (このサーバーの過去ログを整理したもの) を読む。path でページ (説明・子・つながり・出来事)、'
-      + 'path と with で2つが両方関わった出来事、query で検索、episode で出来事と根拠の発言 (引用番号つき) を開く。',
+      + 'path と section でページの中の1つの節だけ、path と with で2つが両方関わった出来事、query で検索、'
+      + 'episode で出来事と根拠の発言 (引用番号つき) を開く。',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: '例: people/たこ。空なら根' },
+        section: { type: 'string', description: 'path のページの中の節の見出し (想起の § のあと)。その節だけ開く' },
         with: { type: 'string', description: 'path と一緒に関わったページ' },
         query: { type: 'string', description: '探す語 (スペース区切り)' },
         episode: { type: 'string', description: '出来事の番号。例: e12' }
@@ -75,6 +79,17 @@ export function hasMemory(guildId: string): boolean {
 
 const episodeLine = (episode: { id: number; kind: string; title: string; at_ms: number }): string =>
   `e${episode.id} ${day(episode.at_ms)}${episode.kind ? ` [${episode.kind}]` : ''} ${episode.title}`;
+
+/** ページの中の1つの節だけ開く。長いページを丸ごと読まずに、見つかった話の周りだけ読める。 */
+function openSection(node: MemoryNode, section: string): string {
+  const head = `# ${node.path} § ${section}${node.summary ? ` — ${node.summary}` : ''}`;
+  const text = sectionOf(node.body, section) ?? (section === '新しい知識' && node.pending ? node.pending.trim() : sectionOf(node.pending, section));
+  if (!text) {
+    const headings = [...headingsOf(node.body), ...(node.pending ? ['新しい知識'] : [])];
+    return [head, `節「${section}」はありません。`, ...(headings.length ? [`節: ${headings.join(' / ')}`] : []), 'section を外すとページ全体を開けます。'].join('\n');
+  }
+  return [head, text.length > BODY_CHARS ? `${text.slice(0, BODY_CHARS)}\n…(以下略)` : text, '', 'ページ全体は section を外して開く。根拠は [e番号] を episode で開く。'].join('\n');
+}
 
 function openPage(guildId: string, node: MemoryNode): string {
   const lines = [`# ${node.path || '(根)'}${node.summary ? ` — ${node.summary}` : ''}`];
@@ -194,7 +209,9 @@ export function runMemoryTool(ctx: MemoryToolContext, args: MemoryToolArgs = {})
     return [`ページ ${path} はありません。`, ...(guess.length ? ['近いもの:', ...guess.map((row) => `- [[${row.path}]] ${row.summary || ''}`)] : [])].join('\n');
   }
 
+  const section = String(args.section ?? '').trim();
   const other = String(args.with ?? '').replace(/^\[\[|\]\]$/g, '').trim();
+  if (section && !other) return openSection(node, section);
   if (other) {
     const target = getNode(guildId, other) ?? getNode(guildId, normalizePath(other) ?? '');
     if (!target) return `ページ ${other} はありません。`;
@@ -215,12 +232,14 @@ export async function runMemoryToolWithMeaning(ctx: MemoryToolContext, args: Mem
   const base = runMemoryTool(ctx, args);
   const query = String(args.query ?? '').trim();
   if (!query || args.episode) return base;
-  const meaning = await meaningOf(ctx.guildId, query, { nodeLimit: 3, episodeLimit: 3, timeoutMs: 3000 });
+  const meaning = await meaningOf(ctx.guildId, query, { nodeLimit: 3, episodeLimit: 3, chunkLimit: 4, timeoutMs: 3000 });
   if (!meaning) return base;
   // すでに言葉の検索で出たものは繰り返さない
   const fresh: Meaning = {
     nodes: meaning.nodes.filter((node) => !base.includes(`[[${node.path}]]`)),
-    episodes: meaning.episodes.filter((episode) => !new RegExp(`(^|\\s)e${episode.id}\\s`).test(base))
+    episodes: meaning.episodes.filter((episode) => !new RegExp(`(^|\\s)e${episode.id}\\s`).test(base)),
+    // 断片はページの中の具体的な話なので、ページが言葉の検索に出ていても出す
+    chunks: meaning.chunks
   };
   const lines = meaningLines(fresh);
   if (lines.length === 0) return base;
