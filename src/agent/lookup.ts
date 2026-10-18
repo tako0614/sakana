@@ -16,6 +16,12 @@ export function lookupAdvised(request: string, { known = false }: { known?: bool
   return known && /[？?]/.test(text);
 }
 
+/**
+ * 調べたことになる道具か。memory_focus は思い出したいことを伝えるだけで、何も取ってこない
+ * (呼んだだけで「調べた」扱いになり、事実を聞かれても調べずに答えられていた)。
+ */
+export const countsAsLookup = (toolName: string): boolean => toolName !== 'memory_focus';
+
 export const LOOKUP_HINT = '事実が絡む話なのに、まだ何も調べていない。答える前に、過去ログ (search) か記憶 (memory) で1回確かめて。確かめても材料が無ければ、そう言って答えていい。';
 
 /**

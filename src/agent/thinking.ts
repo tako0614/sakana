@@ -34,6 +34,8 @@ export function toolLabel(name: string, args: unknown = {}): string {
   if (name === 'read') return stringField(args, 'direction') === 'replies' ? '返信をたどる' : '読み込み';
   if (name === 'channels') return 'チャンネル一覧';
   if (name === 'governance') return '統治記録';
+  if (name === 'memory') return '記憶';
+  if (name === 'memory_focus') return '思い出す';
   if (name === 'browser') return stringField(args, 'action') === 'search' ? 'web 検索' : 'ブラウザ';
 
   return name;

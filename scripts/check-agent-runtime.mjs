@@ -213,6 +213,34 @@ try {
   assert.deepEqual(toolAnswer.usage,
     { prompt_tokens: 27, completion_tokens: 5, prompt_cache_hit_tokens: 6, cost: 0 },
     'the durable tool result remains cumulative across both provider rounds');
+
+  // memory_focus: モデルが示した「いま思い出したいこと」が、次の往復の前の想起 (memory.read の thought) に届く
+  {
+    const reads = [];
+    let focusRequests = 0;
+    const usage = { prompt_tokens: 5, completion_tokens: 1, prompt_cache_hit_tokens: 0 };
+    const focusRun = await runAgent({ guildId: 'g', runId: 'memory-focus-wiring', system: 's', userContent: 'u',
+      memory: { read: async (query) => { reads.push(query); return { text: `pointer for: ${query.thought ?? '(no focus)'}` }; } },
+      toolset: { readOnly: true, definitions: [], call: async () => 'unused' },
+      request: async ({ messages, tools }) => {
+        focusRequests += 1;
+        if (focusRequests === 1) {
+          assert.ok(tools.some((tool) => tool.function.name === 'memory_focus'), 'the model is offered memory_focus when memory is attached');
+          return { choices: [{ message: { tool_calls: [{ id: 'focus-1', function: { name: 'memory_focus',
+            arguments: JSON.stringify({ context: '雑談', thought: 'たこのレビューの話' }) } }] } }], usage };
+        }
+        const seen = JSON.stringify(messages);
+        assert.match(seen, /pointer for: memory_focus\.context: 雑談/, 'the focus reaches the recall before the next round');
+        assert.match(seen, /memory_focus\.thought: たこのレビューの話/);
+        return { choices: [{ message: { content: 'focused answer' } }], usage };
+      } });
+    assert.equal(focusRun.text, 'focused answer');
+    assert.equal(reads.length, 2, 'recall runs before every round');
+    assert.equal(reads[0].thought, undefined, 'there is no focus before the model has spoken');
+    assert.match(reads[1].thought, /memory_focus\.thought: たこのレビューの話/);
+    assert.deepEqual(reads[1].observations, [], 'memory_focus itself is not an observation of the world');
+    assert.deepEqual(focusRun.used.map((tool) => tool.name), ['memory_focus']);
+  }
   assert.deepEqual(toolAnswer.invocation,
     { rounds: 1, usage: { prompt_tokens: 7, completion_tokens: 3, prompt_cache_hit_tokens: 1, cost: 0 } },
     'the resumed invocation charges only its new post-tool model round');

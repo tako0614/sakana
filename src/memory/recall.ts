@@ -179,24 +179,45 @@ export async function recallWithMeaning(guildId: string,
   return { text: text.length > maxChars ? `${text.slice(0, maxChars)}…` : text, paths: parts.paths, episodeIds: parts.episodeIds, chunkIds: parts.chunkIds };
 }
 
+/** memory_focus の中身 (runtime が「memory_focus.context: …」の形で渡す) から、ラベルを外した本文。 */
+export const focusOf = (thought: string | undefined): string => (thought ?? '')
+  .replace(/^memory_focus\.(?:context|thought):\s*/gm, '')
+  .replace(/\s+/g, ' ')
+  .trim()
+  .slice(0, 700);
+
+const union = <T>(...sets: ReadonlySet<T>[]): Set<T> => new Set(sets.flatMap((set) => [...set]));
+
 /**
  * 考えている途中の想起 (runtime が往復ごとに呼ぶ)。依頼と、モデルが直前に考えていたこと (CoT)、いま調べていること
  * (道具の結果) から、まだ出していない記憶だけを足す。最初の往復 (道具の結果がまだ無い) は、呼ばれたときの想起が済んでいるので何も足さない。
  * 思考は provider が文章で返したときだけ (暗号化されたものは読めない) で、無ければ依頼と道具の結果で引く。
+ *
+ * モデルが memory_focus で「いま思い出したいこと」を示したら、それを最優先の手がかりにして選び直す (想起は受動のまま、向きだけ変える)。
+ * 焦点は次に変えるまで残るので、示している間は毎回の往復で同じ指し先を出す (往復ごとの想起はその往復にしか付かないため、
+ * 出した行を除くと、焦点を示したのに次の往復で消えてしまう)。焦点が無いときは、途中で出したものは繰り返さない。
+ * 入力に残っている開始時の想起 (seed.shown) は、どちらでも出さない。
  */
 export function meaningReader(guildId: string, seed: { request: string; shown?: RecallParts | undefined }):
-  (query: { observations: string[]; reasoning?: string | undefined }) => Promise<{ text: string } | null> {
-  const shown: RecallParts = { text: '', paths: new Set(seed.shown?.paths), episodeIds: new Set(seed.shown?.episodeIds), chunkIds: new Set(seed.shown?.chunkIds) };
-  return async ({ observations, reasoning }) => {
-    if (observations.length === 0) return null;
-    // 手がかりは、依頼 → モデル自身が直前に考えていたこと (CoT。読めるときだけ) → 道具が返した内容、の順
+  (query: { observations: string[]; reasoning?: string | undefined; thought?: string | undefined }) => Promise<{ text: string } | null> {
+  const start: RecallParts = { text: '', paths: new Set(seed.shown?.paths), episodeIds: new Set(seed.shown?.episodeIds), chunkIds: new Set(seed.shown?.chunkIds) };
+  const mid: RecallParts = { text: '', paths: new Set(), episodeIds: new Set(), chunkIds: new Set() };
+  return async ({ observations, reasoning, thought }) => {
+    const focus = focusOf(thought);
+    if (observations.length === 0 && !focus) return null;
+    // 手がかりは、(焦点) → 依頼 → モデル自身が直前に考えていたこと (CoT。読めるときだけ) → 道具が返した内容、の順
     const noticed = observations.map((observation) => observation.replace(/^tool:[^:]*:\s*/, '').slice(0, 300));
-    const query = [seed.request.slice(0, 300), ...(reasoning ? [reasoning.slice(-600)] : []), ...noticed].join('\n').slice(0, 1600);
-    const meaning = await meaningOf(guildId, query, { nodeLimit: 2, episodeLimit: 2, chunkLimit: 2, excludePaths: shown.paths, excludeEpisodes: shown.episodeIds, excludeChunks: shown.chunkIds, timeoutMs: 2000 });
+    const query = [...(focus ? [focus] : []), seed.request.slice(0, 300), ...(reasoning ? [reasoning.slice(-600)] : []), ...noticed].join('\n').slice(0, 1600);
+    // 焦点があるときは、途中で出したものも出し直す (消えているので)
+    const skip = focus ? start : { paths: union(start.paths, mid.paths), episodeIds: union(start.episodeIds, mid.episodeIds), chunkIds: union(start.chunkIds, mid.chunkIds) };
+    const meaning = await meaningOf(guildId, query, { nodeLimit: 2, episodeLimit: 2, chunkLimit: 2, excludePaths: skip.paths, excludeEpisodes: skip.episodeIds, excludeChunks: skip.chunkIds, timeoutMs: 2000 });
     const lines = meaningLines(meaning);
     if (lines.length === 0 || !meaning) return null;
-    remember(shown, meaning);
-    return { text: ['調べている内容に近い記憶 (見出しだけ。まだ出していないもの。§ は節で、path と section で開ける。中身は memory ツールで path / episode を開いて読む):', ...lines].join('\n') };
+    remember(mid, meaning);
+    const head = focus
+      ? 'あなたが示した焦点に近い記憶 (見出しだけ。§ は節で、path と section で開ける。中身は memory ツールで path / episode を開いて読む):'
+      : '調べている内容に近い記憶 (見出しだけ。まだ出していないもの。§ は節で、path と section で開ける。中身は memory ツールで path / episode を開いて読む):';
+    return { text: [head, ...lines].join('\n') };
   };
 }
 

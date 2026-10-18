@@ -84,7 +84,7 @@ function providerMessage(message: StateMessage): ChatMessage {
   return visible;
 }
 const memoryStateTool: ToolDefinition = { type: 'function', function: { name: 'memory_focus',
-  description: '次の推論で探す記憶の焦点を設定する。文脈と、明示できる短い検討状態を使う。事実認定や外部操作は行わない。',
+  description: '次の往復の前に、いま思い出したいこと (人・話題・出来事) を伝える。それに近い記憶の指し先 (見出しと番号) が足される。context は話の流れ、thought は気になっていること (短く)。調べものや事実認定はしない。',
   parameters: { type: 'object', properties: { context: { type: 'string', maxLength: 3000 }, thought: { type: 'string', maxLength: 3000 } }, additionalProperties: false } } };
 // cost は OpenRouter の実際の請求額 (USD)。会話 agent の上限はこれで数える
 const usageKeys = ['prompt_tokens', 'completion_tokens', 'prompt_cache_hit_tokens', 'cost'] as const;

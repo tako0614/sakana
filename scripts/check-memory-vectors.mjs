@@ -18,7 +18,8 @@ process.env.MEMORY_CHUNK_GAP = '0.5';
 process.env.MEMORY_CHUNK_CHARS = '0';   // 1 行ずつ。まとめる大きさは、あとで切り替えて試す
 const store = await import('../src/memory/store.js');
 const vectors = await import('../src/memory/vectors.js');
-const { recallFor, recallWithMeaning, meaningReader, meaningLines } = await import('../src/memory/recall.js');
+const recallLib = await import('../src/memory/recall.js');
+const { recallFor, recallWithMeaning, meaningReader, meaningLines } = recallLib;
 const { runMemoryToolWithMeaning, runMemoryTool } = await import('../src/memory/tool.js');
 const chunkLib = await import('../src/memory/chunks.js');
 
@@ -314,6 +315,35 @@ assert.ok(withThought === null || /ダブスタ|レビュー/.test(withThought.t
 vectors.setEmbedder(async () => { throw new Error('worker down'); });
 assert.equal(await meaningReader(GUILD, { request: 'x' })({ observations: ['tool:search: レビュー'] }), null, 'a failing worker adds nothing');
 vectors.setEmbedder(fakeEmbed);
+
+// ---- memory_focus: 受動の想起の向きを、モデルが変える -------------------------------
+{
+  const queries = [];
+  vectors.setEmbedder(async (texts, kind) => { if (kind === 'query') queries.push(texts[0]); return fakeEmbed(texts); });
+  const focus = 'memory_focus.context: レビューの話\nmemory_focus.thought: たこが自分のPRはレビューを飛ばしたというダブスタの話';
+  const reader = meaningReader(GUILD, { request: '誰の話？' });
+  assert.equal(await reader({ observations: [] }), null, 'no focus and nothing looked at yet: nothing is added');
+  const focused = await reader({ observations: [], thought: focus });
+  assert.ok(focused && /焦点/.test(focused.text), 'a focus alone brings related memory before any tool was used');
+  assert.match(focused.text, /ダブスタ|たこ/);
+  assert.ok(!queries.at(-1).includes('memory_focus.'), 'the labels are stripped from the query');
+  assert.ok(queries.at(-1).startsWith('レビューの話 たこが自分のPR'), 'the focus leads the query, ahead of the request');
+  // 往復ごとの想起はその往復にしか付かない。焦点を示している間は、同じ指し先を毎回出す
+  const again = await reader({ observations: [], thought: focus });
+  assert.ok(again && /ダブスタ|たこ/.test(again.text), 'while the focus stays, the pointers come back every round');
+  // 焦点が無い往復は、出したものを繰り返さない
+  const plain = await reader({ observations: ['tool:search: たこ レビュー 飛ばした'] });
+  assert.ok(!plain || !/\[\[topics\/ダブスタ\]\]|\[\[people\/たこ\]\]/.test(plain.text), 'without a focus, what was shown is not shown again');
+  // 開始時の想起で入力に入れたものは、焦点があっても出さない
+  const shown = await recallWithMeaning(GUILD, { request: 'たこって自分のPRはレビューを飛ばしてたよね' });
+  const afterStart = await meaningReader(GUILD, { request: 'x', shown })({ observations: [], thought: focus });
+  const shownLines = [...shown.chunkIds].map((id) => store.memoryDb().prepare('SELECT text FROM memory_chunks WHERE id = ?').get(id).text.slice(0, 16));
+  assert.ok(!afterStart || (![...shown.paths].some((path) => afterStart.text.split('\n').includes(`  [[${path}]]`)) && !shownLines.some((line) => afterStart.text.includes(line))),
+    'what the start-of-run recall already put in the input (pages and lines) is not repeated; another line of the same page may follow');
+  vectors.setEmbedder(fakeEmbed);
+  assert.equal(recallLib.focusOf('memory_focus.thought: 長い話 '.repeat(200)).length, 700, 'a long focus is cut');
+  assert.equal(recallLib.focusOf(undefined), '');
+}
 
 // ---- memory ツール -------------------------------------------------------------
 const ctx = { guildId: GUILD };

@@ -10,7 +10,7 @@ process.env.ARCHIVE_DB_PATH = join(directory, 'archive.sqlite');
 process.env.AGENT_RUNTIME_PATH = join(directory, 'runs.sqlite');
 process.env.OPENROUTER_API_KEY = 'check';
 const { createCoach, isEmptyResult } = await import('../src/agent/coach.ts');
-const { lookupAdvised, lookupGuard, LOOKUP_HINT } = await import('../src/agent/lookup.ts');
+const { lookupAdvised, lookupGuard, countsAsLookup, LOOKUP_HINT } = await import('../src/agent/lookup.ts');
 const { runAgent } = await import('../src/ai/runtime.ts');
 
 // ---- coach: 空振りの連続と同じ呼び出しの繰り返し ----------------------------------
@@ -79,5 +79,9 @@ const guard = lookupGuard({ request: 'Aについて教えて', known: false, use
 assert.throws(() => guard({ content: 'x' }), (error) => error.governanceRetryHint === LOOKUP_HINT);
 assert.equal(guard({ content: 'y' }), 'y');
 answers += 1;
+
+// memory_focus は思い出したいことを伝えるだけで、何も取ってこない。呼んだだけで「調べた」扱いにしない
+for (const name of ['search', 'read', 'memory', 'channels', 'info', 'browser', 'governance']) assert.ok(countsAsLookup(name), `${name} looks something up`);
+assert.ok(!countsAsLookup('memory_focus'), 'memory_focus alone is not a lookup');
 
 console.log('coach ok (空振りの連続と同じ呼び出しに助言 / 事実を聞かれて調べていなければ1回だけやり直し / 雑談は止めない)');

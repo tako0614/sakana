@@ -28,7 +28,7 @@ import { governance, type GovernanceReservation } from './boundary.js';
 import { closeBrowserSandbox } from './browser.js';
 import { failureNotice } from './failure.js';
 import { stripAddressNarration } from './narration.js';
-import { lookupGuard } from './lookup.js';
+import { countsAsLookup, lookupGuard } from './lookup.js';
 import { softenUnverifiedQuotes } from './quotes.js';
 import { dropRestartedAnswer } from './repeat.js';
 import { agentConfig, agentEnabled } from './config.js';
@@ -551,7 +551,7 @@ export async function handleAgentRequest(
       weigh: weighCost,
       // 事実を聞かれたのに何も調べずに答えそうなら、答える前に1回だけ確かめさせる (lookup.ts)
       ...(toolset.definitions.length > 0 ? { validate: lookupGuard({ request, known: (recalled?.paths.size ?? 0) > 0, usedTool: () => toolUsed }) } : {}),
-      onToolCall: (name, args) => { toolUsed = true; thinking.setStatus(toolLabel(name, args)); }
+      onToolCall: (name, args) => { if (countsAsLookup(name)) toolUsed = true; thinking.setStatus(toolLabel(name, args)); }
     });
 
     finalizeCall(reservation.id, {
