@@ -52,8 +52,10 @@ export function recordVex(record: VexRecord, now = Date.now()): void {
   });
 }
 
+// 冷却と 1 時間の上限は、自分から入った回数だけ数える。名前で呼ばれた (named) 分と、会話の続き (continuation) は数えない:
+// 数えると、呼ばれて答えた直後の続きの発言が、冷却で止まっていた (2026-10-20 の「なぁvex」のあと「自我を君に与えた」)。
 const joinedSince = db.prepare<[string, number], { n: number; last: number | null }>(
-  "SELECT COUNT(*) AS n, MAX(created_at) AS last FROM vex_decisions WHERE channel_id = ? AND action = 'joined' AND created_at > ?");
+  "SELECT COUNT(*) AS n, MAX(created_at) AS last FROM vex_decisions WHERE channel_id = ? AND action = 'joined' AND COALESCE(note, '') NOT IN ('named', 'continuation') AND created_at > ?");
 const spentSince = db.prepare<[number], { total: number | null }>('SELECT SUM(cost_usd) AS total FROM vex_decisions WHERE created_at > ?');
 
 /** そのチャンネルで、since 以降に入った回数と、最後に入った時刻。 */

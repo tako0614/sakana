@@ -19,6 +19,7 @@ db.exec(`
 const ENV_VALUES = {
   callMode: vexConfig.callMode,
   ambient: vexConfig.ambient,
+  arbiter: vexConfig.arbiter,
   channels: [...vexConfig.channels],
   threshold: vexConfig.threshold,
   quietMs: vexConfig.quietMs,
@@ -48,6 +49,7 @@ export function applyVexSettings(config: VexConfig = vexConfig): void {
   config.callMode = mode;
   config.call = mode !== 'off';
   config.ambient = saved['ambient'] === undefined ? ENV_VALUES.ambient : saved['ambient'] === '1';
+  config.arbiter = saved['arbiter'] === undefined ? ENV_VALUES.arbiter : saved['arbiter'] === '1';
 
   let channels = ENV_VALUES.channels;
   if (saved['channels'] !== undefined) {
@@ -86,6 +88,11 @@ export function setCallMode(mode: string, by: string | null): boolean {
 
 export function setAmbient(enabled: boolean, by: string | null): void {
   save('ambient', enabled ? '1' : '0', by);
+  applyVexSettings();
+}
+
+export function setArbiter(enabled: boolean, by: string | null): void {
+  save('arbiter', enabled ? '1' : '0', by);
   applyVexSettings();
 }
 

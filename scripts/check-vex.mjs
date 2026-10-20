@@ -239,7 +239,7 @@ function say(channel, content, { author, bot = false, ago = 0, reference = null,
 function ambientConfig(overrides = {}) {
   return loadVexConfig({
     VEX_API_URL: endpoint, VEX_CALL: 'judge', VEX_NAME_DELAY_MS: '30', VEX_AMBIENT: '1', VEX_CHANNELS: 'chan1 chan2 chan3 chan4 chan5 chan6 chan7 chan8 chan9',
-    VEX_QUIET_MS: '40', VEX_COOLDOWN_MS: '60000', VEX_MAX_PER_HOUR: '3', VEX_THRESHOLD: '0.6', VEX_TIMEOUT_MS: '1500',
+    VEX_ARBITER: '0', VEX_QUIET_MS: '40', VEX_COOLDOWN_MS: '60000', VEX_MAX_PER_HOUR: '3', VEX_THRESHOLD: '0.6', VEX_TIMEOUT_MS: '1500',
     VEX_FALLBACK_MODELS: 'fb/one', VEX_DAILY_USD: '1', ...overrides
   });
 }
@@ -581,8 +581,154 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
   if (isChannelAllowed('priv', scope)) fail('一部の人にしか見えないチャンネルは、自発参加では読ませない');
 }
 
-server.closeAllConnections?.();
-server.close();
+// ---- 実際の履歴から: URL だけの発言には入らない / 直前に答えた相手の続きは冷却に止められない ----------------------
+{
+  const me = { id: 'bot-self', bot: true, username: 'vex' };
+  const alice = { id: 'u-alice', bot: false, username: 'alice' };
+  const bob = { id: 'u-bob', bot: false, username: 'bob' };
+
+  // URL だけ・絵文字だけ・メンションだけの発言は、本当の文字が無いので判定に回さない (YouTube の URL だけの発言に入ってしまった)
+  db.exec('DELETE FROM vex_decisions');
+  resetDecideState(); api.calls.length = 0; api.onCall = null;
+  api.respond = () => ({ status: 200, p: 0.9, cost: 0.000003 });
+  {
+    const channel = makeChannel('chan1');
+    const { judge, joins } = makeJudge(ambientConfig());
+    judge.observe(say(channel, 'https://www.youtube.com/watch?v=h7-nURqDA2M'));
+    judge.observe(say(channel, 'https://example.com/a https://example.com/b <:thiink:1373791842390249533>'));
+    await sleep(200);
+    if (api.calls.length !== 0 || joins.length !== 0) fail(`リンクだけの発言には入らない: ${api.calls.length}/${joins.length}`);
+    judge.observe(say(channel, 'この動画の最後の曲って何だっけ？ https://www.youtube.com/watch?v=h7-nURqDA2M'));
+    await sleep(200);
+    if (api.calls.length !== 1) fail('リンクのほかに文字があれば判定する');
+  }
+
+  // 続きの発言: 直前に自分が答えた相手が、名前もメンションも付けずに話し続ける
+  {
+    db.exec('DELETE FROM vex_decisions');
+    resetDecideState(); api.calls.length = 0;
+    api.respond = () => ({ status: 200, p: 0.1 });  // 判定モデルは通さない (通ったら低い p で落ちるはず)
+    const channel = makeChannel('chan2');
+    const config = ambientConfig({ VEX_COOLDOWN_MS: '600000' });
+    const { judge, joins } = makeJudge(config);
+    // 冷却中にする: 少し前に自分から入った記録
+    db.prepare("INSERT INTO vex_decisions (created_at, guild_id, channel_id, message_id, action) VALUES (?, 'guild', 'chan2', 'old', 'joined')").run(Date.now() - 60_000);
+
+    // 呼ばれて答えたところまで (本番では index.ts が、bot の発言で待っている判定を捨てて noteOwn を呼ぶ)
+    judge.observe(say(channel, 'ちょっと話しかけていい？', { author: alice }));
+    say(channel, '-# thinking', { bot: true, author: me });
+    judge.cancel('chan2'); judge.noteOwn('chan2', '-# thinking <t:1:R>');
+    say(channel, 'なに、自我の話の続きか？', { bot: true, author: me });
+    judge.cancel('chan2'); judge.noteOwn('chan2', 'なに、自我の話の続きか？');
+    const follow = say(channel, '自我を君に与えた', { author: alice });
+    if (!judge.isContinuation(follow)) fail('答えた相手の次の発言は続き');
+    judge.observe(follow);
+    await sleep(200);
+    if (api.calls.length !== 0) fail('続きは判定モデルを通さない');
+    if (joins.length !== 1 || joins[0].message.id !== follow.id || joins[0].join?.continuation !== true) fail(`冷却中でも続きには答える: ${joins.length}`);
+    if (!actions('chan2').endsWith('joined:continuation')) fail(`台帳: ${actions('chan2')}`);
+    // 続きと名前で呼ばれた分は、自発参加の冷却に数えない
+    db.prepare("DELETE FROM vex_decisions WHERE message_id = 'old'").run();
+    if (judge.gate('chan2') !== null) fail('続きの join が冷却や上限を食わない');
+
+    // 別の人の発言・時間が空いた・短い間に何度も答えた後は、続きではない
+    if (judge.isContinuation(say(channel, 'ところで別の話', { author: bob }))) fail('別の人の発言は続きではない');
+    const late = makeJudge(config).judge;
+    late.noteOwn('chan2', 'x', Date.now() - 200_000);
+    late.observe(say(makeChannel('chan2'), 'こんにちは', { author: alice }));
+    if (late.isContinuation({ channelId: 'chan2', author: alice, createdTimestamp: Date.now() })) fail('時間が空いたら続きではない');
+    const busy = makeJudge(config).judge;
+    busy.observe(say(makeChannel('chan3'), 'こんにちは', { author: alice }));
+    for (let i = 0; i < 4; i += 1) busy.noteOwn('chan3', `返事${i}`, Date.now() - 1000 * (4 - i));
+    if (busy.isContinuation({ channelId: 'chan3', author: alice, createdTimestamp: Date.now() })) fail('短い間に何度も答えたあとは続きとして入らない');
+    // 自発参加がオフなら、続きとしても入らない
+    const off = makeJudge(ambientConfig({ VEX_AMBIENT: '0' })).judge;
+    off.observe(say(makeChannel('chan4'), 'こんにちは', { author: alice }));
+    off.noteOwn('chan4', 'どうも');
+    const quiet = say(makeChannel('chan4'), 'つづき', { author: alice });
+    off.observe(quiet);
+    await sleep(150);
+    if (api.calls.length !== 0) fail('オフのときは判定も続きもしない');
+  }
+}
+
+// ---- 審判 (LLM): 判定モデルを通った場面と、名前の無い続きを、会話の履歴を読んで最終判断する -------------------------------
+{
+  const { parseVerdict } = await import('../src/vex/arbiter.js');
+  if (parseVerdict('{"ask": "LINEJSって何？", "join": true}').join !== true) fail('根拠の引用つきの join は通す');
+  if (parseVerdict('{"ask": "", "join": true}').join !== false) fail('根拠の引用が無い join は通さない');
+  if (parseVerdict('{"ask": "", "join": false}').join !== false || parseVerdict('いいえ').join !== false || parseVerdict(undefined).join !== false) fail('false・読めない答えは入らない');
+  if (parseVerdict('判断:\n{"ask":"x","join":true}\nです').join !== true) fail('前後に文字があっても JSON を読む');
+
+  const me = { id: 'bot-self', bot: true, username: 'vex' };
+  const alice = { id: 'u-alice', bot: false, username: 'alice' };
+  const arbiterConfig = (overrides = {}) => ambientConfig({ VEX_ARBITER: '1', VEX_COOLDOWN_MS: '0', VEX_MAX_PER_HOUR: '99', ...overrides });
+  const inputs = [];
+  const make = (config, verdict) => {
+    const joins = [];
+    const judge = new AmbientJudge({
+      config, selfId: () => 'bot-self', canSpeak: () => true, join: async (message, join) => { joins.push({ message, join }); },
+      arbitrate: async (input) => { inputs.push(input); return typeof verdict === 'function' ? verdict(input) : verdict; }
+    });
+    return { judge, joins };
+  };
+  const rowsFor = (channelId) => db.prepare('SELECT action, note, cost_usd FROM vex_decisions WHERE channel_id = ? ORDER BY id').all(channelId);
+
+  // 自発参加: 判定モデルが高い p を付けても、審判が「入らない」なら入らない (台帳に理由が残る)
+  db.exec('DELETE FROM vex_decisions');
+  resetDecideState(); api.calls.length = 0; api.onCall = null;
+  api.respond = () => ({ status: 200, p: 0.9, cost: 0.000003 });
+  {
+    const channel = makeChannel('chan1');
+    for (let i = 0; i < 12; i += 1) say(channel, `前の発言${i}です`, { ago: 20 - i });
+    const { judge, joins } = make(arbiterConfig(), { join: false, reason: '独り言', costUsd: 0.0002, latencyMs: 100, model: 'm' });
+    judge.observe(say(channel, 'PC が壊れたので後で試します'));
+    await sleep(250);
+    if (joins.length !== 0) fail('審判が入らないと言ったら入らない');
+    const rows = rowsFor('chan1');
+    if (rows.length !== 1 || rows[0].action !== 'below' || !rows[0].note.includes('独り言') || !(rows[0].cost_usd > 0.0002)) fail(`台帳 (審判の理由と費用): ${JSON.stringify(rows)}`);
+    if (inputs.at(-1).kind !== 'ambient' || inputs.at(-1).lines.length !== 10 || !inputs.at(-1).lines.at(-1).includes('PC が壊れた')) fail(`審判には直近 10 件が古い順で渡る: ${JSON.stringify(inputs.at(-1))}`);
+  }
+  {
+    db.exec('DELETE FROM vex_decisions');
+    const channel = makeChannel('chan2');
+    const { judge, joins } = make(arbiterConfig(), { join: true, reason: '「LINEJSって何？」', costUsd: 0.0002, latencyMs: 100, model: 'm' });
+    judge.observe(say(channel, 'LINEJSって何？ 誰か知ってる？'));
+    await sleep(250);
+    if (joins.length !== 1 || joins[0].join?.continuation) fail('審判が入ると言ったら入る');
+    if (!rowsFor('chan2')[0].note.startsWith('arbiter: 「LINEJS')) fail(`台帳: ${JSON.stringify(rowsFor('chan2'))}`);
+    // 審判が失敗したら入らない
+    db.exec('DELETE FROM vex_decisions');
+    const down = make(arbiterConfig(), null);
+    down.judge.observe(say(makeChannel('chan3'), 'LINEJSって何？ 誰か知ってる？'));
+    await sleep(250);
+    if (down.joins.length !== 0 || rowsFor('chan3')[0]?.note !== 'arbiter_failed') fail(`審判が落ちたら入らない: ${JSON.stringify(rowsFor('chan3'))}`);
+    // 審判を切ると、判定モデルだけで決まる
+    const noArbiter = make(arbiterConfig({ VEX_ARBITER: '0' }), { join: false, reason: 'x', costUsd: 0, latencyMs: 0, model: 'm' });
+    noArbiter.judge.observe(say(makeChannel('chan4'), 'LINEJSって何？ 誰か知ってる？'));
+    await sleep(250);
+    if (noArbiter.joins.length !== 1) fail('審判を切ったら判定モデルだけで入る');
+  }
+
+  // 続きの発言: 審判が「自分に向いている」と言ったときだけ入る
+  {
+    db.exec('DELETE FROM vex_decisions');
+    api.calls.length = 0;
+    for (const [verdict, expected] of [[{ join: false, reason: '', costUsd: 0.0001, latencyMs: 50, model: 'm' }, 0], [{ join: true, reason: 'は？', costUsd: 0.0001, latencyMs: 50, model: 'm' }, 1]]) {
+      const channel = makeChannel(`cont${expected}`);
+      const { judge, joins } = make(arbiterConfig(), verdict);
+      judge.observe(say(channel, 'ちょっと話しかけていい？', { author: alice }));
+      say(channel, 'なに？', { bot: true, author: me });
+      judge.cancel(channel.id); judge.noteOwn(channel.id, 'なに？');
+      judge.observe(say(channel, 'は？', { author: alice }));
+      await sleep(250);
+      if (joins.length !== expected || (expected && joins[0].join?.continuation !== true)) fail(`続きは審判の答えに従う (${expected}): ${joins.length}`);
+      if (inputs.at(-1).kind !== 'continuation' || inputs.at(-1).speaker !== 'alice') fail('審判には続きの発言と持ち主が渡る');
+    }
+    if (api.calls.length !== 0) fail('続きは判定モデルを通さない');
+  }
+}
+
 // ---- /vex で切り替える設定 (再起動なし・DB に残る・reset で環境変数の値に戻る) ---------------------------------------
 {
   const settings = await import('../src/vex/settings.js');
@@ -600,6 +746,8 @@ server.close();
   if (settings.setCallMode('bogus', 'admin') || vexConfig.callMode !== 'judge') fail('知らないモードは受け付けない');
   if (!settings.setCallMode('off', 'admin') || vexConfig.call || nameHandling('vex どう思う？') !== null) fail('off にすると名前に反応しない');
 
+  settings.setArbiter(false, 'admin');
+  if (vexConfig.arbiter) fail('審判を切れる');
   settings.setAmbient(true, 'admin');
   if (!vexConfig.ambient || judge.enabled) fail('チャンネルが無ければ、オンでも入らない');
   if (!settings.setChannel('c1', true, 'admin') || !vexConfig.channels.has('c1')) fail('チャンネルを足せる');
@@ -620,15 +768,18 @@ server.close();
   settings.applyVexSettings();
   if (vexConfig.callMode !== 'off' || !vexConfig.ambient || vexConfig.threshold !== 0.7 || !vexConfig.channels.has('c2')) fail('変えた値は再起動しても残る');
   if (!['call', 'ambient', 'channels', 'threshold'].every((key) => settings.changedSettings().includes(key))) fail('変えた項目が分かる');
+  if (vexConfig.arbiter) fail('審判の切り替えも残る');
 
   const removed = settings.resetVexSettings();
   if (removed < 5 || settings.changedSettings().length !== 0) fail('reset で変更を捨てる');
-  if (vexConfig.callMode !== 'mention' || !vexConfig.call || vexConfig.ambient || vexConfig.channels.size !== 0 || vexConfig.threshold !== 0.6 || vexConfig.quietMs !== 90_000) fail('reset すると環境変数の値に戻る');
+  if (vexConfig.callMode !== 'mention' || !vexConfig.call || vexConfig.ambient || !vexConfig.arbiter || vexConfig.channels.size !== 0 || vexConfig.threshold !== 0.6 || vexConfig.quietMs !== 90_000) fail('reset すると環境変数の値に戻る');
 
   const vex = vexCommands.find((entry) => entry.data.name === 'vex');
   if (!vex) fail('/vex が登録されている');
   const subs = vex.data.toJSON().options.map((option) => option.name).join(',');
-  if (subs !== 'status,call,ambient,channel,set,reset') fail(`/vex の操作: ${subs}`);
+  if (subs !== 'status,call,ambient,arbiter,channel,set,reset') fail(`/vex の操作: ${subs}`);
 }
 
+server.closeAllConnections?.();
+server.close();
 console.log('vex ok');

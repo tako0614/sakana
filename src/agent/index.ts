@@ -60,7 +60,7 @@ import { SilentIndicator, ThinkingIndicator, isIndicatorMessage, toolLabel, type
 import type { AmbientJoin } from '../vex/ambient.js';
 import { nameHandling } from '../vex/call.js';
 import { vexConfig } from '../vex/config.js';
-import { AMBIENT_HINT, isPassAnswer } from '../vex/pass.js';
+import { AMBIENT_HINT, CONTINUE_HINT, isPassAnswer } from '../vex/pass.js';
 import { buildToolset } from './tools.js';
 import {
   errorCode,
@@ -512,7 +512,7 @@ export async function handleAgentRequest(
     const system = buildSystemPrompt(runContext, toolset);
     const request = stripMention(message.content, client.user.id);
     // 自発参加では、依頼の代わりに「呼ばれていない」ことを伝える前置きを付ける (想起や検索は発言そのもので行う)
-    const prompt = ambient ? `${AMBIENT_HINT}\n${request}` : request;
+    const prompt = ambient ? `${ambient.continuation ? CONTINUE_HINT : AMBIENT_HINT}\n${request}` : request;
     // 呼ばれたときの想起: 名前の照合 + 意味の近い記憶 (間に合わなければ名前だけ)
     // 直前の会話 (LLM に見せている会話文。system は含めない) も意味検索の手がかりにする
     const conversation = conversationText(recent);

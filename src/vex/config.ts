@@ -35,6 +35,8 @@ export interface VexConfig {
   /** 名前を持っている (callMode が off 以外)。プロンプトの自己紹介に使う。 */
   call: boolean;
   ambient: boolean;
+  /** 判定モデルを通った場面 (と、名前の無い続きの発言) を、LLM の審判が会話の履歴と記憶の概要を読んで決める。 */
+  arbiter: boolean;
   /** 自発参加してよいチャンネル。空なら自発参加はどこでもしない。 */
   channels: Set<string>;
   model: string;
@@ -71,6 +73,7 @@ export function loadVexConfig(env: NodeJS.ProcessEnv = process.env): VexConfig {
     callMode: mode,
     call: mode !== 'off',
     ambient: flag(env.VEX_AMBIENT, false),
+    arbiter: flag(env.VEX_ARBITER, true),
     channels: new Set(list(env.VEX_CHANNELS)),
     model: env.VEX_MODEL ?? 'perplexity/pplx-decider-flash-v1.2',
     fallbacks: list(env.VEX_FALLBACK_MODELS ?? 'typesafe/jev-1.14,inception/mercury-decide:free'),

@@ -20,6 +20,7 @@ import {
   envValues,
   resetVexSettings,
   setAmbient,
+  setArbiter,
   setCallMode,
   setChannel,
   setNumber
@@ -45,6 +46,7 @@ function statusText(): string {
     '**vex の状態**',
     `名前 (vex): **${vexConfig.callMode}** — ${MODE_TEXT[vexConfig.callMode]}`,
     `自発参加: **${vexConfig.ambient ? 'オン' : 'オフ'}** — チャンネル: ${channels.length ? channels.map((id) => `<#${id}>`).join(' ') : 'なし (どこにも入らない)'}`,
+    `審判 (LLM が会話の履歴と記憶の概要を読んで最終判断): **${vexConfig.arbiter ? 'オン' : 'オフ'}**`,
     `閾値 ${vexConfig.threshold} (名前が出たとき ${vexConfig.nameThreshold}) / 静かになってから ${Math.round(vexConfig.quietMs / 1000)} 秒 / `
       + `入ったあとの冷却 ${Math.round(vexConfig.cooldownMs / 60_000)} 分 / 1 時間に ${vexConfig.maxPerHour} 回まで`,
     stats.decisions === 0
@@ -89,6 +91,10 @@ export const vexCommands = [
         .setDescription('呼ばれていない会話への自発参加をオン / オフします')
         .addBooleanOption((option) => option.setName('enabled').setDescription('オンにするか').setRequired(true)))
       .addSubcommand((sub) => sub
+        .setName('arbiter')
+        .setDescription('判定モデルのあとの審判 (LLM) をオン / オフします。オフだと判定モデルの閾値だけで決まります')
+        .addBooleanOption((option) => option.setName('enabled').setDescription('オンにするか').setRequired(true)))
+      .addSubcommand((sub) => sub
         .setName('channel')
         .setDescription('自発参加してよいチャンネルを足す / 外します')
         .addStringOption((option) => option
@@ -128,6 +134,12 @@ export const vexCommands = [
         const enabled = interaction.options.getBoolean('enabled', true);
         setAmbient(enabled, by);
         await say(`自発参加を${enabled ? 'オン' : 'オフ'}にしました。${enabled && vexConfig.channels.size === 0 ? '\n(入ってよいチャンネルがまだありません。`/vex channel add` で足してください)' : ''}\n\n${statusText()}`);
+        return;
+      }
+      if (sub === 'arbiter') {
+        const enabled = interaction.options.getBoolean('enabled', true);
+        setArbiter(enabled, by);
+        await say(`審判を${enabled ? 'オン' : 'オフ'}にしました。\n\n${statusText()}`);
         return;
       }
       if (sub === 'channel') {

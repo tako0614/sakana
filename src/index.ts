@@ -325,6 +325,8 @@ async function handleMessageCreate(message: Message): Promise<void> {
   if (message.author.bot) {
     // 会話が動いた。自発参加の判定を待っていたら捨てる (自分の発言で輪を作らない)
     ambientJudge.cancel(message.channelId);
+    // 自分が答えた相手を覚える。その人の次の発言は、名前が無くても会話の続きとして見る
+    if (message.author.id === message.client.user.id) ambientJudge.noteOwn(message.channelId, message.content);
     // AIだけのコミュニティではbotの通常会話も立法上の事実資料になる。
     // 統治面の公式投稿はrecordGovernanceMessage側で除外し、botを自動処罰の対象にはしない。
     if (governanceConfig.enabled) {
