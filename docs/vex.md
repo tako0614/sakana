@@ -2,8 +2,24 @@
 
 発言に「vex」が出たときの扱いを `VEX_CALL` で選ぶ: `1` = メンションと同じに確定で答える / `judge` = 判定モデルに文脈で決めさせる / `0` = 何もしない (既定)。
 呼ばれていない会話でも、役に立つときだけ自分から入る (自発参加、`VEX_AMBIENT`)。どちらも環境変数で、既定はオフ。`.env.example` の「vex」の節にある。
-**本番の現状 (2026-10-18): `VEX_CALL=1` (メンション扱い)、自発参加と judge はオフ**。判定モデルの機能は、コードと台帳を残したまま止めてある。
+**本番の現状 (2026-10-20): `VEX_CALL=judge` (名前が出た発言を判定モデルに回す)、自発参加は #雑談だけオン**。切り替えは `/vex` コマンド (下)。
 Discord のメンションと bot への返信は、いつでも確定で答える。
+
+## `/vex` コマンドで切り替える (2026-10-20)
+
+環境変数を変えて再起動しなくても、管理者 (「サーバー管理」権限か `ARCHIVE_ADMIN_USERS`) が Discord から切り替えられる。値は DB (`vex_settings`) に残り、
+環境変数より優先する。bot 全体の設定で、サーバーごとではない。
+
+| コマンド | 内容 |
+|---|---|
+| `/vex status` | いまの状態と、直近 24 時間の判定 (送った・(skip) で黙った・閾値未満・失敗の数と費用) |
+| `/vex call mode:<off\|mention\|judge>` | 「vex」と名前が出た発言の扱い。off=何もしない / mention=確定で答える / judge=判定モデルが文脈で決める |
+| `/vex ambient enabled:<true\|false>` | 呼ばれていない会話への自発参加のオン / オフ |
+| `/vex channel action:<add\|remove> [channel]` | 自発参加してよいチャンネルを足す / 外す (省略するとこのチャンネル) |
+| `/vex set key value` | `threshold` (0.05〜0.99)・`quiet_seconds` (3〜600)・`cooldown_minutes` (0〜1440)・`max_per_hour` (0〜60 の整数) |
+| `/vex reset` | コマンドで変えた値をすべて捨てて、環境変数の値に戻す |
+
+反映はすぐ (再起動なし)。止めたいときは `/vex ambient enabled:false` と `/vex call mode:off`。
 
 ## 動き
 

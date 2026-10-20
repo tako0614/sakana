@@ -29,6 +29,7 @@ npm run web:dev
 - `/top [type] [period]` - テキスト / ボイスの XP ランキングを表示
 - `/index <build|update|verify|repair|embed|status|cancel|reset>` - 過去ログの取り込み・取りこぼしの確認・意味検索の準備 (サーバー管理権限が必要)
 - `/agentlimit <show|set|grant|revoke|reset>` - エージェントの使用量を見る / 上限を変える (show 以外は管理者のみ)
+- `/vex <status|call|ambient|channel|set|reset>` - vex (名前呼びと、呼ばれていない会話への自発参加) の状態を見る / 再起動なしで切り替える (管理者のみ。docs/vex.md)
 - `/agentban <add|remove|list>` - 特定の人を、そのサーバーで AI エージェントを使えなくする / 戻す / 一覧 (管理者のみ)。使えなくした人のメンション・名前・返信には何も返さず、費用も枠も使いません。理由のメモは管理者の一覧にだけ出ます。サーバーごと・人ごとで、`/as` などの他のコマンドには効きません
 - `/search` - 過去ログ検索 (誰でも使える)
 - `/searchstats` - 検索条件に一致したメッセージを「誰が / どこで / いつ」で集計

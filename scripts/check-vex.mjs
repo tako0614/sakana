@@ -583,4 +583,52 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
 
 server.closeAllConnections?.();
 server.close();
+// ---- /vex で切り替える設定 (再起動なし・DB に残る・reset で環境変数の値に戻る) ---------------------------------------
+{
+  const settings = await import('../src/vex/settings.js');
+  const { vexConfig } = await import('../src/vex/config.js');
+  const { vexCommands } = await import('../src/vex/command.js');
+  const { AmbientJudge } = await import('../src/vex/ambient.js');
+
+  if (vexConfig.callMode !== 'mention' || !vexConfig.call || vexConfig.ambient || vexConfig.channels.size !== 0) fail('起動時は環境変数のまま');
+  const judge = new AmbientJudge({ selfId: () => 'bot', canSpeak: () => true, join: async () => {} });
+  if (judge.enabled) fail('自発参加はオフのとき動かない');
+
+  if (!settings.setCallMode('judge', 'admin')) fail('judge に切り替えられる');
+  if (vexConfig.callMode !== 'judge' || !vexConfig.call) fail('call=judge が config に反映される');
+  if (nameHandling('vex どう思う？') !== 'judge') fail('切り替えが名前の扱いにすぐ効く (judge)');
+  if (settings.setCallMode('bogus', 'admin') || vexConfig.callMode !== 'judge') fail('知らないモードは受け付けない');
+  if (!settings.setCallMode('off', 'admin') || vexConfig.call || nameHandling('vex どう思う？') !== null) fail('off にすると名前に反応しない');
+
+  settings.setAmbient(true, 'admin');
+  if (!vexConfig.ambient || judge.enabled) fail('チャンネルが無ければ、オンでも入らない');
+  if (!settings.setChannel('c1', true, 'admin') || !vexConfig.channels.has('c1')) fail('チャンネルを足せる');
+  if (settings.setChannel('c1', true, 'admin')) fail('同じチャンネルをまた足しても変わらない');
+  if (!judge.enabled) fail('オンでチャンネルがあれば自発参加が動く (再起動なし)');
+  if (!settings.setChannel('c1', false, 'admin') || vexConfig.channels.has('c1') || judge.enabled) fail('チャンネルを外せる');
+  settings.setChannel('c2', true, 'admin');
+
+  if (!settings.setNumber('threshold', 0.7, 'admin') || vexConfig.threshold !== 0.7) fail('閾値を変えられる');
+  if (settings.setNumber('threshold', 1.5, 'admin') || settings.setNumber('threshold', Number.NaN, 'admin') || vexConfig.threshold !== 0.7) fail('範囲外の閾値は受け付けない');
+  if (!settings.setNumber('quiet_seconds', 20, 'admin') || vexConfig.quietMs !== 20_000) fail('静かさの待ちは秒で入れてミリ秒になる');
+  if (!settings.setNumber('cooldown_minutes', 5, 'admin') || vexConfig.cooldownMs !== 300_000) fail('冷却は分で入れてミリ秒になる');
+  if (settings.setNumber('max_per_hour', 2.5, 'admin') || !settings.setNumber('max_per_hour', 4, 'admin') || vexConfig.maxPerHour !== 4) fail('1 時間の上限は整数だけ');
+  if (settings.setNumber('nope', 1, 'admin')) fail('知らない項目は受け付けない');
+
+  // 再起動: メモリの値が環境変数に戻っていても、DB に残した値を読み直せば同じになる
+  vexConfig.callMode = 'mention'; vexConfig.call = true; vexConfig.ambient = false; vexConfig.threshold = 0.1; vexConfig.channels.clear();
+  settings.applyVexSettings();
+  if (vexConfig.callMode !== 'off' || !vexConfig.ambient || vexConfig.threshold !== 0.7 || !vexConfig.channels.has('c2')) fail('変えた値は再起動しても残る');
+  if (!['call', 'ambient', 'channels', 'threshold'].every((key) => settings.changedSettings().includes(key))) fail('変えた項目が分かる');
+
+  const removed = settings.resetVexSettings();
+  if (removed < 5 || settings.changedSettings().length !== 0) fail('reset で変更を捨てる');
+  if (vexConfig.callMode !== 'mention' || !vexConfig.call || vexConfig.ambient || vexConfig.channels.size !== 0 || vexConfig.threshold !== 0.6 || vexConfig.quietMs !== 90_000) fail('reset すると環境変数の値に戻る');
+
+  const vex = vexCommands.find((entry) => entry.data.name === 'vex');
+  if (!vex) fail('/vex が登録されている');
+  const subs = vex.data.toJSON().options.map((option) => option.name).join(',');
+  if (subs !== 'status,call,ambient,channel,set,reset') fail(`/vex の操作: ${subs}`);
+}
+
 console.log('vex ok');

@@ -66,3 +66,19 @@ export function joinedInChannel(channelId: string, since: number): { count: numb
 export function decisionSpend(since: number): number {
   return spentSince.get(since)?.total ?? 0;
 }
+
+const statsSince = db.prepare<[number], { action: string; n: number; cost: number | null }>(
+  'SELECT action, COUNT(*) AS n, SUM(cost_usd) AS cost FROM vex_decisions WHERE created_at > ? GROUP BY action');
+
+/** since 以降の判定を、どうしたか別に数える (/vex status 用)。 */
+export function vexStats(since: number): { byAction: Record<string, number>; decisions: number; costUsd: number } {
+  const byAction: Record<string, number> = {};
+  let decisions = 0;
+  let costUsd = 0;
+  for (const row of statsSince.all(since)) {
+    byAction[row.action] = row.n;
+    decisions += row.n;
+    costUsd += row.cost ?? 0;
+  }
+  return { byAction, decisions, costUsd };
+}

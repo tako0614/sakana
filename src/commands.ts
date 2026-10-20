@@ -11,6 +11,7 @@ import { archiveCommands } from './archive/commands.js';
 import { agentCommands } from './agent/commands.js';
 import { mimicCommands } from './mimic/command.js';
 import { memoryCommands } from './memory/command.js';
+import { vexCommands } from './vex/command.js';
 import { governanceConfig } from './governance/config.js';
 import { governanceCommands } from './governance/commands.js';
 
@@ -29,6 +30,7 @@ export const commands: Command[] = [
   ...agentCommands,
   ...mimicCommands,
   ...memoryCommands,
+  ...vexCommands,
   ...(governanceConfig.enabled ? governanceCommands : []),
   {
     data: new SlashCommandBuilder()
