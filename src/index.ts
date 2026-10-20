@@ -35,7 +35,7 @@ import { canBotSpeak } from './archive/permissions.js';
 import { AmbientJudge, type VexMessage } from './vex/ambient.js';
 import { agentEnabled } from './agent/config.js';
 import { sweepStaleIndicators } from './agent/indicators.js';
-import { pruneCalls } from './agent/ratelimit.js';
+import { isAgentBanned, pruneCalls } from './agent/ratelimit.js';
 import { sweepEnabledGuilds } from './archive/embed-job.js';
 import { sweepMemoryVectors } from './memory/vectors.js';
 import { embedConfig } from './embed/config.js';
@@ -381,7 +381,7 @@ async function handleMessageCreate(message: Message): Promise<void> {
   }
 
   // 呼ばれていない発言。静かになったら、入るべきか判定する (非同期、失敗しても何も起きない)
-  ambientJudge.observe(message as unknown as VexMessage);
+  if (!isAgentBanned(message.guildId, message.author.id)) ambientJudge.observe(message as unknown as VexMessage);
 
   if (message.author.username !== ossTargetUsername) {
     return;

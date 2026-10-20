@@ -20,13 +20,16 @@ import { agentConfig } from './config.js';
 import {
   TUNABLES,
   type TunableKey,
+  banAgentUser,
   getTunable,
   getUsage,
   grantDailyUsd,
+  listAgentBans,
   listGrants,
   listTunables,
   resetUsage,
-  setTunable
+  setTunable,
+  unbanAgentUser
 } from './ratelimit.js';
 import { AGENT_ENGINES } from './engines.js';
 
@@ -96,7 +99,7 @@ function usageEmbed(userId: string): EmbedBuilder {
   return embed;
 }
 
-async function requireAdmin(interaction: ChatInputCommandInteraction): Promise<boolean> {
+async function requireAdmin(interaction: ChatInputCommandInteraction, what = '上限を変えられる'): Promise<boolean> {
   // キャッシュ済みのサーバーなら GuildMember が載っている。載っていなければ取りに行く
   // (API の生のメンバーは permissions が文字列なので、そのままでは判定できない)。
   const member = interaction.inCachedGuild()
@@ -105,7 +108,7 @@ async function requireAdmin(interaction: ChatInputCommandInteraction): Promise<b
   if (canManageIndex(member)) return true;
 
   await interaction.reply({
-    content: '上限を変えられるのは「サーバー管理」権限を持つ人か、`ARCHIVE_ADMIN_USERS` に登録された人だけです。',
+    content: `${what}のは「サーバー管理」権限を持つ人か、\`ARCHIVE_ADMIN_USERS\` に登録された人だけです。`,
     allowedMentions: { parse: [] },
     flags: MessageFlags.Ephemeral
   });
@@ -228,6 +231,75 @@ export const agentCommands = [
         allowedMentions: { parse: [] },
         flags: MessageFlags.Ephemeral
       });
+    }
+  },
+  {
+    data: new SlashCommandBuilder()
+      .setName('agentban')
+      .setDescription('特定の人が AI エージェントを使えないようにする / 戻す (管理者用)')
+      // /agentlimit と同じ理由で可視性は開けて、実行可否は execute 側で判定する
+      .setContexts(InteractionContextType.Guild)
+      .addSubcommand((sub) => sub
+        .setName('add')
+        .setDescription('この人の呼びかけに、このサーバーで応えないようにします')
+        .addUserOption((option) => option
+          .setName('user')
+          .setDescription('対象')
+          .setRequired(true))
+        .addStringOption((option) => option
+          .setName('reason')
+          .setDescription('理由のメモ (管理者の一覧にだけ出ます)')
+          .setMaxLength(200)
+          .setRequired(false)))
+      .addSubcommand((sub) => sub
+        .setName('remove')
+        .setDescription('この人をまた使えるようにします')
+        .addUserOption((option) => option
+          .setName('user')
+          .setDescription('対象')
+          .setRequired(true)))
+      .addSubcommand((sub) => sub
+        .setName('list')
+        .setDescription('使えなくしている人の一覧')),
+
+    async execute(interaction: ChatInputCommandInteraction): Promise<void> {
+      const guildId = interaction.guildId;
+      if (!guildId) {
+        await interaction.reply({ content: 'サーバーの中で使ってください。', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (!await requireAdmin(interaction, 'エージェントを使えなくできる')) return;
+
+      const sub = interaction.options.getSubcommand();
+      const say = (content: string): Promise<unknown> => interaction.reply({ content, allowedMentions: { parse: [] }, flags: MessageFlags.Ephemeral });
+
+      if (sub === 'list') {
+        const bans = listAgentBans(guildId);
+        await say(bans.length === 0
+          ? '使えなくしている人はいません。'
+          : [`使えなくしている人 (${bans.length})`, ...bans.map((row) => `<@${row.userId}>${row.reason ? ` — ${row.reason}` : ''} (${row.bannedBy ? `<@${row.bannedBy}> が` : ''}<t:${Math.floor(row.createdAt / 1000)}:R>)`)]
+            .join('\n').slice(0, 1900));
+        return;
+      }
+
+      const target = interaction.options.getUser('user', true);
+
+      if (sub === 'remove') {
+        await say(unbanAgentUser(guildId, target.id)
+          ? `${target} をまた使えるようにしました。`
+          : `${target} は使えなくしていません。`);
+        return;
+      }
+
+      // bot は呼びかけで動かないので入れても意味が無い (一覧を汚すだけ)
+      if (target.bot) {
+        await say('bot は最初から呼びかけで動かないので、入れる必要はありません。');
+        return;
+      }
+      const fresh = banAgentUser(guildId, target.id, interaction.user.id, interaction.options.getString('reason'));
+      await say(fresh
+        ? `${target} はこのサーバーで AI エージェントを使えなくしました。呼びかけには何も返しません (メッセージも出ません)。戻すときは \`/agentban remove\`。`
+        : `${target} はすでに使えなくしています。理由のメモを更新しました。`);
     }
   }
 ];

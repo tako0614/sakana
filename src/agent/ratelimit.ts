@@ -79,6 +79,19 @@ db.exec(`
   );
 `);
 
+// AI agent を使わせない人 (サーバーごと)。管理者が /agentban で入れる。
+// 使用量の上限 (agent_calls) とは別の話で、上限が空いていても、この表にいる人の呼びかけには応えない。
+db.exec(`
+  CREATE TABLE IF NOT EXISTS agent_bans (
+    guild_id   TEXT NOT NULL,
+    user_id    TEXT NOT NULL,
+    reason     TEXT,
+    banned_by  TEXT,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+  );
+`);
+
 // 既存の DB には CREATE TABLE IF NOT EXISTS では列が増えないので、無いときだけ足す。
 //
 // counted = 0 は「請求の記録としては残すが、上限の判定では数えない」印。
@@ -600,4 +613,37 @@ export function pruneCalls(keepMs = 30 * 86_400_000): void {
   } catch (error) {
     console.error('Failed to prune agent calls:', error);
   }
+}
+
+// ---- AI agent を使わせない人 -----------------------------------------------------
+
+const selectBan = db.prepare<[string, string], { one: number }>('SELECT 1 AS one FROM agent_bans WHERE guild_id = ? AND user_id = ?');
+
+/** その人は、このサーバーで AI agent を使えないか。メッセージのたびに呼ぶので主キー1回の参照だけにしてある。 */
+export function isAgentBanned(guildId: string | null | undefined, userId: string | null | undefined): boolean {
+  if (!guildId || !userId) return false;
+  return Boolean(selectBan.get(guildId, userId));
+}
+
+/** 使えなくする。すでに使えない人なら理由だけ更新して false を返す。 */
+export function banAgentUser(guildId: string, userId: string, byUserId: string | null, reason?: string | null): boolean {
+  const fresh = !isAgentBanned(guildId, userId);
+  db.prepare(`
+    INSERT INTO agent_bans (guild_id, user_id, reason, banned_by, created_at) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT (guild_id, user_id) DO UPDATE SET reason = excluded.reason, banned_by = excluded.banned_by
+  `).run(guildId, userId, reason?.trim().slice(0, 200) || null, byUserId, Date.now());
+  return fresh;
+}
+
+/** 使えるように戻す。もともと使えた人なら false。 */
+export function unbanAgentUser(guildId: string, userId: string): boolean {
+  return db.prepare('DELETE FROM agent_bans WHERE guild_id = ? AND user_id = ?').run(guildId, userId).changes > 0;
+}
+
+export interface AgentBan { userId: string; reason: string | null; bannedBy: string | null; createdAt: number }
+
+export function listAgentBans(guildId: string): AgentBan[] {
+  return db.prepare<[string], { user_id: string; reason: string | null; banned_by: string | null; created_at: number }>(
+    'SELECT user_id, reason, banned_by, created_at FROM agent_bans WHERE guild_id = ? ORDER BY created_at DESC'
+  ).all(guildId).map((row) => ({ userId: row.user_id, reason: row.reason, bannedBy: row.banned_by, createdAt: row.created_at }));
 }

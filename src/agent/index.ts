@@ -44,6 +44,7 @@ import { buildSystemPrompt, buildUserContent } from './prompt.js';
 import {
   finalizeCall,
   getTunable,
+  isAgentBanned,
   isAgentReply,
   recordToolCalls,
   releaseCall,
@@ -159,6 +160,8 @@ export function isAgentRequest(message: Message, client: Client): boolean {
   // bot / webhook の発言では起動しない。自分の回答への返信で自分が起動する輪を作らないため。
   if (!message.guildId || message.author?.bot || message.webhookId) return false;
   if (!client.user) return false;
+  // /agentban で使えなくされた人には応えない (メッセージも出さない。上限と違い、運営の判断なので理由は本人に返さない)
+  if (isAgentBanned(message.guildId, message.author?.id)) return false;
 
   const mentioned = message.mentions.has(client.user, {
     ignoreDirect: false,
@@ -359,6 +362,9 @@ export async function handleAgentRequest(
   const member = message.member ?? await guild.members.fetch(message.author.id).catch(() => null);
 
   if (!member) { ambient?.report('failed'); return; }
+
+  // どの入口から来ても (メンション・名前・自発参加) 使えない人には動かない。費用も枠も使わない。
+  if (isAgentBanned(guild.id, message.author.id)) { ambient?.report('failed'); return; }
 
   // /model で自作モデルを選んでいる人はそちらへ回す。
   //
