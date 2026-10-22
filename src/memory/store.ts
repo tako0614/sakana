@@ -306,6 +306,10 @@ export function memoryDb(): Database.Database {
     );
 
     CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    -- 記憶のサイトの公開状態 (サーバーごと)。/memory site が書き、サイト (Worker) にも送る。行が無ければサイトの既定に従う
+    CREATE TABLE IF NOT EXISTS site_access (
+      guild_id TEXT PRIMARY KEY, access TEXT NOT NULL, updated_at INTEGER NOT NULL, updated_by TEXT
+    );
 
     -- ページの本文を「1行 = 1つの知識」に割った断片 (chunks.ts)。意味検索の最小の単位で、
     -- ベクトルは memory_vectors に kind = 'chunk'、id = この id で持つ。builder ではなく bot の定期実行が作る。
@@ -999,4 +1003,23 @@ export function resetTree(guildId: string): void {
     d.prepare('DELETE FROM episodes WHERE guild_id = ?').run(guildId);
     d.prepare("DELETE FROM state WHERE key LIKE ? AND key NOT LIKE 'public-channels:%'").run(`%:${guildId}%`);
   })();
+}
+
+// ---- 記憶のサイトの公開状態 -------------------------------------------------------------
+
+/** off = 誰にも見せない / members = ログインしたメンバーだけ / public = 誰でも。 */
+export type SiteAccess = 'off' | 'members' | 'public';
+export const SITE_ACCESS_VALUES: readonly SiteAccess[] = ['off', 'members', 'public'];
+
+/** /memory site で設定した公開状態。まだ設定していなければ null (サイトの既定に従う)。 */
+export function getSiteAccess(guildId: string): SiteAccess | null {
+  const row = memoryDb().prepare<[string], { access: string }>('SELECT access FROM site_access WHERE guild_id = ?').get(guildId);
+  return SITE_ACCESS_VALUES.find((value) => value === row?.access) ?? null;
+}
+
+export function setSiteAccess(guildId: string, access: SiteAccess, by: string | null = null, now = Date.now()): void {
+  memoryDb().prepare(`
+    INSERT INTO site_access (guild_id, access, updated_at, updated_by) VALUES (?, ?, ?, ?)
+    ON CONFLICT(guild_id) DO UPDATE SET access = excluded.access, updated_at = excluded.updated_at, updated_by = excluded.updated_by
+  `).run(guildId, access, now, by);
 }

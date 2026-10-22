@@ -150,6 +150,7 @@ provider の当たり外れ: OpenRouter は同じモデルを複数の provider 
 
 記憶は Discord の中 (`/memory explore`) のほかに、法令集と同じ Cloudflare Worker (`worker/`) の `/wiki` で、
 wiki として読めます (サーバーごとに `/<サーバーID>/wiki`。Discord でログインした、そのサーバーのメンバーだけが読める。Discord で `/memory url` を使うとリンクが出る)。ページは記事、出来事は年表と出来事のページ、
+公開はサーバーごとに `/memory site mode:off|members|public` (管理者) で切り替えられる (`off` はメンバーにも見せない。worker/README.md の「公開のオン / オフ」)。
 本文の `[[リンク]]` は wiki のリンク、`[e12]` は脚注の番号 (その出来事のページへ直接飛ぶ) になります。
 
 - 送り方: `scripts/memory-site-sync.ts` (systemd `sakana-memory-site.timer`、10分おき) が memory.sqlite を読み、

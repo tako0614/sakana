@@ -7,7 +7,7 @@ import { layout } from './layout.ts';
 import { GUILD_ID, makeLinks, memoryGuilds, type Links } from './links.ts';
 import { scanReferences } from './markdown.ts';
 import * as store from './store.ts';
-import type { Env, NodeRow, Session } from './types.ts';
+import type { Env, NodeRow, Session, SiteAccess } from './types.ts';
 import {
   articleView, episodeView, homeView, loginView, messageView, monthView, referencesOf, searchView, timelineIndexView, treeNav,
   type ArticleData, type Page, type TimelineData
@@ -64,6 +64,21 @@ const redirect = (location: string): Response => new Response(null, { status: 30
 /** 見せていないサーバーの URL。サーバーがあるかどうかも、中身も出さない。 */
 const notFound = (): Response => respond(messageView('見つかりません', 'そのページはありません。', { status: 404 }), {});
 
+/**
+ * そのサーバーの公開状態。bot が /memory site で設定した値 (D1) が先で、無ければ wrangler.jsonc の MEMORY_ACCESS
+ * (public なら誰でも、それ以外は members)。off は、メンバーにも見せない (URL が無いのと同じ 404)。
+ */
+export async function accessFor(env: Env, guild: string): Promise<SiteAccess> {
+  try {
+    const set = await store.siteAccess(env.LAWS, guild);
+    if (set) return set;
+  } catch (error) {
+    // 表が無い・読めないときは、設定が無いのと同じ (既定)。閉じる側に倒したいので、読めなかったことは記録だけ残す
+    console.error('site access lookup failed:', error);
+  }
+  return isPublicAccess(env) ? 'public' : 'members';
+}
+
 const positive = (value: string | null, fallback = 1): number => {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed >= 1 && parsed <= 100_000 ? parsed : fallback;
@@ -88,13 +103,13 @@ export async function handleWiki(request: Request, env: Env, deps: Deps = defaul
   // 以前の bot のログインリンク: 見せているサーバーが1つだけならそのトップ (ログイン画面) へ
   if (path === '/auth/link') {
     const only = guilds.length === 1 ? guilds[0] : null;
-    return only ? redirect(makeLinks(only).home) : notFound();
+    return only && (await accessFor(env, only)) !== 'off' ? redirect(makeLinks(only).home) : notFound();
   }
   if (path === '/auth/login' || path === '/auth/callback') {
     if (!authConfigured(env)) return respond(messageView('ログインの設定がありません', 'このサイトでは Discord ログインがまだ使えません。', { status: 503 }), {});
     if (path === '/auth/login') {
       const guild = url.searchParams.get('g') ?? '';
-      return guilds.includes(guild) ? loginRedirect(request, env, guild, deps.auth) : notFound();
+      return guilds.includes(guild) && (await accessFor(env, guild)) !== 'off' ? loginRedirect(request, env, guild, deps.auth) : notFound();
     }
     const result = await finishLogin(request, env, deps.auth);
     if (result.ok) return result.response;
@@ -113,6 +128,10 @@ export async function handleWiki(request: Request, env: Env, deps: Deps = defaul
   const guild = match[1];
   const rest = match[2] ?? '';
   if (!guilds.includes(guild)) return notFound();
+  const access = await accessFor(env, guild);
+  // 公開を止めているサーバー: 見せていないサーバーと同じ 404 (サーバーがあるかも、メンバーかどうかも出さない)
+  if (access === 'off') return notFound();
+  const open = access === 'public';
   const links = makeLinks(guild);
   if (rest === '' || rest === '/') return redirect(links.home);
   if (rest === '/auth/logout') return logoutResponse(request, guild);
@@ -123,7 +142,7 @@ export async function handleWiki(request: Request, env: Env, deps: Deps = defaul
 
   // gate: 誰でも読める設定 (MEMORY_ACCESS=public) でなければ、このサーバーのメンバーとしてログインした人だけ
   let user: Session | null = null;
-  if (!isPublicAccess(env)) {
+  if (!open) {
     // 入口が決まっていて (MEMORY_SITE_ORIGIN)、別の入口 (workers.dev など) から来たら、そちらへ転送する: cookie も Discord の戻り先もそこにしか無い
     const origin = siteOrigin(env, url);
     if (origin !== url.origin) return redirect(`${origin}${url.pathname}${url.search}`);
@@ -133,7 +152,7 @@ export async function handleWiki(request: Request, env: Env, deps: Deps = defaul
     user = await currentSession(request, env, guild, deps.now());
     if (!user) return respond(loginView(`${url.pathname}${url.search}`, links), { links });
   }
-  const ctx: Context = { user, links, cache: isPublicAccess(env) ? PUBLIC : PRIVATE };
+  const ctx: Context = { user, links, cache: open ? PUBLIC : PRIVATE };
   const db = env.LAWS;
 
   const nav = async (current: string): Promise<SafeHtml> => {

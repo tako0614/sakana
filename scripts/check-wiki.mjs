@@ -472,6 +472,65 @@ const authEnv = { ...env, MEMORY_ACCESS: 'members', DISCORD_CLIENT_ID: '111', DI
   assert.equal((await handleWiki(new Request(`https://wiki.test${P}/wiki`, { method: 'POST' }), env, deps)).status, 405);
 }
 
+// ---- 公開状態 (サーバーごとの off / members / public。bot の /memory site が /v1/memory/access で書く) -----------------
+{
+  const OTHER_GUILD = '1517186886714789910';
+  const twoGuilds = { ...authEnv, MEMORY_GUILD_IDS: `${GUILD} ${OTHER_GUILD}` };
+  const accessDb = createD1();   // 他の検査の状態を持ち込まない (別の D1)
+  const accessEnv = { ...twoGuilds, LAWS: accessDb };
+  const member = await auth.signSession({ g: GUILD, uid: '42', name: 'たこ', avatar: null, exp: Math.floor(NOW / 1000) + 3600 }, SESSION_SECRET);
+  const get = (path, cookie, e = accessEnv) => handleWiki(new Request(`https://wiki.test${path}`, { headers: cookie ? { cookie } : {} }), e, deps);
+  const setAccess = (body, token = TOKEN, e = accessEnv) => handleIngest(new Request('https://x.test/v1/memory/access', {
+    method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(body) }), e, NOW);
+  const read = (guild, e = accessEnv) => handleIngest(new Request(`https://x.test/v1/memory/access?guild=${guild}`, { headers: { authorization: `Bearer ${TOKEN}` } }), e, NOW);
+  const cookie = `sk_session_${GUILD}=${member}`;
+  // 画面の中身を確かめられるよう、1 ページだけ入れる
+  await handleIngest(new Request('https://x.test/v1/memory/batch', { method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ guildId: GUILD, nodes: [node(1, '', { body: '- ひみつの記憶の本文' })], episodes: [] }) }), accessEnv, NOW);
+
+  // 設定が無いサーバーは、MEMORY_ACCESS (members) に従う: ログインが要る
+  assert.equal((await read(GUILD)).status, 200);
+  assert.deepEqual(await (await read(GUILD)).json(), { guildId: GUILD, access: null, default: 'members' }, 'no row: the default');
+  assert.equal((await get(`${P}/wiki`)).status, 401, 'default: a visitor must log in');
+  assert.equal((await get(`${P}/wiki`, cookie)).status, 200, 'default: a logged-in member reads');
+
+  // off: メンバーにも見せない。見せていないサーバーと同じ 404 で、本文も出ない。ログインの入口も閉じる
+  assert.equal((await setAccess({ guildId: GUILD, access: 'off', by: '1406999581971058888' })).status, 200);
+  assert.deepEqual(await (await read(GUILD)).json(), { guildId: GUILD, access: 'off', default: 'members' });
+  for (const [path, c] of [[`${P}/wiki`, null], [`${P}/wiki`, cookie], [`${P}/e/1`, cookie], [`${P}/s?q=x`, cookie], [`${P}/t`, cookie], [`${P}`, cookie], ['/auth/login?g=' + GUILD, null]]) {
+    const response = await get(path, c);
+    assert.equal(response.status, 404, `off: ${path}${c ? ' (as a member)' : ''} is gone`);
+    const text = await response.text();
+    assert.ok(!text.includes('ひみつの記憶') && !text.includes('ログインして'), 'and shows nothing of the book');
+  }
+  assert.equal((await get('/auth/link?t=old', null, { ...accessEnv, MEMORY_GUILD_IDS: GUILD })).status, 404, 'off: the old login link does not lead anywhere');
+  // 取り込みは off の間も受け付ける (閉じていても、再開したときに最新が出る)
+  assert.equal((await handleIngest(new Request(`https://x.test/v1/memory/hashes?guild=${GUILD}`, { headers: { authorization: `Bearer ${TOKEN}` } }), accessEnv, NOW)).status, 200, 'off: ingest still works');
+  // ほかのサーバーには効かない
+  assert.equal((await read(OTHER_GUILD).then((r) => r.json())).access, null, 'another server has no setting');
+
+  // public: 設定が members でも、このサーバーだけログイン無しで読める (サーバーごとの設定が env に勝つ)
+  assert.equal((await setAccess({ guildId: GUILD, access: 'public' })).status, 200);
+  const open = await get(`${P}/wiki`);
+  assert.equal(open.status, 200, 'public: a visitor reads');
+  assert.match(open.headers.get('cache-control'), /public/);
+  assert.match(await open.text(), /ひみつの記憶/);
+
+  // members: env が public でも、このサーバーはログインが要る
+  assert.equal((await setAccess({ guildId: GUILD, access: 'members' })).status, 200);
+  assert.equal((await get(`${P}/wiki`, null, { ...accessEnv, MEMORY_ACCESS: 'public' })).status, 401, 'members: the row beats a public default');
+  assert.equal((await get(`${P}/wiki`, cookie)).status, 200, 'members: a logged-in member reads');
+
+  // 入力の検査: トークン・値・サーバー
+  assert.equal((await setAccess({ guildId: GUILD, access: 'off' }, 'wrong')).status, 401, 'a wrong token cannot change it');
+  assert.equal((await setAccess({ guildId: GUILD, access: 'closed' })).status, 400, 'an unknown value is refused');
+  assert.equal((await setAccess({ guildId: GUILD })).status, 400);
+  assert.equal((await setAccess({ guildId: '999999999999999999', access: 'off' })).status, 400, 'a server the site does not carry cannot be set');
+  assert.equal((await get(`${P}/wiki`, cookie)).status, 200, 'and nothing changed');
+  assert.equal((await read(GUILD).then((r) => r.json())).access, 'members');
+  assert.equal((await handleIngest(new Request(`https://x.test/v1/memory/access?guild=${GUILD}`), accessEnv, NOW)).status, 401, 'reading it needs the token too');
+}
+
 // ---- サーバーごとの分離 ---------------------------------------------------------------
 // 別のサーバーを足しても、データ・URL・リンク・検索・取り込みのどれも混ざらない。同じ id・同じパスで別の内容を入れて確かめる。
 {
@@ -568,4 +627,4 @@ const authEnv = { ...env, MEMORY_ACCESS: 'members', DISCORD_CLIENT_ID: '111', DI
   assert.equal(store.monthRange('x'), null);
 }
 
-console.log('wiki ok (escape / 取り込みと差分と prune / 検索 / 公開設定 / ログイン (state・メンバー確認・署名つき cookie・戻り先) / 全画面 / サーバーごとの分離: データ・URL・リンク・検索・取り込み・cookie)');
+console.log('wiki ok (escape / 取り込みと差分と prune / 検索 / 公開設定 / サーバーごとの公開状態 (off・members・public) / ログイン (state・メンバー確認・署名つき cookie・戻り先) / 全画面 / サーバーごとの分離: データ・URL・リンク・検索・取り込み・cookie)');

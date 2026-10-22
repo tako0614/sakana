@@ -3,7 +3,9 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import Database from 'better-sqlite3';
 import 'dotenv/config';
+import { pushSiteAccess } from '../src/memory/site-access.js';
 import { siteGuilds } from '../src/memory/site.js';
+import type { SiteAccess } from '../src/memory/store.js';
 
 // 記憶を公開サイト (Worker + D1) へ送る。builder の後に timer から動かす (deploy/sakana-memory-site.*)。
 //
@@ -434,6 +436,18 @@ async function main(): Promise<void> {
         writeFileSync(outFile, JSON.stringify(snapshot));
         console.log(`wrote ${outFile}`);
         continue;
+      }
+      // 公開状態 (/memory site) をサイトに送り直す。サイト側が空になっても、次の同期で戻る。取り込みが失敗しても先に送る
+      if (memory && url && token && args['dry-run'] !== true) {
+        try {
+          const saved = memory.prepare('SELECT access FROM site_access WHERE guild_id = ?').get(guildId) as { access?: string } | undefined;
+          if (saved?.access === 'off' || saved?.access === 'members' || saved?.access === 'public') {
+            const pushed = await pushSiteAccess(guildId, saved.access as SiteAccess, null, { env: process.env });
+            console.log(`[${guildId}] access ${saved.access}: ${pushed.ok ? 'sent' : `not sent (${pushed.reason ?? '?'})`}`);
+          }
+        } catch (error) {
+          if (!/no such table/i.test(String(error))) console.log(`[${guildId}] access: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       // 記憶の無いサーバーは送らない (サイトの一覧に空のサーバーを作らない)
       if (snapshot.nodes.length === 0) {

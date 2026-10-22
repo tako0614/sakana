@@ -20,6 +20,10 @@ export interface Env {
   SESSION_SECRET?: string;
 }
 
+/** サーバーごとの公開状態。off = 誰にも見せない / members = ログインしたメンバーだけ / public = 誰でも */
+export type SiteAccess = 'off' | 'members' | 'public';
+export const SITE_ACCESS: readonly SiteAccess[] = ['off', 'members', 'public'];
+
 export interface NodeRow {
   guild_id: string;
   id: number;

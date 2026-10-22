@@ -172,7 +172,63 @@ const options = { url: 'https://site.test', token: TOKEN, guildId: GUILD, fetchI
   assert.match(text, /見られるチャンネルが限られている発言 2 件/);
 }
 
+// ---- 公開状態 (/memory site: off / members / public)。bot の DB に残し、サイトにも送る ----------------------------------
+{
+  const { siteConfigFor } = await import('../src/memory/site.js');
+  const { siteApi, pushSiteAccess, changeSiteAccess } = await import('../src/memory/site-access.js');
+  const { memoryCommand } = await import('../src/memory/command.js');
+  const env = { MEMORY_SITE_PUBLIC_URL: 'https://site.test', MEMORY_SITE_GUILDS: GUILD };
+  const apiEnv = { MEMORY_SITE_URL: 'https://api.test/', MEMORY_SITE_TOKEN: 'tok', GOVERNANCE_LAW_API_URL: 'https://old.test', GOVERNANCE_LAW_API_TOKEN: 'old' };
+
+  // 設定が無ければ従来どおりリンクを出す。off にするとリンクもボタンも出さない (出しても 404 になる)。戻せば出る
+  assert.equal(store.getSiteAccess(GUILD), null, 'no setting at first');
+  assert.deepEqual(siteConfigFor(GUILD, env), { origin: 'https://site.test', guildId: GUILD });
+  store.setSiteAccess(GUILD, 'off', 'admin');
+  assert.equal(store.getSiteAccess(GUILD), 'off');
+  assert.equal(siteConfigFor(GUILD, env), null, 'off: no link, no button');
+  store.setSiteAccess(GUILD, 'members', 'admin');
+  assert.ok(siteConfigFor(GUILD, env), 'members: the link is back');
+  store.setSiteAccess(GUILD, 'public', 'admin');
+  assert.ok(siteConfigFor(GUILD, env), 'public: the link is shown');
+  assert.equal(siteConfigFor('1255999999999999999', env), null, 'a server that is not on the site never gets one');
+
+  // サイトの入口: MEMORY_SITE_* が先、無ければ法令集と同じ Worker。トークンが無ければ null
+  assert.deepEqual(siteApi(apiEnv), { url: 'https://api.test', token: 'tok' });
+  assert.deepEqual(siteApi({ GOVERNANCE_LAW_API_URL: 'https://old.test/', GOVERNANCE_LAW_API_TOKEN: 'old' }), { url: 'https://old.test', token: 'old' });
+  assert.equal(siteApi({ MEMORY_SITE_URL: 'https://api.test' }), null);
+
+  // 送る: 宛先・Bearer・本文。失敗は投げずに理由を返す
+  const sent = [];
+  const fetchOk = async (url, init) => { sent.push({ url, init }); return new Response('{"ok":true}', { status: 200 }); };
+  assert.deepEqual(await pushSiteAccess(GUILD, 'off', 'admin', { env: apiEnv, fetchImpl: fetchOk }), { ok: true });
+  assert.equal(sent[0].url, 'https://api.test/v1/memory/access');
+  assert.equal(sent[0].init.headers.authorization, 'Bearer tok');
+  assert.deepEqual(JSON.parse(sent[0].init.body), { guildId: GUILD, access: 'off', by: 'admin' });
+  const failed = await pushSiteAccess(GUILD, 'off', null, { env: apiEnv, fetchImpl: async () => new Response('bad', { status: 400 }) });
+  assert.equal(failed.ok, false);
+  assert.match(failed.reason, /400/);
+  assert.equal((await pushSiteAccess(GUILD, 'off', null, { env: apiEnv, fetchImpl: async () => { throw new Error('offline'); } })).reason, 'offline');
+  assert.equal((await pushSiteAccess(GUILD, 'off', null, { env: {}, fetchImpl: fetchOk })).ok, false, 'no site configured: nothing is sent');
+
+  // サイトに届かなくても、bot 側の設定は残る (リンクは止まる)
+  store.setSiteAccess(GUILD, 'public', 'admin');
+  const down = await changeSiteAccess(GUILD, 'off', 'admin', { env: apiEnv, fetchImpl: async () => { throw new Error('offline'); } });
+  assert.equal(down.ok, false);
+  assert.equal(store.getSiteAccess(GUILD), 'off', 'the bot side changed even though the site was unreachable');
+  assert.equal(siteConfigFor(GUILD, env), null);
+  const up = await changeSiteAccess(GUILD, 'members', 'admin', { env: apiEnv, fetchImpl: fetchOk });
+  assert.equal(up.ok, true);
+  assert.equal(store.getSiteAccess(GUILD), 'members');
+
+  // コマンド: /memory site mode:off|members|public (管理者用)
+  const site = memoryCommand.data.toJSON().options.find((option) => option.name === 'site');
+  assert.ok(site, '/memory site exists');
+  assert.deepEqual(site.options[0].choices.map((choice) => choice.value), ['off', 'members', 'public']);
+  assert.equal(site.options[0].required ?? false, false, 'mode is optional: no mode shows the current state');
+  store.db?.prepare?.('DELETE FROM site_access WHERE guild_id = ?').run(GUILD);
+}
+
 store.resetTree(GUILD);
 archive.prepare('DELETE FROM messages WHERE guild_id = ?').run(GUILD);
 archive.prepare('DELETE FROM channels WHERE guild_id = ?').run(GUILD);
-console.log('memory site ok (引用は全員に見えるチャンネルだけ / 子孫の出来事数 / 差分だけ送る / 消えた行を消す / 空にしても戻る / 束に分ける)');
+console.log('memory site ok (引用は全員に見えるチャンネルだけ / 公開状態 (off ならリンクを出さない・サイトへ送る) / 子孫の出来事数 / 差分だけ送る / 消えた行を消す / 空にしても戻る / 束に分ける)');

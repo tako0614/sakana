@@ -1,8 +1,9 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } from 'discord.js';
+import { getSiteAccess } from './store.js';
 
 // 記憶のサイト (worker/ の /wiki) への入り口。/memory url と explore の「サイトで開く」が使う。
 //
-// サイトは Discord でログインした、そのサーバーのメンバーだけが読める (MEMORY_ACCESS=public の間は誰でも。worker/README.md)。リンクはただの URL。
+// サイトは Discord でログインした、そのサーバーのメンバーだけが読める (サーバーごとに /memory site で off / members / public を切り替えられる。worker/README.md)。リンクはただの URL。
 //
 // 設定が揃っているときだけ出す (サイトを配備する前に URL だけが出て「not found」になった、2026-10-17):
 //   MEMORY_SITE_PUBLIC_URL    サイトの origin (https のみ。開発の localhost を除く)
@@ -41,7 +42,10 @@ export interface SiteConfig {
 /** そのサーバーで入り口を出してよいときの設定。足りない・別のサーバーなら null。 */
 export function siteConfigFor(guildId: string, env: NodeJS.ProcessEnv = process.env): SiteConfig | null {
   const origin = siteOrigin(env);
-  return origin && siteGuilds(env).includes(guildId) ? { origin, guildId } : null;
+  if (!origin || !siteGuilds(env).includes(guildId)) return null;
+  // /memory site で公開を止めているサーバーは、リンクもボタンも出さない (出しても 404 になる。回答の [e12] の出典リンクも付けない)
+  try { if (getSiteAccess(guildId) === 'off') return null; } catch { /* 読めなければ、止めていないものとして扱う */ }
+  return { origin, guildId };
 }
 
 /** サイトの中のパス (/<サーバーID>/…)。パスの区切りは / のまま、各部分だけ percent-encode する。 */

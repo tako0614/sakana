@@ -10,9 +10,10 @@ import { snapshotPublicChannels } from './snapshot.js';
 import { memoryStatus, type MemoryStatus } from './status.js';
 import {
   OTHERS, addTopLevel, includeChannel, includedChannels, listChildren, memoryDb, moveSubtree, normalizePath, removeIncluded,
-  removeTopLevel, topLevels
+  removeTopLevel, topLevels, getSiteAccess, SITE_ACCESS_VALUES, type SiteAccess
 } from './store.js';
 import { parseEpisodeId, replyWithSiteLink, siteConfigFor, type SiteTarget } from './site.js';
+import { changeSiteAccess, siteApi } from './site-access.js';
 import { hasMemory, runMemoryTool, type MemoryRefTable } from './tool.js';
 import { errorMessage } from './types.js';
 
@@ -22,9 +23,15 @@ import { errorMessage } from './types.js';
 // 返事は本人にだけ見える形にし (チャンネルを流さない)、誰にも通知しない (allowedMentions)。
 
 const UNIT = process.env.MEMORY_TREE_SYSTEMD_UNIT ?? 'sakana-memory.service';
-const ADMIN_ONLY = new Set(['status', 'pause', 'resume', 'include', 'exclude', 'list', 'add', 'remove']);
+const ADMIN_ONLY = new Set(['status', 'pause', 'resume', 'include', 'exclude', 'list', 'add', 'remove', 'site']);
 // 返事に入る名前やパスは利用者の入力。@everyone などを書かれても誰にも通知しない
 const NO_PINGS = { parse: [] };
+
+const SITE_MODE_LABEL: Record<SiteAccess, string> = {
+  off: 'off — 公開を止める (メンバーにも見せない)',
+  members: 'members — ログインしたメンバーだけ',
+  public: 'public — 誰でも (ログイン無し)'
+};
 
 /** 最上位の一覧と、その下のページ数。 */
 function categoryList(guildId: string): string {
@@ -89,7 +96,7 @@ async function replyWithSiteUrl(interaction: ChatInputCommandInteraction, guildI
   const refuse = (content: string) => interaction.reply({ content, flags: MessageFlags.Ephemeral, allowedMentions: NO_PINGS });
   const config = siteConfigFor(guildId);
   if (!config) {
-    await refuse('このサーバーの記憶のサイトはまだありません。');
+    await refuse(getSiteAccess(guildId) === 'off' ? 'このサーバーの記憶のサイトは、いま公開を止めています。' : 'このサーバーの記憶のサイトはまだありません。');
     return;
   }
   if (!hasMemory(guildId)) {
@@ -137,6 +144,9 @@ export const memoryCommand = {
     .addSubcommand((sub) => sub.setName('url').setDescription('記憶のサイト (メンバーだけ読める) へのリンクを出す')
       .addStringOption((option) => option.setName('path').setDescription('開くページ。例: people/たこ。空ならトップ'))
       .addStringOption((option) => option.setName('id').setDescription('開く出来事の番号。例: e12')))
+    .addSubcommand((sub) => sub.setName('site').setDescription('記憶のサイトの公開を切り替える。省略すると今の状態 (管理者)')
+      .addStringOption((option) => option.setName('mode').setDescription('off=公開を止める / members=ログインしたメンバーだけ / public=誰でも')
+        .addChoices(...SITE_ACCESS_VALUES.map((value) => ({ name: SITE_MODE_LABEL[value], value })))))
     .addSubcommand((sub) => sub.setName('status').setDescription('読み込みの進み具合と費用 (管理者)'))
     .addSubcommand((sub) => sub.setName('pause').setDescription('読み込みを一時停止する (管理者)'))
     .addSubcommand((sub) => sub.setName('resume').setDescription('読み込みを再開する (管理者)'))
@@ -166,6 +176,24 @@ export const memoryCommand = {
         await interaction.reply({ content: 'この操作は「サーバー管理」権限を持つ人か `ARCHIVE_ADMIN_USERS` の人だけが使えます。', flags: MessageFlags.Ephemeral });
         return;
       }
+    }
+    // 記憶のサイトの公開状態。管理者だけ (上で確かめ済み)。本人にだけ返す
+    if (sub === 'site') {
+      const mode = interaction.options.getString('mode');
+      const reply = (content: string) => interaction.reply({ content, flags: MessageFlags.Ephemeral, allowedMentions: NO_PINGS });
+      if (!mode) {
+        const current = getSiteAccess(guildId);
+        await reply(`記憶のサイト: **${current ?? '(未設定。サイトの既定に従う)'}**${current ? ` — ${SITE_MODE_LABEL[current]}` : ''}\n`
+          + '変えるときは `/memory site mode:off|members|public`。');
+        return;
+      }
+      if (!SITE_ACCESS_VALUES.some((value) => value === mode)) { await reply(`その値は使えません: ${mode}`); return; }
+      const result = await changeSiteAccess(guildId, mode as SiteAccess, interaction.user.id);
+      const pushedLine = result.ok
+        ? 'サイトにも反映しました。'
+        : `⚠ **サイトにはまだ届いていません** (${result.reason ?? '理由不明'})。bot 側では変わっていて、リンクは出しません。${siteApi() ? '次の同期 (10 分ごと) でもう一度送ります。' : ''}`;
+      await reply(`記憶のサイトを **${mode}** にしました — ${SITE_MODE_LABEL[mode as SiteAccess]}\n${pushedLine}`);
+      return;
     }
     // リンクはその人専用 (開くとその人としてログインする)。本人にだけ返す
     if (sub === 'url') {

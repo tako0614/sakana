@@ -12,7 +12,8 @@
   "routes": [{ "pattern": "sakana.takos.jp", "custom_domain": true }],
   // 記憶 (/<サーバーID>/wiki) は、Discord でログインした、そのサーバーのメンバーだけが読める (検索エンジンには noindex)。
   //   MEMORY_GUILD_IDS   見せるサーバー (カンマ区切り。ここに無いサーバーの URL は 404)
-  //   MEMORY_ACCESS      'members' (既定。ログイン必須) | 'public' (誰でも)。2026-10-18 に 'members' にした
+  //   MEMORY_ACCESS      'members' (既定。ログイン必須) | 'public' (誰でも)。2026-10-18 に 'members' にした。
+  //                      サーバーごとの off / members / public は D1 (memory_site_access) が先で、これは設定が無いサーバーの既定 (worker/README.md)
   //   MEMORY_SITE_ORIGIN ログインの入口。Discord の OAuth2 > Redirects にここの /auth/callback を登録する
   //   DISCORD_CLIENT_ID  ログイン用の Discord アプリの ID (公開してよい。bot のアプリと同じでなくてよい)
   //   secret: DISCORD_CLIENT_SECRET (Discord アプリの Client Secret) / SESSION_SECRET (cookie の署名の鍵。ランダムな文字列)

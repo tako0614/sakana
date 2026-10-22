@@ -111,6 +111,25 @@ CSP は `default-src 'none'` です。型検査は `npx tsc -p tsconfig.json` (s
 - **サーバーを足す**: `wrangler.jsonc` の `MEMORY_GUILD_IDS` に ID を足して配備し、bot の `.env` の `MEMORY_SITE_GUILDS` にも足します
   (builder がそのサーバーの記憶を作り終えていること。記憶の無いサーバーは送りません)。
 
+### 公開のオン / オフ (サーバーごと)
+
+サーバーごとに、wiki の公開状態を **off / members / public** に切り替えられる。値は D1 の `memory_site_access` にあり、
+bot の `/memory site mode:off|members|public` (管理者) か、`tsx scripts/memory-site-access.ts <サーバーID> off|members|public` が
+`POST /v1/memory/access` (Bearer、取り込みと同じトークン) で書く。設定が無いサーバーは `MEMORY_ACCESS` (既定 `members`) に従う。
+
+| 状態 | 見え方 |
+|---|---|
+| `off` | 誰にも見せない。メンバーにも。URL (`/<サーバーID>/…`・ログインの入口・以前のログインリンク) は、見せていないサーバーと同じ 404 で、サーバーがあるかも、メンバーかどうかも出さない |
+| `members` | Discord でログインした、そのサーバーのメンバーだけ |
+| `public` | 誰でも (ログイン無し。短くキャッシュ) |
+
+- **取り込みは `off` の間も受け付ける** (閉じていても、再開したときに最新が出る)。
+- bot は設定を自分の記憶 DB (`site_access`) にも持つ。`off` のサーバーでは、`/memory url`・「サイトで開く」のボタン・回答の出典リンク (`[e12]`) を出さない。
+  同期 (`scripts/memory-site-sync.ts`、10 分ごと) のたびにサイトへ送り直すので、サイト側の D1 が空になっても戻る。
+- `GET /v1/memory/access?guild=<ID>` で今の値 (`access`: 設定、`default`: 設定が無いときの既定) を読める。
+- 見せるサーバーの一覧 (`MEMORY_GUILD_IDS`) に無いサーバーは、設定もできない (400)。
+- 2026-10-22: Evex Developers を `off` にした。
+
 ### ログイン (Discord OAuth)
 
 - 仕組み: `/auth/login` が Discord (`identify guilds`) へ送り、`/auth/callback` で戻る。state を cookie と突き合わせ、ユーザーの

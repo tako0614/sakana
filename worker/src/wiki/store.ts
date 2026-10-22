@@ -1,4 +1,4 @@
-import type { EpisodeBrief, EpisodeRow, NodeBrief, NodeRow, QuoteRow } from './types.ts';
+import { SITE_ACCESS, type EpisodeBrief, type EpisodeRow, type NodeBrief, type NodeRow, type QuoteRow, type SiteAccess } from './types.ts';
 
 // 記憶の読み取り。D1 への問い合わせだけを置き、HTML は作らない。
 // 値はすべて bind で渡す (SQL に文字列を連結しない)。D1 は1回の問い合わせの bind が100個までなので、
@@ -321,4 +321,19 @@ export async function siteStats(db: D1Database, guild: string): Promise<SiteStat
     lastAt: counts?.last_at ?? null,
     syncedAt: meta ? Number(meta.value) || null : null
   };
+}
+
+// ---- 公開状態 (サーバーごと) ----------------------------------------------------------
+
+/** bot が設定した公開状態。行が無い (まだ設定していない) なら null。 */
+export async function siteAccess(db: D1Database, guild: string): Promise<SiteAccess | null> {
+  const row = await one<{ access: string }>(db, 'SELECT access FROM memory_site_access WHERE guild_id = ?1', guild);
+  return SITE_ACCESS.find((value) => value === row?.access) ?? null;
+}
+
+export async function setSiteAccess(db: D1Database, guild: string, access: SiteAccess, by: string | null, now: number): Promise<void> {
+  await db.prepare(`
+    INSERT INTO memory_site_access (guild_id, access, updated_at, updated_by) VALUES (?1, ?2, ?3, ?4)
+    ON CONFLICT (guild_id) DO UPDATE SET access = excluded.access, updated_at = excluded.updated_at, updated_by = excluded.updated_by
+  `).bind(guild, access, now, by).run();
 }

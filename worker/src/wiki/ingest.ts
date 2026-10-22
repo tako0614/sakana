@@ -1,6 +1,7 @@
 import { memoryGuilds } from './links.ts';
 import { GUILD_ID } from './links.ts';
-import type { EpisodePayload, Env, NodePayload } from './types.ts';
+import * as store from './store.ts';
+import { SITE_ACCESS, type EpisodePayload, type Env, type NodePayload } from './types.ts';
 
 // bot (builder の後に動く memory-site-sync) から記憶を受け取る口。
 //   GET  /v1/memory/hashes?guild=ID      いま持っている行の content_hash (差分を取るため)
@@ -235,9 +236,21 @@ export async function handleIngest(request: Request, env: Env, now = Date.now())
       const toMap = (rows: { id: number; hash: string }[] | undefined) => Object.fromEntries((rows ?? []).map((row) => [String(row.id), row.hash]));
       return json({ nodes: toMap(nodes.results), episodes: toMap(episodes.results) });
     }
+    // 公開状態 (off / members / public)。取り込みと同じ Bearer。off の間も、取り込みは受け付ける
+    if (request.method === 'GET' && url.pathname === '/v1/memory/access') {
+      const guild = guildOf(url.searchParams.get('guild'), env);
+      return json({ guildId: guild, access: await store.siteAccess(env.LAWS, guild), default: env.MEMORY_ACCESS === 'public' ? 'public' : 'members' });
+    }
     if (request.method !== 'POST') return json({ error: 'method not allowed' }, 405);
     const body = await readJson(request);
     const guild = guildOf(body.guildId, env);
+    if (url.pathname === '/v1/memory/access') {
+      const access = SITE_ACCESS.find((value) => value === body.access);
+      if (!access) throw new BadRequest('access は off / members / public のどれかです');
+      const by = typeof body.by === 'string' && body.by.length <= 64 ? body.by : null;
+      await store.setSiteAccess(env.LAWS, guild, access, by, now);
+      return json({ ok: true, guildId: guild, access });
+    }
     if (url.pathname === '/v1/memory/batch') {
       const nodes = array(body.nodes ?? [], 'nodes', MAX_ITEMS).map(parseNode);
       const episodes = array(body.episodes ?? [], 'episodes', MAX_ITEMS).map(parseEpisode);
