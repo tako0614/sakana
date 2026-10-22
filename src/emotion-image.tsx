@@ -1,3 +1,7 @@
+/** @jsxRuntime automatic */
+/** @jsxImportSource react */
+// ↑ JSX の変換方法をこのファイルに書いておく。bot は /root/sakana (tsconfig.json の無い場所) から動くので、tsconfig の "jsx" を
+//   当てにすると tsx が従来の React.createElement に変換し、`React is not defined` で「きもち」が毎回失敗していた (2026-10-21)。
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { CSSProperties } from 'react';
 
@@ -127,7 +131,7 @@ function EmotionImage({ authorName, avatarUrl, text, result }: EmotionImageInput
         {/* 右側: 上位5位の感情グラフ (五角形レーダー) */}
         <section className="chart">
           <div className="chart-inner">
-            <PentagonRadar emotions={emotions.slice(0, 5)} dominantColor={meta.color} />
+            <PentagonRadar emotions={emotions.slice(0, 5)} dominantColor={meta.color} absolute={result.neutral === true} />
           </div>
         </section>
       </main>
@@ -140,7 +144,7 @@ interface Point {
   y: number;
 }
 
-function PentagonRadar({ emotions, dominantColor }: { emotions: EmotionScore[]; dominantColor: string }) {
+function PentagonRadar({ emotions, dominantColor, absolute = false }: { emotions: EmotionScore[]; dominantColor: string; absolute?: boolean }) {
   const center = 200;
   const radius = 125;
 
@@ -157,7 +161,8 @@ function PentagonRadar({ emotions, dominantColor }: { emotions: EmotionScore[]; 
   );
 
   // スコアが小さい場合でもグラフがしっかり見えるよう、最大値を基準に相対スケーリングする
-  const maxScore = Math.max(0.01, ...emotions.map((e) => e.score));
+  // 感情の無い発言 (absolute) は 1.0 を外枠にして、小さい形のまま出す (最大値を外枠にすると、何も無いのに広がって見える)
+  const maxScore = absolute ? 1 : Math.max(0.01, ...emotions.map((e) => e.score));
   // 0〜maxScore を 0〜1 の比率に変換（一番高い感情が常に外枠に届くようにする）
   const dataPoints = emotions.map((emotion, index) => getPoint(index, Math.max(0, emotion.score) / maxScore));
   const dashed: CSSProperties = { stroke: '#e2e8f0', strokeWidth: 1.5 };
