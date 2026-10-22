@@ -14,6 +14,8 @@ export interface EmotionScore {
 
 export interface EmotionResult {
   emotions: EmotionScore[];
+  /** どの感情も低い (感情の無い発言)。見出しを「落ち着いている」にする。 */
+  neutral?: boolean;
 }
 
 export interface EmotionImageInput {
@@ -36,7 +38,8 @@ const emotionMeta: Record<string, EmotionMeta> = {
   anger: { ja: '怒り', color: '#ef4444' },
   fear: { ja: '恐れ', color: '#8b5cf6' },
   disgust: { ja: '嫌悪', color: '#64748b' },
-  trust: { ja: '信頼', color: '#14b8a6' }
+  trust: { ja: '信頼', color: '#14b8a6' },
+  neutral: { ja: '平静', color: '#94a3b8' }
 };
 
 const roastLines: Record<string, string> = {
@@ -47,7 +50,8 @@ const roastLines: Record<string, string> = {
   anger: '触らぬ神に祟りなし。とりあえずそっと距離を置きましょう。',
   fear: '怯えています。あたまを撫でて、安心させてあげましょう。',
   disgust: '地雷を踏まないように注意が必要です。',
-  trust: '何かお願い事をするなら今がチャンスです。'
+  trust: '何かお願い事をするなら今がチャンスです。',
+  neutral: '特に感情は動いていないようです。普通に話しかけて大丈夫です。'
 };
 
 const verbs: Record<string, string> = {
@@ -58,7 +62,8 @@ const verbs: Record<string, string> = {
   anger: '怒っている',
   fear: '恐れている',
   disgust: '嫌悪している',
-  trust: '信頼している'
+  trust: '信頼している',
+  neutral: '落ち着いている'
 };
 
 // 画像の中から外へ取りに行けるのは Discord のアバター画像だけ (描画側の Chrome でも同じ制限をかける)
@@ -78,7 +83,7 @@ export function renderEmotionHtml({ authorName, avatarUrl, text, result }: Emoti
 
 function EmotionImage({ authorName, avatarUrl, text, result }: EmotionImageInput) {
   const emotions = [...result.emotions].sort((a, b) => b.score - a.score);
-  const topLabel = emotions[0]?.label ?? '';
+  const topLabel = result.neutral === true ? 'neutral' : (emotions[0]?.label ?? '');
   const meta = getEmotionMeta(topLabel);
 
   // 文字数に応じてフォントサイズを動的に調整

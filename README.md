@@ -825,17 +825,13 @@ OSS_TARGET_USERNAME=kurage.1
 OSS_TRIGGER_TEXT=oss
 OSS_RESPONSE_TEXT=oss!
 EMOTION_TRIGGER_TEXT=きもち
-EMOTION_PYTHON_BIN=python3
-EMOTION_MODEL_NAME=neuralnaut/deberta-wrime-emotions
-EMOTION_MAX_LENGTH=128
-EMOTION_ANALYSIS_TIMEOUT_MS=180000
 ```
 
 開発中は `DISCORD_GUILD_ID` を設定すると、スラッシュコマンドの反映が速くなります。
 
 `kurage.1` が `oss` と送ったとき、bot は同じチャンネルに `oss!` と送ります。文言は `OSS_RESPONSE_TEXT` で変更できます。
 
-任意のメッセージに `きもち` とリプライすると、リプライ先の本文を `neuralnaut/deberta-wrime-emotions` で分析し、HTML から生成した画像を返信します。初回は Hugging Face からモデルをダウンロードするため時間がかかります。
+任意のメッセージに `きもち` とリプライすると、リプライ先の本文の感情を判定モデル (jev、OpenRouter の Decisions API) で読み、HTML から生成した画像を返信します。喜び・悲しみ・期待・驚き・怒り・恐れ・嫌悪・信頼の 8 つそれぞれに「書き手はいま感じているか」を 1 回で聞き、その確率が強さになります (1 回 約 0.5 秒・約 $0.000005。`typesafe/jev-1.14`、混んだら `perplexity/pplx-decider-flash-v1.2`。`EMOTION_MODELS` で変えられます)。どの感情も 0.4 未満 (`EMOTION_NEUTRAL_BELOW`) の発言 (「おはよう」など) は「落ち着いている」と出します。以前は Python の DeBERTa (WRIME) を毎回起動していましたが、「夜道怖すぎて動けない」を悲しみ 1 位と読むなど精度が低く、モデルの読み込みも重かったので置き換えました (2026-10-22)。画像の描画には Chrome が必要です (`EMOTION_CHROME_PATH`)。
 
 通常メッセージを読むには、Discord Developer Portal の Bot 設定で `Message Content Intent` を有効にしてください。
 
@@ -847,7 +843,7 @@ Node.js 22.13以上が必要です。会話・統治agentは共通の実行基�
 npm install
 ```
 
-気持ち分析機能は Python 依存関係も必要です。
+意味検索 (記憶・過去ログ) は Python 依存関係が必要です。「きもち」の感情分析は Python を使いません。
 
 ```bash
 python3 -m venv .venv
@@ -859,10 +855,10 @@ pip install -r requirements.txt
 
 Debian / Ubuntu では `python3-venv` が別パッケージなので、`No module named 'ensurepip'` が出たら `apt install python3.14-venv` (バージョンは環境に合わせる) が必要です。
 
-venv を使う場合は `.env` の `EMOTION_PYTHON_BIN` を以下にします。
+venv を使う場合は `.env` の `SEMANTIC_PYTHON_BIN` を以下にします (意味検索が使う Python。未設定なら `EMOTION_PYTHON_BIN`、それも無ければ `python3`)。
 
 ```env
-EMOTION_PYTHON_BIN=.venv/bin/python
+SEMANTIC_PYTHON_BIN=.venv/bin/python
 ```
 
 ## Register Slash Commands

@@ -1,22 +1,15 @@
-import { spawn } from 'node:child_process';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { AttachmentBuilder, type Message, type MessageReplyOptions } from 'discord.js';
 import puppeteer from 'puppeteer-core';
 import { IMAGE_HOSTS, renderEmotionHtml, type EmotionImageInput, type EmotionResult } from './emotion-image.js';
+import { analyzeEmotion } from './emotion-jev.js';
 
-// 「きもち」: リプライ先の発言の感情を Python のモデルで読み、画像にして返す。
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const analyzerScript = resolve(__dirname, '../scripts/analyze-emotions.py');
+// 「きもち」: リプライ先の発言の感情を判定モデル (jev、emotion-jev.ts) で読み、画像にして返す。
 
 const emotionTriggerText = process.env.EMOTION_TRIGGER_TEXT ?? 'きもち';
-const pythonBin = process.env.EMOTION_PYTHON_BIN ?? 'python3';
-const analysisTimeoutMs = Number(process.env.EMOTION_ANALYSIS_TIMEOUT_MS ?? 180_000);
 // 描画に使う Chrome。以前は node-html-to-image が古い puppeteer と Chrome 128 を抱えていた (既知の脆弱性つき)
 const chromePath = process.env.EMOTION_CHROME_PATH ?? '/usr/bin/google-chrome';
 const renderTimeoutMs = 30_000;
-// 解析も描画も重い (モデルの読み込み・Chrome の起動)。連打で止まらないよう同時に2件まで
+// 描画が重い (Chrome の起動)。連打で止まらないよう同時に2件まで
 const MAX_RUNNING = 2;
 let running = 0;
 
@@ -48,7 +41,7 @@ export async function handleEmotionRequest(message: Message): Promise<void> {
   running += 1;
   try {
     if ('sendTyping' in message.channel) await message.channel.sendTyping();
-    const result = await analyzeEmotion(targetText);
+    const result = parseEmotionResult(await analyzeEmotion(targetText));
     const image = await renderEmotionImage({
       authorName: targetMessage.member?.displayName ?? targetMessage.author.displayName ?? targetMessage.author.username,
       avatarUrl: getMessageAuthorAvatarUrl(targetMessage),
@@ -61,19 +54,16 @@ export async function handleEmotionRequest(message: Message): Promise<void> {
   } catch (error) {
     console.error('Failed to analyze emotion:', error);
     await replySafely(message, {
-      content: [
-        '気持ち分析に失敗しました。',
-        'Python 依存関係が未設定の場合は `pip install -r requirements.txt` を実行してください。'
-      ].join('\n')
+      content: '気持ち分析に失敗しました。少し待ってからもう一度どうぞ。'
     });
   } finally {
     running -= 1;
   }
 }
 
-/** 解析スクリプトの出力を確かめる。形が違えば失敗にする (画像の描画に変な値を渡さない)。 */
+/** 解析結果の形を確かめる。形が違えば失敗にする (画像の描画に変な値を渡さない)。 */
 export function parseEmotionResult(raw: unknown): EmotionResult {
-  const emotions = (raw as { emotions?: unknown } | null)?.emotions;
+  const { emotions, neutral } = (raw ?? {}) as { emotions?: unknown; neutral?: unknown };
   if (!Array.isArray(emotions) || emotions.length === 0) throw new Error('Invalid analyzer output: no emotions');
   return {
     emotions: emotions.map((item: unknown) => {
@@ -82,62 +72,9 @@ export function parseEmotionResult(raw: unknown): EmotionResult {
         throw new Error('Invalid analyzer output: bad emotion entry');
       }
       return { label: label.slice(0, 40), score };
-    })
+    }),
+    ...(neutral === true ? { neutral: true } : {})
   };
-}
-
-// 解析スクリプトに渡す環境変数。bot の秘密 (Discord のトークンや API キー) は渡さない
-const ANALYZER_ENV_KEYS = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR', 'HF_HOME', 'HF_HUB_OFFLINE', 'TRANSFORMERS_CACHE',
-  'TRANSFORMERS_OFFLINE', 'XDG_CACHE_HOME', 'CUDA_VISIBLE_DEVICES', 'OMP_NUM_THREADS', 'EMOTION_MODEL_NAME', 'EMOTION_MAX_LENGTH'];
-
-function analyzerEnv(): NodeJS.ProcessEnv {
-  return Object.fromEntries(ANALYZER_ENV_KEYS.flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]])));
-}
-
-function analyzeEmotion(text: string): Promise<EmotionResult> {
-  return new Promise((resolvePromise, reject) => {
-    const child = spawn(pythonBin, [analyzerScript], { env: analyzerEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
-
-    let stdout = '';
-    let stderr = '';
-    let settled = false;
-
-    const timeout = setTimeout(() => {
-      settled = true;
-      child.kill('SIGTERM');
-      reject(new Error(`Emotion analysis timed out after ${analysisTimeoutMs}ms`));
-    }, analysisTimeoutMs);
-
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => { stdout += chunk; });
-    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
-
-    child.on('error', (error) => {
-      clearTimeout(timeout);
-      if (!settled) {
-        settled = true;
-        reject(error);
-      }
-    });
-
-    child.on('close', (code) => {
-      clearTimeout(timeout);
-      if (settled) return;
-      settled = true;
-      if (code !== 0) {
-        reject(new Error(stderr || `Emotion analyzer exited with code ${code}`));
-        return;
-      }
-      try {
-        resolvePromise(parseEmotionResult(JSON.parse(stdout)));
-      } catch (error) {
-        reject(new Error(`Invalid analyzer output: ${error instanceof Error ? error.message : String(error)}`));
-      }
-    });
-
-    child.stdin.end(JSON.stringify({ text }));
-  });
 }
 
 // 描画用の Chrome にも bot の秘密は渡さない
