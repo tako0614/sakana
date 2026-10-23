@@ -100,7 +100,7 @@ function EmotionImage({ authorName, avatarUrl, text, result }: EmotionImageInput
         {/* 右側: 上位5位の感情グラフ (五角形レーダー) */}
         <section className="chart">
           <div className="chart-inner">
-            <PentagonRadar emotions={emotions.slice(0, 5)} dominantColor={meta.color} absolute={result.neutral === true} />
+            <Radar axes={emotions.slice(0, 5).map((emotion) => ({ label: getEmotionMeta(emotion.label).ja, score: emotion.score }))} color={meta.color} absolute={result.neutral === true} title="上位5感情レーダーチャート" />
           </div>
         </section>
       </main>
@@ -155,7 +155,7 @@ function Highlight({ authorName, avatarUrl, text, color, verbText, roast }: High
   );
 }
 
-// ---- よっきゅう (三大欲求): 食欲・睡眠欲・性欲の 3 本のゲージ ----------------------------------------------
+// ---- よっきゅう (三大欲求): 食欲・睡眠欲・性欲の三角形のレーダーチャート (きもちと同じ作り) ----------------------------------------------
 
 export interface DesireScore {
   label: string;
@@ -208,23 +208,9 @@ function DesireImage({ authorName, avatarUrl, text, result }: DesireImageInput) 
       <main>
         <Highlight authorName={authorName} avatarUrl={avatarUrl} text={text} color={meta.color} verbText={meta.verb} roast={meta.roast} />
         <section className="chart">
-          <div className="gauges">
-            <div className="gauges-title">三大欲求</div>
-            {gauges.map(({ label, score }) => {
-              const item = desireMeta[label] as DesireMeta;
-              const percent = Math.round(Math.min(1, Math.max(0, score)) * 100);
-              return (
-                <div className="gauge" key={label}>
-                  <div className="gauge-head">
-                    <span className="gauge-name">{item.ja}</span>
-                    <span className="gauge-value" style={{ color: item.color }}>{percent}%</span>
-                  </div>
-                  <div className="gauge-track">
-                    <div className="gauge-fill" style={{ width: `${percent}%`, background: item.color }}></div>
-                  </div>
-                </div>
-              );
-            })}
+          <div className="chart-inner">
+            <Radar axes={gauges.map(({ label, score }) => ({ label: (desireMeta[label] as DesireMeta).ja, score }))} color={meta.color}
+              absolute={result.neutral === true} title="三大欲求レーダーチャート" />
           </div>
         </section>
       </main>
@@ -237,56 +223,66 @@ interface Point {
   y: number;
 }
 
-function PentagonRadar({ emotions, dominantColor, absolute = false }: { emotions: EmotionScore[]; dominantColor: string; absolute?: boolean }) {
+interface RadarAxis {
+  label: string;
+  score: number;
+}
+
+/** レーダーチャート。軸の数は axes の長さ (きもち = 上位 5 感情の五角形、よっきゅう = 三大欲求の三角形)。 */
+function Radar({ axes, color, absolute = false, title }: { axes: RadarAxis[]; color: string; absolute?: boolean; title: string }) {
   const center = 200;
   const radius = 125;
+  const count = Math.max(3, axes.length);
+  // 三角形は、下の 2 つの頂点が横に開くのでラベルを外へ出し (頂点の点と重なる)、全体が下に寄らないよう中心を下げる
+  const labelRatio = count === 3 ? 1.45 : 1.25;
+  const centerY = count === 3 ? 245 : center;
 
   const getPoint = (index: number, ratio: number): Point => {
-    const angle = -Math.PI / 2 + (2 * Math.PI * index) / 5;
+    const angle = -Math.PI / 2 + (2 * Math.PI * index) / count;
     const distance = radius * ratio;
-    return { x: center + Math.cos(angle) * distance, y: center + Math.sin(angle) * distance };
+    return { x: center + Math.cos(angle) * distance, y: centerY + Math.sin(angle) * distance };
   };
 
   const formatPoint = (p: Point) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`;
 
   const gridPoints = [1, 2, 3].map((level) =>
-    Array.from({ length: 5 }, (_, index) => formatPoint(getPoint(index, level / 3))).join(' ')
+    Array.from({ length: count }, (_, index) => formatPoint(getPoint(index, level / 3))).join(' ')
   );
 
   // スコアが小さい場合でもグラフがしっかり見えるよう、最大値を基準に相対スケーリングする
-  // 感情の無い発言 (absolute) は 1.0 を外枠にして、小さい形のまま出す (最大値を外枠にすると、何も無いのに広がって見える)
-  const maxScore = absolute ? 1 : Math.max(0.01, ...emotions.map((e) => e.score));
-  // 0〜maxScore を 0〜1 の比率に変換（一番高い感情が常に外枠に届くようにする）
-  const dataPoints = emotions.map((emotion, index) => getPoint(index, Math.max(0, emotion.score) / maxScore));
+  // 感情・欲求の無い発言 (absolute) は 1.0 を外枠にして、小さい形のまま出す (最大値を外枠にすると、何も無いのに広がって見える)
+  const maxScore = absolute ? 1 : Math.max(0.01, ...axes.map((axis) => axis.score));
+  // 0〜maxScore を 0〜1 の比率に変換（一番高い軸が常に外枠に届くようにする）
+  const dataPoints = axes.map((axis, index) => getPoint(index, Math.max(0, axis.score) / maxScore));
   const dashed: CSSProperties = { stroke: '#e2e8f0', strokeWidth: 1.5 };
 
   return (
-    <svg className="radar" viewBox="0 0 400 400" role="img" aria-label="上位5感情レーダーチャート">
+    <svg className="radar" viewBox="0 0 400 400" role="img" aria-label={title}>
       {gridPoints.map((points, index) => (
         <polygon key={index} className="radar-grid" points={points} />
       ))}
-      {Array.from({ length: 5 }, (_, index) => {
+      {Array.from({ length: count }, (_, index) => {
         const point = getPoint(index, 1);
         return (
-          <line key={index} style={dashed} strokeDasharray="4 4" x1={center} y1={center} x2={point.x.toFixed(1)} y2={point.y.toFixed(1)} />
+          <line key={index} style={dashed} strokeDasharray="4 4" x1={center} y1={centerY} x2={point.x.toFixed(1)} y2={point.y.toFixed(1)} />
         );
       })}
       <polygon
         points={dataPoints.map(formatPoint).join(' ')}
-        fill={dominantColor}
+        fill={color}
         fillOpacity="0.25"
-        stroke={dominantColor}
+        stroke={color}
         strokeWidth="4"
         strokeLinejoin="round"
       />
       {dataPoints.map((point, index) => (
-        <circle key={index} cx={point.x.toFixed(1)} cy={point.y.toFixed(1)} r="6" fill="#ffffff" stroke={dominantColor} strokeWidth="3.5" />
+        <circle key={index} cx={point.x.toFixed(1)} cy={point.y.toFixed(1)} r="6" fill="#ffffff" stroke={color} strokeWidth="3.5" />
       ))}
-      {emotions.map((emotion, index) => {
-        const point = getPoint(index, 1.25);
+      {axes.map((axis, index) => {
+        const point = getPoint(index, labelRatio);
         return (
-          <text key={emotion.label} className="radar-label" x={point.x.toFixed(1)} y={point.y.toFixed(1)}>
-            {getEmotionMeta(emotion.label).ja}
+          <text key={axis.label} className="radar-label" x={point.x.toFixed(1)} y={point.y.toFixed(1)}>
+            {axis.label}
           </text>
         );
       })}
@@ -352,12 +348,5 @@ main { display: flex; width: 100%; height: 100%; overflow: hidden; background: #
 .chart-inner { margin-top: 8px; }
 .radar { width: 400px; height: 400px; overflow: visible; }
 .radar-grid { fill: none; stroke: #e2e8f0; stroke-width: 2; }
-.gauges { display: flex; width: 100%; flex-direction: column; gap: 34px; }
-.gauges-title { font-size: 26px; font-weight: 900; letter-spacing: 0.2em; color: #475569; text-align: center; margin-bottom: 4px; }
-.gauge-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 10px; }
-.gauge-name { font-size: 30px; font-weight: 900; color: #1e293b; letter-spacing: 0.05em; }
-.gauge-value { font-size: 34px; font-weight: 900; }
-.gauge-track { height: 26px; border-radius: 9999px; background: #e2e8f0; overflow: hidden; }
-.gauge-fill { height: 100%; border-radius: 9999px; }
 .radar-label { fill: #334155; font-size: 20px; font-weight: 900; letter-spacing: 0.05em; text-anchor: middle; dominant-baseline: middle; }
 `;

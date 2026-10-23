@@ -119,7 +119,8 @@ for (const question of Object.values(DESIRE_QUESTIONS)) assert.equal(question.ty
   const html = renderDesireHtml({ authorName: '<b>たこ</b>', avatarUrl: 'https://cdn.discordapp.com/a.png', text: '</div><script>alert(1)</script>', result: { desires: [{ label: 'hunger', score: 0.1 }, { label: 'sleep', score: 0.98 }, { label: 'sex', score: 0.05 }] } });
   assert.ok(!html.includes('<script>alert') && !html.includes('<b>たこ'), 'desire image escapes text and names');
   assert.match(html, /食欲/); assert.match(html, /睡眠欲/); assert.match(html, /性欲/);
-  assert.match(html, /width:98%/, 'the gauge length is the probability');
+  assert.match(html, /<svg class="radar"/, 'the desires are drawn as a radar chart, like the emotions');
+  assert.equal(html.match(/<circle /g).length, 3, 'three axes, three points');
   assert.match(html, /眠たがっている/, 'the headline follows the strongest desire');
   assert.match(renderDesireHtml({ authorName: 'a', avatarUrl: 'https://cdn.discordapp.com/a.png', text: 'おはよう', result: { desires: [{ label: 'hunger', score: 0.29 }], neutral: true } }), /欲求は落ち着いている/);
   assert.match(renderDesireHtml({ authorName: 'a', avatarUrl: 'https://cdn.discordapp.com/a.png', text: 'x', result: { desires: [{ label: 'sex', score: 0.9 }] } }), /煩悩があふれている/, 'the third desire has a mild headline');
@@ -144,7 +145,7 @@ if (existsSync(chrome)) {
   assert.equal(desirePng.readUInt32BE(16), 960);
   assert.equal(desirePng.readUInt32BE(20), 540);
   if (process.env.DESIRE_PREVIEW) (await import('node:fs')).writeFileSync(process.env.DESIRE_PREVIEW, desirePng);
-  console.log(`emotion ok (エスケープ / CSP / 読み込みは Discord のアバターだけ / 解析結果の形 / jev での分析・フォールバック・neutral / よっきゅう (3 問・ゲージ・トリガー) / 描画 ${png.length} bytes)`);
+  console.log(`emotion ok (エスケープ / CSP / 読み込みは Discord のアバターだけ / 解析結果の形 / jev での分析・フォールバック・neutral / よっきゅう (3 問・三角のレーダー・トリガー) / 描画 ${png.length} bytes)`);
 } else {
-  console.log('emotion ok (エスケープ / CSP / 読み込みは Discord のアバターだけ / 解析結果の形 / jev での分析・フォールバック・neutral / よっきゅう (3 問・ゲージ・トリガー) / Chrome が無いので描画は省略)');
+  console.log('emotion ok (エスケープ / CSP / 読み込みは Discord のアバターだけ / 解析結果の形 / jev での分析・フォールバック・neutral / よっきゅう (3 問・三角のレーダー・トリガー) / Chrome が無いので描画は省略)');
 }
