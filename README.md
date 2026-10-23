@@ -826,6 +826,7 @@ OSS_TARGET_USERNAME=kurage.1
 OSS_TRIGGER_TEXT=oss
 OSS_RESPONSE_TEXT=oss!
 EMOTION_TRIGGER_TEXT=きもち
+DESIRE_TRIGGER_TEXT=よっきゅう
 ```
 
 開発中は `DISCORD_GUILD_ID` を設定すると、スラッシュコマンドの反映が速くなります。
@@ -833,6 +834,8 @@ EMOTION_TRIGGER_TEXT=きもち
 `kurage.1` が `oss` と送ったとき、bot は同じチャンネルに `oss!` と送ります。文言は `OSS_RESPONSE_TEXT` で変更できます。
 
 任意のメッセージに `きもち` とリプライすると、リプライ先の本文の感情を判定モデル (jev、OpenRouter の Decisions API) で読み、HTML から生成した画像を返信します。喜び・悲しみ・期待・驚き・怒り・恐れ・嫌悪・信頼の 8 つそれぞれに「書き手はいま感じているか」を 1 回で聞き、その確率が強さになります (1 回 約 0.5 秒・約 $0.000005。`typesafe/jev-1.14`、混んだら `perplexity/pplx-decider-flash-v1.2`。`EMOTION_MODELS` で変えられます)。どの感情も 0.4 未満 (`EMOTION_NEUTRAL_BELOW`) の発言 (「おはよう」など) は「落ち着いている」と出します。以前は Python の DeBERTa (WRIME) を毎回起動していましたが、「夜道怖すぎて動けない」を悲しみ 1 位と読むなど精度が低く、モデルの読み込みも重かったので置き換えました (2026-10-22)。画像の描画には Chrome が必要です (`EMOTION_CHROME_PATH`)。
+
+任意のメッセージに `よっきゅう` とリプライすると、その発言の三大欲求 (食欲・睡眠欲・性欲) を同じ判定モデル (jev) で読み、3 本のゲージの画像を返信します(3 問を 1 回で聞く。約 0.5 秒・約 $0.000005)。見出しは一番強い欲求に合わせた決まった文 (「お腹がすいている」「眠たがっている」「煩悩があふれている」) で、どれも 0.4 未満 (`EMOTION_NEUTRAL_BELOW`) なら「欲求は落ち着いている」と出します。どのチャンネル・誰の発言にも使えます (2026-10-23)。画像の描画の枠はきもちと共有です。
 
 通常メッセージを読むには、Discord Developer Portal の Bot 設定で `Message Content Intent` を有効にしてください。
 

@@ -62,18 +62,22 @@ export function resetEmotionJevState(): void {
 
 type Fetch = typeof fetch;
 
-function readProbabilities(body: unknown): EmotionResult['emotions'] {
+type Questions = Record<string, { type: 'noul'; instructions: string; criteria: { true: string; false: string } }>;
+
+function readProbabilities(body: unknown, ids: readonly string[]): { label: string; score: number }[] {
   const answers = typeof body === 'object' && body !== null ? (body as { answers?: Record<string, { noul?: unknown } | undefined> }).answers : undefined;
-  const emotions = Object.keys(EMOTIONS).map((label) => {
+  return ids.map((label) => {
     const score = answers?.[label]?.noul;
     if (typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > 1) throw new Error(`Decisions API returned no probability for ${label}`);
     return { label, score: Math.round(score * 10_000) / 10_000 };
   });
-  return emotions;
 }
 
-/** 発言の感情を読む。全部のモデルが失敗したら投げる。 */
-export async function analyzeEmotion(text: string, { config = loadEmotionJevConfig(), fetchImpl = fetch, now = Date.now }: { config?: EmotionJevConfig; fetchImpl?: Fetch; now?: () => number } = {}): Promise<EmotionResult> {
+/**
+ * 発言について、はい/いいえの質問をまとめて 1 回で聞き、質問の ID ごとの「はい」の確率を返す (きもち・よっきゅう共通)。
+ * 混んだ・落ちたモデルは次へ回し、一度失敗したモデルは少しのあいだ飛ばす。全部失敗したら投げる。
+ */
+export async function askProbabilities(text: string, questions: Questions, { config = loadEmotionJevConfig(), fetchImpl = fetch, now = Date.now }: { config?: EmotionJevConfig; fetchImpl?: Fetch; now?: () => number } = {}): Promise<{ label: string; score: number }[]> {
   if (!config.apiKey) throw new Error('OPENROUTER_API_KEY is not configured');
   let lastError: unknown = new Error('no emotion model is available');
   for (const model of config.models) {
@@ -82,13 +86,11 @@ export async function analyzeEmotion(text: string, { config = loadEmotionJevConf
       const response = await fetchImpl(config.endpoint, {
         method: 'POST',
         headers: { authorization: `Bearer ${config.apiKey}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ model, state: { text: text.slice(0, MAX_CHARS) }, questions: EMOTION_QUESTIONS }),
+        body: JSON.stringify({ model, state: { text: text.slice(0, MAX_CHARS) }, questions }),
         signal: AbortSignal.timeout(config.timeoutMs)
       });
       if (!response.ok) throw Object.assign(new Error(`Decisions API HTTP ${response.status}`), { status: response.status });
-      const emotions = readProbabilities(await response.json());
-      const neutral = Math.max(...emotions.map((emotion) => emotion.score)) < config.neutralBelow;
-      return { emotions, ...(neutral ? { neutral: true } : {}) };
+      return readProbabilities(await response.json(), Object.keys(questions));
     } catch (error) {
       lastError = error;
       skipUntil.set(model, now() + SKIP_MS);
@@ -96,4 +98,12 @@ export async function analyzeEmotion(text: string, { config = loadEmotionJevConf
     }
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/** 発言の感情を読む。全部のモデルが失敗したら投げる。 */
+export async function analyzeEmotion(text: string, options: { config?: EmotionJevConfig; fetchImpl?: Fetch; now?: () => number } = {}): Promise<EmotionResult> {
+  const config = options.config ?? loadEmotionJevConfig();
+  const emotions = await askProbabilities(text, EMOTION_QUESTIONS, { ...options, config });
+  const neutral = Math.max(...emotions.map((emotion) => emotion.score)) < config.neutralBelow;
+  return { emotions, ...(neutral ? { neutral: true } : {}) };
 }

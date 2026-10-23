@@ -13,6 +13,17 @@ const renderTimeoutMs = 30_000;
 const MAX_RUNNING = 2;
 let running = 0;
 
+/** 描画の枠 (きもち・よっきゅう共通で同時に 2 件)。空いていなければ busy。 */
+export async function withRenderSlot<T>(run: () => Promise<T>): Promise<{ busy: true } | { busy: false; value: T }> {
+  if (running >= MAX_RUNNING) return { busy: true };
+  running += 1;
+  try {
+    return { busy: false, value: await run() };
+  } finally {
+    running -= 1;
+  }
+}
+
 export function isEmotionRequest(message: Message): boolean {
   return message.content.trim() === emotionTriggerText && Boolean(message.reference?.messageId);
 }
@@ -97,8 +108,10 @@ export function isAllowedImageRequest(url: string): boolean {
   }
 }
 
-export async function renderEmotionImage(input: EmotionImageInput): Promise<Buffer> {
-  const html = renderEmotionHtml(input);
+export const renderEmotionImage = (input: EmotionImageInput): Promise<Buffer> => renderHtmlImage(renderEmotionHtml(input));
+
+/** HTML (emotion-image.tsx が作る 960x540 の 1 枚) を Chrome で PNG にする。きもち・よっきゅう共通。 */
+export async function renderHtmlImage(html: string): Promise<Buffer> {
   const browser = await puppeteer.launch({
     executablePath: chromePath,
     headless: true,
@@ -127,12 +140,12 @@ export async function renderEmotionImage(input: EmotionImageInput): Promise<Buff
   }
 }
 
-function getMessageAuthorAvatarUrl(message: Message): string {
+export function getMessageAuthorAvatarUrl(message: Message): string {
   const avatarOptions = { extension: 'png', size: 128, forceStatic: true } as const;
   return message.member?.displayAvatarURL(avatarOptions) ?? message.author.displayAvatarURL(avatarOptions);
 }
 
-async function replySafely(message: Message, response: string | MessageReplyOptions): Promise<void> {
+export async function replySafely(message: Message, response: string | MessageReplyOptions): Promise<void> {
   // 誰にも通知を飛ばさない (リプライ先・本文の @ も含めて)
   const allowedMentions = { parse: [], repliedUser: false };
   const replyOptions: MessageReplyOptions = typeof response === 'string'

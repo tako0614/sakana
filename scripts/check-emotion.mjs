@@ -12,6 +12,9 @@ import { existsSync } from 'node:fs';
 
 const { renderEmotionHtml } = await import('../src/emotion-image.js');
 const { EMOTIONS, EMOTION_QUESTIONS, analyzeEmotion, loadEmotionJevConfig, resetEmotionJevState } = await import('../src/emotion-jev.js');
+const { DESIRE_QUESTIONS, analyzeDesire } = await import('../src/desire-jev.js');
+const { isDesireRequest } = await import('../src/desire.js');
+const { renderDesireHtml } = await import('../src/emotion-image.js');
 const { isAllowedImageRequest, parseEmotionResult, renderEmotionImage } = await import('../src/emotion.js');
 
 const result = { emotions: [{ label: 'joy', score: 0.8 }, { label: 'anger', score: 0.1 }, { label: 'unknown<b>', score: 0.05 }] };
@@ -95,13 +98,53 @@ await assert.rejects(analyzeEmotion('z', { config, fetchImpl: respond(() => ({ s
 await assert.rejects(analyzeEmotion('z', { config: { ...config, apiKey: '' }, fetchImpl: respond(() => ({ body: answers({}) })) }), /OPENROUTER_API_KEY/);
 resetEmotionJevState();
 
+// ---- よっきゅう (三大欲求): 同じ聞き方で、質問が 3 つ -----------------------------------------------------------
+assert.deepEqual(Object.keys(DESIRE_QUESTIONS), ['hunger', 'sleep', 'sex'], '食欲・睡眠欲・性欲の順');
+for (const question of Object.values(DESIRE_QUESTIONS)) assert.equal(question.type, 'noul');
+{
+  calls.length = 0;
+  const desireAnswers = (scores) => ({ answers: Object.fromEntries(Object.keys(DESIRE_QUESTIONS).map((id) => [id, { noul: scores[id] ?? 0.04 }])), usage: { cost: 0.000003 } });
+  resetEmotionJevState();
+  let read = await analyzeDesire('お腹すいた〜ラーメン食べたい', { config, fetchImpl: respond(() => ({ body: desireAnswers({ hunger: 0.98 }) })) });
+  assert.equal(Object.keys(calls[0].body.questions).join(), 'hunger,sleep,sex', 'three questions in one call');
+  assert.equal(calls[0].body.state.text, 'お腹すいた〜ラーメン食べたい');
+  assert.deepEqual(read.desires.map((desire) => desire.label), ['hunger', 'sleep', 'sex']);
+  assert.equal(read.desires[0].score, 0.98);
+  assert.ok(!read.neutral);
+  read = await analyzeDesire('おはよう', { config, fetchImpl: respond(() => ({ body: desireAnswers({ hunger: 0.29, sleep: 0.24 }) })) });
+  assert.equal(read.neutral, true, 'every desire below the threshold is neutral');
+  await assert.rejects(analyzeDesire('x', { config, fetchImpl: respond(() => ({ body: { answers: { hunger: { noul: 0.5 } } } })) }), /no probability/);
+  resetEmotionJevState();
+
+  const html = renderDesireHtml({ authorName: '<b>たこ</b>', avatarUrl: 'https://cdn.discordapp.com/a.png', text: '</div><script>alert(1)</script>', result: { desires: [{ label: 'hunger', score: 0.1 }, { label: 'sleep', score: 0.98 }, { label: 'sex', score: 0.05 }] } });
+  assert.ok(!html.includes('<script>alert') && !html.includes('<b>たこ'), 'desire image escapes text and names');
+  assert.match(html, /食欲/); assert.match(html, /睡眠欲/); assert.match(html, /性欲/);
+  assert.match(html, /width:98%/, 'the gauge length is the probability');
+  assert.match(html, /眠たがっている/, 'the headline follows the strongest desire');
+  assert.match(renderDesireHtml({ authorName: 'a', avatarUrl: 'https://cdn.discordapp.com/a.png', text: 'おはよう', result: { desires: [{ label: 'hunger', score: 0.29 }], neutral: true } }), /欲求は落ち着いている/);
+  assert.match(renderDesireHtml({ authorName: 'a', avatarUrl: 'https://cdn.discordapp.com/a.png', text: 'x', result: { desires: [{ label: 'sex', score: 0.9 }] } }), /煩悩があふれている/, 'the third desire has a mild headline');
+
+  const message = (content, reference = { messageId: '1' }) => ({ content, reference });
+  assert.equal(isDesireRequest(message('よっきゅう')), true);
+  assert.equal(isDesireRequest(message('  よっきゅう \n')), true, 'surrounding whitespace is fine');
+  assert.equal(isDesireRequest(message('よっきゅう', null)), false, 'it must be a reply');
+  assert.equal(isDesireRequest(message('よっきゅうして')), false);
+  assert.equal(isDesireRequest(message('きもち')), false);
+}
+
 const chrome = process.env.EMOTION_CHROME_PATH ?? '/usr/bin/google-chrome';
 if (existsSync(chrome)) {
   const png = await renderEmotionImage({ authorName: 'たこ', avatarUrl: 'https://cdn.discordapp.com/embed/avatars/0.png', text: 'テスト', result });
   assert.equal(png.subarray(1, 4).toString(), 'PNG', 'renders a PNG');
   assert.equal(png.readUInt32BE(16), 960, 'the image is 960 wide');
   assert.equal(png.readUInt32BE(20), 540, 'and 540 high');
-  console.log(`emotion ok (エスケープ / CSP / 読み込みは Discord のアバターだけ / 解析結果の形 / jev での分析・フォールバック・neutral / 描画 ${png.length} bytes)`);
+  const { renderHtmlImage } = await import('../src/emotion.js');
+  const desirePng = await renderHtmlImage(renderDesireHtml({ authorName: 'たこ', avatarUrl: 'https://cdn.discordapp.com/embed/avatars/0.png', text: 'お腹すいたし眠いし', result: { desires: [{ label: 'hunger', score: 0.94 }, { label: 'sleep', score: 0.98 }, { label: 'sex', score: 0.06 }] } }));
+  assert.equal(desirePng.subarray(1, 4).toString(), 'PNG', 'the desire image renders a PNG');
+  assert.equal(desirePng.readUInt32BE(16), 960);
+  assert.equal(desirePng.readUInt32BE(20), 540);
+  if (process.env.DESIRE_PREVIEW) (await import('node:fs')).writeFileSync(process.env.DESIRE_PREVIEW, desirePng);
+  console.log(`emotion ok (エスケープ / CSP / 読み込みは Discord のアバターだけ / 解析結果の形 / jev での分析・フォールバック・neutral / よっきゅう (3 問・ゲージ・トリガー) / 描画 ${png.length} bytes)`);
 } else {
-  console.log('emotion ok (エスケープ / CSP / 読み込みは Discord のアバターだけ / 解析結果の形 / jev での分析・フォールバック・neutral / Chrome が無いので描画は省略)');
+  console.log('emotion ok (エスケープ / CSP / 読み込みは Discord のアバターだけ / 解析結果の形 / jev での分析・フォールバック・neutral / よっきゅう (3 問・ゲージ・トリガー) / Chrome が無いので描画は省略)');
 }

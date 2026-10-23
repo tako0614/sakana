@@ -16,6 +16,7 @@ import {
 import cron from 'node-cron';
 import { commandMap } from './commands.js';
 import { enforceGuildAllowlist, isAllowedGuild } from './guilds.js';
+import { handleDesireRequest, isDesireRequest } from './desire.js';
 import { handleEmotionRequest, isEmotionRequest } from './emotion.js';
 import { addTextXP, addVoiceXP, getTopXP, type XpRow } from './db.js';
 import { handleArchiveComponent } from './archive/commands.js';
@@ -364,6 +365,12 @@ async function handleMessageCreate(message: Message): Promise<void> {
 
   if (isEmotionRequest(message)) {
     await handleEmotionRequest(message);
+    return;
+  }
+
+  // 「よっきゅう」とリプライされたら、その発言の三大欲求を画像で返す
+  if (isDesireRequest(message)) {
+    await handleDesireRequest(message);
     return;
   }
 

@@ -90,48 +90,141 @@ function EmotionImage({ authorName, avatarUrl, text, result }: EmotionImageInput
   const topLabel = result.neutral === true ? 'neutral' : (emotions[0]?.label ?? '');
   const meta = getEmotionMeta(topLabel);
 
-  // 文字数に応じてフォントサイズを動的に調整
-  const nameLength = [...authorName].length;
-  const nameSize = nameLength > 20 ? 24 : nameLength > 12 ? 32 : 42;
-
-  const verbText = verbs[topLabel] ?? '感情が昂っている';
-  const verbLength = [...verbText].length;
-  const verbSize = verbLength > 10 ? 40 : verbLength > 6 ? 52 : 64;
-
-  const textLength = [...text].length;
-  const textSize = textLength > 120 ? 18 : textLength > 80 ? 20 : textLength > 40 ? 24 : 28;
-
   return (
     <body>
       <main>
         {/* 左側: ハイライト表示とコメント */}
-        <section className="highlight" style={{ background: meta.color }}>
-          {/* 背景の装飾 */}
-          <div className="glow glow-light"></div>
-          <div className="glow glow-dark"></div>
-
-          <div className="headline">
-            <div className="name-row">
-              <span className="name" style={{ fontSize: nameSize }}>{authorName}</span>
-              <span className="particle">は</span>
-            </div>
-            <span className="verb" style={{ fontSize: verbSize }}>{verbText}！</span>
-          </div>
-
-          <div className="speech">
-            <img className="avatar" src={avatarUrl} alt="" />
-            <div className="speech-bubble" style={{ fontSize: textSize }}>{text}</div>
-          </div>
-
-          <div className="roast">
-            <div className="roast-text">{roastLines[topLabel] ?? '優しく見守ってあげてください。'}</div>
-          </div>
-        </section>
+        <Highlight authorName={authorName} avatarUrl={avatarUrl} text={text} color={meta.color}
+          verbText={verbs[topLabel] ?? '感情が昂っている'} roast={roastLines[topLabel] ?? '優しく見守ってあげてください。'} />
 
         {/* 右側: 上位5位の感情グラフ (五角形レーダー) */}
         <section className="chart">
           <div className="chart-inner">
             <PentagonRadar emotions={emotions.slice(0, 5)} dominantColor={meta.color} absolute={result.neutral === true} />
+          </div>
+        </section>
+      </main>
+    </body>
+  );
+}
+
+interface HighlightProps {
+  authorName: string;
+  avatarUrl: string;
+  text: string;
+  color: string;
+  verbText: string;
+  roast: string;
+}
+
+/** 左側の面: 「〇〇は〜している！」の見出し・本人のアイコンと発言・一言。きもち (感情) とよっきゅう (三大欲求) で共通。 */
+function Highlight({ authorName, avatarUrl, text, color, verbText, roast }: HighlightProps) {
+  // 文字数に応じてフォントサイズを動的に調整
+  const nameLength = [...authorName].length;
+  const nameSize = nameLength > 20 ? 24 : nameLength > 12 ? 32 : 42;
+
+  // 見出しは「〜している！」を 1 行に収める。面の幅 (約 370px) を、「！」を含む文字数で割る (7〜8 文字の見出しで「！」が切れていた)
+  const verbSize = Math.max(32, Math.min(64, Math.floor(370 / ([...verbText].length + 1))));
+
+  const textLength = [...text].length;
+  const textSize = textLength > 120 ? 18 : textLength > 80 ? 20 : textLength > 40 ? 24 : 28;
+
+  return (
+    <section className="highlight" style={{ background: color }}>
+      {/* 背景の装飾 */}
+      <div className="glow glow-light"></div>
+      <div className="glow glow-dark"></div>
+
+      <div className="headline">
+        <div className="name-row">
+          <span className="name" style={{ fontSize: nameSize }}>{authorName}</span>
+          <span className="particle">は</span>
+        </div>
+        <span className="verb" style={{ fontSize: verbSize }}>{verbText}！</span>
+      </div>
+
+      <div className="speech">
+        <img className="avatar" src={avatarUrl} alt="" />
+        <div className="speech-bubble" style={{ fontSize: textSize }}>{text}</div>
+      </div>
+
+      <div className="roast">
+        <div className="roast-text">{roast}</div>
+      </div>
+    </section>
+  );
+}
+
+// ---- よっきゅう (三大欲求): 食欲・睡眠欲・性欲の 3 本のゲージ ----------------------------------------------
+
+export interface DesireScore {
+  label: string;
+  score: number;
+}
+
+export interface DesireResult {
+  desires: DesireScore[];
+  /** どの欲求も低い (欲求の無い発言)。見出しを「欲求は落ち着いている」にする。 */
+  neutral?: boolean;
+}
+
+export interface DesireImageInput {
+  authorName: string;
+  avatarUrl: string;
+  text: string;
+  result: DesireResult;
+}
+
+interface DesireMeta {
+  ja: string;
+  color: string;
+  verb: string;
+  roast: string;
+}
+
+// 一言は決まった文だけ (モデルの出力を画像の文にしない)。言い回しは軽く、露骨にしない
+export const desireMeta: Record<string, DesireMeta> = {
+  hunger: { ja: '食欲', color: '#f97316', verb: 'お腹がすいている', roast: 'まずは何か食べさせてあげましょう。話はそれからです。' },
+  sleep: { ja: '睡眠欲', color: '#6366f1', verb: '眠たがっている', roast: '布団に帰してあげましょう。いまは何を言っても入りません。' },
+  sex: { ja: '性欲', color: '#ec4899', verb: '煩悩があふれている', roast: 'そっとしておくのが優しさです。深くは聞かないでおきましょう。' },
+  neutral: { ja: '平静', color: '#94a3b8', verb: '欲求は落ち着いている', roast: '三大欲求は静かです。穏やかな時間をどうぞ。' }
+};
+
+export function renderDesireHtml({ authorName, avatarUrl, text, result }: DesireImageInput): string {
+  const markup = renderToStaticMarkup(<DesireImage authorName={authorName} avatarUrl={avatarUrl} text={text} result={result} />);
+  return '<!doctype html><html lang="ja"><head><meta charset="utf-8">'
+    + `<meta http-equiv="Content-Security-Policy" content="${CONTENT_SECURITY_POLICY}">`
+    + `<style>${css}</style></head>${markup}</html>`;
+}
+
+function DesireImage({ authorName, avatarUrl, text, result }: DesireImageInput) {
+  const order = ['hunger', 'sleep', 'sex'];
+  const gauges = order.map((label) => ({ label, score: result.desires.find((desire) => desire.label === label)?.score ?? 0 }));
+  const top = [...gauges].sort((a, b) => b.score - a.score)[0]?.label ?? 'neutral';
+  const meta = desireMeta[result.neutral === true ? 'neutral' : top] ?? desireMeta['neutral'] as DesireMeta;
+
+  return (
+    <body>
+      <main>
+        <Highlight authorName={authorName} avatarUrl={avatarUrl} text={text} color={meta.color} verbText={meta.verb} roast={meta.roast} />
+        <section className="chart">
+          <div className="gauges">
+            <div className="gauges-title">三大欲求</div>
+            {gauges.map(({ label, score }) => {
+              const item = desireMeta[label] as DesireMeta;
+              const percent = Math.round(Math.min(1, Math.max(0, score)) * 100);
+              return (
+                <div className="gauge" key={label}>
+                  <div className="gauge-head">
+                    <span className="gauge-name">{item.ja}</span>
+                    <span className="gauge-value" style={{ color: item.color }}>{percent}%</span>
+                  </div>
+                  <div className="gauge-track">
+                    <div className="gauge-fill" style={{ width: `${percent}%`, background: item.color }}></div>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </section>
       </main>
@@ -259,5 +352,12 @@ main { display: flex; width: 100%; height: 100%; overflow: hidden; background: #
 .chart-inner { margin-top: 8px; }
 .radar { width: 400px; height: 400px; overflow: visible; }
 .radar-grid { fill: none; stroke: #e2e8f0; stroke-width: 2; }
+.gauges { display: flex; width: 100%; flex-direction: column; gap: 34px; }
+.gauges-title { font-size: 26px; font-weight: 900; letter-spacing: 0.2em; color: #475569; text-align: center; margin-bottom: 4px; }
+.gauge-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 10px; }
+.gauge-name { font-size: 30px; font-weight: 900; color: #1e293b; letter-spacing: 0.05em; }
+.gauge-value { font-size: 34px; font-weight: 900; }
+.gauge-track { height: 26px; border-radius: 9999px; background: #e2e8f0; overflow: hidden; }
+.gauge-fill { height: 100%; border-radius: 9999px; }
 .radar-label { fill: #334155; font-size: 20px; font-weight: 900; letter-spacing: 0.05em; text-anchor: middle; dominant-baseline: middle; }
 `;
