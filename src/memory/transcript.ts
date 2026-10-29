@@ -35,7 +35,7 @@ const afterCursor = (row: { created_at: number; message_id: string }, cursor: Cu
   || row.created_at > cursor.last_ms
   || (row.created_at === cursor.last_ms && idAfter(row.message_id, cursor.last_id));
 
-interface MessageRow {
+export interface MessageRow {
   message_id: string;
   author_id: string;
   author_name: string;
@@ -123,7 +123,7 @@ export class NameBook {
   }
 }
 
-function extrasOf(row: MessageRow): string {
+export function extrasOf(row: MessageRow): string {
   const out: string[] = [];
   if (row.attachment_count > 0) out.push(/image/.test(row.attachment_kinds ?? '') ? '[画像]' : '[添付]');
   if (row.sticker_count > 0) out.push('[スタンプ]');
@@ -131,7 +131,7 @@ function extrasOf(row: MessageRow): string {
   return out.join('');
 }
 
-function cleanText(content: string | null | undefined): string {
+export function cleanText(content: string | null | undefined): string {
   let text = String(content ?? '')
     .replace(/https?:\/\/\S+/g, (url) => (url.length > 70 ? `${url.slice(0, 67)}…` : url))
     .replace(/<a?:(\w+):\d+>/g, ':$1:')
