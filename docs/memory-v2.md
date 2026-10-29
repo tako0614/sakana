@@ -67,6 +67,33 @@ v1 (`docs/memory-tree.md`) の「精度が足りず、内容が薄い」を直�
 - 詳細さは**切り替えの関門**: 出来事 / 千発言、本文を持つページの割合、人物ページの本文の長さが v1 を下回れば切り替えない。
 - 主張を持つ entity は必ず本文を持つ (組み立てが失敗しても、主張を並べた本文になる)。
 
+## 想起 (Part B)
+
+主張 (claims) を検索の単位にし、呼ばれたときの想起を「見出し」から「関係する主張そのもの」に変えた。
+
+- **索引**: 主張を `[誰 / 時期 / 種類] 本文` の形で埋め込む (`memory_vectors` の kind = `claim`、`src/memory/claims.ts`)。語彙は `claims_fts` (FTS5 trigram)。
+  主張のある記憶では、ページの断片 (chunk) は振らない (同じ文の二重化を避ける)。意味検索 (`memory` ツールの query・考え中の想起) は主張を 1 つの知識として返す。
+- **埋め込みモデル**: 記憶だけ日本語特化の `cl-nagoya/ruri-v3-130m` (512 次元、接頭辞 `検索クエリ: ` / `検索文書: `)。会話ログの検索は e5-small のまま。
+  `src/embed/worker.ts` はモデルごとのワーカー (`createEmbedWorker` / `memoryWorker()`)。`MEMORY_EMBED_MODEL` で戻せる (掛け直しになる)。
+- **メモリパック** (`src/memory/pack.ts`): ① 入口の門 (判定モデル jev: 依頼がコミュニティの具体的な話に触れているか、0.2 未満なら何も出さない)
+  → ② 候補 (依頼の埋め込みの近さ + 語彙 BM25 を RRF で融合。`<@id>` でメンションされた人の主張は優先)
+  → ③ 再順位づけ (上位の主張・出来事を jev が 1 回の呼び出しで採点し、0.6 以上だけ残す。`src/memory/rerank.ts`)
+  → ④ 整理 (同じ文の重複・同じ出来事ばかりを畳む。予算 1,800 字)。出力は日付・種類・`[e12]` つきの主張と、関係する出来事。
+  判定モデルが使えない・埋め込みが間に合わないときは null で、従来の見出しの想起に落ちる。何も当たらなければ空 (空は空)。
+  `MEMORY_PACK=off` で止められる。閾値は `MEMORY_PACK_GATE` / `MEMORY_PACK_KEEP`。
+- 試す: `MEMORY_DB_PATH=… node --import tsx scripts/memory-pack-try.ts --guild ID --text "…"`。索引を先に作る: `scripts/memory-index.ts`。
+
+## 切り替えと更新
+
+1. 構築が終わった `memory2.sqlite` に `validate` を当てる。
+2. `scripts/memory-index.ts` で ruri のベクトルと語彙の索引を先に作る (主張・出来事・ページ約 17 万件、数時間)。
+3. `init --v1 <本番の memory.sqlite>` で公開チャンネルの控えなど小さな表を写し直す。
+4. `sakana-memory.timer` (v1 の builder) と `sakana-memory-site.timer` を止め、`memory.sqlite` を退避して `memory2.sqlite` と入れ替える。
+   新しいリリース (src/embed・src/memory・src/emotion-jev.ts) を overlay して `sakana.service` を再起動する。v1 の builder の timer は無効化する
+   (v1 の統合が v2 のページを 3,000 字に書き直すため)。
+5. 以後の更新は `deploy/sakana-memory-v2.{service,timer}` (毎日 `memory-v2.ts update --live`)。新着の区間だけが AI を呼び、
+   組み立ては変わった主張のページだけ。投影は差分で、変わらないページ・出来事のベクトルは振り直さない。
+
 ## CLI
 
 ```
@@ -75,7 +102,8 @@ node --import tsx scripts/memory-v2.ts estimate --guild ID --db memory2.sqlite  
 node --import tsx scripts/memory-v2.ts canary   --guild ID --db memory2.sqlite --n 30 --compose     少数の区間で通しで試す
 node --import tsx scripts/memory-v2.ts run      --guild ID --db memory2.sqlite --confirm            全体 (止まっても同じコマンドで続きから)
 node --import tsx scripts/memory-v2.ts validate --guild ID --db memory2.sqlite --v1 memory.sqlite   関門
-node --import tsx scripts/memory-v2.ts sample / show / status
+node --import tsx scripts/memory-v2.ts update   --guild ID --live                                        新着だけを足す (切り替え後の毎日の更新)
+node --import tsx scripts/memory-v2.ts sample / show / status / labelpack / verify-variant
 ```
 
 環境変数: `MEMORY_V2_EXTRACT_MODELS` / `MEMORY_V2_VERIFY_MODELS` / `MEMORY_V2_COMPOSE_MODELS` / `…_REASONING`(low|medium|high|off) /

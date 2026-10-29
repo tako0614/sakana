@@ -347,8 +347,9 @@ const thing = entities.filter((e) => e.kind === 'thing');
 equal(thing.length, 1, '正規化した名前が同じものは 1 つ (Go vs Rust / go vs RUST)');
 equal(thing[0].category, 'debates', '分類は多数決 (debates 1 / topics 1 は先に見たほう)');
 if (nameKey('Go vs Rust') !== nameKey('go VS rust')) fail('nameKey は大小・空白を無視する');
-equal(claimOf('OS を Rust').entity_id, null, '冗談の主張は entity にぶら下げない');
-equal(claimOf('去年').entity_id, null, 'wrong の主張も');
+const entityOf = (needle) => memoryDb().prepare('SELECT entity_id FROM v2_claims WHERE text LIKE ?').get(`%${needle}%`)?.entity_id ?? null;
+if (entityOf('OS を Rust') === null) fail('冗談の主張にも entity は付く (想起で誰の冗談かを出す)');
+equal(entityOf('去年'), null, 'wrong の主張には entity を付けない');
 
 // ---- 組み立て --------------------------------------------------------------
 

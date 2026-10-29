@@ -48,7 +48,7 @@ const textKey = (text: string): string => text.normalize('NFKC').toLowerCase().r
 export function loadGroups(entityId: number): Group[] {
   const rows = memoryDb().prepare<[number], ClaimRow>(`
     SELECT id, text, type, modality, hedged, as_of, episode_id, attrs FROM v2_claims
-    WHERE entity_id = ? AND verdict <> 'wrong' ORDER BY as_of, id
+    WHERE entity_id = ? AND verdict <> 'wrong' AND modality NOT IN ('joke', 'hypothetical', 'roleplay') ORDER BY as_of, id
   `).all(entityId);
   const groups = new Map<string, Group>();
   for (const row of rows) {

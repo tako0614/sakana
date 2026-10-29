@@ -67,6 +67,24 @@ export const embedConfig = {
   sweepCron: process.env.SEMANTIC_SWEEP_CRON ?? '0 40 4 * * *',
   sweepWindowMs: number(process.env.SEMANTIC_SWEEP_WINDOW_MS, 7 * 86_400_000),
 
+  // 記憶 (src/memory) の埋め込み。会話ログとは別のモデルを使える。既定は日本語特化の ruri-v3-130m (512 次元)。
+  // 掛け直しになるので、変えると記憶のベクトルは全部振り直し (memory_vectors.model で突き合わせる)。
+  // e5-small に戻すなら MEMORY_EMBED_MODEL=intfloat/multilingual-e5-small (接頭辞は python 側の既定の e5 になる)。
+  memory: (() => {
+    const modelName = process.env.MEMORY_EMBED_MODEL ?? 'cl-nagoya/ruri-v3-130m';
+    const ruri = /ruri/i.test(modelName);
+    return {
+      modelName,
+      modelRevision: process.env.MEMORY_EMBED_REVISION || undefined,
+      maxLength: number(process.env.MEMORY_EMBED_MAX_LENGTH, 384),
+      threads: number(process.env.MEMORY_EMBED_THREADS, number(process.env.SEMANTIC_THREADS, 4)),
+      microBatch: number(process.env.MEMORY_EMBED_MICRO_BATCH, 16),
+      nice: number(process.env.SEMANTIC_NICE, 5),
+      prefixQuery: process.env.MEMORY_EMBED_PREFIX_QUERY ?? (ruri ? '検索クエリ: ' : undefined),
+      prefixPassage: process.env.MEMORY_EMBED_PREFIX_PASSAGE ?? (ruri ? '検索文書: ' : undefined)
+    };
+  })(),
+
   // クエリ
   maxCandidates: number(process.env.SEMANTIC_MAX_CANDIDATES, 150_000),
   // 1位からこれ以上落ちた候補は捨てる。実測で無関係な文どうしでも 0.77〜0.82

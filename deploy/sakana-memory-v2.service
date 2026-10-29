@@ -1,0 +1,22 @@
+[Unit]
+Description=Sakana memory v2 update (new messages only: plan, extract, compose the changed pages, project)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# .env (OPENROUTER_API_KEY, MEMORY_DB_PATH, MEMORY_TREE_GUILD ...) は dotenv が作業ディレクトリから読む。
+# リリースを切り替えるときは sakana.service と同じく drop-in (90-release.conf) で ExecStart を差し替える。
+WorkingDirectory=/root/sakana
+# 新着の区間だけが AI を呼ぶ。組み立ては変わった主張のページだけ (同じ入力は保存した出力を使う)。
+# 最低コスト: 検証なし・組み立ての推論なし (docs/memory-v2.md)
+Environment=MEMORY_V2_VERIFY=off
+Environment=MEMORY_V2_COMPOSE_REASONING=off
+ExecStart=/usr/bin/node --import tsx scripts/memory-v2.ts update --live --settle-hours 2 --max-cost 3
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sakana-memory-v2

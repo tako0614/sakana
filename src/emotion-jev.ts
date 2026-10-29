@@ -62,7 +62,7 @@ export function resetEmotionJevState(): void {
 
 type Fetch = typeof fetch;
 
-type Questions = Record<string, { type: 'noul'; instructions: string; criteria: { true: string; false: string } }>;
+export type Questions = Record<string, { type: 'noul'; instructions: string; criteria: { true: string; false: string } }>;
 
 function readProbabilities(body: unknown, ids: readonly string[]): { label: string; score: number }[] {
   const answers = typeof body === 'object' && body !== null ? (body as { answers?: Record<string, { noul?: unknown } | undefined> }).answers : undefined;

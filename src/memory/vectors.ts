@@ -11,15 +11,16 @@
 
 import { createHash } from 'node:crypto';
 import { embedConfig } from '../embed/config.js';
-import { embedTexts, isDisabled, prewarm, workerInfo } from '../embed/worker.js';
+import { memoryWorker } from '../embed/worker.js';
 import { bestLine, chunkText, syncChunks } from './chunks.js';
+import { allClaims, claimEmbedText, hasClaims, loadClaims, syncClaimFts } from './claims.js';
 import { memoryDb } from './store.js';
 
-type Kind = 'node' | 'episode' | 'chunk';
+type Kind = 'node' | 'episode' | 'chunk' | 'claim';
 type EmbedFn = (texts: readonly string[], kind: 'passage' | 'query') => Promise<{ dim: number; vectors: string[] }>;
 
 const defaultEmbed: EmbedFn = async (texts, kind) => {
-  const reply = await embedTexts(texts, { kind, encode: 'float32' });
+  const reply = await memoryWorker().embedTexts(texts, { kind, encode: 'float32' });
   return { dim: reply.dim, vectors: reply.vectors };
 };
 
@@ -30,7 +31,7 @@ export function setEmbedder(fn?: EmbedFn): void {
   matrices.clear();
 }
 
-const modelKey = (): string => embedConfig.modelName;
+const modelKey = (): string => embedConfig.memory.modelName;
 const hashOf = (text: string): string => createHash('sha1').update(modelKey()).update('\n').update(text).digest('hex');
 
 // ---- 何を埋め込むか -------------------------------------------------------------
@@ -75,11 +76,18 @@ function itemsOf(guildId: string): Item[] {
     const text = episodeText(episode);
     items.push({ kind: 'episode', id: episode.id, text, hash: hashOf(text) });
   }
-  // ページの中の1つの知識 (syncChunks が本文から作った表)。ページ名と節が付くので、誰の何の話かが残る
-  for (const chunk of db.prepare<[string], { id: number; path: string; heading: string; text: string; aliases: string }>(
+  // ページの中の1つの知識 (syncChunks が本文から作った表)。ページ名と節が付くので、誰の何の話かが残る。
+  // v2 の記憶は主張が同じ粒度の知識なので、断片は振らない (同じ文を二重に振って、検索でも重なるため)
+  const claimsMode = hasClaims(guildId);
+  if (!claimsMode) for (const chunk of db.prepare<[string], { id: number; path: string; heading: string; text: string; aliases: string }>(
     'SELECT c.id, c.path, c.heading, c.text, n.aliases FROM memory_chunks c JOIN nodes n ON n.id = c.node_id WHERE c.guild_id = ?').all(guildId)) {
     const text = chunkText(chunk.path, parseAliases(chunk.aliases), chunk.heading, chunk.text);
     items.push({ kind: 'chunk', id: chunk.id, text, hash: hashOf(text) });
+  }
+  // v2 の主張 (1 つの命題)。「[誰 / 時期 / 種類] 本文」の形で埋め込む (claims.ts)
+  for (const claim of allClaims(guildId)) {
+    const text = claimEmbedText(claim);
+    items.push({ kind: 'claim', id: claim.id, text, hash: hashOf(text) });
   }
   return items;
 }
@@ -125,6 +133,7 @@ export async function syncMemoryVectors(guildId: string,
     const db = memoryDb();
     // 先に本文から断片の表を作り直す (builder が書き直したぶんだけ変わる。SQL だけで済む)
     syncChunks(guildId);
+    syncClaimFts(guildId);
     const items = itemsOf(guildId);
     const stored = new Map<string, string>();
     for (const row of db.prepare<[string, string], { kind: string; id: number; text_hash: string }>(
@@ -174,7 +183,7 @@ export async function syncMemoryVectors(guildId: string,
 
 /** 記憶のあるサーバーぜんぶで、変わったぶんを振り直す (夜間と起動の少しあと)。失敗しても次の回がある。 */
 export async function sweepMemoryVectors(): Promise<void> {
-  if (!embedConfig.enabled || isDisabled()) return;
+  if (!embedConfig.enabled || memoryWorker().isDisabled()) return;
   const guilds = memoryDb().prepare<[], { guild_id: string }>('SELECT DISTINCT guild_id FROM nodes').all().map((row) => row.guild_id);
   for (const guildId of guilds) {
     const result = await syncMemoryVectors(guildId);
@@ -187,6 +196,11 @@ export async function sweepMemoryVectors(): Promise<void> {
 /** ベクトルを持つサーバーが記憶にあるか (想起で意味検索を試す価値があるか)。 */
 export function hasVectors(guildId: string): boolean {
   return Boolean(memoryDb().prepare('SELECT 1 FROM memory_vectors WHERE guild_id = ? AND model = ? LIMIT 1').get(guildId, modelKey()));
+}
+
+/** その種類のベクトルを持つか (主張の索引がまだ振られていない DB で、新しい想起を使わないため)。 */
+export function hasKind(guildId: string, kind: Kind): boolean {
+  return Boolean(memoryDb().prepare('SELECT 1 FROM memory_vectors WHERE guild_id = ? AND kind = ? AND model = ? LIMIT 1').get(guildId, kind, modelKey()));
 }
 
 // ---- 引く ---------------------------------------------------------------------
@@ -264,11 +278,11 @@ const COLD_SKIP_MS = 30_000;
 
 export async function embedQuery(text: string, { timeoutMs = 3000 }: { timeoutMs?: number } = {}): Promise<Float32Array | null> {
   const clean = text.replace(/\s+/g, ' ').trim().slice(0, 1200);
-  if (!clean || !embedConfig.enabled || isDisabled()) return null;
+  if (!clean || !embedConfig.enabled || memoryWorker().isDisabled()) return null;
   const real = embedder === defaultEmbed;
-  const cold = real && workerInfo() === null;
+  const cold = real && memoryWorker().workerInfo() === null;
   if (cold) {
-    prewarm();
+    memoryWorker().prewarm();
     if (Date.now() < coldUntil) return null;
   }
   const work = embedder([clean], 'query').then((reply) => decode(reply.vectors[0] ?? '', reply.dim), () => null);
@@ -293,11 +307,11 @@ const SEGMENT_CHARS = 500;
 export async function embedQueries(texts: readonly string[], { timeoutMs = 3000 }: { timeoutMs?: number } = {}): Promise<(Float32Array | null)[] | null> {
   const clean = texts.map((text) => text.replace(/\s+/g, ' ').trim().slice(0, SEGMENT_CHARS));
   const wanted = clean.map((text, index) => ({ text, index })).filter((entry) => entry.text);
-  if (wanted.length === 0 || !embedConfig.enabled || isDisabled()) return null;
+  if (wanted.length === 0 || !embedConfig.enabled || memoryWorker().isDisabled()) return null;
   const real = embedder === defaultEmbed;
-  const cold = real && workerInfo() === null;
+  const cold = real && memoryWorker().workerInfo() === null;
   if (cold) {
-    prewarm();
+    memoryWorker().prewarm();
     if (Date.now() < coldUntil) return null;
   }
   const work = embedder(wanted.map((entry) => entry.text), 'query').then((reply) => {
@@ -404,7 +418,21 @@ export async function meaningOf(guildId: string, input: string | readonly QueryS
   // 断片: 探すのは 1 行ずつ (いちばん当たる) が、出すのは節ごと。同じ節で当たった行は、いちばん近い 1 件にまとめて「ほか N 件」と数える。
   // 1位との差と下限で絞り、同じページからは CHUNKS_PER_PAGE 節まで
   const chunks: MeaningChunk[] = [];
-  if (chunkLimit > 0) {
+  if (chunkLimit > 0 && hasKind(guildId, 'claim')) {
+    // v2 の記憶: 1 つの知識 = 主張。ページ (entity) ごとに CHUNKS_PER_PAGE 件まで。節は無い (heading は空)
+    const raw = nearestOfAny(guildId, 'claim', queries, { limit: chunkLimit * 8, exclude: excludeChunks ? new Set(excludeChunks) : undefined });
+    const best = raw[0]?.score ?? 0;
+    const perPage = new Map<string, number>();
+    const claims = loadClaims(guildId, raw.map((hit) => hit.id));
+    for (const hit of raw) {
+      if (hit.score < chunkFloor || hit.score < best - chunkGap || chunks.length >= chunkLimit) continue;
+      const claim = claims.get(hit.id);
+      if (!claim || !claim.path) continue;
+      if ((perPage.get(claim.path) ?? 0) >= CHUNKS_PER_PAGE) continue;
+      perPage.set(claim.path, (perPage.get(claim.path) ?? 0) + 1);
+      chunks.push({ id: claim.id, path: claim.path, heading: '', text: claim.text, line: claim.text, episodeIds: claim.episodeId ? [claim.episodeId] : [], score: hit.score, more: 0 });
+    }
+  } else if (chunkLimit > 0) {
     const raw = nearestOfAny(guildId, 'chunk', queries, { limit: chunkLimit * 8, exclude: excludeChunks ? new Set(excludeChunks) : undefined });
     const best = raw[0]?.score ?? 0;
     const perPage = new Map<string, number>();

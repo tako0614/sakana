@@ -1,11 +1,12 @@
 import { db as archive } from '../../archive/db.js';
 import { memoryDb, normalizePath } from '../store.js';
-import { CATEGORIES, UNSERIOUS, type Category, type Modality } from './types.js';
+import { CATEGORIES, type Category } from './types.js';
 
 // S3 解決 (機械)。主張の主体を「ページになるもの (entity)」に決める。
 //   人物: author_id ごとに 1 つ。表示名は履歴 (最新の名前がページ名、昔の名前は別名)。同じ名前の別人は ~末尾4桁 で分ける
 //   もの: 正規化した名前の一致だけで同一視する。意味での統合はしない (誤統合のほうが害が大きい)
-// 冗談・仮定・ごっこ・wrong の主張は、ページの材料にしない (entity も作らない)。
+// wrong の主張は使わない。冗談・仮定・ごっこの主張にも entity は付ける (想起で「誰の冗談か」を出せるように)が、
+// ページの材料にはしない (compose が除く。serious な主張が無い entity にはページができない)。
 
 /** 名前の比較用: 全角半角・大小・空白・記号を無視する。 */
 export const nameKey = (name: string): string =>
@@ -48,7 +49,7 @@ export function resolveEntities(guildId: string, people = loadPeople(guildId)): 
   const d = memoryDb();
   const claims = d.prepare<[string], ClaimKey>(`
     SELECT id, about_kind, about_key, category, modality, verdict FROM v2_claims WHERE guild_id = ? AND verdict <> 'wrong'
-  `).all(guildId).filter((claim) => !UNSERIOUS.includes(claim.modality as Modality));
+  `).all(guildId);
 
   const personClaims = new Map<string, number[]>();
   const thingClaims = new Map<string, { ids: number[]; spellings: Map<string, number>; votes: Map<Category, number> }>();
@@ -98,7 +99,9 @@ export function resolveEntities(guildId: string, people = loadPeople(guildId)): 
       const base = clean && !deleted ? `people/${clean}` : `people/${clean || 'user'}~${authorId.slice(-4)}`;
       const path = normalizePath(unique(base, authorId.slice(-4))) ?? `people/user~${authorId.slice(-4)}`;
       const aliases = [...new Set(names.slice(1).map((entry) => entry.name).filter((name) => name !== latest))].slice(0, 12);
-      const id = Number(insert.run(guildId, 'person', authorId, latest || 'user', 'people', path, JSON.stringify(aliases),
+      // 削除済みユーザーは名前が全員同じなので、表示にも末尾 4 桁を付けて見分ける (想起の「誰が」にも出る)
+      const display = deleted && !latest.includes('#') ? `${latest}#${authorId.slice(-4)}` : latest;
+      const id = Number(insert.run(guildId, 'person', authorId, display || 'user', 'people', path, JSON.stringify(aliases),
         JSON.stringify({ messages: info?.messages ?? 0, firstMs: info?.firstMs ?? null, lastMs: info?.lastMs ?? null, names: names.length })).lastInsertRowid);
       for (const claimId of ids) assign.run(id, claimId);
       stats.people += 1;

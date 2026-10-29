@@ -1,0 +1,9 @@
+[Unit]
+Description=Update the Sakana memory (v2) once a day with the new messages
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

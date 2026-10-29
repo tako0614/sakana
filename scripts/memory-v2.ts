@@ -9,7 +9,7 @@ import { readFileSync } from 'node:fs';
 //   node --import tsx scripts/memory-v2.ts canary   --guild ID --db memory2.sqlite [--n 30] [--max-cost 1.5]  少数の区間で通しで試す
 //   node --import tsx scripts/memory-v2.ts run      --guild ID --db memory2.sqlite --confirm [--stage S] [--max-cost X]
 //        stage: extract (抽出 + 検証) | resolve | compose | arcs | root | project | all
-//   node --import tsx scripts/memory-v2.ts update   --guild ID --db memory.sqlite [--settle-hours 1] [--max-cost 3]    新着だけを足す (計画 → 抽出 → 検証 → 組み立て → 投影。保存した出力は払い直さない)
+//   node --import tsx scripts/memory-v2.ts update   --guild ID --live [--settle-hours 1] [--max-cost 3]    新着だけを足す (計画 → 抽出 → 検証 → 組み立て → 投影。保存した出力は払い直さない)
 //   node --import tsx scripts/memory-v2.ts status   --guild ID --db memory2.sqlite
 //   node --import tsx scripts/memory-v2.ts validate --guild ID --db memory2.sqlite [--v1 …]               関門
 //   node --import tsx scripts/memory-v2.ts show     --guild ID --db memory2.sqlite --path people/たこ     組み立てたページ
@@ -37,7 +37,7 @@ const number = (name: string, fallback: number): number => {
   return n;
 };
 
-const guildId = text('guild');
+const guildId = text('guild') ?? process.env.MEMORY_TREE_GUILD;
 if (!command || !guildId) {
   console.error('使い方: memory-v2.ts <init|estimate|canary|run|status|validate|show|sample> --guild ID --db FILE');
   process.exit(2);
@@ -45,8 +45,9 @@ if (!command || !guildId) {
 const guild: string = guildId;
 const db = text('db');
 if (db) process.env.MEMORY_DB_PATH = db;
-else if (!process.env.MEMORY_DB_PATH || /memory\.sqlite$/.test(process.env.MEMORY_DB_PATH)) {
-  console.error('--db で v2 用の新しいファイルを指定してください (本番の memory.sqlite は壊さない)');
+else if (!process.env.MEMORY_DB_PATH || (/memory\.sqlite$/.test(process.env.MEMORY_DB_PATH) && !args.live)) {
+  // 構築は新しいファイルに作る。切り替えたあとの更新 (update) だけは、本番の memory.sqlite を --live で明示して使う
+  console.error('--db で v2 用の新しいファイルを指定してください (本番の memory.sqlite は壊さない。切り替え後の update だけ --live)');
   process.exit(2);
 }
 

@@ -2,6 +2,7 @@ import {
   episodesFor, getNode, linkedPages, nodeNames, recentEpisodesFor, searchEpisodes, searchNodes, sharedEpisodes,
   type NodeName
 } from './store.js';
+import { recallPack } from './pack.js';
 import { embedQuery, hasVectors, meaningOf, scoresFor, type Meaning, type MeaningChunk, type QuerySegment } from './vectors.js';
 
 // 思い出す。会話に出た名前や言葉を手がかりに、関係するページと出来事を数件だけ引く。
@@ -206,6 +207,13 @@ export function conversationText(messages: readonly { authorName?: string | unde
  */
 export async function recallWithMeaning(guildId: string,
   { request = '', context = '', conversation = '', maxChars = 2400, timeoutMs = 3000 }: { request?: string; context?: string; conversation?: string; maxChars?: number; timeoutMs?: number } = {}): Promise<RecallParts> {
+  // v2 の記憶 (主張の索引がある) は、メモリパック: 入口の門 → 候補 → 判定モデルの再順位づけ → 関係する主張そのものを渡す。
+  // 索引が無い・判定モデルが使えないときは null で、従来の見出しの想起に落ちる
+  const pack = await recallPack(guildId, { request }).catch((error: unknown) => {
+    console.error('Memory pack failed:', error);
+    return null;
+  });
+  if (pack) return pack;
   // 名前で見つけたページの出来事は、重要度順でなく依頼に近い順に選ぶ (近いものが無ければ見出しだけ)。
   // 質問側の埋め込みが間に合わない・ベクトルが無いときは、従来の重要度順。
   const vector = hasVectors(guildId) && request.trim() ? await embedQuery(request, { timeoutMs }) : null;
