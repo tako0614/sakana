@@ -189,9 +189,11 @@ export class AmbientJudge {
   /** 判定に回す価値がある発言か (安い門。ここで落とせば API も呼ばない)。 */
   worthJudging(message: VexMessage, named = false, continuation = false): boolean {
     if (message.author.bot || message.webhookId) return false;
-    if (message.channel.nsfw || /nsfw/i.test(message.channel.name ?? '')) return false;
+    // 名前で呼ばれたときは、NSFW のチャンネルでも答える (呼んだのは本人。以前は NSFW を先に弾いていて、
+    // 「vex ちゃん〜して」と呼んでも黙っていた: 2026-11-04 #nsfw)。呼ばれていない自発参加は NSFW に入らない
     // 名前が出ていれば、短くても (vex だけ)・返信でも・他の人へのメンションつきでも判定する
     if (named) return true;
+    if (message.channel.nsfw || /nsfw/i.test(message.channel.name ?? '')) return false;
     const text = String(message.content ?? '').trim();
     // URL・カスタム絵文字・メンションを除いた、本当の文字で見る。リンクを貼っただけの発言には入らない
     // (YouTube の URL だけの発言に入って、見ていない動画の的外れな返事をした)。続きの発言は「は？」のように短い

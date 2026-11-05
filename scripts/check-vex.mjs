@@ -4,7 +4,7 @@
 //   - 名前の検出: 英字の単語としてだけ。コード・URL・引用・別の単語の中は呼びではない
 //   - 名前の扱いは VEX_CALL で切り替わる: mention (既定の 1) = メンション扱いで確定 / judge = 判定モデルが文脈で決める
 //   - state が、評価に使った形 (scripts/vex/questions.mjs) と同じ
-//   - 自発参加の門: 許可チャンネル・相槌/短文/返信/他人宛て/NSFW・冷却・1時間の上限・1日の費用
+//   - 自発参加の門: 許可チャンネル・相槌/短文/返信/他人宛て/NSFW (名前で呼ばれたときは NSFW でも答える)・冷却・1時間の上限・1日の費用
 //   - 閾値、静かになるまで待つ、会話が進んだら入らない、bot の発言でタイマーを捨てる
 //   - API が落ちても入らないだけ (例外にしない)。混んだら次のモデルへ回る
 
@@ -342,11 +342,17 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
   // 名前が出ていても判定に回さない発言 / 名前が出ていない発言 (許可チャンネルの外)
   api.calls.length = 0;
   judge.observe(say(channel, 'vex が言ってた', { bot: true }));
-  judge.observe(say(makeChannel('x', { nsfw: true }), 'vex どう思う？'));
+  judge.observe(say(makeChannel('x', { nsfw: true }), 'これってどうなってるの？誰か分かる人いる？'));
   judge.observe(say(channel, 'evex どう思う？'));
   judge.observe(say(channel, 'これってどうなってるの？誰か分かる人いる？'));
   await sleep(250);
-  if (api.calls.length) fail('bot・NSFW・名前が出ていない発言は、許可チャンネルの外では判定しない');
+  if (api.calls.length) fail('bot・名前が出ていない NSFW の発言・名前が出ていない発言は、許可チャンネルの外では判定しない');
+  // 名前で呼ばれたら、NSFW のチャンネルでも判定する (呼んだのは本人)
+  judge.observe(say(makeChannel('x', { nsfw: true }), 'vex どう思う？'));
+  judge.observe(say(makeChannel('nsfw-room'), 'vex どう思う？'));
+  await sleep(250);
+  if (api.calls.length < 2) fail(`名前で呼ばれたら NSFW でも判定する: ${api.calls.length}`);
+  api.calls.length = 0;
 
   // オフ・メンション扱いのときは、名前が出ても判定しない (メンション扱いは isAgentRequest が確定で起動するので重ねない)
   for (const mode of ['0', '1']) {
@@ -431,7 +437,8 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
   if (ok('<@222> これってどうなってるの？', { mentions: ['222'] })) fail('別の人宛ては回さない');
   if (!ok('<@bot-self> これってどうなってるの？', { mentions: ['bot-self'] })) fail('自分宛てのメンションだけなら回す (呼びは別経路で扱う)');
   if (ok('これってどうなってるの？', { webhookId: 'w' })) fail('webhook は回さない');
-  if (judge.worthJudging(say(makeChannel('chan5', { nsfw: true }), 'これってどうなってるの？'))) fail('NSFW は回さない');
+  if (judge.worthJudging(say(makeChannel('chan5', { nsfw: true }), 'これってどうなってるの？'))) fail('呼ばれていない発言は NSFW に回さない');
+  if (!judge.worthJudging(say(makeChannel('chan5', { nsfw: true }), 'vex どう思う？'), true)) fail('名前で呼ばれたら NSFW でも回す');
   if (judge.worthJudging(say(makeChannel('chan5', { name: 'nsfw-art' }), 'これってどうなってるの？'))) fail('名前に nsfw があれば回さない');
 }
 
