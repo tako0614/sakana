@@ -329,7 +329,7 @@ OpenRouter の安いモデルを人ごとに `/model` で選びます。既定�
 | system prompt を1文字も可変にしない                                | キャッシュは前方一致。時刻を入れていた頃は後ろ 5.5KB が毎回新規扱いだった                                                                                                                      |
 | 可変な文脈 (時刻・チャンネル・呼んだ人) は user メッセージ側       | 同上。キャッシュできる前置きを system 1,851字 + ツール定義 4,127字 = 約2,800トークンに固定                                                                                                     |
 
-スクリーンショットはモデルに渡さず、返信に画像として添付します。
+画像は `image` ツール (読む `look` / 作る `draw` / 画面を撮る `shot`) が扱います。詳しくは [docs/agent-image.md](docs/agent-image.md)。
 
 ### ツール
 
@@ -584,11 +584,11 @@ xvfb-run -a --server-args="-screen 0 1280x720x24 -nolisten tcp" \
 
 CDP 側でも `navigator.webdriver` を `undefined` に保ち、`navigator.languages` を `Accept-Language` と揃える程度の補正を入れています。plugins や WebGL ベンダの**偽装はしません** — 不整合はかえって検知材料になるためです。
 
-`browser` ツール1つに全機能を載せています: `search` / `open` / `text` / `links` / `html` / `screenshot` / `click` / `type` / `key` / `scroll` / `wait` / `eval` / `back` / `forward` / `reload` / `tabs` / `tab` / `new_tab` / `close_tab` / `console` / `network`、そして生の CDP を直接叩く `cdp` (`Page.printToPDF` など、ここに実装していないものはこれで呼べます)。
+`browser` ツール1つに全機能を載せています: `search` / `open` / `text` / `links` / `html` / `click` / `type` / `key` / `scroll` / `wait` / `eval` / `back` / `forward` / `reload` / `tabs` / `tab` / `new_tab` / `close_tab` / `console` / `network`、そして生の CDP を直接叩く `cdp` (`Page.printToPDF` など、ここに実装していないものはこれで呼べます)。
 
 権限は2段に分けています。
 
-- **誰でも**: `search` / `open` / `text` / `links` / `screenshot` / `scroll` / `wait` / `back` / `forward` / `reload` / `console` / `network`。ただし **Cookie を共有しない独立コンテキスト** (`Target.createBrowserContext`) に作った専用タブの中だけで、そのタブは**実行ごとに作って捨てます**。既存タブは読めず、ログイン済みサイトも引き継がず、他の人が開いたページや履歴も残りません。
+- **誰でも**: `search` / `open` / `text` / `links` / `scroll` / `wait` / `back` / `forward` / `reload` / `console` / `network`。ただし **Cookie を共有しない独立コンテキスト** (`Target.createBrowserContext`) に作った専用タブの中だけで、そのタブは**実行ごとに作って捨てます**。既存タブは読めず、ログイン済みサイトも引き継がず、他の人が開いたページや履歴も残りません。
 - **`AGENT_BROWSER_TRUSTED_USERS` に書いた人だけ**: 上記に加えて `click` / `type` / `key` / `eval` / `cdp` / タブ操作。既定プロファイルの既存タブも触れます。
 
 **「サーバー管理」権限では操作系を許しません。** モデレータ権限は普通に何人も持っているのに、生 CDP と `eval` は共有 Chrome に載っているログインセッションまで届きます。名指しの許可リストだけにしてあり、空なら誰にも出しません (`AGENT_BROWSER_FULL_FOR_ALL=true` で全員に開けますが、上の理由で推奨しません)。

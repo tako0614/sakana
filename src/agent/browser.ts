@@ -28,6 +28,7 @@ import {
   numberField,
   recordField,
   stringField,
+  MAX_ATTACHED_IMAGES,
   type AgentContext,
   type BrowserState,
   type ToolArgs,
@@ -35,8 +36,9 @@ import {
 } from './types.js';
 
 // 閲覧するだけの action。誰でも使える。
+// スクリーンショットは image ツールの shot に移した (画像の添付は image だけが担う)
 const READ_ACTIONS = new Set([
-  'search', 'open', 'text', 'html', 'links', 'screenshot', 'wait',
+  'search', 'open', 'text', 'html', 'links', 'wait',
   'back', 'forward', 'reload', 'scroll', 'console', 'network'
 ]);
 
@@ -45,8 +47,6 @@ const READ_ACTIONS = new Set([
 const FULL_ACTIONS = new Set([
   'click', 'type', 'key', 'eval', 'cdp', 'tabs', 'tab', 'new_tab', 'close_tab'
 ]);
-
-const MAX_SCREENSHOTS = 2;
 
 // action:"cdp" から呼べるメソッド。禁止リストは必ず漏れるので許可リストにする。
 // 特に Browser.setDownloadBehavior (root でのファイル書き込み) と
@@ -80,7 +80,7 @@ export function browserToolDefinition(browserFull: boolean): ToolDefinition {
       name: 'browser',
       description: [
         'Discord の外を見るための外付け Chrome。search で web を検索し (URL を知らなくていい)、',
-        'open で URL を開いて本文を返す。screenshot は返信に画像を添付する。',
+        'open で URL を開いて本文を返す (画面の画像を添付するときは image の shot)。',
         browserFull ? 'cdp は生の CDP メソッド (読み取り系のみ許可)。' : ''
       ].join(' '),
       parameters: {
@@ -445,6 +445,9 @@ export async function runBrowserAction(ctx: AgentContext, args: ToolArgs = {}): 
 
   if (!action) return 'action を指定してください。';
 
+  // 添付は image ツールに移った。古い呼び方をしてきたモデルを、止めずに案内する
+  if (action === 'screenshot') return 'スクリーンショットは image ツールの action:"shot" に移りました。そちらで呼んでください。';
+
   if (!READ_ACTIONS.has(action) && !FULL_ACTIONS.has(action)) {
     return `未対応の action です: ${action}`;
   }
@@ -452,7 +455,7 @@ export async function runBrowserAction(ctx: AgentContext, args: ToolArgs = {}): 
   if (FULL_ACTIONS.has(action) && !ctx.browserFull) {
     return [
       `action "${action}" はブラウザを操作する権限が必要なので、この人には許可されていません。`,
-      'open / text / links / screenshot などの閲覧系だけ使えます。'
+      'open / text / links などの閲覧系だけ使えます。'
     ].join(' ');
   }
 
@@ -461,17 +464,37 @@ export async function runBrowserAction(ctx: AgentContext, args: ToolArgs = {}): 
   if (alreadyTainted) return alreadyTainted;
 
   const session = await resolveSession(ctx);
-  const screenshotsBefore = ctx.screenshots.length;
+  const imagesBefore = ctx.images.length;
 
   const result = await performAction(ctx, session, action, args);
 
   // 操作の最中に内部宛の応答が見つかったら、読み取った結果は捨てる
   const tainted = ctx.browser?.tainted;
   if (tainted) {
-    ctx.screenshots.length = Math.min(ctx.screenshots.length, screenshotsBefore);
+    ctx.images.length = Math.min(ctx.images.length, imagesBefore);
     return tainted;
   }
 
+  return result;
+}
+
+/**
+ * image ツールの shot。いまブラウザで開いているページを撮って ctx.images に積む。
+ * 内部宛の応答に触れていた実行では、他のブラウザ操作と同じく、撮らずに理由だけ返す (撮ったあとに分かれば捨てる)。
+ */
+export async function captureBrowserShot(ctx: AgentContext): Promise<string> {
+  const alreadyTainted = ctx.browser?.tainted;
+  if (alreadyTainted) return alreadyTainted;
+
+  const session = await resolveSession(ctx);
+  const imagesBefore = ctx.images.length;
+  const result = await performAction(ctx, session, 'screenshot', {});
+
+  const tainted = ctx.browser?.tainted;
+  if (tainted) {
+    ctx.images.length = Math.min(ctx.images.length, imagesBefore);
+    return tainted;
+  }
   return result;
 }
 
@@ -529,21 +552,21 @@ async function performAction(ctx: AgentContext, session: CdpSession, action: str
     }
 
     case 'screenshot': {
-      if (ctx.screenshots.length >= MAX_SCREENSHOTS) {
-        return `スクリーンショットは1回の実行で ${MAX_SCREENSHOTS} 枚までです。`;
+      if (ctx.images.length >= MAX_ATTACHED_IMAGES) {
+        return `画像の添付は1回の実行で ${MAX_ATTACHED_IMAGES} 枚までです。`;
       }
 
       const shot = await session.send('Page.captureScreenshot', { format: 'png' });
       const data = stringField(shot, 'data');
       if (!data) return 'スクリーンショットを取得できませんでした。';
 
-      ctx.screenshots.push(Buffer.from(data, 'base64'));
+      ctx.images.push({ data: Buffer.from(data, 'base64'), name: `screenshot-${ctx.images.length + 1}.png`, origin: 'page' });
       const info = await session.evaluate('({ title: document.title, url: location.href })');
 
       // 画像自体はモデルに渡さない (テキストモデルだし、渡せてもトークンが重い)。
       // 返信に添付して人間に見せる。
       return [
-        `スクリーンショットを撮って返信に添付しました (${ctx.screenshots.length}枚目)。`,
+        `スクリーンショットを撮って返信に添付しました (${ctx.images.length}枚目)。`,
         `title: ${truncate(stringField(info, 'title'), 200)}`,
         `url: ${stringField(info, 'url')}`
       ].join('\n');

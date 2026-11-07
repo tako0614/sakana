@@ -1,29 +1,11 @@
 import { AttachmentBuilder, type Message, type MessageReplyOptions } from 'discord.js';
-import puppeteer from 'puppeteer-core';
 import { IMAGE_HOSTS, renderEmotionHtml, type EmotionImageInput, type EmotionResult } from './emotion-image.js';
 import { analyzeEmotion } from './emotion-jev.js';
+import { launchRenderChrome, renderTimeoutMs, takeRenderSlot } from './render.js';
 
 // 「きもち」: リプライ先の発言の感情を判定モデル (jev、emotion-jev.ts) で読み、画像にして返す。
 
 const emotionTriggerText = process.env.EMOTION_TRIGGER_TEXT ?? 'きもち';
-// 描画に使う Chrome。以前は node-html-to-image が古い puppeteer と Chrome 128 を抱えていた (既知の脆弱性つき)
-const chromePath = process.env.EMOTION_CHROME_PATH ?? '/usr/bin/google-chrome';
-const renderTimeoutMs = 30_000;
-// 描画が重い (Chrome の起動)。連打で止まらないよう同時に2件まで
-const MAX_RUNNING = 2;
-let running = 0;
-
-/** 描画の枠 (きもち・よっきゅう共通で同時に 2 件)。空いていなければ busy。 */
-export async function withRenderSlot<T>(run: () => Promise<T>): Promise<{ busy: true } | { busy: false; value: T }> {
-  if (running >= MAX_RUNNING) return { busy: true };
-  running += 1;
-  try {
-    return { busy: false, value: await run() };
-  } finally {
-    running -= 1;
-  }
-}
-
 export function isEmotionRequest(message: Message): boolean {
   return message.content.trim() === emotionTriggerText && Boolean(message.reference?.messageId);
 }
@@ -44,12 +26,11 @@ export async function handleEmotionRequest(message: Message): Promise<void> {
     await replySafely(message, 'リプライ先に分析できるテキストがありません。');
     return;
   }
-  if (running >= MAX_RUNNING) {
+  const release = takeRenderSlot();
+  if (!release) {
     await replySafely(message, 'いま気持ち分析が混んでいます。少し待ってからもう一度どうぞ。');
     return;
   }
-
-  running += 1;
   try {
     if ('sendTyping' in message.channel) await message.channel.sendTyping();
     const result = parseEmotionResult(await analyzeEmotion(targetText));
@@ -68,7 +49,7 @@ export async function handleEmotionRequest(message: Message): Promise<void> {
       content: '気持ち分析に失敗しました。少し待ってからもう一度どうぞ。'
     });
   } finally {
-    running -= 1;
+    release();
   }
 }
 
@@ -88,15 +69,6 @@ export function parseEmotionResult(raw: unknown): EmotionResult {
   };
 }
 
-// 描画用の Chrome にも bot の秘密は渡さない
-function chromeEnv(): Record<string, string> {
-  const keys = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'FONTCONFIG_PATH', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME'];
-  return Object.fromEntries(keys.flatMap((key) => {
-    const value = process.env[key];
-    return value === undefined ? [] : [[key, value]];
-  }));
-}
-
 /** Discord のアバター画像だけ取りに行かせる。ほかの URL (内部のサービス・file://) は描画側の Chrome でも止める。 */
 export function isAllowedImageRequest(url: string): boolean {
   if (url.startsWith('data:') || url === 'about:blank') return true;
@@ -112,16 +84,7 @@ export const renderEmotionImage = (input: EmotionImageInput): Promise<Buffer> =>
 
 /** HTML (emotion-image.tsx が作る 960x540 の 1 枚) を Chrome で PNG にする。きもち・よっきゅう共通。 */
 export async function renderHtmlImage(html: string): Promise<Buffer> {
-  const browser = await puppeteer.launch({
-    executablePath: chromePath,
-    headless: true,
-    timeout: renderTimeoutMs,
-    // Chrome は一時フォルダに通信用のソケットを作り、そのパスが 108 文字を超えると起動しない
-    env: { ...chromeEnv(), TMPDIR: (process.env.TMPDIR ?? '/tmp').length > 60 ? '/tmp' : (process.env.TMPDIR ?? '/tmp') },
-    // root で動くコンテナなので sandbox は使えない。代わりに JavaScript を止め、外への読み込みを絞る
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--no-first-run',
-      '--disable-extensions', '--disable-background-networking', '--disable-sync', '--disable-default-apps', '--mute-audio']
-  });
+  const browser = await launchRenderChrome(renderTimeoutMs);
   try {
     const page = await browser.newPage();
     await page.setViewport({ width: 960, height: 540 });

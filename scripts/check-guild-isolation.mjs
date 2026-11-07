@@ -126,7 +126,7 @@ try {
 
   await check('tool names are looked up as data, never as object properties', async () => {
     const toolset = await buildToolset(toolCtx([publicChannel]));
-    assert.deepEqual(toolset.definitions.map((definition) => definition.function.name), ['search', 'read', 'channels', 'info']);
+    assert.deepEqual(toolset.definitions.map((definition) => definition.function.name), ['search', 'read', 'channels', 'info', 'image']);
     for (const name of ['constructor', 'toString', '__proto__', 'hasOwnProperty', 'valueOf', 'isPrototypeOf']) {
       assert.match(await toolset.call(name, {}), /そのツールはありません/, name);
     }

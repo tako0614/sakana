@@ -26,7 +26,7 @@ process.env.AGENT_BROWSER = '0';
 const { INTERNAL_REASON, UNRESOLVED_REASON, inspectUrl, isBlockedAddress } = await import('../src/agent/urlguard.js');
 const { ResponseGuard, TAINT_REASON, classifyAddressSpace } = await import('../src/agent/netguard.js');
 const { watchPopups } = await import('../src/agent/cdp.js');
-const { runBrowserAction } = await import('../src/agent/browser.js');
+const { captureBrowserShot, runBrowserAction } = await import('../src/agent/browser.js');
 
 const realLookup = dns.promises.lookup;
 const realWarn = console.warn;
@@ -349,14 +349,18 @@ try {
   {
     const ctx = {
       browserFull: false,
-      screenshots: [Buffer.from('keep')],
+      images: [{ data: Buffer.from('keep'), name: 'screenshot-1.png', origin: 'page' }],  extraCostUsd: 0,
       browser: { contextId: 'c', sandboxTargetId: 't', opened: [], tainted: TAINT_REASON }
     };
     // Chrome に触る前に返す (ここでは繋ぐ先が無い)
-    for (const action of ['open', 'text', 'html', 'links', 'screenshot', 'search', 'reload']) {
+    for (const action of ['open', 'text', 'html', 'links', 'search', 'reload']) {
       assert.equal(await runBrowserAction(ctx, { action, url: 'https://public.test/', query: 'x' }), TAINT_REASON, `${action}: tainted なら理由だけ返す`);
     }
-    assert.equal(ctx.screenshots.length, 1, '画像も増やさない');
+    assert.equal(ctx.images.length, 1, '画像も増やさない');
+    // スクリーンショットは image ツールの shot に移った。browser からは案内だけ返し、shot は tainted なら理由だけ返す
+    assert.match(await runBrowserAction(ctx, { action: 'screenshot' }), /image ツール/);
+    assert.equal(await captureBrowserShot(ctx), TAINT_REASON, 'shot: tainted なら撮らずに理由だけ返す');
+    assert.equal(ctx.images.length, 1, 'shot でも画像を増やさない');
     // 権限の判定は tainted より先 (操作系を許していない人には従来どおりの断り)
     assert.match(await runBrowserAction(ctx, { action: 'eval', expression: '1' }), /権限が必要/);
   }

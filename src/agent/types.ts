@@ -60,6 +60,17 @@ export interface ResolvedRef {
   ref?: number;
 }
 
+/** 返信に添付する画像。origin が page のものは、ブラウザが内部宛の応答に触れたときに捨てる (draw はネットワークに触れない)。 */
+export interface AttachedImage {
+  data: Buffer;
+  name: string;
+  alt?: string;
+  origin: 'page' | 'draw';
+}
+
+/** 1 回の実行で添付できる画像の数 (draw と shot の合計) */
+export const MAX_ATTACHED_IMAGES = 3;
+
 /** この実行専用の隔離タブ・コンテキスト。 */
 export interface BrowserState {
   contextId: string | null;
@@ -85,7 +96,14 @@ export interface AgentContext {
   viewer?: GuildMember | Role;
   me: GuildMember;
   refs: RefTable;
-  screenshots: Buffer[];
+  /** 返信に添付する画像 (image ツールの draw / shot)。最後のメッセージにまとめて付ける */
+  images: AttachedImage[];
+  /** image の look が使った費用 (USD)。実行の費用に足して、ユーザーの上限に数える */
+  extraCostUsd: number;
+  /** 依頼の発言の ID (image の look が message 省略のときに読む発言) */
+  requestMessageId?: string | null;
+  /** image の look を呼んだ回数 */
+  looks?: number;
   channelScope: ChannelScope;
   browserFull: boolean;
   canAttach: boolean;

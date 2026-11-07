@@ -48,6 +48,7 @@ import {
   isAgentBanned,
   isAgentReply,
   recordToolCalls,
+  costOf,
   releaseCall,
   remainingFor,
   rememberAgentReply,
@@ -469,7 +470,9 @@ export async function handleAgentRequest(
       // (ニックネームはサーバーごとに違うので client.user では足りない)。
       me,
       refs,
-      screenshots: [],
+      images: [],
+      extraCostUsd: 0,
+      requestMessageId: message.id,
       // 自発参加は誰の依頼でもないので、全員に見えるものだけを読む (最後に発言した人の権限は使わない)
       channelScope: ambient ? getPublicChannelScope(guild) : getChannelScope(guild, member),
       ...(ambient ? { viewer: guild.roles.everyone } : {}),
@@ -563,10 +566,14 @@ export async function handleAgentRequest(
       onToolCall: (name, args) => { if (countsAsLookup(name)) toolUsed = true; thinking.setStatus(toolLabel(name, args)); }
     });
 
+    // image の look は別の 1 回の呼び出しなので、実行の usage には入っていない。実費を足して、その人の上限に数える
+    const billedUsage = runContext.extraCostUsd > 0
+      ? { ...result.invocation.usage, cost: costOf(result.invocation.usage) + runContext.extraCostUsd }
+      : result.invocation.usage;
     finalizeCall(reservation.id, {
       status: 'ok',
       rounds: result.invocation.rounds,
-      usage: result.invocation.usage
+      usage: billedUsage
     });
     // 枠は finalizeCall が返した。以降に何が起きても releaseCall で二重に返さない。
     finished = true;
@@ -595,11 +602,11 @@ export async function handleAgentRequest(
     const answer = expanded ? expanded.text : 'うまく答えをまとめられませんでした。条件を絞ってもう一度聞いてください。';
     const citeRowList = expanded ? citeRows(guild.id, expanded) : [];
 
-    // 撮ったのに貼れないときは黙らない (画像が出ている前提で読まれる)
-    const blocked = runContext.screenshots.length > 0 && !runContext.canAttach;
+    // 撮った・作ったのに貼れないときは黙らない (画像が出ている前提で読まれる)
+    const blocked = runContext.images.length > 0 && !runContext.canAttach;
     const chunks = chunkForDiscord(
       blocked
-        ? `${answer}\n\n-# (スクリーンショットは撮ったけど、このチャンネルにファイルを添付する権限が無くて貼れなかった)`
+        ? `${answer}\n\n-# (画像は用意したけど、このチャンネルにファイルを添付する権限が無くて貼れなかった)`
         : answer
     );
 
@@ -610,9 +617,11 @@ export async function handleAgentRequest(
     }
 
     const files = runContext.canAttach
-      ? runContext.screenshots.map(
-        (buffer, index) => new AttachmentBuilder(buffer, { name: `screenshot-${index + 1}.png` })
-      )
+      ? runContext.images.map((image) => {
+        const file = new AttachmentBuilder(image.data, { name: image.name });
+        if (image.alt) file.setDescription(image.alt);
+        return file;
+      })
       : [];
 
     for (const [index, chunk] of chunks.entries()) {

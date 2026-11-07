@@ -37,6 +37,10 @@ export function toolLabel(name: string, args: unknown = {}): string {
   if (name === 'memory') return '記憶';
   if (name === 'memory_focus') return '思い出す';
   if (name === 'browser') return stringField(args, 'action') === 'search' ? 'web 検索' : 'ブラウザ';
+  if (name === 'image') {
+    const action = stringField(args, 'action');
+    return action === 'draw' ? '画像を描く' : action === 'shot' ? '画面を撮る' : '画像を読む';
+  }
 
   return name;
 }

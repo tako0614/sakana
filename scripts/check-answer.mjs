@@ -660,7 +660,8 @@ const { stripMention } = await import('../src/agent/index.js');
   const withImage = userContentOf({ extras: 'screenshot.png' });
   const askBlock = withImage.slice(withImage.indexOf('## 依頼'));
   if (!askBlock.includes('screenshot.png')) fail(`依頼の添付が出ていない: ${askBlock}`);
-  if (!askBlock.includes('中身は見えない')) fail('読めないことを書かないと、読めたふりをする');
+  if (!askBlock.includes('image の look で読める')) fail('貼られた画像は image の look で読めると伝えないと、見えないと答える');
+  if (askBlock.includes('中身は見えない')) fail('読めるのに、見えないと書いてはいけない');
 
   // 添付が無いときは1行も足さない (普通の依頼のトークンを増やさない)
   if (userContentOf().includes('貼られているもの')) fail('添付が無いのに行を足している');

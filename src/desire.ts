@@ -1,7 +1,8 @@
 import { AttachmentBuilder, type Message } from 'discord.js';
 import { analyzeDesire } from './desire-jev.js';
 import { renderDesireHtml } from './emotion-image.js';
-import { getMessageAuthorAvatarUrl, renderHtmlImage, replySafely, withRenderSlot } from './emotion.js';
+import { getMessageAuthorAvatarUrl, renderHtmlImage, replySafely } from './emotion.js';
+import { withRenderSlot } from './render.js';
 
 // 「よっきゅう」: リプライ先の発言の三大欲求 (食欲・睡眠欲・性欲) を判定モデル (jev、desire-jev.ts) で読み、3 本のゲージの画像にして返す。
 // きもち (emotion.ts) と同じ流れで、どのチャンネル・誰の発言にも使える。画像の描画の枠はきもちと共有する。

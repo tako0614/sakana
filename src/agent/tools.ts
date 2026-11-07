@@ -22,6 +22,7 @@ import type { AgentToolset } from '../ai/runtime.js';
 import { prewarm } from '../embed/worker.js';
 import { governance as governanceRecords } from './boundary.js';
 import { browserToolDefinition, runBrowserAction } from './browser.js';
+import { imageToolDefinition, runImage } from './image.js';
 import { infoDefinition, runInfo } from './info.js';
 import { governanceDefinition, runGovernanceInfo } from './governance.js';
 import { resolveAuthorFilter, resolveMemberId } from './members.js';
@@ -1084,7 +1085,7 @@ function pickHits(data: unknown): RawMessage[] {
  * ただしアーカイブ済みスレッドはキャッシュに載らないことが多いので、
  * getChannelScope と同じ規則で親チャンネルの権限を見る。
  */
-function canSeeHit(ctx: AgentContext, channelId: string): boolean {
+export function canSeeHit(ctx: AgentContext, channelId: string): boolean {
   const cached = ctx.guild.channels.cache.get(channelId);
   if (cached) return canRead(cached, ctx.viewer ?? ctx.member);
 
@@ -1971,6 +1972,7 @@ export interface Toolset extends AgentToolset {
   archiveAvailable: boolean;
   browserAvailable: boolean;
   governanceAvailable: boolean;
+  imageAvailable: boolean;
   memoryAvailable: boolean;
   semanticAvailable: boolean;
 }
@@ -2016,6 +2018,11 @@ export async function buildToolset(ctx: AgentContext): Promise<Toolset> {
   if (browserAvailable) {
     entries.push({ definition: browserToolDefinition(ctx.browserFull), handler: (args) => runBrowserAction(ctx, args) });
   }
+  // 画像を読む (look) はいつでも。作る (draw) と画面を撮る (shot) は、添付できるチャンネルだけ
+  entries.push({
+    definition: imageToolDefinition({ canAttach: ctx.canAttach, browser: browserAvailable }),
+    handler: (args) => runImage(ctx, args, { canSee: (channelId) => canSeeHit(ctx, channelId) })
+  });
 
   const definitions = entries.map((entry) => entry.definition);
   const coach = createCoach();
@@ -2028,6 +2035,7 @@ export async function buildToolset(ctx: AgentContext): Promise<Toolset> {
     archiveAvailable,
     browserAvailable,
     governanceAvailable,
+    imageAvailable: true,
     memoryAvailable,
     semanticAvailable: semanticReady,
 
