@@ -100,6 +100,11 @@ function openPage(guildId: string, node: MemoryNode): string {
     lines.push(`期間: ${from === to ? from : `${from}〜${to}`}`);
   }
   if (node.body) lines.push('', node.body.length > BODY_CHARS ? `${node.body.slice(0, BODY_CHARS)}\n…(以下略)` : node.body);
+  // 長いページ (v2 の人物の子ページは時期ごとの節で数十万字になる) は頭しか見えないので、節の一覧を添えて section で開けるようにする
+  if (node.body.length > BODY_CHARS) {
+    const headings = headingsOf(node.body);
+    if (headings.length) lines.push('', `節 (section で 1 つずつ開ける): ${headings.slice(0, 60).join(' / ')}${headings.length > 60 ? ` …ほか ${headings.length - 60} 件` : ''}`);
+  }
   if (node.pending) lines.push('', 'まだ本文に統合していない新しい知識:', node.pending.trim().split('\n').slice(0, 20).join('\n'));
 
   const children = listChildren(guildId, node.path, 41);

@@ -102,7 +102,8 @@ export function arcPage(arc: Arc, output: unknown, taken: Set<string>): ArcPage 
 export async function composeArcs(ctx: Ctx, { limit = Infinity }: { limit?: number } = {}): Promise<{ arcs: number; pages: number }> {
   const arcs = planArcs(ctx.guildId).slice(0, limit);
   const d = memoryDb();
-  const taken = new Set(d.prepare<[string], { path: string }>('SELECT path FROM v2_pages WHERE guild_id = ?').all(ctx.guildId).map((row) => row.path.toLowerCase()));
+  // 筋書き自身の前回のパスは数えない (これから置き換える。数えると毎回 ~2 が付いて、パスが入れ替わり続ける)
+  const taken = new Set(d.prepare<[string], { path: string }>("SELECT path FROM v2_pages WHERE guild_id = ? AND source <> 'arc'").all(ctx.guildId).map((row) => row.path.toLowerCase()));
   const raws = new Map<number, unknown>();
   let cursor = 0;
   let stop: unknown = null;

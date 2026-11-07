@@ -122,11 +122,10 @@ export function factsOf(entity: EntityInfo): string[] {
   return facts;
 }
 
-const chunked = (groups: Group[]): Group[][] => {
-  const count = Math.ceil(groups.length / PART_MAX);
-  const size = Math.ceil(groups.length / count);
-  return Array.from({ length: count }, (_, i) => groups.slice(i * size, (i + 1) * size));
-};
+// 固定の大きさ (PART_MAX) で前から切る。主張が増えても、前のほうの部分は変わらない (= 保存した出力がそのまま使え、
+// 毎晩の更新で書き直すのは最後の部分だけ。均等に割ると、1 件増えるたびに全部の境目が動いて全部書き直しになる)
+const chunked = (groups: Group[]): Group[][] =>
+  Array.from({ length: Math.ceil(groups.length / PART_MAX) }, (_, i) => groups.slice(i * PART_MAX, (i + 1) * PART_MAX));
 
 const periodOf = (groups: Group[]): string => {
   const a = day(groups[0]?.firstAt ?? 0).slice(0, 7);

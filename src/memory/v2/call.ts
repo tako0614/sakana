@@ -51,7 +51,8 @@ export const v2Config = {
   /** S4〜S6 組み立て: 検証済みの主張から文章にする */
   compose: {
     models: list(process.env.MEMORY_V2_COMPOSE_MODELS, DEEPSEEK),
-    reasoning: effort(process.env.MEMORY_V2_COMPOSE_REASONING, LOW),
+    // 書き直しの作業なので推論は要らない (切ると費用が約 4 割減る)。保存した出力は推論の設定ごとに別なので、途中で変えると書き直しになる
+    reasoning: effort(process.env.MEMORY_V2_COMPOSE_REASONING ?? 'off', LOW),
     outputTokens: Number(process.env.MEMORY_V2_COMPOSE_TOKENS || 24000),
     temperature: 0.2,
     providerPrefs: deepseekPrefs

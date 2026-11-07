@@ -275,17 +275,37 @@ export function entityInfos(guildId: string): EntityInfo[] {
     .map((row) => ({ id: row.id, kind: row.kind, name: row.name, path: row.path, aliases: JSON.parse(row.aliases) as string[], meta: JSON.parse(row.meta) as EntityInfo['meta'] }));
 }
 
+const BUCKETS = Number(process.env.MEMORY_V2_BATCH_BUCKETS || 1500);
+const bucketOf = (path: string): number => {
+  let hash = 2166136261;
+  for (const char of path) hash = Math.imul(hash ^ char.codePointAt(0)!, 16777619) >>> 0;
+  return hash % BUCKETS;
+};
+
+/**
+ * 小さなページを 1 回の呼び出しにまとめる。まとめ方は「ページ名の hash の箱」で決める (箱の中はページ名順)。
+ * 順番に詰めると、ページが 1 つ増える・順序が変わるたびに後ろの組が全部ずれて、保存した出力が使えず全部書き直しになる。
+ * 箱なら、増えたページの箱だけが変わる (毎晩の更新で書き直すのは変わった箱だけ)。箱が大きすぎれば順に割る。
+ */
 function batches(inputs: readonly PartInput[]): PartInput[][] {
-  const out: PartInput[][] = [];
-  let current: PartInput[] = [];
-  let chars = 0;
+  const boxes = new Map<number, PartInput[]>();
   for (const input of inputs) {
-    const size = input.part.groups.reduce((sum, g) => sum + g.text.length + 40, 0);
-    if (current.length && (current.length >= BATCH_PAGES || chars + size > BATCH_CHARS)) { out.push(current); current = []; chars = 0; }
-    current.push(input);
-    chars += size;
+    const box = bucketOf(input.bundle.path);
+    boxes.set(box, [...(boxes.get(box) ?? []), input]);
   }
-  if (current.length) out.push(current);
+  const out: PartInput[][] = [];
+  for (const box of [...boxes.keys()].sort((a, b) => a - b)) {
+    const list = (boxes.get(box) ?? []).sort((a, b) => a.bundle.path.localeCompare(b.bundle.path));
+    let current: PartInput[] = [];
+    let chars = 0;
+    for (const input of list) {
+      const size = input.part.groups.reduce((sum, g) => sum + g.text.length + 40, 0);
+      if (current.length && (current.length >= BATCH_PAGES || chars + size > BATCH_CHARS)) { out.push(current); current = []; chars = 0; }
+      current.push(input);
+      chars += size;
+    }
+    if (current.length) out.push(current);
+  }
   return out;
 }
 
