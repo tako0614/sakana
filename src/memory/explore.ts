@@ -106,6 +106,34 @@ export function renderText(text: unknown): string {
     .trim();
 }
 
+/** 本文を 1 画面に収まる大きさに割る。見出し (## 時期) の手前を優先して切り、長い節は行で割る。 */
+const BODY_PART = 2400;
+export function splitBody(body: string, max = BODY_PART): string[] {
+  const parts: string[] = [];
+  let current = '';
+  const flush = (): void => { if (current) parts.push(current); current = ''; };
+  for (const section of body.split(/\n(?=#{1,2} )/)) {
+    const pieces: string[] = [];
+    if (section.length <= max) pieces.push(section);
+    else {
+      let piece = '';
+      for (const line of section.split('\n')) {
+        if (piece && piece.length + line.length + 1 > max) { pieces.push(piece); piece = ''; }
+        // 1 行が上限を超えるなら、その行を割る (本文の 1 行はふつう数百字)
+        if (line.length > max) { for (let i = 0; i < line.length; i += max) pieces.push(clip(line.slice(i, i + max), max + 1)); continue; }
+        piece += (piece ? '\n' : '') + line;
+      }
+      if (piece) pieces.push(piece);
+    }
+    for (const piece of pieces) {
+      if (current && current.length + piece.length + 1 > max) flush();
+      current += (current ? '\n' : '') + piece;
+    }
+  }
+  flush();
+  return parts.length ? parts : [''];
+}
+
 function nodeById(guildId: string, id: unknown): MemoryNode | null {
   const row = memoryDb().prepare<[string, number], { path: string }>('SELECT path FROM nodes WHERE guild_id = ? AND id = ?').get(guildId, Number(id));
   return row ? getNode(guildId, row.path) : null;
@@ -161,12 +189,15 @@ function pageCount(guildId: string, path: string): number {
   return memoryDb().prepare<[string, string], { c: number }>("SELECT COUNT(*) AS c FROM nodes WHERE guild_id = ? AND path LIKE ? ESCAPE '\\'").get(guildId, like)?.c ?? 0;
 }
 
-export function pageView(guildId: string, node: MemoryNode, { offset = 0, shared = false }: { offset?: number; shared?: boolean } = {}): MemoryView {
+export function pageView(guildId: string, node: MemoryNode, { offset = 0, shared = false, part = 0 }: { offset?: number; shared?: boolean; part?: number } = {}): MemoryView {
   const isRoot = !node.path;
   const lines: string[] = [];
   if (node.summary && !isRoot) lines.push(`*${node.summary}*`, '');
+  // 長い本文 (v2 の人物の子ページは数十万字) は、画面に収まる大きさに割って、前後の本文のボタンで読む
+  const bodyParts = node.body ? splitBody(node.body) : [];
+  const partIndex = Math.max(0, Math.min(part, bodyParts.length - 1));
   if (node.body) {
-    lines.push(renderText(node.body));
+    lines.push(renderText(bodyParts[partIndex] ?? node.body));
   } else if (node.pending) {
     // まだ本文に書き直していないページは、溜まった知識を短く見せる
     const facts = node.pending.trim().split('\n').map((line) => renderText(line.replace(/^-\s*/, ''))).filter(Boolean);
@@ -202,7 +233,8 @@ export function pageView(guildId: string, node: MemoryNode, { offset = 0, shared
   }
   // 本文はあるが、まだ本文に入っていない知識がある (本文は長いので末尾に書くと切れる。足元に出す)
   const waiting = node.body && node.pending ? node.pending.split('\n').filter(Boolean).length : 0;
-  const footer = [node.first_at ? `期間 ${month(node.first_at)}〜${month(node.last_at ?? node.first_at)}` : null,
+  const footer = [bodyParts.length > 1 ? `本文 ${partIndex + 1}/${bodyParts.length}` : null,
+    node.first_at ? `期間 ${month(node.first_at)}〜${month(node.last_at ?? node.first_at)}` : null,
     node.updated_at ? `更新 ${day(node.updated_at)}` : null,
     waiting ? `📝 本文に入る前の知識 ${waiting} 件` : null].filter(Boolean).join(' · ');
   if (footer) embed.setFooter({ text: footer });
@@ -239,6 +271,16 @@ export function pageView(guildId: string, node: MemoryNode, { offset = 0, shared
       { disabled: offset + CHILDREN_PER_PAGE >= totalChildren }));
   }
   components.push(buttonRow(...nav));
+  if (bodyParts.length > 1) {
+    const to = (index: number): string => `${PREFIX}:n:${node.id}:${offset}:${index}`;
+    components.push(buttonRow(
+      button(to(0), '⏮ 最初', { disabled: partIndex === 0 }),
+      button(to(Math.max(0, partIndex - 1)), '◀ 前の本文', { disabled: partIndex === 0 }),
+      button(`${PREFIX}:noop:body`, `${partIndex + 1}/${bodyParts.length}`, { disabled: true }),
+      button(to(Math.min(bodyParts.length - 1, partIndex + 1)), '次の本文 ▶', { disabled: partIndex >= bodyParts.length - 1 }),
+      button(to(bodyParts.length - 1), '最新 ⏭', { disabled: partIndex >= bodyParts.length - 1 })
+    ));
+  }
   const tools = [button(`${PREFIX}:s`, '🔍 探す', { style: ButtonStyle.Primary })];
   if (episodes.length) tools.push(button(`${PREFIX}:t:${node.id}:0`, '🕒 年表'));
   tools.push(shareButton(isRoot ? 'root' : `n:${node.id}:${offset}`, shared));
@@ -384,12 +426,12 @@ export function viewFor(guildId: string, target: unknown, { shared = false, canQ
 
 function buildView(guildId: string, target: unknown, { shared, canQuote }: { shared: boolean; canQuote: QuoteFilter }): MemoryView {
   if (target === 'root') return rootView(guildId, { shared });
-  const [kind, id, extra] = String(target).split(':');
+  const [kind, id, extra, partRaw] = String(target).split(':');
   if (kind === 'e') return episodeView(guildId, Number(id), { fromId: idOf(extra), shared, canQuote });
   const node = nodeById(guildId, id);
   if (!node) return rootView(guildId, { shared });
   if (kind === 't') return timelineView(guildId, node, { offset: offsetOf(extra), shared });
-  return pageView(guildId, node, { offset: offsetOf(extra), shared });
+  return pageView(guildId, node, { offset: offsetOf(extra), shared, part: offsetOf(partRaw) });
 }
 
 // 新しいメッセージ (共有・自分で開く・/memory explore の最初の画面) は、embed とメニューを合わせた大きさにも上限がある。日本語は1文字3バイトなので、

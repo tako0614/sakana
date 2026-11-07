@@ -513,6 +513,34 @@ for (const offset of ['-5', '1e400', '99999999999999999999']) {
   assert.ok(clip('あ'.repeat(200), 100).length <= 100, 'clip stays within the limit');
 }
 
+// 長い本文 (v2 の人物の子ページは数十万字) は、画面に収まる大きさに割って、前後のボタンで読める
+{
+  const { splitBody, viewFor } = await import('../src/memory/explore.js');
+  const sections = Array.from({ length: 40 }, (_, i) => `## 2025-${String((i % 12) + 1).padStart(2, '0')} (${i})\n${Array.from({ length: 12 }, (_, j) => `- ${i}-${j} ${'あ'.repeat(60)} [e${i * 20 + j + 1}]`).join('\n')}`);
+  const long = sections.join('\n\n');
+  const parts = splitBody(long);
+  assert.ok(parts.length > 5, `long body is split: ${parts.length}`);
+  assert.ok(parts.every((part) => part.length <= 2400 + 120), 'every part fits one screen');
+  assert.equal(parts.join('\n').replace(/\s+/g, ''), long.replace(/\s+/g, ''), 'splitting loses nothing');
+  assert.ok(parts.slice(1, -1).every((part) => part.startsWith('## ')), 'parts start at a heading when possible');
+  assert.equal(splitBody('short body').length, 1);
+  store.ensureNode(GUILD, 'people/長いページ', { summary: '長い本文のテスト' });
+  store.writePage(GUILD, 'people/長いページ', { body: long });
+  const id = store.getNode(GUILD, 'people/長いページ').id;
+  const first = viewFor(GUILD, `n:${id}`, { shared: false, canQuote: () => true });
+  const firstJson = first.embeds[0].toJSON();
+  assert.match(firstJson.footer.text, /本文 1\/\d+/, 'the footer says which part is shown');
+  const bodyRow = first.components.map((row) => row.toJSON()).find((row) => row.components.some((c) => /本文/.test(c.label ?? '')));
+  assert.ok(bodyRow, 'there is a row to move between parts');
+  assert.equal(bodyRow.components.find((c) => /次の本文/.test(c.label)).custom_id, `memx:n:${id}:0:1`);
+  assert.ok(first.components.length <= 5, 'at most five action rows');
+  const last = viewFor(GUILD, `n:${id}:0:${parts.length - 1}`, { shared: false, canQuote: () => true }).embeds[0].toJSON();
+  assert.match(last.footer.text, new RegExp(`本文 ${parts.length}/${parts.length}`));
+  assert.notEqual(last.description, firstJson.description, 'the last part differs from the first');
+  const beyond = viewFor(GUILD, `n:${id}:0:9999`, { shared: false, canQuote: () => true }).embeds[0].toJSON();
+  assert.match(beyond.footer.text, new RegExp(`本文 ${parts.length}/${parts.length}`), 'a too-large part falls back to the last one');
+}
+
 globalThis.__restoreSiteEnv?.();
 store.resetTree(GUILD);
 archive.prepare('DELETE FROM messages WHERE guild_id = ?').run(GUILD);
