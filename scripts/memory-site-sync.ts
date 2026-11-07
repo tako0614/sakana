@@ -422,6 +422,18 @@ async function main(): Promise<void> {
   archive?.pragma('busy_timeout = 30000');
   try {
     for (const guildId of guilds) {
+      // 公開しない (off) サーバーは、記憶の中身を送らない。見えないのに数万行を書き込むだけになる
+      // (2026-11-07 に記憶を作り直して 8,700 ページ・7 万出来事になった。Evex は off)。公開状態だけは毎回送り直す。
+      // 公開 (members / public) に変えれば、次の同期で差分が送られる。--force で off でも送る
+      if (!fromFile && !outFile && memory && url && token && args['dry-run'] !== true && args.force !== true) {
+        let off = false;
+        try { off = (memory.prepare('SELECT access FROM site_access WHERE guild_id = ?').get(guildId) as { access?: string } | undefined)?.access === 'off'; } catch { /* 表が無ければ送る */ }
+        if (off) {
+          const pushed = await pushSiteAccess(guildId, 'off', null, { env: process.env });
+          console.log(`[${guildId}] access off: ${pushed.ok ? 'sent' : `not sent (${pushed.reason ?? '?'})`} / 公開しないので記憶の中身は送りません`);
+          continue;
+        }
+      }
       let snapshot: Snapshot;
       if (fromFile) {
         snapshot = JSON.parse(readFileSync(fromFile, 'utf8')) as Snapshot;

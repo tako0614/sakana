@@ -144,3 +144,14 @@ node --import tsx scripts/memory-v2.ts sample / show / status / labelpack / veri
 - 語彙 (文字 3-gram BM25) と融合 (RRF) で e5-small の B2 は 67.8 → 78.0、ruri は 81.0 → 84.3。
 - 判定モデル (jev) で上位 20 件を 1 回で再順位づけ: hit@1 72 → 87%、hit@3 81 → 91%。
   依頼そのものに「このコミュニティの具体的な話に触れているか」を 1 問聞く入口の門は、関係ある質問の 82% (閾値 0.2) を通し、関係ない質問を 100% 止めた。
+
+## 切り替え済み (2026-11-07)
+
+- 本番の `memory.sqlite` は v2 (構築: 2,332 区間 + 追い込み 187 区間、ページ 8,702・出来事 69,783・主張 約 8 万、費用 約 $7.6)。
+  旧版は `/root/sakana/data/memory-v1-20261107T004008Z.sqlite` に退避してある。リリースは `releases/20261107T004008Z-memory-v2-live`。
+- 戻すとき: `sakana` を止め、`memory.sqlite` を別名に退避して `memory-v1-*.sqlite` を `memory.sqlite` に戻し、
+  `/etc/systemd/system/sakana.service.d/90-release.conf` と `sakana-memory-site.service.d` の release を前のもの (`/root/sakana/` の `*.bak-*` に控え) に戻して再起動、
+  `sakana-memory.timer` (v1 の builder) を enable、`sakana-memory-v2.timer` を disable。
+- 毎日 03:30 (UTC) に `sakana-memory-v2.service` が `memory-v2.ts update --live` を回す。検証なし・組み立ての推論なし (最低コスト)。1 回数十円以下の見込み。
+- 公開しない (off) サーバーは、サイトの同期 (`memory-site-sync.ts`) が記憶の中身を送らない (公開状態だけ送る)。Evex は off のまま。
+- 長いページ (人物の子ページは 15 万〜20 万字) は、`memory` ツールが頭の 6,000 字と節の一覧を返し、`section` で時期ごとに開ける。
