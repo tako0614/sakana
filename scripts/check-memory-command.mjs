@@ -224,7 +224,7 @@ assert.match(embedText(search.calls[1][1]), /統治機能を作った/);
 }
 
 // explore: メニューでたどる。部品は Discord の制限内で組み立てられる
-const { citeMenu, handleMemoryComponent, rootView } = await import('../src/memory/explore.js');
+const { citeMenu, citeRows, handleMemoryComponent, rootView } = await import('../src/memory/explore.js');
 const explore = interaction({ sub: 'explore', admin: false, options: { path: '' } });
 await memoryCommand.execute(explore);
 const first = explore.calls[1][1];
@@ -366,6 +366,21 @@ assert.deepEqual(siteButtons(episodeJson).map((b) => b.custom_id), [`memx:site:e
   assert.match(shown.embeds[0].title ?? shown.embeds[0].description, /統治機能を作った/, 'it shows the episode');
   assert.deepEqual(siteButtons(shown), [], 'no site button while the site is off');
   checkLimits(shown, 'cite');
+
+  // 回答の下の根拠: 発言はリンクボタン (1 行 5 個・最大 2 行)、そのあとにメニュー。中身が無ければ行を足さない
+  const messageUrl = (n) => `https://discord.com/channels/${GUILD}/${CHANNEL}/14000000000000000${String(n).padStart(2, '0')}`;
+  const rowsOf = citeRows(GUILD, {
+    sources: [{ kind: 'episode', id: episodeId, label: '統治機能を作った' }],
+    messages: Array.from({ length: 7 }, (_, i) => ({ url: messageUrl(i + 1), label: `たこのメッセージ${i ? '②' : ''}` }))
+  }).map((r) => r.toJSON());
+  assert.deepEqual(rowsOf.map((r) => r.components.length), [5, 2, 1], 'buttons 5 + 2, then the menu');
+  assert.equal(rowsOf[0].components[0].style, 5, 'a link button');
+  assert.equal(rowsOf[0].components[0].url, messageUrl(1));
+  assert.equal(rowsOf[0].components[0].custom_id, undefined, 'a link button has no custom id');
+  assert.equal(rowsOf[2].components[0].custom_id, 'memx:cite');
+  assert.equal(citeRows(GUILD, { sources: [], messages: [] }).length, 0, 'nothing to show, no rows');
+  assert.equal(citeRows(GUILD, { sources: [], messages: [{ url: 'https://evil.example/x', label: 'x' }] }).length, 0, 'only Discord message links become buttons');
+  assert.ok(citeRows(GUILD, { sources: [], messages: Array.from({ length: 14 }, (_, i) => ({ url: messageUrl(i + 1), label: `m${i}` })) }).length <= 2, 'at most two rows of buttons');
 
   // 記事を選ぶと、その記事の画面が選んだ人にだけ出る
   const pickPage = click({ customId: 'memx:cite', values: [`n:${siteNodeId}`], allowReply: true });

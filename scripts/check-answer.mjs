@@ -871,6 +871,43 @@ try {
   console.log('citation labels ok (発言は[たこのメッセージ]のリンク / 出来事は[題]+一覧 / 重複は丸数字 / 5件まで)');
 }
 
+// --- 出典は本文に残さず、回答の下に並べる (below) ---
+{
+  const { expandCitationsDetailed } = formatModule;
+  const labels = {
+    below: true,
+    message: (entry) => `${{ 1: 'たこ', 2: 'たこ', 3: 'さば' }[Number(entry.messageId.slice(-1))]}のメッセージ`,
+    episode: (id) => ({ 12: 'テトリス杯の決勝', 13: '言い合い' })[id] ?? null,
+    page: (path) => (path === 'people/たこ' ? { id: 7, label: 'たこの記事' } : null)
+  };
+  const out = expandCitationsDetailed('4月に書いてる [1]。7月にも [2]。決勝は荒れた [e12]。作者は [p:people/たこ]。作り話 [e99] [p:people/いない]。', tableOf(3), { labels });
+  if (out.text !== '4月に書いてる。7月にも。決勝は荒れた。作者は。作り話。') fail(`本文に目印を残さない: ${out.text}`);
+  if (/[\[\]①②]/.test(out.text)) fail(`括弧も丸数字も本文に出ない: ${out.text}`);
+  if (JSON.stringify(out.messages) !== JSON.stringify([{ url: msgUrl(1), label: 'たこのメッセージ' }, { url: msgUrl(2), label: 'たこのメッセージ②' }])) fail(`発言は下に並べる (同じ名前は丸数字): ${JSON.stringify(out.messages)}`);
+  if (JSON.stringify(out.sources) !== JSON.stringify([{ kind: 'episode', id: 12, label: 'テトリス杯の決勝' }, { kind: 'page', id: 7, label: 'たこの記事' }])) fail(`出来事と記事は一覧に: ${JSON.stringify(out.sources)}`);
+
+  // 同じ発言を何度引いても 1 つ。引いていない発言は並ばない。自分の発言は並べない
+  const again = expandCitationsDetailed('まず [1]、あとで [1]。', tableOf(3), { labels });
+  if (again.text !== 'まず、あとで。' || again.messages.length !== 1) fail(`同じ発言は 1 つ: ${JSON.stringify(again)}`);
+  const refs = tableOf(2);
+  refs.add({ messageId: '100000000000000099', channelId: 'c1', guildId: 'g1', authorId: 'bot-1' });
+  const mine = expandCitationsDetailed('自分の話 [3]。', refs, { labels, selfId: 'bot-1' });
+  if (mine.text !== '自分の話。' || mine.messages.length !== 0) fail(`自分の発言は根拠にしない: ${JSON.stringify(mine)}`);
+
+  // ボタンの数 (2 行 × 5) を超えた発言は並べない。本文の番号は消える
+  const many = expandCitationsDetailed(Array.from({ length: 12 }, (_, i) => `[${i + 1}]`).join(' '), tableOf(12), { labels });
+  if (many.messages.length !== 10 || /\[\d+\]/.test(many.text)) fail(`発言のボタンは 10 個まで: ${many.messages.length} ${many.text}`);
+
+  // 添字は引用ではない (下に並べない)
+  const index = expandCitationsDetailed('items[1] と grid[1][2]', tableOf(3), { labels });
+  if (index.text !== 'items[1] と grid[1][2]' || index.messages.length !== 0) fail(`添字は触らない: ${index.text}`);
+
+  // 末尾のモデル名は残る
+  const tagged = expandCitationsDetailed('本文 [1]', tableOf(1), { labels, label: 'deepseek' });
+  if (tagged.text !== '本文\n\n-# deepseek') fail(`モデルの表示は残る: ${JSON.stringify(tagged.text)}`);
+  console.log('citation below ok (本文に目印を残さない / 発言はボタン / 出来事・記事はメニュー / 重複・自分の発言・上限)');
+}
+
 // ブラウザの通信の関門 (DNS リバインディング対策と、断る理由に IP を書かないこと)。
 // package.json の check から呼ばれるのはこのファイルなので、ここから読み込む。
 await import('./check-browser-guard.mjs');

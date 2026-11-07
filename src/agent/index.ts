@@ -18,7 +18,7 @@ import {
 } from 'discord.js';
 import { canBotAttach, canBotSpeak, canManageIndex, getChannelScope, getPublicChannelScope } from '../archive/permissions.js';
 import { conversationText, meaningReader, recallWithMeaning, type RecallParts } from '../memory/recall.js';
-import { citeMenu } from '../memory/explore.js';
+import { citeRows } from '../memory/explore.js';
 import { getEpisode, getNode, nameOf } from '../memory/store.js';
 import { db as archiveDb } from '../archive/db.js';
 import { isSelfHosted } from '../mimic/client.js';
@@ -584,16 +584,16 @@ export async function handleAgentRequest(
       ambient.report('passed');
       return;
     }
-    // 出典は「[たこのメッセージ]」のようなラベルにする (ラベルはコードが作る。モデルは [3] / [e12] / [p:people/たこ] を書くだけ)。
-    // 発言のラベルは元の発言へのリンク、出来事・記事のラベルは同じ名前のメニューから Discord の中で開く (サイトが無くても開ける)
+    // 出典は本文に残さず、回答の下の「根拠」に並べる (モデルは [3] / [e12] / [p:people/たこ] を書くだけ。ラベルはコードが作る)。
+    // 発言は元の発言へ飛ぶリンクボタン、出来事・記事はメニューから Discord の中で開く (サイトが無くても開ける)
     const expanded = text
       ? expandCitationsDetailed(softenUnverifiedQuotes(stripAddressNarration(dropRestartedAnswer(text), member.displayName), result.observed), refs, {
         label: modelLabel(model), selfId: client.user.id,
-        labels: { message: (entry) => citedMessageLabel(guild, entry), episode: (id) => memoryEpisodeLabel(guild.id, id), page: (path) => memoryPageLabel(guild.id, path) }
+        labels: { below: true, message: (entry) => citedMessageLabel(guild, entry), episode: (id) => memoryEpisodeLabel(guild.id, id), page: (path) => memoryPageLabel(guild.id, path) }
       })
       : null;
     const answer = expanded ? expanded.text : 'うまく答えをまとめられませんでした。条件を絞ってもう一度聞いてください。';
-    const citeRow = expanded ? citeMenu(guild.id, expanded.sources) : null;
+    const citeRowList = expanded ? citeRows(guild.id, expanded) : [];
 
     // 撮ったのに貼れないときは黙らない (画像が出ている前提で読まれる)
     const blocked = runContext.screenshots.length > 0 && !runContext.canAttach;
@@ -623,7 +623,7 @@ export async function handleAgentRequest(
         allowedMentions: index === 0 && !ambient ? PING_ASKER : NO_MENTIONS,
         // 添付と根拠のメニューは最後のメッセージにまとめてつける
         ...(index === chunks.length - 1 && files.length > 0 ? { files } : {}),
-        ...(index === chunks.length - 1 && citeRow ? { components: [citeRow] } : {})
+        ...(index === chunks.length - 1 && citeRowList.length > 0 ? { components: citeRowList } : {})
       };
 
       const sent = index === 0

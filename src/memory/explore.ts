@@ -491,6 +491,24 @@ export function citeMenu(guildId: string, sources: readonly { kind: 'episode' | 
   return options.length ? select(`${PREFIX}:cite`, '📜 根拠を開く', options) : null;
 }
 
+/**
+ * 回答の下の「根拠」。発言は、押すとその発言に飛ぶリンクボタン (1 行 5 個。最大 2 行)、出来事・記事は citeMenu のメニュー。
+ * 本文には出典の目印を置かず、ここだけに並べる。何も無ければ空 (行を足さない)。
+ */
+export function citeRows(
+  guildId: string,
+  { sources, messages }: { sources: readonly { kind: 'episode' | 'page'; id: number; label: string }[]; messages: readonly { url: string; label: string }[] }
+): (ButtonRow | MenuRow)[] {
+  const rows: (ButtonRow | MenuRow)[] = [];
+  const links = messages
+    .filter((entry) => /^https:\/\/discord\.com\/channels\/\d+\/\d+\/\d+$/.test(entry.url))
+    .map((entry) => new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(entry.url).setLabel(clip(entry.label, 80)));
+  for (let i = 0; i < links.length && rows.length < 2; i += 5) rows.push(buttonRow(...links.slice(i, i + 5)));
+  const menu = citeMenu(guildId, sources);
+  if (menu) rows.push(menu);
+  return rows;
+}
+
 /** 原文を出してよいかを調べるチャンネル。アーカイブ済みのスレッドはキャッシュに無いので親で判定する (非公開スレッドは出さない)。 */
 function sourceChannel(guild: Guild, channelId: string): GuildBasedChannel | null {
   const cached = guild.channels.cache.get(channelId);
