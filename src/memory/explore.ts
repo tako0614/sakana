@@ -272,13 +272,15 @@ export function pageView(guildId: string, node: MemoryNode, { offset = 0, shared
   }
   components.push(buttonRow(...nav));
   if (bodyParts.length > 1) {
-    const to = (index: number): string => `${PREFIX}:n:${node.id}:${offset}:${index}`;
+    // 1 つのメッセージの中で部品の ID は重複できない。端では「最初」と「前」が同じ番号を指すので、役割の印を付けて分ける
+    // (末尾の印は画面の切り替えでは読まれない)。2026-11-07 に Invalid Form Body (COMPONENT_CUSTOM_ID_DUPLICATED) で開けなくなった
+    const to = (index: number, role: string): string => `${PREFIX}:n:${node.id}:${offset}:${index}:${role}`;
     components.push(buttonRow(
-      button(to(0), '⏮ 最初', { disabled: partIndex === 0 }),
-      button(to(Math.max(0, partIndex - 1)), '◀ 前の本文', { disabled: partIndex === 0 }),
+      button(to(0, 'first'), '⏮ 最初', { disabled: partIndex === 0 }),
+      button(to(Math.max(0, partIndex - 1), 'prev'), '◀ 前の本文', { disabled: partIndex === 0 }),
       button(`${PREFIX}:noop:body`, `${partIndex + 1}/${bodyParts.length}`, { disabled: true }),
-      button(to(Math.min(bodyParts.length - 1, partIndex + 1)), '次の本文 ▶', { disabled: partIndex >= bodyParts.length - 1 }),
-      button(to(bodyParts.length - 1), '最新 ⏭', { disabled: partIndex >= bodyParts.length - 1 })
+      button(to(Math.min(bodyParts.length - 1, partIndex + 1), 'next'), '次の本文 ▶', { disabled: partIndex >= bodyParts.length - 1 }),
+      button(to(bodyParts.length - 1, 'last'), '最新 ⏭', { disabled: partIndex >= bodyParts.length - 1 })
     ));
   }
   const tools = [button(`${PREFIX}:s`, '🔍 探す', { style: ButtonStyle.Primary })];

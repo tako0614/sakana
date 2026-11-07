@@ -532,7 +532,15 @@ for (const offset of ['-5', '1e400', '99999999999999999999']) {
   assert.match(firstJson.footer.text, /本文 1\/\d+/, 'the footer says which part is shown');
   const bodyRow = first.components.map((row) => row.toJSON()).find((row) => row.components.some((c) => /本文/.test(c.label ?? '')));
   assert.ok(bodyRow, 'there is a row to move between parts');
-  assert.equal(bodyRow.components.find((c) => /次の本文/.test(c.label)).custom_id, `memx:n:${id}:0:1`);
+  assert.match(bodyRow.components.find((c) => /次の本文/.test(c.label)).custom_id, new RegExp(`^memx:n:${id}:0:1:`));
+  // どの位置でも、1 つのメッセージの中で部品の custom_id は重複しない (Discord が Invalid Form Body で拒む)。端と端の一つ手前が危ない
+  for (const part of [0, 1, 2, parts.length - 2, parts.length - 1]) {
+    for (const shared of [false, true]) {
+      const view = viewFor(GUILD, `n:${id}:0:${part}`, { shared, canQuote: () => true });
+      const ids = view.components.flatMap((row) => row.toJSON().components.map((c) => c.custom_id)).filter(Boolean);
+      assert.equal(ids.length, new Set(ids).size, `custom_id duplicated at part ${part}${shared ? ' (shared)' : ''}: ${ids.join(' ')}`);
+    }
+  }
   assert.ok(first.components.length <= 5, 'at most five action rows');
   const last = viewFor(GUILD, `n:${id}:0:${parts.length - 1}`, { shared: false, canQuote: () => true }).embeds[0].toJSON();
   assert.match(last.footer.text, new RegExp(`本文 ${parts.length}/${parts.length}`));
