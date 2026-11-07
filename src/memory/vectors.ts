@@ -132,7 +132,8 @@ export async function syncMemoryVectors(guildId: string,
   try {
     const db = memoryDb();
     // 先に本文から断片の表を作り直す (builder が書き直したぶんだけ変わる。SQL だけで済む)
-    syncChunks(guildId);
+    // 主張のある記憶 (v2) は主張が 1 つの知識なので、本文を 1 行ずつに割った断片の表は作らない (本文が数十万字になるページもある)
+    if (!hasClaims(guildId)) syncChunks(guildId);
     syncClaimFts(guildId);
     const items = itemsOf(guildId);
     const stored = new Map<string, string>();

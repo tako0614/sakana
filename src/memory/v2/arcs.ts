@@ -180,7 +180,10 @@ export async function composeRoot(ctx: Ctx): Promise<boolean> {
   });
   ctx.counters.calls += result.cached ? 0 : 1;
   ctx.counters.cost += result.cost;
-  const body = String((result.json as { body: string }).body).trim().slice(0, Math.round(treeConfig.rootChars * 1.5));
+  // 長すぎるときは、途中で切らず、収まる最後の行で終える (リストの途中で切れた根を常駐させない)
+  const raw = String((result.json as { body: string }).body).trim();
+  const limit = Math.round(treeConfig.rootChars * 1.5);
+  const body = raw.length <= limit ? raw : raw.slice(0, Math.max(raw.lastIndexOf('\n', limit), Math.floor(limit / 2))).trimEnd();
   memoryDb().prepare(`
     INSERT OR REPLACE INTO v2_pages (guild_id, path, entity_id, summary, body, aliases, weight, claims, cited, source, first_at, last_at, updated_at)
     VALUES (?, '', NULL, '', ?, '[]', 0, 0, 0, 'root', NULL, NULL, ?)
