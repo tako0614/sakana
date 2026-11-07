@@ -7,7 +7,7 @@ import {
 import { db as archive } from '../archive/db.js';
 import { canRead } from '../archive/permissions.js';
 import {
-  countChildren, episodeTimeline, episodesFor, getEpisode, getNode, linkedPages, listChildren, loadPublicChannels,
+  countChildren, episodeTimeline, episodesFor, getEpisode, getNode, getSiteAccess, linkedPages, listChildren, loadPublicChannels,
   memoryDb, nameOf, parentOf, searchEpisodes, searchNodes, topLevels, type MemoryNode
 } from './store.js';
 import { replyWithSiteLink, siteConfigFor, type SiteTarget } from './site.js';
@@ -153,7 +153,8 @@ const buttonRow = (...buttons: ButtonBuilder[]): ButtonRow => new ActionRowBuild
  * サイトの設定が無い・別のサーバーなら null (ボタンを出さない)。target は画面と同じ表し方 (root / n:<ページ> / e:<出来事>)。
  */
 function siteButton(guildId: string, target: string): ButtonBuilder | null {
-  return siteConfigFor(guildId) ? button(`${PREFIX}:site:${target}`, '🌐 サイトで開く') : null;
+  // サイトを公開していない (off) サーバーには、開けないリンクを出さない。画面は Discord の中だけで使える
+  return siteConfigFor(guildId) && getSiteAccess(guildId) !== 'off' ? button(`${PREFIX}:site:${target}`, '🌐 サイトで開く') : null;
 }
 
 /** 画面の target を、サイトの行き先にする。存在しなければ null。 */
@@ -470,6 +471,26 @@ export function fitShared(view: MemoryView): MemoryView {
   return view;
 }
 
+/**
+ * エージェントの回答に付ける「根拠を開く」メニュー。選ぶと、その出来事・記事の画面 (explore と同じ) を、選んだ人にだけ出す。
+ * 回答の本文は [出来事の題] [たこの記事] というラベルだけ置き、本文の文字は押せないので、同じラベルをここに並べる。サイトが無くても開ける。
+ */
+export function citeMenu(guildId: string, sources: readonly { kind: 'episode' | 'page'; id: number; label: string }[]): MenuRow | null {
+  const options: MenuOption[] = [];
+  for (const entry of sources) {
+    if (entry.kind === 'page') {
+      const node = nodeById(guildId, entry.id);
+      if (!node) continue;
+      options.push({ label: clip(`[${entry.label}]`, 100), description: clip(`記事 ${node.path}${node.summary ? ` ${node.summary}` : ''}`, 100), value: `n:${node.id}` });
+      continue;
+    }
+    const episode = getEpisode(guildId, entry.id);
+    if (!episode) continue;
+    options.push({ label: clip(`[${entry.label}]`, 100), description: clip(`${day(episode.at_ms)}${episode.kind ? ` ${episode.kind}` : ''} ${episode.title}`, 100), value: `e:${episode.id}` });
+  }
+  return options.length ? select(`${PREFIX}:cite`, '📜 根拠を開く', options) : null;
+}
+
 /** 原文を出してよいかを調べるチャンネル。アーカイブ済みのスレッドはキャッシュに無いので親で判定する (非公開スレッドは出さない)。 */
 function sourceChannel(guild: Guild, channelId: string): GuildBasedChannel | null {
   const cached = guild.channels.cache.get(channelId);
@@ -568,6 +589,13 @@ export async function handleMemoryComponent(interaction: MemoryInteraction): Pro
     const viewerQuotes = viewerQuoteFilter(interaction);
     const sharedQuotes = sharedQuoteFilter(interaction);
     if (action === 'noop') { await interaction.deferUpdate(); return true; }
+    // 回答の根拠のメニュー: 回答は書き換えず、選んだ人にだけ出来事の画面を出す
+    if (action === 'cite') {
+      const picked = interaction.isStringSelectMenu?.() ? interaction.values[0] ?? '' : '';
+      if (!/^[en]:\d{1,12}$/.test(picked)) { await interaction.deferUpdate(); return true; }
+      await reply(fitShared(viewFor(guildId, picked, { canQuote: viewerQuotes })), { ephemeral: true });
+      return true;
+    }
     // 探す: ボタンで入力欄を出し、送られたら結果の画面に差し替える (入力欄は最初の返事でしか出せない)
     if (action === 's' && !interaction.isModalSubmit()) { await interaction.showModal(searchModal()); return true; }
     if (action === 'q' && interaction.isModalSubmit?.()) {

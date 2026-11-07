@@ -18,8 +18,9 @@ import {
 } from 'discord.js';
 import { canBotAttach, canBotSpeak, canManageIndex, getChannelScope, getPublicChannelScope } from '../archive/permissions.js';
 import { conversationText, meaningReader, recallWithMeaning, type RecallParts } from '../memory/recall.js';
-import { siteConfigFor, siteUrl } from '../memory/site.js';
-import { getEpisode } from '../memory/store.js';
+import { citeMenu } from '../memory/explore.js';
+import { getEpisode, getNode, nameOf } from '../memory/store.js';
+import { db as archiveDb } from '../archive/db.js';
 import { isSelfHosted } from '../mimic/client.js';
 import { engineFor } from '../mimic/prefs.js';
 import { handleMimicRequest } from '../mimic/respond.js';
@@ -36,7 +37,7 @@ import {
   RefTable,
   chunkForDiscord,
   describeExtras,
-  expandCitations,
+  expandCitationsDetailed,
   fromDiscordMessage
 } from './format.js';
 import { runAgent } from './llm.js';
@@ -583,11 +584,16 @@ export async function handleAgentRequest(
       ambient.report('passed');
       return;
     }
-    const answer = text
-      ? expandCitations(softenUnverifiedQuotes(stripAddressNarration(dropRestartedAnswer(text), member.displayName), result.observed), refs, {
-        label: modelLabel(model), selfId: client.user.id, episodeUrl: (id) => memoryEpisodeUrl(guild.id, id)
+    // 出典は「[たこのメッセージ]」のようなラベルにする (ラベルはコードが作る。モデルは [3] / [e12] / [p:people/たこ] を書くだけ)。
+    // 発言のラベルは元の発言へのリンク、出来事・記事のラベルは同じ名前のメニューから Discord の中で開く (サイトが無くても開ける)
+    const expanded = text
+      ? expandCitationsDetailed(softenUnverifiedQuotes(stripAddressNarration(dropRestartedAnswer(text), member.displayName), result.observed), refs, {
+        label: modelLabel(model), selfId: client.user.id,
+        labels: { message: (entry) => citedMessageLabel(guild, entry), episode: (id) => memoryEpisodeLabel(guild.id, id), page: (path) => memoryPageLabel(guild.id, path) }
       })
-      : 'うまく答えをまとめられませんでした。条件を絞ってもう一度聞いてください。';
+      : null;
+    const answer = expanded ? expanded.text : 'うまく答えをまとめられませんでした。条件を絞ってもう一度聞いてください。';
+    const citeRow = expanded ? citeMenu(guild.id, expanded.sources) : null;
 
     // 撮ったのに貼れないときは黙らない (画像が出ている前提で読まれる)
     const blocked = runContext.screenshots.length > 0 && !runContext.canAttach;
@@ -615,8 +621,9 @@ export async function handleAgentRequest(
         // 1通目だけ聞いた人に通知する。2通目以降で鳴らすと同じ答えで2回鳴る。
         // モデルの文章に @everyone / ロールが入っていても、どちらも parse が空なので通知にならない。
         allowedMentions: index === 0 && !ambient ? PING_ASKER : NO_MENTIONS,
-        // 添付は最後のメッセージにまとめてつける
-        ...(index === chunks.length - 1 && files.length > 0 ? { files } : {})
+        // 添付と根拠のメニューは最後のメッセージにまとめてつける
+        ...(index === chunks.length - 1 && files.length > 0 ? { files } : {}),
+        ...(index === chunks.length - 1 && citeRow ? { components: [citeRow] } : {})
       };
 
       const sent = index === 0
@@ -652,11 +659,27 @@ export async function handleAgentRequest(
   }
 }
 
-/** 記憶の出来事 (e12) の URL。サイトが無いサーバー・実在しない番号 (モデルの作り話) は null。 */
-function memoryEpisodeUrl(guildId: string, id: number): string | null {
-  const config = siteConfigFor(guildId);
-  if (!config || !Number.isSafeInteger(id) || id <= 0) return null;
-  return getEpisode(guildId, id) ? siteUrl(config.origin, guildId, { kind: 'episode', id }) : null;
+/** 記憶の出来事 (e12) のラベル (出来事の題)。実在しない番号 (モデルの作り話) は null。 */
+function memoryEpisodeLabel(guildId: string, id: number): string | null {
+  if (!Number.isSafeInteger(id) || id <= 0) return null;
+  return getEpisode(guildId, id)?.title ?? null;
+}
+
+/** 記憶の記事 ([p:people/たこ]) の id とラベル「たこの記事」。中身のある実在の記事だけ (モデルの作り話・空の記事は null)。 */
+function memoryPageLabel(guildId: string, path: string): { id: number; label: string } | null {
+  const node = getNode(guildId, path);
+  if (!node || !node.path || !(node.body || node.summary)) return null;
+  return { id: node.id, label: `${nameOf(node.path)}の記事` };
+}
+
+/** 発言 ([3]) のラベル「たこのメッセージ」。名前は今のサーバーでの表示名、無ければアーカイブの名前。 */
+function citedMessageLabel(guild: { members: { cache: { get(id: string): { displayName?: string } | undefined } } }, entry: { authorId?: string | undefined; messageId: string | null }): string | null {
+  const live = entry.authorId ? guild.members.cache.get(entry.authorId)?.displayName : undefined;
+  let name = live;
+  if (!name && entry.messageId) {
+    try { name = archiveDb.prepare<[string], { author_name: string }>('SELECT author_name FROM messages WHERE message_id = ?').get(entry.messageId)?.author_name; } catch { name = undefined; }
+  }
+  return name ? `${name}のメッセージ` : null;
 }
 
 /**

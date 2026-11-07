@@ -124,6 +124,8 @@ export function messageLink(entry: ResolvedRef | null | undefined): string | nul
 }
 
 const MAX_EPISODE_URLS = 3;
+/** ラベルの形で本文に出す記憶 (出来事・記事) の数。メニューの選択肢になる */
+const MAX_EPISODE_MARKS = 5;
 
 // 出典の目印。文の終わりに小さなリンクとして置く (ChatGPT の出典のように、文中に)。
 // ラベルは丸数字 1 文字。URL は <> で囲んで、Discord にプレビューを出させない。
@@ -184,16 +186,56 @@ export function dropFootnoteList(text: string): string {
   return lines.filter((_, index) => !drop.has(index)).join('\n');
 }
 
+/** 出典の表示を、丸数字でなく「[たこのメッセージ]」のようなラベルにするときの指定。ラベルはコードが作る (モデルには書かせない)。 */
+export interface CitationLabels {
+  /** 発言 ([3]) のラベル。作れなければ null (「メッセージ」になる) */
+  message?: ((entry: ResolvedRef) => string | null) | undefined;
+  /** 記憶の出来事 ([e12]) のラベル。実在しない出来事なら null (番号は消すだけ) */
+  episode?: ((id: number) => string | null) | undefined;
+  /** 記憶の記事 ([p:people/たこ]) の id とラベル。実在しない記事なら null (記号は消すだけ) */
+  page?: ((path: string) => { id: number; label: string } | null) | undefined;
+}
+
+/** ラベルに入れてよい形にする: リンクの括弧・強調・メンションを壊す記号を除き、長ければ切る (絵文字の途中では切らない)。 */
+export function citationLabel(text: unknown, max = 18): string {
+  const clean = String(text ?? '').replace(/[\[\]()<>*_`~|@#\\]/g, '').replace(/\s+/g, ' ').trim();
+  const chars = [...clean];
+  return chars.length > max ? `${chars.slice(0, max - 1).join('')}…` : clean;
+}
+
+/** 本文にラベルで出した記憶。呼び出し側が「開く」メニューにする (出てきた順) */
+export interface CitedSource { kind: 'episode' | 'page'; id: number; label: string }
+
 export function expandCitations(
   text: unknown,
   refs: RefTable,
-  { label = null, selfId = null, episodeUrl = null }: {
+  options: {
     label?: string | null;
     selfId?: string | null;
     /** 記憶の出来事 (e12) の URL。サイトが無い・そんな出来事は無いなら null (番号は消すだけ) */
     episodeUrl?: ((id: number) => string | null) | null;
+    labels?: CitationLabels;
   } = {}
 ): string {
+  return expandCitationsDetailed(text, refs, options).text;
+}
+
+/**
+ * expandCitations と同じ。ラベルの形 (labels) のときは、本文に出した出来事・記事の一覧 (sources) も返す (呼び出し側が「開く」メニューにする)。
+ *   発言 [3]  → [たこのメッセージ](<発言へのリンク>)   押すとその発言に飛ぶ
+ *   出来事 [e12] → [出来事の題]                          本文では押せない。同じラベルのメニューから Discord の中で開く (サイトが無くても開ける)
+ *   記事 [p:people/たこ] → [たこの記事]                  同上
+ */
+export function expandCitationsDetailed(
+  text: unknown,
+  refs: RefTable,
+  { label = null, selfId = null, episodeUrl = null, labels }: {
+    label?: string | null;
+    selfId?: string | null;
+    episodeUrl?: ((id: number) => string | null) | null;
+    labels?: CitationLabels;
+  } = {}
+): { text: string; sources: CitedSource[] } {
   const raw = dropFootnoteList(String(text ?? ''));
   const numbers = new Map<string, number>();
   const episodeUrls = new Set<string>();
@@ -204,11 +246,25 @@ export function expandCitations(
     if (no === undefined) { no = numbers.size + 1; numbers.set(url, no); }
     return no;
   };
+  // ラベルの形: 同じラベルが別の出典に付くときは、丸数字を足して見分ける ([たこのメッセージ] [たこのメッセージ②])
+  const labelOf = new Map<string, string>();
+  const taken = new Map<string, number>();
+  const uniqueLabel = (key: string, wanted: string): string => {
+    const known = labelOf.get(key);
+    if (known) return known;
+    const count = (taken.get(wanted) ?? 0) + 1;
+    taken.set(wanted, count);
+    const shown = count === 1 ? wanted : `${wanted}${sourceMark(count)}`;
+    labelOf.set(key, shown);
+    return shown;
+  };
+  const cited: CitedSource[] = [];
 
   // 直前の空白ごと食う。番号を抜いた跡に空白が残ると句点の前が空く。全角スペースも食う (日本語で書かせているので混ざる)。
   // 空白の連なりは先頭からしか試さない (否定の後読み)。これが無いと、番号の続かない長い空白の列で
   // 開始位置ごとに列の端まで読み直し、文字数の2乗で時間がかかる (回答はモデルが書くので、長さを抑えられない)。
-  const body = raw.replace(/(?<![ \t　])[ \t　]*\[(\d{1,4}|e\d{1,9}(?:[ \t]*[,、][ \t]*e\d{1,9})*)\]/gi,
+  // 記事は `[p:people/たこ]` (カテゴリ/名前。`/` が無ければ `x[p:q]` のような添字・範囲と区別がつかないので引用にしない)
+  const body = raw.replace(/(?<![ \t　])[ \t　]*\[(\d{1,4}|e\d{1,9}(?:[ \t]*[,、][ \t]*e\d{1,9})*|p:[^\[\]\n/]{1,40}\/[^\[\]\n]{1,150})\]/gi,
     (match: string, group: string, offset: number) => {
       const spaced = /^[ \t　]/.test(match);
       if (/^\d+$/.test(group)) {
@@ -225,15 +281,43 @@ export function expandCitations(
         // 変換していない括弧の直後 (`grid[1][2]`) は、これまでどおり添字。
         if (!spaced && /[\w.)\]]/.test(raw[offset - 1] ?? '') && !converted.has(offset)) return match;
         converted.add(offset + match.length);
+        if (labels) {
+          const wanted = citationLabel((entry && labels.message?.(entry)) || 'メッセージ');
+          return `[${uniqueLabel(url, wanted)}](<${url}>)`;
+        }
         return sourceLink(numberOf(url), url);
       }
 
-      // 記憶の出来事 ([e3214] / [e3214, e11489])。`items[e1]` のような添字は触らない。
+      // 記憶の出来事 ([e3214] / [e3214, e11489]) と記事 ([p:people/たこ])。`items[e1]` のような添字は触らない。
       // `[e1][e2]` と続けて書くことはあるので `]` は数えない。
       if (!spaced && /[\w.)]/.test(raw[offset - 1] ?? '')) return match;
       converted.add(offset + match.length);
+      if (/^p:/i.test(group)) {
+        // 記事。ラベルの形でなければ (メニューが無い) 記号だけ消す。実在しない記事も消す
+        if (!labels) return '';
+        const path = group.slice(2).trim().replace(/^\/+|\/+$/g, '');
+        let page: { id: number; label: string } | null = null;
+        try { page = labels.page?.(path) ?? null; } catch { page = null; }
+        if (!page) return '';
+        const key = `n${page.id}`;
+        if (!labelOf.has(key) && cited.length >= MAX_EPISODE_MARKS) return '';
+        const shown = uniqueLabel(key, citationLabel(page.label));
+        if (!cited.some((entry) => entry.kind === 'page' && entry.id === page.id)) cited.push({ kind: 'page', id: page.id, label: shown });
+        return `[${shown}]`;
+      }
       const links: string[] = [];
       for (const id of group.match(/\d+/g) ?? []) {
+        if (labels) {
+          let wanted: string | null = null;
+          try { wanted = labels.episode?.(Number(id)) ?? null; } catch { wanted = null; }
+          if (!wanted) continue;
+          const key = `e${Number(id)}`;
+          if (!labelOf.has(key) && cited.length >= MAX_EPISODE_MARKS) continue;
+          const shown = uniqueLabel(key, citationLabel(wanted));
+          if (!cited.some((entry) => entry.kind === 'episode' && entry.id === Number(id))) cited.push({ kind: 'episode', id: Number(id), label: shown });
+          links.push(`[${shown}]`);
+          continue;
+        }
         let url: string | null = null;
         try { url = episodeUrl?.(Number(id)) ?? null; } catch { url = null; }
         if (!url) continue;
@@ -246,7 +330,8 @@ export function expandCitations(
 
   // どのモデルが書いたかは毎回出す (出典は文中にあるので、末尾はこれだけ)。
   // モデルが自分で書いた末尾の `-# ...` は落とす (足すのはここだけ。二重になる)
-  return label ? `${stripTrailingSubtext(body.trim()).trim()}\n\n-# ${label}` : body.trim();
+  const finished = label ? `${stripTrailingSubtext(body.trim()).trim()}\n\n-# ${label}` : body.trim();
+  return { text: finished, sources: cited };
 }
 
 function collapse(text: unknown): string {

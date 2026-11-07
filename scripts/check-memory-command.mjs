@@ -224,7 +224,7 @@ assert.match(embedText(search.calls[1][1]), /統治機能を作った/);
 }
 
 // explore: メニューでたどる。部品は Discord の制限内で組み立てられる
-const { handleMemoryComponent, rootView } = await import('../src/memory/explore.js');
+const { citeMenu, handleMemoryComponent, rootView } = await import('../src/memory/explore.js');
 const explore = interaction({ sub: 'explore', admin: false, options: { path: '' } });
 await memoryCommand.execute(explore);
 const first = explore.calls[1][1];
@@ -326,6 +326,61 @@ assert.deepEqual(siteButtons(episodeJson).map((b) => b.custom_id), [`memx:site:e
   const mixed = click({ customId: 'memx:site:x:1', allowReply: true });
   await handleMemoryComponent(mixed);
   assert.match(mixed.replies[0].content, /サイトにありません/, 'a malformed target is refused');
+}
+{
+  // サイトを公開していない (off) サーバーでは「サイトで開く」を出さない (開けないリンクを置かない)。画面そのものは Discord の中で使える
+  store.setSiteAccess(GUILD, 'off');
+  const closed = click({ customId: 'memx:open', values: [episodeOption.value] });
+  await handleMemoryComponent(closed);
+  assert.deepEqual(siteButtons(json(closed.updates[0])), [], 'no site button while the site is off');
+  assert.ok(closed.updates[0].embeds.length > 0, 'the view itself still works while the site is off');
+  store.setSiteAccess(GUILD, 'members');
+  const open = click({ customId: 'memx:open', values: [episodeOption.value] });
+  await handleMemoryComponent(open);
+  assert.equal(siteButtons(json(open.updates[0])).length, 1, 'the button is back once the site is on');
+}
+{
+  // 回答の根拠のメニュー: 本文に [出来事の題] と書いた出来事を並べ、選ぶと、選んだ人にだけ出来事の画面を出す (サイトが off でも)
+  store.setSiteAccess(GUILD, 'off');
+  const row = citeMenu(GUILD, [
+    { kind: 'episode', id: episodeId, label: '統治機能を作った' }, { kind: 'episode', id: 999999, label: '無い出来事' },
+    { kind: 'page', id: Number(siteNodeId), label: 'たこの記事' }, { kind: 'page', id: 999999, label: '無い記事' }
+  ]);
+  assert.ok(row, 'an existing episode makes a menu');
+  const menu = row.toJSON().components[0];
+  assert.equal(menu.custom_id, 'memx:cite');
+  assert.deepEqual(menu.options.map((o) => o.value), [`e:${episodeId}`, `n:${siteNodeId}`], 'episodes and pages that are gone are not offered');
+  assert.equal(menu.options[0].label, '[統治機能を作った]');
+  assert.match(menu.options[0].description, /統治機能を作った/);
+  assert.equal(menu.options[1].label, '[たこの記事]');
+  assert.match(menu.options[1].description, /^記事 people\/たこ/);
+  assert.equal(citeMenu(GUILD, [{ kind: 'episode', id: 999999, label: 'x' }, { kind: 'page', id: 999999, label: 'y' }]), null, 'no menu without anything to open');
+  assert.equal(citeMenu(GUILD, []), null);
+
+  const pick = click({ customId: 'memx:cite', values: [`e:${episodeId}`], allowReply: true });
+  assert.equal(await handleMemoryComponent(pick), true);
+  assert.equal(pick.replies.length, 1, 'one new message');
+  assert.equal(pick.replies[0].flags, MessageFlags.Ephemeral, 'the episode opens only for whoever picked it');
+  assert.equal(pick.updates.length, 0, 'the answer itself is left as it was');
+  const shown = json(pick.replies[0]);
+  assert.match(shown.embeds[0].title ?? shown.embeds[0].description, /統治機能を作った/, 'it shows the episode');
+  assert.deepEqual(siteButtons(shown), [], 'no site button while the site is off');
+  checkLimits(shown, 'cite');
+
+  // 記事を選ぶと、その記事の画面が選んだ人にだけ出る
+  const pickPage = click({ customId: 'memx:cite', values: [`n:${siteNodeId}`], allowReply: true });
+  assert.equal(await handleMemoryComponent(pickPage), true);
+  assert.equal(pickPage.replies.length, 1);
+  assert.equal(pickPage.replies[0].flags, MessageFlags.Ephemeral, 'the page opens only for whoever picked it');
+  assert.match(JSON.stringify(json(pickPage.replies[0]).embeds[0]), /たこ/, 'it shows the page');
+  assert.deepEqual(siteButtons(json(pickPage.replies[0])), [], 'no site button while the site is off');
+  // 形の違う値は何も開かない (値は利用者が書き換えられる)
+  for (const value of ['x:1', 'n:abc', 'e:abc', 'e:1:2', '../e:1', 'e:1234567890123']) {
+    const bad = click({ customId: 'memx:cite', values: [value], allowReply: true });
+    assert.equal(await handleMemoryComponent(bad), true);
+    assert.equal(bad.replies.length, 0, `${value} opens nothing`);
+  }
+  store.setSiteAccess(GUILD, 'members');
 }
 assert.match(episodeJson.embeds[0].description, /discord\.com\/channels/, 'episode view links its sources');
 // 開いたページへ戻れる

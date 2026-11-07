@@ -807,6 +807,70 @@ try {
   clearReplies();
 }
 
+// --- 出典のラベル ([たこのメッセージ] の形) ---
+// ラベルはコードが作る。発言は押すとその発言に飛ぶリンク、記憶の出来事は本文では押せない [題] で、一覧 (episodes) を返す (回答の下のメニューになる)。
+{
+  const { expandCitationsDetailed, citationLabel } = formatModule;
+  const refs = tableOf(3);
+  const name = { 1: 'たこ', 2: 'たこ', 3: 'さば' };
+  const labels = {
+    message: (entry) => `${name[Number(entry.messageId.slice(-1))]}のメッセージ`,
+    episode: (id) => ({ 12: 'テトリス杯の決勝', 13: 'Rust と Go の言い合い', 14: '[事件] *強調* <@1>' })[id] ?? null,
+    page: (path) => ({ 'people/たこ': { id: 7, label: 'たこの記事' }, 'topics/Claude Code': { id: 8, label: 'Claude Codeの記事' } })[path] ?? null
+  };
+  const a = expandCitationsDetailed('4月に書いてる [1]。7月にも [2]。さばは [3]。', refs, { labels });
+  if (a.text !== `4月に書いてる[たこのメッセージ](<${msgUrl(1)}>)。7月にも[たこのメッセージ②](<${msgUrl(2)}>)。さばは[さばのメッセージ](<${msgUrl(3)}>)。`) {
+    fail(`発言のラベルが「[たこのメッセージ]」のリンクになっていない (同じ名前は丸数字で見分ける): ${a.text}`);
+  }
+  if (/[①②]\(</.test(a.text.replace(/メッセージ[①②]/g, ''))) fail(`丸数字のリンクが残っている: ${a.text}`);
+  if (a.sources.length !== 0) fail('発言だけなら出来事・記事の一覧は空');
+
+  // 同じ発言を2回引いたら、同じラベル (丸数字は付かない)
+  const again = expandCitationsDetailed('まず [1]、あとで [1]。', tableOf(1), { labels });
+  if (again.text !== `まず[たこのメッセージ](<${msgUrl(1)}>)、あとで[たこのメッセージ](<${msgUrl(1)}>)。`) fail(`同じ発言は同じラベル: ${again.text}`);
+
+  // ラベルが作れない発言は「メッセージ」
+  const plain = expandCitationsDetailed('これ [1]', tableOf(1), { labels: { message: () => null } });
+  if (plain.text !== `これ[メッセージ](<${msgUrl(1)}>)`) fail(`ラベルが無ければ「メッセージ」: ${plain.text}`);
+
+  // 出来事: 本文は [題] だけ (URL を持たない)。一覧は出てきた順で、実在しない出来事 (e99) は番号ごと消える
+  const b = expandCitationsDetailed('決勝は荒れた [e12]。言い合いは続いた [e13] [e99]。', refs, { labels });
+  if (b.text !== '決勝は荒れた[テトリス杯の決勝]。言い合いは続いた[Rust と Go の言い合い]。') fail(`出来事のラベル: ${b.text}`);
+  if (JSON.stringify(b.sources) !== JSON.stringify([{ kind: 'episode', id: 12, label: 'テトリス杯の決勝' }, { kind: 'episode', id: 13, label: 'Rust と Go の言い合い' }])) fail(`出来事の一覧: ${JSON.stringify(b.sources)}`);
+  if (/\]\(</.test(b.text)) fail('出来事のラベルはリンクにしない (押せないものに URL は付けない)');
+
+  // 題に括弧・強調・メンションがあっても、リンクやメンションを壊さない
+  const c = expandCitationsDetailed('事件があった [e14]', refs, { labels });
+  if (c.text !== '事件があった[事件 強調 1]') fail(`題の記号を除く: ${c.text}`);
+  if (citationLabel('あ'.repeat(30)) !== `${'あ'.repeat(17)}…`) fail('ラベルは 18 文字まで');
+  if (citationLabel('🐟'.repeat(30)) !== `${'🐟'.repeat(17)}…`) fail('絵文字の途中では切らない');
+
+  // 出来事のラベルは 5 件まで (メニューに載る数)。6 件目以降は番号を消すだけ。同じ出来事は数えない
+  const many = expandCitationsDetailed('[e1] [e2] [e3] [e4] [e5] [e6] [e1]', refs, { labels: { episode: (id) => `題${id}` } });
+  if (many.sources.length !== 5) fail(`出来事のラベルは 5 件まで: ${many.sources.length}`);
+  if (many.text.includes('題6')) fail('6 件目は本文にも出さない');
+
+  // 記事: [p:カテゴリ/名前] を [名前の記事] にし、一覧に入れる。出来事と混ぜても出てきた順。実在しない記事・作り話のパスは消える
+  const d = expandCitationsDetailed('たこは作者 [p:people/たこ]。決勝は荒れた [e12]。使い方は [p:topics/Claude Code]。', refs, { labels });
+  if (d.text !== 'たこは作者[たこの記事]。決勝は荒れた[テトリス杯の決勝]。使い方は[Claude Codeの記事]。') fail(`記事のラベル: ${d.text}`);
+  if (JSON.stringify(d.sources) !== JSON.stringify([{ kind: 'page', id: 7, label: 'たこの記事' }, { kind: 'episode', id: 12, label: 'テトリス杯の決勝' }, { kind: 'page', id: 8, label: 'Claude Codeの記事' }])) fail(`記事と出来事の一覧: ${JSON.stringify(d.sources)}`);
+  // 実在しない記事 (作り話) は記号ごと消える。末尾の / は直して引く。同じ記事は一覧に 1 件
+  const gone = expandCitationsDetailed('作り話 [p:people/いない] [p:people/たこ/] 同じ [p:people/たこ]', refs, { labels });
+  if (gone.text !== '作り話[たこの記事] 同じ[たこの記事]') fail(`作り話のパスは消す・同じ記事は同じラベル: ${gone.text}`);
+  if (gone.sources.length !== 1) fail(`記事の一覧は重複しない・作り話は入らない: ${JSON.stringify(gone.sources)}`);
+  // `/` の無い [p:q] や添字 x[p:q/r] は引用にしない
+  const slice = expandCitationsDetailed('範囲は [p:q] で、x[p:q/r] はそのまま', refs, { labels });
+  if (slice.text !== '範囲は [p:q] で、x[p:q/r] はそのまま' || slice.sources.length !== 0) fail(`添字・範囲は触らない: ${slice.text}`);
+  // ラベルの形でなければ、記事の記号は消すだけ (メニューが無いので)
+  const legacy = expandCitationsDetailed('本文 [p:people/たこ] 続き', refs);
+  if (legacy.text !== '本文 続き') fail(`ラベルなしは記号を消す: ${legacy.text}`);
+
+  // 末尾のモデル名は従来どおり、ラベルの形でも付く
+  const tagged = expandCitationsDetailed('本文 [1]', tableOf(1), { labels, label: 'deepseek' });
+  if (!tagged.text.endsWith('\n\n-# deepseek')) fail(`モデルの表示は残る: ${tagged.text}`);
+  console.log('citation labels ok (発言は[たこのメッセージ]のリンク / 出来事は[題]+一覧 / 重複は丸数字 / 5件まで)');
+}
+
 // ブラウザの通信の関門 (DNS リバインディング対策と、断る理由に IP を書かないこと)。
 // package.json の check から呼ばれるのはこのファイルなので、ここから読み込む。
 await import('./check-browser-guard.mjs');
