@@ -1,6 +1,6 @@
 import { memoryDb } from '../store.js';
 import { arrayOf, isRecord } from '../types.js';
-import { CLAIM_TYPES, type ClaimType, type Modality } from './types.js';
+import { CLAIM_TYPES, cut, type ClaimType, type Modality } from './types.js';
 
 // S4 組み立て。ページは検証済みの主張 (claims) から書く。前のページ本文は渡さない (要約の要約をしない)。
 //
@@ -222,8 +222,8 @@ export function normalizeCompose(json: unknown): Map<string, PartOutput> {
   for (const raw of arrayOf(json.pages)) {
     if (!isRecord(raw) || typeof raw.path !== 'string' || typeof raw.body !== 'string') continue;
     out.set(raw.path.trim(), {
-      summary: String(raw.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 80), body: raw.body.trim(),
-      aliases: arrayOf(raw.aliases).filter((a): a is string => typeof a === 'string').map((a) => a.trim().slice(0, 40)).filter(Boolean).slice(0, 8)
+      summary: cut(String(raw.summary ?? '').replace(/\s+/g, ' ').trim(), 80), body: raw.body.trim(),
+      aliases: arrayOf(raw.aliases).filter((a): a is string => typeof a === 'string').map((a) => cut(a.trim(), 40)).filter(Boolean).slice(0, 8)
     });
   }
   return out;

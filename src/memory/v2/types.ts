@@ -116,3 +116,10 @@ export interface VerifyItem {
   modality: Modality | null;
   note: string;
 }
+
+/** UTF-16 の単位で max 以内に切る。サロゲートペア (絵文字・𝕹) の真ん中では切らない (壊れた文字は Discord が 500 で拒む)。 */
+export function cut(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const last = text.charCodeAt(max - 1);
+  return text.slice(0, last >= 0xd800 && last <= 0xdbff ? max - 1 : max);
+}

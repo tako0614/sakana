@@ -502,6 +502,17 @@ for (const offset of ['-5', '1e400', '99999999999999999999']) {
   assert.match(json(odd.updates[0]).embeds[0].title, /たこ/, `offset ${offset} still opens the page`);
 }
 
+// 選択肢の名前を切るとき、絵文字・𝕹 のようなサロゲートペアの真ん中で切らない (壊れた文字は Discord が 500 を返す: 2026-11-07)
+{
+  const { clip } = await import('../src/memory/explore.js');
+  const lone = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+  for (const name of ['𝕹𝖎𝖘𝖊𝖘𝖎𝖒𝖆𝖉𝖔𝖔'.repeat(20), '🔥'.repeat(150), `${'あ'.repeat(98)}🔥🔥`]) {
+    for (const max of [10, 99, 100, 101]) assert.equal(lone.test(clip(name, max)), false, `clip(${max}) must not leave half of a surrogate pair`);
+  }
+  assert.equal(clip('short', 100), 'short');
+  assert.ok(clip('あ'.repeat(200), 100).length <= 100, 'clip stays within the limit');
+}
+
 globalThis.__restoreSiteEnv?.();
 store.resetTree(GUILD);
 archive.prepare('DELETE FROM messages WHERE guild_id = ?').run(GUILD);

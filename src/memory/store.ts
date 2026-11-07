@@ -37,6 +37,12 @@ export const MAX_TOP_LEVEL = 20;
 
 export const MAX_DEPTH = 4;
 const MAX_PART = 48;
+/** サロゲートペア (絵文字・𝕹) の真ん中で切らない (壊れた文字は Discord が 500 で拒む) */
+const safeSlice = (text: string, max: number): string => {
+  if (text.length <= max) return text;
+  const last = text.charCodeAt(max - 1);
+  return text.slice(0, last >= 0xd800 && last <= 0xdbff ? max - 1 : max);
+};
 
 // ---- 行の形 ----------------------------------------------------------------
 
@@ -388,7 +394,7 @@ export function normalizePath(raw: unknown): string | null {
     .replace(/^\[\[|\]\]$/g, '')
     .replace(/\\/g, '/')
     .split('/')
-    .map((part) => part.replace(/[\s　]+/g, ' ').replace(/[#`*<>|?"[\]]/g, '').trim().slice(0, MAX_PART))
+    .map((part) => safeSlice(part.replace(/[\s　]+/g, ' ').replace(/[#`*<>|?"[\]]/g, '').trim(), MAX_PART))
     .filter((part) => part && part !== '.' && part !== '..');
   if (parts.length === 0) return null;
   const [head] = parts;

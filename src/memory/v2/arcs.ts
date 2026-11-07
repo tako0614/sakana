@@ -3,6 +3,7 @@ import { memoryDb, normalizePath } from '../store.js';
 import { errorMessage, isRecord } from '../types.js';
 import { v2Config } from './call.js';
 import { nameKey } from './resolve.js';
+import { cut } from './types.js';
 import type { Ctx } from './run.js';
 
 // S5 筋書き / S6 根。
@@ -91,12 +92,12 @@ export function arcPage(arc: Arc, output: unknown, taken: Set<string>): ArcPage 
   const missing = arc.episodes.filter((e) => !cited.has(e.id));
   const body = [...lines, ...(missing.length ? ['', '## 追記', ...missing.map((e) => `- ${day(e.at)} ${e.title}: ${e.summary}${e.outcome ? ` → ${e.outcome}` : ''} [e${e.id}]`)] : [])]
     .join('\n').replace(/\n{3,}/g, '\n\n').trim();
-  const title = output.title.replace(/[/／\\]/g, '／').replace(/\s+/g, ' ').trim().slice(0, 30);
+  const title = cut(output.title.replace(/[/／\\]/g, '／').replace(/\s+/g, ' ').trim(), 30);
   let path = normalizePath(`events/${title || arc.name}`);
   if (!path || !body) return null;
   for (let n = 2; taken.has(path.toLowerCase()); n += 1) path = `${normalizePath(`events/${title || arc.name}`) ?? 'events/x'}~${n}`;
   taken.add(path.toLowerCase());
-  return { path, summary: String(output.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 80) || title, body };
+  return { path, summary: cut(String(output.summary ?? '').replace(/\s+/g, ' ').trim(), 80) || title, body };
 }
 
 export async function composeArcs(ctx: Ctx, { limit = Infinity }: { limit?: number } = {}): Promise<{ arcs: number; pages: number }> {

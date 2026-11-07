@@ -2,7 +2,7 @@ import { copiedRatio } from '../build.js';
 import { memoryDb } from '../store.js';
 import { arrayOf, isRecord, type JsonRecord } from '../types.js';
 import {
-  CATEGORIES, CLAIM_TYPES, EPISODE_KINDS, MODALITIES,
+  CATEGORIES, CLAIM_TYPES, EPISODE_KINDS, MODALITIES, cut,
   type Category, type ClaimDraft, type ClaimType, type EpisodeDraft, type ExtractResult, type Modality, type RenderedSection
 } from './types.js';
 import { messageIdsOf } from './prepare.js';
@@ -78,7 +78,7 @@ export function extractUser(section: RenderedSection, { more }: { more?: readonl
 
 // ---- 検査 ------------------------------------------------------------------
 
-const str = (value: unknown, max: number): string => String(value ?? '').replace(/\s*\n\s*/g, ' ').trim().slice(0, max);
+const str = (value: unknown, max: number): string => cut(String(value ?? '').replace(/\s*\n\s*/g, ' ').trim(), max);
 const ints = (value: unknown): number[] => (Array.isArray(value) ? arrayOf(value) : [value])
   .map((item) => (typeof item === 'string' && /^\d+$/.test(item.trim()) ? Number(item) : item))
   .filter((item): item is number => typeof item === 'number' && Number.isInteger(item));
@@ -144,7 +144,7 @@ export function normalizeExtract(section: RenderedSection, json: unknown): Extra
     kept.set(index, episodes.length);
     episodes.push({
       conv: section.lines.get(lines[0] as number)?.conv ?? null,
-      kind: asKind(raw.kind), title: title.slice(0, 40), summary, outcome: emptyOutcome(str(raw.outcome, 400)) ? '' : str(raw.outcome, 400), lines,
+      kind: asKind(raw.kind), title: cut(title, 40), summary, outcome: emptyOutcome(str(raw.outcome, 400)) ? '' : str(raw.outcome, 400), lines,
       quotes: validLines(raw.quotes).slice(0, 3), entities, related: [],
       importance: Math.min(3, Math.max(1, ints(raw.importance)[0] ?? 2))
     });

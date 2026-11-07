@@ -42,7 +42,16 @@ const COLOR = '#2b2d31';
 const HIDDEN_NOTE = '-# 見られないチャンネルの発言は省きました';
 const day = (ms: number): string => new Date(ms + TZ_MS).toISOString().slice(0, 10);
 const month = (ms: number): string => day(ms).slice(0, 7);
-const clip = (text: unknown, max: number): string => { const t = String(text ?? ''); return t.length > max ? `${t.slice(0, max - 1)}…` : t; };
+// 長さは UTF-16 の単位で数える (Discord の上限もそう)。サロゲートペア (𝕹・絵文字) の途中で切ると、
+// 壊れた文字が選択肢に入って Discord が 500 を返す (2026-11-07、名前に 𝕹𝖎𝖘𝖊𝖘𝖎𝖒𝖆𝖉𝖔𝖔 や 🔥 を含むページのメニュー)。
+export const clip = (text: unknown, max: number): string => {
+  const t = String(text ?? '');
+  if (t.length <= max) return t;
+  let end = Math.max(0, max - 1);
+  const last = t.charCodeAt(end - 1);
+  if (end > 0 && last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${t.slice(0, end)}…`;
+};
 // ID の数。数でない・負のものは 0。何件目から (offset) は LIMIT に渡すので上限で止める
 // (作り替えた ID で子ページを全部読ませない)
 const MAX_OFFSET = 100_000;
