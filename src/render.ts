@@ -1,3 +1,5 @@
+import { existsSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import puppeteer, { type Browser } from 'puppeteer-core';
 
 // HTML → 画像の描画に使う Chrome の共有部分 (きもち・よっきゅう・agent の image ツール)。
@@ -43,12 +45,62 @@ function chromeEnv(): Record<string, string> {
   }));
 }
 
+// Chrome のプロファイル (毎回作って捨てる) は tmpfs に置く。本番 (CT102) は / が遅い loop デバイスで、
+// 既定の /tmp に置くと、終了 (close) だけで 5〜6 秒かかっていた。tmpfs なら 0.03 秒。数十 MB を数秒だけ使う。
+const PROFILE_ROOT = process.env.RENDER_PROFILE_ROOT ?? '/dev/shm';
+const PROFILE_PREFIX = 'sakana-chrome-';
+const STALE_PROFILE_MS = 30 * 60_000;
+
+/** 落ちたときに残ったプロファイルを片付ける (30 分より古いものだけ。動いている描画のものには触らない)。 */
+function sweepStaleProfiles(): void {
+  try {
+    for (const name of readdirSync(PROFILE_ROOT)) {
+      if (!name.startsWith(PROFILE_PREFIX)) continue;
+      const path = join(PROFILE_ROOT, name);
+      if (Date.now() - statSync(path).mtimeMs > STALE_PROFILE_MS) rmSync(path, { recursive: true, force: true });
+    }
+  } catch {
+    // 片付けられなくても描画には関係ない
+  }
+}
+
+/** tmpfs が使えればそこに、使えなければ null (puppeteer が既定の場所に作る)。 */
+function makeProfileDir(): string | null {
+  try {
+    if (!existsSync(PROFILE_ROOT)) return null;
+    sweepStaleProfiles();
+    return mkdtempSync(join(PROFILE_ROOT, PROFILE_PREFIX));
+  } catch {
+    return null;
+  }
+}
+
 /** 描画用の headless Chrome を起こす。呼んだ側が必ず close する。 */
-export function launchRenderChrome(timeoutMs = renderTimeoutMs): Promise<Browser> {
+export async function launchRenderChrome(timeoutMs = renderTimeoutMs): Promise<Browser> {
+  const profile = makeProfileDir();
+  try {
+    const browser = await launchChrome(timeoutMs, profile);
+    // Chrome が終わったら (落ちても) プロファイルを消す。終わる間際に子プロセスが書き足すので、少し置いてもう一度消す
+    if (profile) {
+      const remove = (): void => rmSync(profile, { recursive: true, force: true });
+      browser.process()?.once('exit', () => {
+        remove();
+        setTimeout(remove, 3000).unref();
+      });
+    }
+    return browser;
+  } catch (error) {
+    if (profile) rmSync(profile, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function launchChrome(timeoutMs: number, profile: string | null): Promise<Browser> {
   return puppeteer.launch({
     executablePath: chromePath,
     headless: true,
     timeout: timeoutMs,
+    ...(profile ? { userDataDir: profile } : {}),
     // Chrome は一時フォルダに通信用のソケットを作り、そのパスが 108 文字を超えると起動しない
     env: { ...chromeEnv(), TMPDIR: (process.env.TMPDIR ?? '/tmp').length > 60 ? '/tmp' : (process.env.TMPDIR ?? '/tmp') },
     // root で動くコンテナなので sandbox は使えない。代わりに JavaScript を止め、外への読み込みを絞る

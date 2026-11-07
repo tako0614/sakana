@@ -11,6 +11,7 @@
 
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import http from 'node:http';
 
 const { RefTable } = await import('../src/agent/format.js');
@@ -262,7 +263,9 @@ const fakeMessage = ({ id = 'm', attachments = [], embeds = [], snapshots = [], 
   await assert.rejects(render.renderDraw('x'.repeat(render.DRAW_MAX_HTML + 1)), /大きすぎ/);
   await assert.rejects(render.renderDraw('   '), /空/);
 }
+const profilesNow = () => { try { return readdirSync('/dev/shm').filter((name) => name.startsWith('sakana-chrome-')); } catch { return []; } };
 if (chrome) {
+  const profilesBefore = new Set(profilesNow());
   const hits = [];
   const server = http.createServer((request, response) => { hits.push(request.url); response.end('x'); });
   await new Promise((resolve) => server.listen(0, resolve));
@@ -316,6 +319,10 @@ if (chrome) {
     second();
     assert.ok(render.takeRenderSlot(), '返した枠は使える (二重に返しても 1 回だけ)');
     render.takeRenderSlot()?.();
+
+    // Chrome のプロファイルは使い終わったら消える (tmpfs = メモリを残さない)。終わり際の書き足しを待ってから数える
+    await new Promise((resolve) => setTimeout(resolve, 3500));
+    assert.deepEqual(profilesNow().filter((name) => !profilesBefore.has(name)), [], 'プロファイルが残っていない');
   } finally {
     server.close();
   }

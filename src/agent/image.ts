@@ -246,10 +246,11 @@ async function defaultAskVision({ dataUrl, question, guildId }: { dataUrl: strin
     fallbackStatuses: [429],
     providerPrefs: agentProviderPrefs(model),
     messages: visionMessages(question, dataUrl),
-    maxOutputTokens: 700,
+    // 推論を切れないモデル (glm-5.3-flash) がある。切らずに最小限にして、推論の分も出力の上限に見込む
+    maxOutputTokens: 1800,
     timeoutMs: Math.min(agentConfig.httpTimeoutMs, 60_000),
     retries: 1,
-    reasoning: { enabled: false },
+    reasoning: { effort: 'low', exclude: true },
     guildId,
     role: 'chat'
   });
