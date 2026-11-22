@@ -1,11 +1,9 @@
-// Discord sources use structured JSON lines. Short citation numbers remain a
-// presentation convenience; author ids, reply targets and source state are explicit.
+// Discord sources share scoped speaker aliases, short citations and explicit source-state labels.
 
 import type { Message } from 'discord.js';
 import { TZ_OFFSET_HOURS } from '../archive/query.js';
-import type { JsonRecord } from '../ai/types.js';
 import type { MessageRow } from '../archive/types.js';
-import { archiveStructure, discordStructure, discordExtraText, messageEnvelope } from '../conversation/message.js';
+import { archiveStructure, discordStructure, discordExtraText } from '../conversation/message.js';
 import {
   isRecord,
   numberField,
@@ -398,37 +396,6 @@ export function fromArchiveRow(row: MessageRow, channelName?: string | null): Ag
   };
 }
 
-/** describeExtras が見る部分。偽物のメッセージ (検証用) でも同じ形を持つ。 */
-type MessageExtras = Pick<Message, 'attachments' | 'embeds' | 'stickers'>;
-
-/**
- * 本文が無いメッセージの中身。画像だけ・埋め込みだけの発言は content が空なので、
- * そのまま渡すと `(本文なし)` になって何が貼られたのか分からない。
- *
- * アーカイブの取り込みは同じものを extra に集めていて (`indexer.js`)、
- * 本文と添付・引用は別フィールドで保持し、共通envelopeでも出典を区別する。
- */
-export function describeExtras(message: MessageExtras): string {
-  const parts: string[] = [];
-
-  for (const attachment of message.attachments?.values() ?? []) {
-    parts.push(attachment.description ? `${attachment.name}: ${attachment.description}` : attachment.name);
-  }
-
-  for (const embed of message.embeds ?? []) {
-    const head = [embed.title, embed.author?.name].filter(Boolean).join(' / ');
-    const body = [head, embed.description].filter(Boolean).join(' — ');
-    if (body) parts.push(`[埋め込み] ${body}`);
-  }
-
-  for (const sticker of message.stickers?.values() ?? []) {
-    parts.push(`[スタンプ] ${sticker.name}`);
-  }
-
-  // 埋め込みの説明は長いことがあるので、何が貼られたか分かる範囲で切る
-  return parts.filter(Boolean).length ? truncate(parts.filter(Boolean).join(' / '), 120) : '';
-}
-
 /**
  * チャンネル名。DM には名前が無く、検証用の偽物は channel 自体を持たないことがある。
  */
@@ -510,172 +477,262 @@ export function fromRawMessage(raw: RawMessage, guildId: string, channelName?: s
   };
 }
 
-export interface FormatOptions {
-  refs?: RefTable | undefined;
+export interface ConversationRenderOptions {
   showChannel?: boolean;
   bodyChars?: number;
   tailOf?: ((message: AgentMessage) => string | null) | null;
+}
+
+export interface FormatOptions extends ConversationRenderOptions {
+  refs?: RefTable | undefined;
   selfId?: string | null | undefined;
+  /** Cached, authorization-safe labels for Discord syntax found in source bodies. */
+  resolveDisplay?: ((kind: 'user' | 'role' | 'channel', id: string) => string | null) | undefined;
 }
 
-const nonEmpty = (value: unknown): boolean => Array.isArray(value) ? value.length > 0 : value !== null && value !== undefined && value !== '';
-
-/**
- * messageEnvelope の既定値・重複を省いた、モデルに見せる形。
- *
- * 1件ごとに schema・location (どれも同じ guild / channel)・author.webhookId=null・
- * body.characters・空の supplemental / mentions / embeds …・reactions.meaning・state.observedAt が並んで、
- * 本文 70 文字の発言が 1,100 文字の JSON になっていた (30 件で 約 1.1 万トークン、中身は 700 トークン)。
- * 省いた欄は既定値 (返信ではない・本文は完結・削除でも固定でもない・添付も埋め込みも無い)。
- * messageEnvelope 自体は統治・調査も使うので触らず、ここで間引くだけ。
- */
-export function slimEnvelope(envelope: JsonRecord, { showChannel = false }: { showChannel?: boolean } = {}): JsonRecord {
-  const out: JsonRecord = { id: envelope.id };
-
-  // 場所: チャンネルをまたぐ検索結果だけ。スレッドのときは、それが分かる最小限
-  const location = isRecord(envelope.location) ? envelope.location : {};
-  const thread = isRecord(location.thread) && location.thread.id ? { id: location.thread.id, name: location.thread.name ?? null, parentChannelId: location.thread.parentChannelId ?? null } : null;
-  if (showChannel) out.location = { channelId: location.channelId, ...(location.channelName ? { channelName: location.channelName } : {}), ...(thread ? { thread } : {}) };
-  else if (thread) out.location = { thread };
-
-  const author = isRecord(envelope.author) ? envelope.author : {};
-  out.author = {
-    id: author.id, name: author.name,
-    ...(author.bot ? { bot: true } : {}),
-    ...(author.webhookId ? { webhookId: author.webhookId } : {}),
-    ...(author.identity && author.identity !== 'participant' ? { identity: author.identity } : {})
-  };
-
-  const body = isRecord(envelope.body) ? envelope.body : {};
-  out.body = { text: body.text, ...(body.complete === false ? { complete: false, characters: body.characters } : {}) };
-
-  const supplemental = isRecord(envelope.supplemental) ? envelope.supplemental : {};
-  if (nonEmpty(supplemental.text)) {
-    out.supplemental = { text: supplemental.text, attribution: supplemental.attribution, ...(supplemental.complete === false ? { complete: false, characters: supplemental.characters } : {}) };
-  }
-
-  // 返信の関係。返信でも転送でもなく、先も無いなら省く (=返信ではない)
-  const reference = isRecord(envelope.reference) ? envelope.reference : {};
-  const plain = (reference.kind === 'none' || reference.kind === 'unknown') && !reference.messageId;
-  if (!plain) {
-    out.reference = {
-      kind: reference.kind, messageId: reference.messageId, availability: reference.availability,
-      ...(reference.ref ? { ref: reference.ref } : {}),
-      ...(reference.authorId ? { authorId: reference.authorId } : {}),
-      ...(reference.channelId && (showChannel || reference.channelId !== location.channelId) ? { channelId: reference.channelId } : {})
-    };
-  }
-  if (envelope.replyChain) out.replyChain = envelope.replyChain;
-
-  const state = isRecord(envelope.state) ? envelope.state : {};
-  out.state = {
-    createdAt: state.createdAt,
-    ...(state.editedAt ? { editedAt: state.editedAt } : {}),
-    ...(state.deleted ? { deleted: true } : {}),
-    ...(state.pinned ? { pinned: true } : {}),
-    ...(state.messageType ? { messageType: state.messageType } : {}),
-    // 古いアーカイブ (構造を残していない発言) は、返信の有無が確かめられないと伝える
-    ...(state.metadata && state.metadata !== 'observed' ? { metadata: state.metadata } : {})
-  };
-
-  for (const key of ['mentions', 'forwarded', 'attachments', 'embeds', 'stickers'] as const) {
-    if (nonEmpty(envelope[key])) out[key] = envelope[key];
-  }
-  const reactions = isRecord(envelope.reactions) ? envelope.reactions.total : null;
-  if (typeof reactions === 'number' && reactions > 0) out.reactions = reactions;
-  if (envelope.contextNote) out.contextNote = envelope.contextNote;
-  return out;
-}
-
-/**
- * メッセージ列を1行1件の構造化JSONで書き出す。本文の改行はJSON内に保つ。
- */
-export function formatMessages(
-  messages: AgentMessage[],
-  { refs, showChannel = false, bodyChars = 300, tailOf = null, selfId = null }: FormatOptions = {}
-): string {
-  // Allocate references first: a reply can appear before its parent in search results.
-  for (const message of messages) refs?.add(message);
-  return messages.map((message) => {
-    const ref = refs?.add(message);
-    const envelope = messageEnvelope(message, {
-      lookup: (id) => refs?.byMessageId.get(id), selfId: selfId ?? null, bodyChars
-    });
-    const note = tailOf?.(message);
-    if (note) envelope.contextNote = note;
-    return `${ref ? `${ref}) ` : ''}${JSON.stringify(slimEnvelope(envelope, { showChannel }))}`;
-  }).join('\n');
-}
-
-const flat = (text: unknown): string => String(text ?? '').replace(/\s*\n\s*/g, ' ⏎ ').trim();
-const listOf = (value: unknown): JsonRecord[] => (Array.isArray(value) ? value.filter(isRecord) : []);
-
-/** envelope 1件を1行にする。省くのは既定値だけで、返信・自分の発言・補足 (発言者の言葉ではない) は残す。 */
-function lineOf(ref: number | null | undefined, envelope: JsonRecord, showChannel: boolean): string {
-  const author = isRecord(envelope.author) ? envelope.author : {};
-  const state = isRecord(envelope.state) ? envelope.state : {};
-  const body = isRecord(envelope.body) ? envelope.body : {};
-  const supplemental = isRecord(envelope.supplemental) ? envelope.supplemental : {};
-  const location = isRecord(envelope.location) ? envelope.location : {};
-  const reference = isRecord(envelope.reference) ? envelope.reference : {};
-  const thread = isRecord(location.thread) && location.thread.id ? location.thread : null;
-
-  const channel = showChannel || thread
-    ? `${showChannel ? `#${String(location.channelName ?? location.channelId ?? '?')}` : ''}${thread ? `[スレッド:${String(thread.name ?? thread.id)}]` : ''}`
-    : '';
-  const who = `${String(author.name ?? 'unknown')}${author.identity && author.identity !== 'participant' ? '(あなた)' : ''}${author.bot ? '[bot]' : ''}`;
-
-  // 返信先: 番号が分かれば ↩N。引けなかった・消えたことも言う (返信先を推測で補わせない)
-  let reply = '';
-  if (reference.kind === 'forward') reply = ' [転送]';
-  else if (reference.kind === 'thread_starter') reply = ' [スレッド開始]';
-  else if (reference.messageId) {
-    reply = reference.ref ? ` ↩${String(reference.ref)}`
-      : reference.availability === 'deleted' ? ' ↩(削除済)' : ' ↩(未取得)';
-  }
-
-  const text = flat(body.text);
-  const cut = body.complete === false ? `…(全${String(body.characters)}字)` : '';
-  let extra = '';
-  if (typeof supplemental.text === 'string' && supplemental.text.trim()) {
-    extra = ` ※補足(発言者の言葉ではない): ${flat(supplemental.text)}${supplemental.complete === false ? '…' : ''}`;
-  } else {
-    const names = listOf(envelope.attachments).map((item) => String(item.name ?? '')).filter(Boolean);
-    if (names.length) extra += ` [添付:${names.slice(0, 3).join(',')}${names.length > 3 ? ` ほか${names.length - 3}件` : ''}]`;
-    const stickers = listOf(envelope.stickers).map((item) => String(item.name ?? '')).filter(Boolean);
-    if (stickers.length) extra += ` [スタンプ:${stickers.slice(0, 2).join(',')}]`;
-  }
-  const marks = [
-    state.editedAt ? '(編集済)' : '',
-    state.deleted ? '(削除済)' : '',
-    typeof (isRecord(envelope.reactions) ? envelope.reactions.total : null) === 'number' && Number(isRecord(envelope.reactions) ? envelope.reactions.total : 0) > 0
-      ? `(反応${String(isRecord(envelope.reactions) ? envelope.reactions.total : 0)})` : ''
-  ].filter(Boolean).join('');
-
-  const head = [ref !== undefined && ref !== null ? `${ref})` : '', shortTime(state.createdAt), channel, `${who}${reply}`].filter(Boolean).join(' ');
-  const content = text || (extra ? '' : '(本文なし)');
-  return `${head}:${content ? ` ${content}` : ''}${cut}${extra}${marks ? ` ${marks}` : ''}`.trimEnd();
-}
-
-/**
- * メッセージ列を1行1件の短い文で書き出す (道具の結果用)。
- * `3) 08/14 14:02 #雑談 たこ ↩2: 本文` — 自分の発言は名前に (あなた)、返信は ↩N、補足は ※ 以降。
- * 1件ずつ JSON にすると 540 文字の飾りが付いて、検索1回で 5〜19k 文字になっていた (往復のたびに送り直される)。
- * 意味の元は formatMessages と同じ envelope で、返信先の解決・本文の切り詰め・自分の判定は変わらない。
- */
+/** Tool wrapper: one legend followed by a source-preserving quoted conversation block. */
 export function formatMessageLines(
   messages: AgentMessage[],
-  { refs, showChannel = false, bodyChars = 300, selfId = null }: FormatOptions = {}
+  options: FormatOptions = {}
 ): string {
-  // 返信は親より前に出ることがある。番号を先に全部振る
-  for (const message of messages) refs?.add(message);
-  return messages.map((message) => {
-    const ref = refs?.add(message);
-    const envelope = messageEnvelope(message, {
-      lookup: (id) => refs?.byMessageId.get(id), selfId: selfId ?? null, bodyChars
-    });
-    return lineOf(ref, envelope, showChannel);
-  }).join('\n');
+  const formatter = createConversationFormatter(messages, options);
+  return [formatter.speakers, formatter.render(messages, options)].filter(Boolean).join('\n\n');
+}
+
+export interface ConversationFormatter {
+  /** このレンダリングブロックだけで使う話者一覧。 */
+  speakers: string;
+  /** 同じ author ID には、表示名が変わっても同じ別名を返す。 */
+  speakerOf(message: AgentMessage): string;
+  render(messages: readonly AgentMessage[], options?: ConversationRenderOptions): string;
+}
+
+const objectList = (value: unknown): Record<string, unknown>[] =>
+  Array.isArray(value) ? value.filter(isRecord) : [];
+const cleanValue = (value: unknown): string => typeof value === 'string' || typeof value === 'number'
+  ? String(value).replace(/[\r\n\t\u0000-\u001f\u007f-\u009f]/g,
+    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`)
+    .replace(/[\\`*_{}\[\]()#+!|>~-]/g, '\\$&') : '';
+const cleanContent = (value: unknown): string => typeof value === 'string'
+  ? value.replace(/[\r\n\t\u0000-\u001f\u007f-\u009f]/g,
+    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`) : '';
+const linesAsQuote = (value: string): string => value.split('\n').map((line) => `> ${line}`).join('\n');
+const linesAsMeta = (value: string): string => value.split('\n').map((line) => `| ${line}`).join('\n');
+const limited = (value: unknown, limit: number): { text: string; complete: boolean; characters: number } => {
+  const text = String(value ?? '');
+  return { text: text.slice(0, limit), complete: text.length <= limit, characters: text.length };
+};
+
+/**
+ * Discord の発言を、ひとつの文書内だけで通用する話者別名と引用本文で表示する。
+ * 参照は先に全件登録するため、検索結果の順番に関係なく返信先を解決できる。
+ */
+export function createConversationFormatter(
+  messages: readonly AgentMessage[],
+  { refs: suppliedRefs, selfId = null, resolveDisplay }: Pick<FormatOptions, 'refs' | 'selfId' | 'resolveDisplay'> = {}
+): ConversationFormatter {
+  const refs = suppliedRefs ?? new RefTable();
+  const showRefs = suppliedRefs !== undefined;
+  const speakerKey = (message: AgentMessage): string => message.authorId && message.authorId !== '0'
+    ? message.authorId : `unknown:${message.messageId}`;
+  const speakers = new Map<string, { alias: string; id: string; names: string[]; bot: boolean }>();
+  const speakersById = new Map<string, { alias: string; names: string[] }>();
+  for (const message of messages) {
+    refs.add(message);
+    const key = speakerKey(message);
+    let speaker = speakers.get(key);
+    if (!speaker) {
+      speaker = { alias: `u${speakers.size + 1}`, id: message.authorId, names: [], bot: false };
+      speakers.set(key, speaker);
+    }
+    const name = String(message.authorName || 'unknown');
+    if (!speaker.names.includes(name)) speaker.names.push(name);
+    speaker.bot ||= message.isBot === true;
+    if (message.authorId && message.authorId !== '0') speakersById.set(message.authorId, speaker);
+  }
+
+  const speakerFor = (message: AgentMessage) => {
+    const speaker = speakers.get(speakerKey(message));
+    if (!speaker) throw new Error('Message speaker is missing from the conversation formatter');
+    return speaker;
+  };
+
+  const legend = [...speakers.values()].map(({ alias, id, names, bot }) => {
+    const tags = [id === selfId ? '自分' : '', bot ? 'bot' : ''].filter(Boolean);
+    const identity = cleanValue(id && id !== '0' ? id : '不明');
+    return `${alias} = ${names.map(cleanValue).join(' / ')}（Discord ID: ${identity}）${tags.length ? ` [${tags.join('/')}]` : ''}`;
+  });
+  const speakerLegend = legend.length ? ['話者（この資料内）:', ...legend].join('\n') : '';
+
+  const render = (section: readonly AgentMessage[], options: ConversationRenderOptions = {}): string => {
+    const { showChannel = false, bodyChars = 300, tailOf = null } = options;
+    return section.map((message) => {
+      const ref = refs.byMessageId.get(message.messageId)?.ref ?? null;
+      const rawName = String(message.authorName || 'unknown');
+      const name = cleanValue(rawName);
+      const speaker = speakerFor(message);
+      const nameNote = speaker.names[0] !== rawName ? `（表示名: ${name}）` : '';
+      const structure = message.structure;
+      const reference = isRecord(structure?.reference) ? structure.reference : {};
+      const kind = reference.kind;
+      const thread = isRecord(structure?.thread) && structure.thread.id ? structure.thread : null;
+      const time = shortTime(message.createdAt);
+      const channel = showChannel ? ` #${cleanValue(message.channelName || message.channelId)}` : '';
+      const threadLabel = thread ? ` [スレッド: ${cleanValue(thread.name || thread.id)}]` : '';
+      let edge = '';
+      let immediateDeleted = reference.availability === 'deleted';
+      if (kind === 'reply') {
+        const parentId = typeof reference.messageId === 'string' && reference.messageId
+          ? reference.messageId : String(message.replyTo ?? '');
+        const parent = parentId ? refs.byMessageId.get(parentId) : undefined;
+        const parentRef = parent?.ref ?? null;
+        immediateDeleted ||= parent?.deleted === true || (!parent && message.referenceState === 'deleted');
+        if (immediateDeleted) edge = ' [返信先:削除済]';
+        else if (parentRef && showRefs) edge = ` ↩${parentRef}`;
+        else if (reference.availability === 'unavailable' || (reference.channelId && reference.channelId !== message.channelId)) edge = ' [返信先:範囲外]';
+        else if (reference.availability === 'resolved') edge = ' [返信先:表示範囲外]';
+        else if (reference.availability === 'not_fetched') edge = ' [返信先:未取得]';
+        else if (reference.availability === 'depth_limit' || message.referenceState === 'depth_limit') edge = ' [返信先:深度上限]';
+        else if (reference.availability === 'cycle' || message.referenceState === 'cycle') edge = ' [返信先:循環]';
+        else if (reference.availability === 'unknown') edge = ' [返信先:状態不明]';
+        else edge = ' [返信]';
+      } else if (kind === 'unknown_reference' || (kind === 'unknown' && reference.messageId)) {
+        edge = ' [参照種別不明]';
+      } else if (kind === 'forward') edge = ' [転送]';
+      else if (kind === 'thread_starter') edge = ' [スレッド開始]';
+
+      const webhook = structure?.webhookId ? ' [webhook]' : '';
+      const header = `${showRefs && ref ? `${ref}) ` : ''}${time}${channel}${threadLabel} ${speaker.alias}${nameNote}${webhook}${edge}:`;
+      const rawBody = String(message.content ?? '');
+      const limit = Number.isFinite(bodyChars) ? Math.max(0, bodyChars) : Infinity;
+      const body = rawBody.slice(0, limit);
+      const forwarded = objectList(structure?.forwarded);
+      const attachments = objectList(structure?.attachments);
+      const embeds = objectList(structure?.embeds);
+      const stickers = objectList(structure?.stickers);
+      const typed = forwarded.length + attachments.length + embeds.length + stickers.length > 0;
+      const out: string[] = [header];
+      if (body.length) out.push(linesAsQuote(body));
+      else if (typed || String(message.extra ?? '').trim()) out.push('| 本文なし（添付等の情報は本文ではありません）');
+      else out.push('> (本文なし)');
+      if (rawBody.length > body.length) out.push(`| …本文を途中まで表示（全${rawBody.length}文字）`);
+
+      // Resolve Discord syntax as separate, low-authority display metadata. Never rewrite
+      // source text: code, quoted syntax, and citation references remain byte-for-byte intact.
+      const hints = new Set<string>();
+      const addHint = (text: string): void => { if (hints.size < 12) hints.add(text); };
+      for (const match of body.matchAll(/<@!?(\d{16,21})>|<@&(\d{16,21})>|<#(\d{16,21})>/g)) {
+        const userId = match[1];
+        const roleId = match[2];
+        const channelId = match[3];
+        const kind = userId ? 'user' : roleId ? 'role' : 'channel';
+        const id = userId ?? roleId ?? channelId;
+        if (!id) continue;
+        const knownSpeaker = kind === 'user' ? speakersById.get(id) : undefined;
+        const label = knownSpeaker ? `${knownSpeaker.alias} (${knownSpeaker.names[0]})` : resolveDisplay?.(kind, id);
+        if (label) addHint(`${match[0]} → ${cleanValue(label)}`);
+      }
+      for (const match of body.matchAll(/<t:(\d{1,12})(?::[tTdDfFR])?>/g)) {
+        const seconds = Number(match[1]);
+        const date = new Date(seconds * 1000);
+        if (Number.isFinite(seconds) && Number.isFinite(date.getTime())) {
+          addHint(`${match[0]} → ${shortTime(date.getTime())} (UTC+9)`);
+        }
+      }
+      if (hints.size) out.push(`| 表示ヒント（本文は原文）: ${[...hints].join(' / ')}`);
+
+      // Bound all non-body source material together, including many fields in many embeds.
+      let richRemaining = Number.isFinite(limit) ? limit : 1200;
+      let richOmitted = false;
+      const addRich = (content: string, clipSource = false): void => {
+        for (const line of content.split('\n')) {
+          if (richRemaining <= 0) { richOmitted = true; return; }
+          if (line.length <= richRemaining) {
+            out.push(line);
+            richRemaining -= line.length;
+          } else {
+            if (clipSource && line.startsWith('| ') && richRemaining > 2) out.push(line.slice(0, richRemaining));
+            richRemaining = 0;
+            richOmitted = true;
+            return;
+          }
+        }
+      };
+
+      for (const item of forwarded) {
+        const fragment = limited(item.content ?? '(本文なし)', limit);
+        addRich('| 転送内容（投稿者の発言とは未確認）:');
+        addRich(linesAsMeta(fragment.text), true);
+        if (!fragment.complete) addRich(`| …転送の表示範囲（全${fragment.characters}文字）`);
+        for (const attachment of objectList(item.attachments)) {
+          const name = cleanValue(attachment.name) || '名前不明';
+          const type = cleanValue(attachment.contentType ?? attachment.content_type);
+          addRich(`| 転送添付: ${name}（未読${type ? `; 種類 ${type}` : ''}）`);
+        }
+      }
+      for (const item of attachments) {
+        const detail = [
+          cleanValue(item.contentType) ? `種類 ${cleanValue(item.contentType)}` : '',
+          typeof item.size === 'number' ? `${item.size} bytes` : '',
+          cleanValue(item.description) ? `説明 ${cleanValue(item.description)}` : ''
+        ].filter(Boolean).join('、');
+        const filename = limited(cleanValue(item.name) || '名前不明', limit);
+        const metadata = limited(detail, limit);
+        addRich(`| 添付: ${filename.text}（未読${metadata.text ? `; ${metadata.text}` : ''}）`);
+        if (!filename.complete || !metadata.complete) addRich(`| …添付情報の表示範囲（名前${filename.characters}文字、他メタデータ${metadata.characters}文字）`);
+      }
+      for (const item of embeds) {
+        const title = cleanValue(item.title);
+        const description = cleanValue(item.description);
+        const label = limited([title, description].filter(Boolean).join(' — '), limit);
+        const fields = objectList(item.fields).map((field) => limited(`${cleanValue(field.name)}: ${cleanValue(field.value)}`, limit)).filter((field) => field.text);
+        if (label.text || fields.length) {
+          addRich(`| 埋め込み（投稿者の発言とは別）: ${label.text || '(内容なし)'}`);
+          for (const field of fields) {
+            addRich(linesAsMeta(field.text), true);
+            if (!field.complete) addRich(`| …埋め込みフィールドの表示範囲（全${field.characters}文字）`);
+          }
+          if (!label.complete) addRich(`| …埋め込み説明の表示範囲（全${label.characters}文字）`);
+        }
+        for (const [label, value] of [['URL', item.url], ['埋め込み作成者', item.author], ['フッター', item.footer]] as const) {
+          if (typeof value === 'string' && value) addRich(`| ${label}: ${JSON.stringify(cleanContent(value))}`);
+        }
+      }
+      for (const item of stickers) {
+        addRich(`| スタンプ: ${limited(cleanValue(item.name) || '名前不明', limit).text}`);
+      }
+      if (!typed && !String(message.extra ?? '').trim() && message.structure?.metadata === 'legacy_incomplete'
+          && typeof message.attachmentCount === 'number' && message.attachmentCount > 0) {
+        addRich(`| 添付件数: ${message.attachmentCount}（詳細未保存、内容未読）`);
+      }
+      if (!typed && String(message.extra ?? '').trim()) {
+        const supplemental = limited(message.extra, limit);
+        addRich('| 補足（発言者の言葉とは限らない）:');
+        addRich(linesAsMeta(supplemental.text), true);
+        if (!supplemental.complete) addRich(`| …補足を途中まで表示（全${supplemental.characters}文字）`);
+      }
+      if (message.deleted) out.push('| 状態: 削除済み記録');
+      if (structure?.partial) out.push('| 状態: 一部のみ取得');
+      const chainState = cleanContent(structure?.replyChainState);
+      const chainStatus = message.referenceState === 'deleted' ? '削除済み'
+        : message.referenceState === 'unavailable' ? '範囲外'
+          : message.referenceState === 'depth_limit' ? '深度上限'
+            : message.referenceState === 'cycle' ? '循環で停止' : '';
+      if (chainStatus && !immediateDeleted) out.push(`| 返信履歴: ${chainStatus}`);
+      else if (chainState && !immediateDeleted) out.push(`| 返信履歴: ${chainState === 'cycle' ? '循環で停止' : chainState === 'depth_limit' ? '深度上限' : cleanValue(chainState)}`);
+      if (typeof message.reactionCount === 'number' && message.reactionCount > 0) out.push(`| 反応数: ${message.reactionCount}（賛同の主張とは限らない）`);
+      if (message.editedAt) out.push('| 状態: 編集済み');
+      const tail = tailOf?.(message);
+      if (tail) {
+        addRich('| 補足（検索・取得条件）:');
+        addRich(linesAsMeta(String(tail)), true);
+      }
+      if (richOmitted) out.push('| …補足情報は文字数上限により省略');
+      return out.join('\n');
+    }).join('\n\n');
+  };
+
+  return { speakers: speakerLegend, speakerOf: (message) => speakerFor(message).alias, render };
 }
 
 /** そのテキストがコードブロックを開いたまま終わっているか。 */

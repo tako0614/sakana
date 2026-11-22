@@ -10,16 +10,18 @@
 // ARCHIVE_DB_PATH / MEMORY_DB_PATH を一時ファイルに向けて呼ぶこと。
 
 import assert from 'node:assert/strict';
+import Database from 'better-sqlite3';
 
 process.env.MEMORY_RECALL_FLOOR = '0.05';
 process.env.MEMORY_RECALL_GAP = '0.5';
+process.env.MEMORY_AUTO_RECALL_FLOOR = '0.05';
 process.env.MEMORY_CHUNK_FLOOR = '0.05';
 process.env.MEMORY_CHUNK_GAP = '0.5';
 process.env.MEMORY_CHUNK_CHARS = '0';   // 1 行ずつ。まとめる大きさは、あとで切り替えて試す
 const store = await import('../src/memory/store.js');
 const vectors = await import('../src/memory/vectors.js');
 const recallLib = await import('../src/memory/recall.js');
-const { recallFor, recallWithMeaning, meaningReader, meaningLines } = recallLib;
+const { memoryReader, meaningLines } = recallLib;
 const { runMemoryToolWithMeaning, runMemoryTool } = await import('../src/memory/tool.js');
 const chunkLib = await import('../src/memory/chunks.js');
 
@@ -186,6 +188,82 @@ assert.ok(episodes[0].score > (episodes[1]?.score ?? 0));
 const skip = vectors.nearest(GUILD, 'episode', query, { limit: 3, exclude: new Set([e1]) });
 assert.ok(!skip.some((hit) => hit.id === e1), 'excluded ids are skipped');
 
+// Warm cache, stable tie ordering, requested-id order, and same-size/same-time
+// updates from both this connection and a separate builder connection.
+{
+  const db = store.memoryDb();
+  const originals = db.prepare('SELECT id, model, vec, updated_at FROM memory_vectors WHERE guild_id = ? AND kind = ? ORDER BY id').all(GUILD, 'episode');
+  const dot = (blob) => {
+    const values = new Float32Array(blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength));
+    let score = 0;
+    for (let i = 0; i < query.length; i += 1) score += values[i] * query[i];
+    return score;
+  };
+  const ordered = () => db.prepare('SELECT id, vec FROM memory_vectors WHERE guild_id = ? AND kind = ? AND model = ?').all(GUILD, 'episode', originals[0].model);
+  const expected = (limit, exclude = new Set()) => ordered().map((row, index) => ({ id: row.id, score: dot(row.vec), index }))
+    .filter((hit) => !exclude.has(hit.id)).sort((a, b) => b.score - a.score || a.index - b.index).slice(0, limit).map(({ id, score }) => ({ id, score }));
+  for (const limit of [0, 1, 2, 10]) {
+    assert.deepEqual(vectors.nearest(GUILD, 'episode', query, { limit }), expected(limit), 'bounded top-k matches a full stable sort');
+    assert.deepEqual(vectors.nearest(GUILD, 'episode', query, { limit, exclude: new Set([e1]) }), expected(limit, new Set([e1])), 'top-k applies exclusions before selection');
+  }
+  const put = db.prepare('UPDATE memory_vectors SET vec = ? WHERE guild_id = ? AND kind = ? AND id = ?');
+  try {
+    put.run(Buffer.from(query.buffer), GUILD, 'episode', e2);
+    assert.deepEqual(vectors.nearest(GUILD, 'episode', query, { limit: 2 }), expected(2), 'local same-time replacement invalidates a warm matrix');
+    assert.equal(vectors.nearest(GUILD, 'episode', query, { limit: originals.length }).find((hit) => hit.id === e2)?.score, dot(Buffer.from(query.buffer)));
+    const external = new Database(process.env.MEMORY_DB_PATH);
+    try {
+      const opposite = Float32Array.from(query, (value) => -value);
+      external.prepare('UPDATE memory_vectors SET vec = ? WHERE guild_id = ? AND kind = ? AND id = ?').run(Buffer.from(opposite.buffer), GUILD, 'episode', e2);
+    } finally { external.close(); }
+    assert.deepEqual(vectors.nearest(GUILD, 'episode', query, { limit: 2 }), expected(2), 'external same-time replacement invalidates a warm matrix');
+    assert.equal(vectors.nearest(GUILD, 'episode', query, { limit: originals.length }).find((hit) => hit.id === e2)?.score, -dot(Buffer.from(query.buffer)));
+    const tied = Buffer.from(query.buffer);
+    put.run(tied, GUILD, 'episode', e1);
+    put.run(tied, GUILD, 'episode', e2);
+    assert.deepEqual(vectors.nearest(GUILD, 'episode', query, { limit: 1 }), expected(1), 'equal scores keep database row order');
+  } finally {
+    for (const row of originals) db.prepare('UPDATE memory_vectors SET vec = ?, updated_at = ? WHERE guild_id = ? AND kind = ? AND id = ?')
+      .run(row.vec, row.updated_at, GUILD, 'episode', row.id);
+  }
+  const originalPrepare = db.prepare;
+  let matrixLoads = 0;
+  db.prepare = function (sql, ...args) {
+    if (typeof sql === 'string' && sql.includes('SELECT id, vec FROM memory_vectors')) matrixLoads += 1;
+    return originalPrepare.call(this, sql, ...args);
+  };
+  try {
+    vectors.nearest(GUILD, 'episode', query);
+    const warmLoads = matrixLoads;
+    const external = new Database(process.env.MEMORY_DB_PATH);
+    try {
+      external.prepare('UPDATE nodes SET weight = weight + 1 WHERE guild_id = ? AND path = ?').run(GUILD, 'people/たこ');
+    } finally { external.close(); }
+    vectors.nearest(GUILD, 'episode', query);
+    assert.equal(matrixLoads, warmLoads, 'an unrelated external commit does not reload vector BLOBs');
+
+    const foreign = `${GUILD}-other`;
+    db.prepare('INSERT INTO memory_vectors (guild_id, kind, id, model, text_hash, vec, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(foreign, 'episode', 999999, originals[0].model, 'test', originals[0].vec, 1);
+    vectors.nearest(GUILD, 'episode', query);
+    assert.equal(matrixLoads, warmLoads, 'a vector write for another guild does not reload this matrix');
+    const previousForeignRevision = db.prepare('SELECT revision FROM memory_vector_revisions WHERE guild_id = ? AND kind = ?').get(foreign, 'episode').revision;
+    const previousLocalRevision = db.prepare('SELECT revision FROM memory_vector_revisions WHERE guild_id = ? AND kind = ?').get(GUILD, 'episode').revision;
+    db.prepare('UPDATE memory_vectors SET guild_id = ? WHERE guild_id = ? AND kind = ? AND id = ?').run(GUILD, foreign, 'episode', 999999);
+    assert.ok(db.prepare('SELECT revision FROM memory_vector_revisions WHERE guild_id = ? AND kind = ?').get(foreign, 'episode').revision > previousForeignRevision, 'moving a row invalidates its old group');
+    assert.ok(db.prepare('SELECT revision FROM memory_vector_revisions WHERE guild_id = ? AND kind = ?').get(GUILD, 'episode').revision > previousLocalRevision, 'moving a row invalidates its new group');
+    assert.deepEqual(vectors.nearest(GUILD, 'episode', query, { limit: 3 }), expected(3), 'the moved row is visible in its new group');
+    db.prepare('DELETE FROM memory_vectors WHERE guild_id = ? AND kind = ? AND id = ?').run(GUILD, 'episode', 999999);
+
+    db.prepare('DELETE FROM memory_vector_revisions WHERE guild_id = ? AND kind = ?').run(GUILD, 'episode');
+    vectors.nearest(GUILD, 'episode', query);
+    const legacyLoads = matrixLoads;
+    put.run(originals.find((row) => row.id === e2).vec, GUILD, 'episode', e2);
+    vectors.nearest(GUILD, 'episode', query);
+    assert.equal(matrixLoads, legacyLoads + 1, 'a write to legacy rows without a revision creates one and reloads the matrix');
+  } finally { db.prepare = originalPrepare; }
+}
+
 const meaning = await vectors.meaningOf(GUILD, '自分のPRはレビューを飛ばしていた');
 assert.ok(meaning.nodes.some((node) => node.path === 'topics/ダブスタ' || node.path === 'people/たこ'));
 assert.ok(meaning.episodes.some((entry) => entry.id === e1));
@@ -223,12 +301,9 @@ assert.ok(!notAgain?.nodes.some((node) => ['topics/ダブスタ', 'people/たこ
   assert.ok(!lines.some((text) => text === '  [[projects/まぐろbot]]'), 'a page that has a line is not listed twice');
   assert.ok(line.length < 140, 'a recall line is a pointer, not the body');
 
-  // 呼ばれたときの想起: 出した断片は控え、あとの想起で繰り返さない
-  const shown = await recallWithMeaning(GUILD, { request: 'まぐろbotの client を魔改造したのってどうなった？' });
-  assert.match(shown.text, /§実装 — Hono の素の client/);
-  assert.ok(shown.chunkIds.size > 0 && shown.paths.has('projects/まぐろbot') && shown.episodeIds.has(1), 'what was shown is remembered');
-  const next = await meaningReader(GUILD, { request: 'まぐろbotの client を魔改造したのってどうなった？', shown })({ observations: ['tool:search: Hono の client を魔改造して作った'] });
-  assert.ok(!next || !/魔改造/.test(next.text), 'a line shown at the start is not shown again while thinking');
+  const recalled = await memoryReader(GUILD, { request: 'Honoのclientを魔改造した話' })({ observations: [] });
+  assert.match(recalled?.text, /§実装 — Hono の素の client.*e1/, 'a guild with the legacy index can still recall evidence');
+
 }
 
 // memory ツール: 節だけ開ける / 見つからなければ節の一覧
@@ -281,133 +356,6 @@ vectors.setEmbedder(async () => { throw new Error('worker down'); });
 assert.equal(await vectors.embedQuery('壊れたワーカー'), null, 'a failing worker is the same as no meaning');
 vectors.setEmbedder(fakeEmbed);
 
-// ---- 呼ばれたときの想起 --------------------------------------------------------
-const request = 'たこって自分のPRはレビューを飛ばしてたよね';
-const named = recallFor(GUILD, { request });
-assert.match(named, /\[\[people\/たこ\]\]/, 'the name matches the page');
-const both = await recallWithMeaning(GUILD, { request });
-assert.match(both.text, /意味が近い記憶/);
-assert.match(both.text, /\[\[topics\/ダブスタ\]\]/, 'a page whose name is not in the sentence is recalled by meaning');
-assert.equal(both.text.match(/^- \[\[people\/たこ\]\]$/gm).length, 1, 'a page found by name is listed once as a page');
-assert.ok(!/^ {2}\[\[people\/たこ\]\]$/m.test(both.text), 'and is not repeated as a bare page in the meaning section (a line of it, with its section, may follow)');
-assert.ok(both.paths.has('topics/ダブスタ') && both.paths.has('people/たこ'));
-vectors.setEmbedder(async () => { throw new Error('worker down'); });
-const fallback = await recallWithMeaning(GUILD, { request });
-assert.equal(fallback.text, named, 'without meaning the name-based recall comes back unchanged');
-vectors.setEmbedder(fakeEmbed);
-assert.equal((await recallWithMeaning('920000000000000999', { request })).text, '', 'a server without memory recalls nothing');
-
-// 直近の会話に出てくる名前だけでは、ページを引かない (依頼に名前が無いと、会話の常連のページと、そのいつもの上位の出来事が毎回出ていた)
-assert.equal(recallFor(GUILD, { request: 'おはよう', context: 'さばが昼にカップ麺を食べた。たこのPRの話' }), '', 'names only in the surrounding chat are not a clue');
-// 名前で見つけたページの出来事は、渡された選び方 (依頼に近い順) に従う。近いものが無ければ見出しだけ
-const bareHeading = recallLib.recallParts(GUILD, { request: 'たこって誰', rank: () => [] });
-assert.match(bareHeading.text, /\[\[people\/たこ\]\]/, 'the page is still listed');
-assert.ok(!/^ {2}e\d+/m.test(bareHeading.text) && bareHeading.episodeIds.size === 0, 'with nothing near enough, no episode lines');
-const pickedEpisode = recallLib.recallParts(GUILD, { request: 'たこって誰', rank: (episodes) => episodes.filter((entry) => entry.id === e1) });
-assert.ok(pickedEpisode.episodeIds.has(e1), 'the ranker chooses which episodes are shown');
-
-// ---- 考えている途中の想起 ------------------------------------------------------
-const read = meaningReader(GUILD, { request: 'さばって何者？', shown: undefined });
-assert.equal(await read({ observations: [] }), null, 'the first round is covered by the start-of-run recall');
-const noticed = await read({ observations: ['tool:search: さば: Rust 最高と言いながら Go も書く。昼はカップ麺'] });
-assert.ok(noticed?.text.includes('調べている内容に近い記憶'), 'what is being looked at brings related memory');
-assert.match(noticed.text, /people\/さば|Rust と Go/);
-const repeated = await read({ observations: ['tool:search: さば: Rust 最高と言いながら Go も書く。昼はカップ麺'] });
-assert.ok(!repeated || !/people\/さば/.test(repeated.text), 'what was already shown is not shown again');
-// モデルが直前に考えていたこと (CoT) も手がかりになる: 道具の結果が曖昧でも、考えていた中身で引ける
-const queries = [];
-vectors.setEmbedder(async (texts, kind) => { if (kind === 'query') queries.push(texts[0]); return fakeEmbed(texts); });
-const withThought = await meaningReader(GUILD, { request: '誰の話？' })({ observations: ['tool:search: (ヒットなし)'], reasoning: '自分のPRはレビューを飛ばしたというダブスタの話を探している' });
-assert.ok(queries.at(-1).includes('ダブスタの話を探している'), 'the thinking text is part of the recall query');
-assert.ok(queries.at(-1).indexOf('誰の話？') < queries.at(-1).indexOf('ダブスタ') && queries.at(-1).indexOf('ダブスタ') < queries.at(-1).indexOf('ヒットなし'), 'order: request, then thinking, then tool results');
-assert.ok(withThought === null || /ダブスタ|レビュー/.test(withThought.text));
-vectors.setEmbedder(async () => { throw new Error('worker down'); });
-assert.equal(await meaningReader(GUILD, { request: 'x' })({ observations: ['tool:search: レビュー'] }), null, 'a failing worker adds nothing');
-vectors.setEmbedder(fakeEmbed);
-
-// ---- 直前の会話を手がかりにする ---------------------------------------------------
-{
-  // 話題が依頼文でなく直前の会話にあるとき (「それって結局どうなったの？」) に、会話の側の手がかりで引ける
-  const talk = recallLib.conversationText([
-    { authorName: 'さば', content: 'たこ、自分のPRはレビューを飛ばして通してたよね https://example.com/pr/1' },
-    { authorName: 'あきら', content: '<@123456789012345678> それダブスタじゃない？' },
-    { authorName: 'たこ', content: '' }
-  ]);
-  assert.equal(talk, 'さば: たこ、自分のPRはレビューを飛ばして通してたよね\nあきら: それダブスタじゃない？', 'name: text, oldest first; URLs, mentions and empty messages are dropped');
-  const long = recallLib.conversationText(Array.from({ length: 12 }, (_, i) => ({ authorName: `u${i}`, content: 'あ'.repeat(120) })), { limit: 6, chars: 200 });
-  assert.equal(long.length, 200, 'a long conversation is cut to its recent end');
-  assert.ok(long.endsWith('あ'), 'the nearest end is kept');
-
-  const question = 'それって結局どうなったの？';
-  // 既定ではオフ: 会話を渡しても、依頼だけで引く (測定では会話文はスコアで選り分けられず、的外れが増えたため)
-  const offCalls = [];
-  vectors.setEmbedder(async (texts, kind) => { if (kind === 'query') offCalls.push([...texts]); return fakeEmbed(texts); });
-  await recallWithMeaning(GUILD, { request: question, conversation: talk });
-  await meaningReader(GUILD, { request: question, conversation: talk })({ observations: ['tool:search: x'] });
-  assert.ok(offCalls.length === 2 && offCalls.every((texts) => texts.length === 1), 'without MEMORY_CONVERSATION_CLUE the conversation is not a clue');
-  assert.ok(!offCalls.some((texts) => texts.some((text) => text.includes('レビューを飛ばして'))), 'and its text is never embedded');
-  vectors.setEmbedder(fakeEmbed);
-  process.env.MEMORY_CONVERSATION_CLUE = '1';
-  const withoutTalk = await vectors.meaningOf(GUILD, question);
-  const withTalk = await vectors.meaningOf(GUILD, [{ text: question }, { text: talk, penalty: 0 }]);
-  assert.ok(withTalk.episodes.some((entry) => entry.id === e1) || withTalk.nodes.some((node) => ['topics/ダブスタ', 'people/たこ'].includes(node.path)), 'the conversation clue reaches the memory');
-  assert.notEqual(withoutTalk?.episodes[0]?.id, e1, 'the bare question does not');
-  // 弱い手がかり: penalty のぶん低く見る
-  const strong = await vectors.meaningOf(GUILD, [{ text: talk, penalty: 0 }]);
-  const weak = await vectors.meaningOf(GUILD, [{ text: talk, penalty: 0.1 }]);
-  const top = (meaning) => meaning.episodes.find((entry) => entry.id === e1).score;
-  assert.ok(Math.abs((top(strong) - top(weak)) - 0.1) < 1e-6, 'a weaker clue scores lower by its penalty');
-  // 同じ記憶は、いちばん高いスコアの手がかりで数える
-  const both = await vectors.meaningOf(GUILD, [{ text: 'さばは昼にカップ麺を食べる' }, { text: talk, penalty: 0 }]);
-  assert.ok(both.episodes.some((entry) => entry.id === e1) && both.episodes.some((entry) => entry.id !== e1), 'clues add up: each brings its own memory');
-  assert.equal(new Set(both.episodes.map((entry) => entry.id)).size, both.episodes.length, 'a memory found by two clues is listed once');
-
-  // 往復の途中: 依頼が曖昧でも、直前の会話の手がかりで、道具の結果を待たずに引ける
-  const reader = meaningReader(GUILD, { request: question, conversation: talk });
-  const mid = await reader({ observations: ['tool:search: (ヒットなし)'] });
-  assert.ok(mid && /ダブスタ|たこ|レビュー/.test(mid.text), 'the conversation clue also works in the per-round recall');
-  const startShown = await recallWithMeaning(GUILD, { request: question, conversation: talk });
-  assert.ok(startShown.text.includes('ダブスタ') || startShown.text.includes('たこ'), 'and in the start-of-run recall');
-  // 別々の手がかりは、1 回の呼び出しでまとめて埋め込む
-  const calls = [];
-  vectors.setEmbedder(async (texts, kind) => { if (kind === 'query') calls.push([...texts]); return fakeEmbed(texts); });
-  await meaningReader(GUILD, { request: '誰の話？', conversation: talk })({ observations: ['tool:search: (ヒットなし)'], reasoning: '自分のPRはレビューを飛ばしたというダブスタの話を探している' });
-  assert.equal(calls.length, 1, 'all the clues are embedded in one call');
-  assert.equal(calls[0].length, 4, 'request, conversation, thinking and the tool result are separate clues');
-  assert.ok(calls[0][2].includes('ダブスタの話を探している') && calls[0][3].includes('ヒットなし'), 'order: request, conversation, thinking, tool result');
-  vectors.setEmbedder(fakeEmbed);
-  delete process.env.MEMORY_CONVERSATION_CLUE;
-}
-
-// ---- memory_focus: 受動の想起の向きを、モデルが変える -------------------------------
-{
-  const queries = [];
-  vectors.setEmbedder(async (texts, kind) => { if (kind === 'query') queries.push(texts[0]); return fakeEmbed(texts); });
-  const focus = 'memory_focus.context: レビューの話\nmemory_focus.thought: たこが自分のPRはレビューを飛ばしたというダブスタの話';
-  const reader = meaningReader(GUILD, { request: '誰の話？' });
-  assert.equal(await reader({ observations: [] }), null, 'no focus and nothing looked at yet: nothing is added');
-  const focused = await reader({ observations: [], thought: focus });
-  assert.ok(focused && /焦点/.test(focused.text), 'a focus alone brings related memory before any tool was used');
-  assert.match(focused.text, /ダブスタ|たこ/);
-  assert.ok(!queries.at(-1).includes('memory_focus.'), 'the labels are stripped from the query');
-  assert.ok(queries.at(-1).startsWith('レビューの話 たこが自分のPR'), 'the focus leads the query, ahead of the request');
-  // 往復ごとの想起はその往復にしか付かない (runtime は焦点を 1 回で捨てる)。明示的に選び直したら、前の往復で出した指し先も出し直す
-  const again = await reader({ observations: [], thought: focus });
-  assert.ok(again && /ダブスタ|たこ/.test(again.text), 'a new explicit focus brings back pointers shown in an earlier round (they are no longer in the input)');
-  // 焦点が無い往復は、出したものを繰り返さない
-  const plain = await reader({ observations: ['tool:search: たこ レビュー 飛ばした'] });
-  assert.ok(!plain || !/\[\[topics\/ダブスタ\]\]|\[\[people\/たこ\]\]/.test(plain.text), 'without a focus, what was shown is not shown again');
-  // 開始時の想起で入力に入れたものは、焦点があっても出さない
-  const shown = await recallWithMeaning(GUILD, { request: 'たこって自分のPRはレビューを飛ばしてたよね' });
-  const afterStart = await meaningReader(GUILD, { request: 'x', shown })({ observations: [], thought: focus });
-  const shownLines = [...shown.chunkIds].map((id) => store.memoryDb().prepare('SELECT text FROM memory_chunks WHERE id = ?').get(id).text.slice(0, 16));
-  assert.ok(!afterStart || (![...shown.paths].some((path) => afterStart.text.split('\n').includes(`  [[${path}]]`)) && !shownLines.some((line) => afterStart.text.includes(line))),
-    'what the start-of-run recall already put in the input (pages and lines) is not repeated; another line of the same page may follow');
-  vectors.setEmbedder(fakeEmbed);
-  assert.equal(recallLib.focusOf('memory_focus.thought: 長い話 '.repeat(200)).length, 700, 'a long focus is cut');
-  assert.equal(recallLib.focusOf(undefined), '');
-}
-
 // ---- memory ツール -------------------------------------------------------------
 const ctx = { guildId: GUILD };
 const byWords = await runMemoryToolWithMeaning(ctx, { query: 'レビュー' });
@@ -420,4 +368,4 @@ assert.equal(await runMemoryToolWithMeaning(ctx, { path: 'people/たこ' }), (aw
 vectors.setEmbedder(async () => { throw new Error('worker down'); });
 assert.equal(await runMemoryToolWithMeaning(ctx, { query: 'レビュー' }), (await import('../src/memory/tool.js')).runMemoryTool(ctx, { query: 'レビュー' }), 'a failing worker returns the plain result');
 
-console.log('memory vectors ok (差分だけ振る / 消えたら消す / 別モデルは使わない / 近い順 / 間に合わなければ null / 想起は名前 + 意味で重複しない / 考え中は未出のものだけ / memory ツール / 本文を1行ずつに割る・書き直しても引き継ぐ・節だけ開く)');
+console.log('memory vectors ok (差分だけ振る / 消えたら消す / 別モデルは使わない / 近い順 / 間に合わなければ null / 旧索引からも自動想起できる / memory ツール / 本文を1行ずつに割る・書き直しても引き継ぐ・節だけ開く)');

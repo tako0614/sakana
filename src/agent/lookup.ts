@@ -7,7 +7,7 @@
 // 事実・過去・人物を聞く言い回し
 const ASKING = /(教えて|について|とは[？?\s]|って(何|なに|誰|だれ|どんな|いつ|どこ)|どんな(人|やつ|話|奴)|誰|だれ|いつ|なんで|なぜ|エピ|やらかし|弱み|黒歴史|過去|昔|前に|探して|調べて|知ってる|覚えてる|どうなの|どういう|何をした|何した)/;
 
-/** 事実を聞いていそうか。known: 依頼に名前が出てきた記憶のページがあるか。 */
+/** 事実を聞いていそうか。known は依頼に関係する想起があったときに使う。 */
 export function lookupAdvised(request: string, { known = false }: { known?: boolean } = {}): boolean {
   const text = request.replace(/<@!?\d+>/g, '').replace(/https?:\/\/\S+/g, '').trim();
   if (text.length < 4) return false;
@@ -28,11 +28,11 @@ export const LOOKUP_HINT = '事実が絡む話なのに、まだ何も調べて�
  * runtime の validate に渡す関数を作る。最初の答えが道具なしで、依頼が事実を聞いているときだけ1回やり直させる
  * (runtime は投げられたエラーの governanceRetryHint を「RETRY: …」として足して、もう1往復させる)。
  */
-export function lookupGuard({ request, known, usedTool }: { request: string; known: boolean; usedTool: () => boolean }):
+export function lookupGuard({ request, known, usedTool }: { request: string; known: () => boolean; usedTool: () => boolean }):
   (message: { content?: unknown }) => unknown {
   let asked = false;
   return (message) => {
-    if (!asked && !usedTool() && lookupAdvised(request, { known })) {
+    if (!asked && !usedTool() && lookupAdvised(request, { known: known() })) {
       asked = true;
       throw Object.assign(new Error('lookup advised'), { governanceRetryHint: LOOKUP_HINT });
     }

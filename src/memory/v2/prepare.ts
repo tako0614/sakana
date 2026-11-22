@@ -23,11 +23,10 @@ import type { LineInfo, RenderedSection, SectionRange, UnitInfo } from './types.
 const TZ_MS = Number(process.env.ARCHIVE_TZ_OFFSET_HOURS ?? 9) * 3_600_000;
 export const GAP_MS = 20 * 60_000;          // これ以上空いたら別の会話
 const TIME_GAP_MS = 10 * 60_000;            // これ以上空いたら行頭に時刻を書く
-const MERGE_MS = 3 * 60_000;                // 同じ人がこの間に続けて書いたら 1 行にまとめる
 export const SECTION_CHARS = Number(process.env.MEMORY_V2_SECTION_CHARS || 20000);
 const CONTEXT_LINES = 6;
 const EXCERPT_CHARS = 30;
-const LINE_OVERHEAD = 12;                   // 行番号・時刻・コードの分 (計画の見積もり用)
+const LINE_OVERHEAD = 24;                   // 行番号・時刻・コード・参照の分 (計画の見積もり用)
 
 const local = (ms: number): string => new Date(ms + TZ_MS).toISOString();
 
@@ -112,7 +111,14 @@ export function planFrom(rows: Iterable<Slim>, channelId: string, target = SECTI
 const MESSAGE_COLUMNS = `message_id, author_id, author_name, content, created_at, reply_to,
   attachment_count, attachment_kinds, sticker_count, embed_count`;
 
-const bodyOf = (row: MessageRow): string => [cleanText(row.content), extrasOf(row)].filter(Boolean).join(' ');
+// V2 の台本では内容を短縮・一行化しない。CRLF だけ揃え、制御文字は可視化する。
+// コードフェンス・引用・空行・インデントは原文のまま残す。
+const sourceText = (content: string | null | undefined): string => String(content ?? '')
+  .replace(/\r\n?/g, '\n')
+  .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g,
+    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`);
+
+const bodyOf = (row: MessageRow): string => [sourceText(row.content), extrasOf(row)].filter(Boolean).join(' ');
 
 /** どこから・どこまで計画するか。after は読み終えた最後の発言 (この次から)、until はこの時刻より新しい発言は待つ (会話の途中で切らない)。 */
 export interface PlanWindow { afterMs?: number; afterId?: string; untilMs?: number }
@@ -194,7 +200,7 @@ function loadBefore(range: SectionRange, firstAt: number): MessageRow[] {
   return picked;
 }
 
-interface ParentRow { author_id: string; author_name: string; is_bot: number; content: string }
+interface ParentRow { message_id: string; author_id: string; author_name: string; is_bot: number; content: string }
 
 export interface RenderOptions {
   book?: NameBook;
@@ -206,7 +212,6 @@ export interface RenderOptions {
 export function renderSection(guildId: string, range: SectionRange, { book = new NameBook(guildId), onlyConvs }: RenderOptions = {}): RenderedSection {
   const rows = loadRange(range);
   const before = rows[0] ? loadBefore(range, rows[0].created_at) : [];
-  const inRange = new Set(rows.map((row) => row.message_id));
 
   // 発言者コード: 出てきた順
   const codes = new Map<string, string>();
@@ -224,26 +229,36 @@ export function renderSection(guildId: string, range: SectionRange, { book = new
   };
   for (const row of [...before, ...rows]) codeOf(row.author_id, row.author_name);
 
-  const parentStatement = archive.prepare<[string], ParentRow>('SELECT author_id, author_name, is_bot, content FROM messages WHERE message_id = ?');
-  const textOf = (row: MessageRow): string => {
-    const content = String(row.content ?? '')
+  const parentStatement = archive.prepare<[string, string, string], ParentRow>(`SELECT message_id, author_id, author_name, is_bot, content FROM messages
+    WHERE message_id = ? AND guild_id = ? AND channel_id = ? AND deleted = 0`);
+  const contentOf = (row: MessageRow): string => {
+    const content = sourceText(row.content)
       .replace(/<@&\d+>/g, '@ロール')
       .replace(/<@!?(\d+)>/g, (_, id: string) => `@${codes.get(id) ?? book.person(id, null)}`)
       .replace(/<#(\d+)>/g, (_, id: string) => book.channel(id));
-    return bodyOf({ ...row, content });
+    return content;
   };
   const excerpt = (content: string): string => {
     const text = cleanText(content).replace(/<@!?\d+>/g, '@…');
     return [...text].length > EXCERPT_CHARS ? `${[...text].slice(0, EXCERPT_CHARS).join('')}…` : text;
   };
+  const lineOf = new Map<string, number>();
+  let lineConv = 0;
+  let previousAt = -Infinity;
+  rows.forEach((row, index) => {
+    if (index === 0 || row.created_at - previousAt >= GAP_MS) lineConv += 1;
+    if (!onlyConvs || onlyConvs.has(`c${lineConv}`)) lineOf.set(row.message_id, index + 1);
+    previousAt = row.created_at;
+  });
   const targetOf = (row: MessageRow): string => {
     if (!row.reply_to) return '';
-    const parent = parentStatement.get(row.reply_to);
+    const parent = parentStatement.get(row.reply_to, guildId, range.channelId);
     if (!parent) return '';
-    if (parent.is_bot) return `→[bot]「${excerpt(parent.content)}」`;
-    if (parent.author_id === row.author_id) return '';
+    const parentLine = lineOf.get(parent.message_id);
+    if (parentLine !== undefined) return ` ↩#${parentLine}`;
+    if (parent.is_bot) return ` ↩[bot]「${excerpt(parent.content)}」`;
     const code = codeOf(parent.author_id, parent.author_name);
-    return inRange.has(row.reply_to) ? `→${code}` : `→${code}「${excerpt(parent.content)}」`;
+    return ` ↩${code}「${excerpt(parent.content)}」`;
   };
 
   const label = book.channel(range.channelId);
@@ -253,13 +268,18 @@ export function renderSection(guildId: string, range: SectionRange, { book = new
 
   if (before.length) {
     out.push('(前の区間の続き。読むだけで、根拠にしない)');
-    for (const row of before) out.push(`  ${codeOf(row.author_id, row.author_name)}${targetOf(row)}: ${textOf(row)}`);
+    for (const row of before) {
+      const body = contentOf(row).split('\n');
+      out.push(`  ${codeOf(row.author_id, row.author_name)}${targetOf(row)}: ${body[0] ?? ''}`);
+      for (const continuation of body.slice(1)) out.push(`    | ${continuation}`);
+      const extra = extrasOf(row);
+      if (extra) out.push(`    | 補足（添付等、本文ではない）: ${extra}`);
+    }
   }
 
   let lineNo = 1;
   let lastDate: string | null = null;
   let lastTimeShown = -Infinity;
-  let prev: { authorId: string; at: number } | null = null;
   let unit: { conv: string; fromLine: number; messages: number; fromMs: number; toMs: number; out: string[] } | null = null;
   const unitOut: Map<string, string[]> = new Map();
 
@@ -277,30 +297,24 @@ export function renderSection(guildId: string, range: SectionRange, { book = new
       closeUnit();
       const conv = `c${units.length + 1}`;
       unit = { conv, fromLine: lineNo, messages: 0, fromMs: row.created_at, toMs: row.created_at, out: [''] };
-      prev = null;
       lastTimeShown = -Infinity;
     }
     const at = local(row.created_at);
     const date = at.slice(0, 10);
     const code = codeOf(row.author_id, row.author_name);
     const target = targetOf(row);
-    const body = textOf(row);
-    const canMerge = prev && prev.authorId === row.author_id && !target && date === lastDate && row.created_at - prev.at <= MERGE_MS;
-    if (canMerge) {
-      const index = unit.out.length - 1;
-      unit.out[index] += ` / ${body}`;
-      const entry = lines.get(lineNo - 1);
-      if (entry) { entry.ids.push(row.message_id); entry.lastMs = row.created_at; }
-    } else {
-      if (date !== lastDate) unit.out.push(`## ${label} ${date}`);
-      const time = row.created_at - lastTimeShown >= TIME_GAP_MS || date !== lastDate ? `${at.slice(11, 16)} ` : '';
-      unit.out.push(`${lineNo}|${time}${code}${target}: ${body}`);
-      lines.set(lineNo, { ids: [row.message_id], authorId: row.author_id, code, firstMs: row.created_at, lastMs: row.created_at, conv: unit.conv });
-      if (time) lastTimeShown = row.created_at;
-      lastDate = date;
-      lineNo += 1;
-    }
-    prev = { authorId: row.author_id, at: row.created_at };
+    const body = contentOf(row);
+    if (date !== lastDate) unit.out.push(`## ${label} ${date}`);
+    const time = row.created_at - lastTimeShown >= TIME_GAP_MS || date !== lastDate ? `${at.slice(11, 16)} ` : '';
+    const bodyLines = body.split('\n');
+    unit.out.push(`${lineNo}|${time}${code}${target}: ${bodyLines[0] || '(本文なし)'}`);
+    for (const continuation of bodyLines.slice(1)) unit.out.push(`  | ${continuation}`);
+    const extra = extrasOf(row);
+    if (extra) unit.out.push(`  | 補足（添付等、本文ではない）: ${extra}`);
+    lines.set(lineNo, { ids: [row.message_id], authorId: row.author_id, code, firstMs: row.created_at, lastMs: row.created_at, conv: unit.conv });
+    if (time) lastTimeShown = row.created_at;
+    lastDate = date;
+    lineNo += 1;
     prevAt = row.created_at;
     unit.messages += 1;
     unit.toMs = row.created_at;

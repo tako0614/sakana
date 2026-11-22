@@ -263,10 +263,7 @@ if (!/search/.test(first)) {
 
 console.log('web search ok (閲覧のみでも search / プロンプトに使う場面)');
 
-// --- 依頼者 ---
-//
-// 見出し行の末尾に埋めていたら、直前の会話の話題の人と混同されて
-// 第三者の話を二人称で書かれた。独立した行であることを固定する。
+// --- 初回の会話と依頼 ---
 
 const said = (id, name, content, extra = {}) => ({
   guildId: 'g1', channelId: 'c1', messageId: id, authorId: id, authorName: name,
@@ -274,114 +271,77 @@ const said = (id, name, content, extra = {}) => ({
 });
 
 const SELF_ID = '111000111000111000';
-
+const CALLER_ID = '999888777666555444';
+const callerMessage = (content, extra = {}) => said('90', 'さば', content, { authorId: CALLER_ID, ...extra });
+const replyTo = (id) => ({ version: 1, reference: { kind: 'reply', messageId: id, availability: 'not_fetched' } });
 const userContentOf = (over = {}) => buildUserContent({
-  ctx: {
-    guild: { name: 'G' },
-    channel: { name: 'general', id: 'c1' },
-    member: { displayName: 'さば', id: '999888777666555444' },
-    client: { user: { id: SELF_ID } }
-  },
-  prompt: '今日の失言おしえて',
-  recent: [],
-  replyChain: [],
+  ctx: { guild: { name: 'G' }, channel: { name: 'general', id: 'c1' }, client: { user: { id: SELF_ID } } },
+  requestMessage: callerMessage('今日の失言おしえて'),
   refs: new RefTable(),
   ...over
 });
 
 {
   const content = userContentOf();
-  const caller = content.split('\n').find((line) => line.includes('依頼者:'));
-  if (!caller) fail('依頼者の行が無い');
-  if (caller.includes('サーバー:') || caller.includes('チャンネル:')) {
-    fail(`依頼者が見出し行に埋まっている: ${caller}`);
+  const lines = content.split('\n');
+  const caller = lines.find((line) => line.startsWith('依頼者: '));
+  if (caller !== '依頼者: u1') fail('依頼者は話者一覧の別名で示す');
+  if (!lines.some((line) => line.startsWith('u1') && line.includes('さば') && line.includes(CALLER_ID))) {
+    fail('話者一覧で依頼者の表示名と Discord ID を引ける');
   }
-  if (content.includes('話しかけてき')) fail('「話しかけてきた」をモデルが口にする (経緯の前置きになる)');
-  if (!caller.includes('さば') || !caller.includes('999888777666555444')) {
-    fail(`表示名と ID の両方が要る (ID が無いと author に渡せない): ${caller}`);
-  }
-  if (!content.includes('今日の失言おしえて')) fail('依頼が入っていない');
+  if (content.split('今日の失言おしえて').length !== 2) fail('依頼本文は1回だけ');
 }
 
 {
-  // 話題が並行するチャンネルでは、返信の鎖と背景が別の見出しで分かれていること。
-  // 混ぜると「どの話の続きか」をモデルが推測することになって答えが混ざる。
+  const root = said('11', 'たこ', 'デプロイどうする');
+  const parent = said('12', 'bot', 'まず CI 直そう', { structure: replyTo('11'), isBot: true });
+  const refs = new RefTable();
   const content = userContentOf({
-    replyChain: [said('11', 'たこ', 'デプロイどうする'), said('12', 'bot', 'まず CI 直そう')],
-    recent: [said('21', 'さば', '昼なに食う'), said('22', 'あきら', 'ラーメン')]
+    requestMessage: callerMessage('結論を教えて', { structure: replyTo('12'), referenceState: 'resolved' }),
+    replyChain: [root, parent],
+    recent: [root, said('21', '同名', '昼なに食う', { structure: replyTo('11') }), said('22', '同名', 'ラーメン')],
+    refs
   });
-
-  const background = content.indexOf('同時に流れている別の話');
-  const thread = content.indexOf('いま答えるべき話');
+  const background = content.indexOf('## 周辺の会話');
+  const thread = content.indexOf('## 返信の鎖');
   const ask = content.indexOf('## 依頼');
-  if (background < 0) fail('背景の見出しが無い');
-  if (thread < 0) fail('返信の鎖の見出しが無い');
+  if (!(background >= 0 && background < thread && thread < ask)) fail('周辺の会話 → 返信の鎖 → 依頼 の順');
+  if (content.split('デプロイどうする').length !== 2) fail('周辺の会話にもある返信先は一度だけ');
+  if (!(content.indexOf('デプロイどうする') < content.indexOf('まず CI 直そう'))) fail('返信の鎖は古い順');
+  const lines = content.split('\n');
+  if (!lines.some((line) => line.startsWith('1)') && line.includes('↩3'))) fail('周辺から返信の鎖も発言番号でつながる');
+  if (!content.slice(ask).includes('↩4')) fail('依頼の発言ヘッダーに直接の返信先を示す');
+  if (refs.resolve('4')?.messageId !== '12') fail('read.at と引用で同じ発言番号を解決する');
+  if (!lines.some((line) => line.startsWith('u1') && line.includes('同名')) ||
+      !lines.some((line) => line.startsWith('u2') && line.includes('同名'))) fail('同名の別人には別々の話者番号を振る');
 
-  // 順序が本体。鎖と依頼の間に背景を挟むと、量と位置の両方で背景が勝つ。
-  if (!(background < thread && thread < ask)) {
-    fail(`並びは 背景 → 鎖 → 依頼 (${background} / ${thread} / ${ask})`);
-  }
-  if (!/答えの材料にしない/.test(content.slice(background, background + 80))) {
-    fail('背景は材料にしないと見出しに書く');
-  }
-  if (!/続きとして答える/.test(content.slice(ask, ask + 60))) {
-    fail('依頼の見出しで鎖の続きだと指す');
-  }
-
-  // 鎖は古い順で、最後の1件が「いま返信された相手」だと分かること
-  const chainBlock = content.slice(thread);
-  if (chainBlock.indexOf('デプロイどうする') > chainBlock.indexOf('まず CI 直そう')) {
-    fail('返信の鎖は古い順に並べる');
-  }
-  const marked = chainBlock.split('\n').filter((l) => l.includes('返信して聞いている'));
-  if (marked.length !== 1) fail(`返信先の印は最後の1件だけ: ${marked.length} 件`);
-  if (!marked[0].includes('まず CI 直そう')) fail(`印が最後の1件に付いていない: ${marked[0]}`);
-
-  // 鎖があるなら背景は削る (混ざる材料を増やさない)
   const many = Array.from({ length: 30 }, (_, i) => said(`3${i}`, 'だれか', `雑談${i}`));
-  const trimmed = userContentOf({
-    replyChain: [said('11', 'たこ', 'デプロイどうする')],
-    recent: many
+  const trimmed = userContentOf({ replyChain: [root], recent: many });
+  if (trimmed.includes('雑談0') || !trimmed.includes('雑談29')) fail('返信のあるときは新しい側の背景10件を保持する');
+  if (!userContentOf({ recent: many }).includes('雑談0')) fail('返信が無ければ背景30件を保持する');
+  if (userContentOf({ recent: many }).includes('## 返信の鎖')) fail('返信の鎖が無ければ欄も省く');
+  const missing = userContentOf({
+    requestMessage: callerMessage('これどうなった？', { structure: replyTo('gone'), referenceState: 'deleted' })
   });
-  if (trimmed.includes('雑談0')) fail('鎖があるときは背景を削る');
-  if (!trimmed.includes('雑談29')) fail('背景は新しい側を残す');
-  // 鎖が無いときは全部渡す
-  if (!userContentOf({ recent: many }).includes('雑談0')) fail('鎖が無いなら背景は削らない');
-
-  // 鎖が無いときは見出しごと出さない
-  if (userContentOf({ recent: [said('21', 'さば', '昼なに食う')] }).includes('いま答えるべき話')) {
-    fail('鎖が空なら見出しを出さない');
-  }
+  if (!missing.includes('返信先の本文は入力にない') || !missing.includes('削除済')) fail('消えた返信先を区別する');
 }
 
 {
-  // 自分の発言を第三者の発言として読ませない。`bot` の印だけでは
-  // 「何かの bot」でしかなく、自分の回答を根拠に引用していた。
   const content = userContentOf({
     recent: [
-      said('21', 'さば', 'たこの失言おしえて'),
-      said(SELF_ID, 'sakana', '6月と今日で言ってることが違う', { isBot: true }),
-      said('23', 'のあ', 'まじか', { isBot: false })
+      said('22', 'Vex', 'bot本人の履歴', { authorId: SELF_ID, isBot: true }),
+      said('23', 'Vex', '別のbotの履歴', { isBot: true })
     ]
   });
-
-  const mine = content.split('\n').find((line) => line.includes('6月と今日で'));
-  if (!mine?.includes('あなた自身の発言')) fail(`自分の発言に印が付いていない: ${mine}`);
-
-  // 他人の行には付けない
-  if (content.split('\n').find((l) => l.includes('たこの失言')).includes('あなた自身')) {
-    fail('他人の発言に「あなた自身」が付いている');
-  }
-
-  // 表示名ではなく ID で判定する (ニックネームはサーバーごとに変わる)
-  const impostor = userContentOf({
-    recent: [said('24', 'sakana', 'なりすまし', { isBot: true })]
-  });
-  if (impostor.includes('あなた自身')) fail('表示名の一致で自分だと判定してはいけない');
-  if (!impostor.includes('bot')) fail('他の bot には bot の印が要る');
+  const rows = content.split('\n');
+  const own = rows.find((line) => line.startsWith('u1 ='));
+  const other = rows.find((line) => line.startsWith('u2 ='));
+  if (!own?.includes('自分') || !own.includes('bot')) fail('自分のbot発言を識別する');
+  if (other?.includes('自分') || !other?.includes('bot')) fail('同じ表示名の別botと混同しない');
+  if (rows.some((line) => /^\d+\)/.test(line) && /自分|\[bot\]/.test(line))) fail('bot と自分の印は話者一覧にまとめる');
 }
 
-console.log('caller ok (独立した行 / 表示名と ID / 話題と背景 / 自分の発言に印)');
+console.log('caller ok (話者一覧 / 背景と返信 / 共通の引用番号 / bot の識別)');
 
 // --- 返信の鎖 ---
 //
@@ -629,50 +589,45 @@ console.log('discord link ok (3つ目を取る / channel も取れる / 番号�
 
 console.log('forward ok (転送の本文を取り込む / 印を付ける)');
 
-// --- 依頼そのものの取りこぼし ---
-//
-// 直近の会話は describeExtras を通っているのに、依頼だけ message.content の
-// 素通しだった。改行は潰れ、貼られた画像は存在すら伝わっていなかった。
+// --- 依頼本文と添付 ---
 
 const { stripMention } = await import('../src/agent/index.js');
 
 {
-  const BOT = '111000111000111000';
-
-  // 改行は残す。箇条書きや貼り付けたログが1行に潰れると、人が見ている形と違うものを読ませる。
-  const listed = stripMention(`<@${BOT}> これ直して\n- A が落ちる\n- B が遅い`, BOT);
-  if (!listed.includes('\n- A が落ちる\n- B が遅い')) fail(`改行が潰れている: ${JSON.stringify(listed)}`);
-  if (listed.startsWith('\n') || listed.endsWith('\n')) fail(`端の空白は落とす: ${JSON.stringify(listed)}`);
-
-  // 行の中の連続空白は畳む (元の挙動)
-  if (stripMention('a    b', BOT) !== 'a b') fail('行内の連続空白は畳む');
-  // 空行が3つ以上続いても2つまで
-  if (stripMention('a\n\n\n\n\nb', BOT) !== 'a\n\nb') fail('空行を詰める');
-  // メンションは消える (ニックネーム形式 <@!id> も)
-  if (stripMention(`<@!${BOT}> やあ`, BOT) !== 'やあ') fail('メンションが残っている');
-  // clientId は正規表現として読ませない (`.` が別の文字に一致して他人のメンションを消さない)
-  if (stripMention('<@1x2> やあ', '1.2') !== '<@1x2> やあ') fail('clientId の記号を正規表現として扱っている');
-  if (stripMention('<@1.2> やあ', '1.2') !== 'やあ') fail('escape した clientId でメンションが消えない');
+  const code = '先にこのコードを直して\n\nif ready:\n    release()\nelse:\n    wait()\n';
+  const raw = `<@!${SELF_ID}> ${code}`;
+  if (stripMention(raw, SELF_ID) !== code) fail('bot メンションだけ外し、段落とインデントを保つ');
+  if (stripMention('<@1x2> やあ', '1.2') !== '<@1x2> やあ') fail('bot ID は正規表現のリテラルとして扱う');
+  if (stripMention('<@1.2> やあ', '1.2') !== 'やあ') fail('エスケープした bot ID にも一致する');
+  const refs = new RefTable();
+  const input = userContentOf({ requestMessage: callerMessage(raw), requestText: code, refs });
+  if (!input.includes('> if ready:\n>     release()\n> else:\n>     wait()')) fail('モデル入力にもコードのインデントを残す');
+  if (input.split('先にこのコードを直して').length !== 2) fail('構造欄に同じ依頼を重ねない');
+  if (refs.resolve('1')?.content !== raw) fail('参照番号には Discord 原文を保持する');
 }
 
 {
-  // 依頼に貼られたものが依頼セクションに出ること
-  const withImage = userContentOf({ extras: 'screenshot.png' });
-  const askBlock = withImage.slice(withImage.indexOf('## 依頼'));
-  if (!askBlock.includes('screenshot.png')) fail(`依頼の添付が出ていない: ${askBlock}`);
-  if (!askBlock.includes('image の look で読める')) fail('貼られた画像は image の look で読めると伝えないと、見えないと答える');
-  if (askBlock.includes('中身は見えない')) fail('読めるのに、見えないと書いてはいけない');
+  const imageOnly = userContentOf({
+    requestMessage: callerMessage('', {
+      extra: 'cat.png', attachmentCount: 1,
+      structure: { version: 1, reference: { kind: 'none' },
+        attachments: [{ name: 'cat.png', contentType: 'image/png', contentRead: false }] }
+    })
+  });
+  if (imageOnly.split('cat.png').length !== 2) fail('画像ファイル名を補足と添付欄で重ねない');
+  const ask = imageOnly.slice(imageOnly.indexOf('## 依頼'));
+  if (!ask.includes('cat.png') || !ask.includes('未読') || !ask.includes('image の look')) {
+    fail('画像のみの依頼でも添付の状態と読み方を渡す');
+  }
+  if (userContentOf().includes('貼られたものに応じる')) fail('通常の依頼に画像専用の案内を足さない');
 
-  // 添付が無いときは1行も足さない (普通の依頼のトークンを増やさない)
-  if (userContentOf().includes('貼られているもの')) fail('添付が無いのに行を足している');
-
-  // 本文なし + 添付 のときに「直近の会話をまとめて」と言わない
-  const imageOnly = userContentOf({ prompt: '', extras: 'cat.png' });
-  if (imageOnly.includes('直近の会話をまとめて')) fail('画像だけの依頼で背景の要約を指示してはいけない');
-  if (!imageOnly.includes('貼られたものについて')) fail('画像だけの依頼の指示が出ていない');
+  const ambient = userContentOf({ ambientHint: '自発参加として判断する。' });
+  if (!ambient.includes('## 応答モード\n自発参加として判断する。') || ambient.includes('> 自発参加として判断する。')) {
+    fail('自発参加の制御文を Discord 発言として扱わない');
+  }
 }
 
-console.log('request ok (改行を保つ / 依頼の添付を伝える)');
+console.log('request ok (本文1回 / コードのインデント / 添付1回 / 自発参加)');
 
 // --- 長い回答の分割 ---
 //

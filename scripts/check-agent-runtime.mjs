@@ -10,7 +10,7 @@ process.env.AGENT_RUNTIME_PATH = join(directory, 'runs.sqlite');
 process.env.OPENROUTER_API_KEY = 'check';
 const { db, saveMessage, markMessageDeleted } = await import('../src/archive/db.js');
 const { toRecord } = await import('../src/archive/indexer.js');
-const { RefTable, formatMessages, fromDiscordMessage, fromArchiveRow } = await import('../src/agent/format.js');
+const { RefTable, createConversationFormatter, fromDiscordMessage, fromArchiveRow } = await import('../src/agent/format.js');
 const { chatRunId, fetchReplyChain } = await import('../src/agent/index.js');
 const { archiveEnvelope } = await import('../src/conversation/message.js');
 const { attachMemoryDelivery, runAgent } = await import('../src/ai/runtime.js');
@@ -29,14 +29,18 @@ try {
   const parent = message('parent', 'original claim');
   const reply = message('reply', 'that is wrong', { reference: { messageId: 'parent', channelId: 'c' } });
   const refs = new RefTable();
-  const rendered = formatMessages([fromDiscordMessage(reply), fromDiscordMessage(parent)], { refs });
-  const rows = rendered.split('\n').map((line) => JSON.parse(line.replace(/^\d+\) /, '')));
-  assert.equal(rows[0].reference.ref, 2, 'reply edges work even when parent sorts after child');
-  assert.equal(rows[0].reference.kind, 'reply');
-  assert.equal(rows[0].reference.authorId, 'author');
-  const absent = JSON.parse(formatMessages([fromDiscordMessage(reply)]).trim());
-  assert.equal(absent.reference.messageId, 'parent');
-  assert.equal(absent.reference.availability, 'not_fetched');
+  const replySource = fromDiscordMessage(reply);
+  const parentSource = fromDiscordMessage(parent);
+  const formatter = createConversationFormatter([replySource, parentSource], { refs });
+  const rendered = formatter.render([replySource]);
+  assert.match(rendered, /u1 ↩2:/, 'reply edges work even when parent sorts after child');
+  assert.equal(formatter.speakerOf(replySource), 'u1');
+  assert.equal(formatter.speakerOf(parentSource), 'u1', 'the same stable author ID keeps one alias');
+  assert.match(formatter.speakers, /Discord ID: author/);
+  const absentFormatter = createConversationFormatter([replySource]);
+  assert.match(absentFormatter.render([replySource]), /返信先:未取得/);
+  assert.doesNotMatch(absentFormatter.render([replySource]), /↩\d+/,
+    'an internal lookup table never emits citations that the caller cannot resolve');
   const forward = message('forward', '', { reference: { type: 1, messageId: 'elsewhere' },
     messageSnapshots: new Map([['elsewhere', { content: 'quoted secret claim' }]]) });
   const forwarded = fromDiscordMessage(forward);

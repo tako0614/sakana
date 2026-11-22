@@ -17,7 +17,7 @@ import {
   type MessageReplyOptions
 } from 'discord.js';
 import { canBotAttach, canBotSpeak, canManageIndex, getChannelScope, getPublicChannelScope } from '../archive/permissions.js';
-import { conversationText, meaningReader, recallWithMeaning, type RecallParts } from '../memory/recall.js';
+import { memoryReader } from '../memory/recall.js';
 import { citeRows } from '../memory/explore.js';
 import { getEpisode, getNode, nameOf } from '../memory/store.js';
 import { db as archiveDb } from '../archive/db.js';
@@ -36,7 +36,6 @@ import { agentConfig, agentEnabled } from './config.js';
 import {
   RefTable,
   chunkForDiscord,
-  describeExtras,
   expandCitationsDetailed,
   fromDiscordMessage
 } from './format.js';
@@ -60,7 +59,7 @@ import {
 } from './ratelimit.js';
 import { SilentIndicator, ThinkingIndicator, isIndicatorMessage, toolLabel, type Indicator } from './thinking.js';
 import type { AmbientJoin } from '../vex/ambient.js';
-import { nameHandling } from '../vex/call.js';
+import { isBareNameCall, nameHandling } from '../vex/call.js';
 import { vexConfig } from '../vex/config.js';
 import { AMBIENT_HINT, CONTINUE_HINT, isPassAnswer } from '../vex/pass.js';
 import { buildToolset } from './tools.js';
@@ -174,7 +173,7 @@ export function isAgentRequest(message: Message, client: Client): boolean {
 
   if (mentioned) return true;
 
-  // 名前 (vex) が出た発言をメンション扱いにする設定 (VEX_CALL=1)。相槌でも答える。
+  // 呼び名が出た発言をメンション扱いにする設定 (VEX_CALL=mention)。相槌でも答える。
   // judge の設定では確定にしない (判定モデルが文脈で決める: src/vex/ambient.ts)
   if (nameHandling(message.content, vexConfig) === 'mention') return true;
 
@@ -189,21 +188,14 @@ export function isAgentRequest(message: Message, client: Client): boolean {
   return !isBareAck(message.content);
 }
 
-/**
- * メンションだけ抜く。
- *
- * 改行は残す。以前は `\s+` を1つの空白に畳んでいて、箇条書き・貼り付けたログ・
- * コードが1行に潰れたままモデルへ渡っていた (人が読んでいる形と違うものを
- * 読ませることになる)。畳むのは行の中の連続空白だけ。
- */
+/** Bot へのメンションを外し、本文の空白と改行はそのまま渡す。 */
 export function stripMention(content: unknown, clientId: string): string {
   // clientId はスノーフレークだが、正規表現に埋めるので念のため記号を逃がしておく
   const escaped = String(clientId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const mention = `<@!?${escaped}>`;
   return String(content ?? '')
-    .replace(new RegExp(`<@!?${escaped}>`, 'g'), ' ')
-    .replace(/[^\S\n]+/g, ' ')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+    .replace(new RegExp(`^[ \t]*${mention}[ \t]?`), '')
+    .replace(new RegExp(mention, 'g'), ' ');
 }
 
 const GOVERNANCE_TOPIC_PATTERN = /(憲法|法令集|官報|法律|現行法|法案|改憲|立法|司法|裁判|判決|違憲|上訴|処分|制裁|行政行為|統治)/;
@@ -359,6 +351,7 @@ export async function handleAgentRequest(
   client: Client<true>,
   options: { ambient?: AmbientJoin } = {}
 ): Promise<void> {
+  const startedAt = performance.now();
   const ambient = options.ambient;
   const guild = message.guild;
   const member = message.member ?? await guild.members.fetch(message.author.id).catch(() => null);
@@ -453,6 +446,14 @@ export async function handleAgentRequest(
   let finished = false;
   let indicator: Indicator | null = null;
   let ctx: AgentContext | null = null;
+  const timings: Record<string, number> = {};
+  let modelCalls = 0;
+  let outcome = 'failed';
+  const measure = async <T>(phase: string, work: () => Promise<T>): Promise<T> => {
+    const start = performance.now();
+    try { return await work(); }
+    finally { timings[phase] = (timings[phase] ?? 0) + performance.now() - start; }
+  };
 
   // 例外や中断でも、この呼び出しで新たに使ったぶんは残す。
   // 再開前の累計をこの新しい予約に付け替えないため、runAgent が
@@ -492,18 +493,22 @@ export async function handleAgentRequest(
     // 直近メッセージの取得) にも時間がかかるので、一番先に出す。
     const thinking: Indicator = ambient ? new SilentIndicator() : new ThinkingIndicator(message.channel);
     indicator = thinking;
-    await thinking.start();
+    await measure('indicator', () => thinking.start());
 
-    const toolset = await buildToolset(runContext);
-
-    // 直近を先に取る (鎖のたどり先がキャッシュに載るので API を叩かずに済む)
-    const preloaded = await fetchRecent(message.channel, {
-      // 依頼そのものと、いま出している経過表示は渡さない
-      exclude: new Set([message.id, thinking.messageId].filter((id): id is string => Boolean(id))),
-      selfId: client.user.id,
-      limit: agentConfig.preloadMessages
-    });
-    const replyChain = await fetchReplyChain(message, message.channel.name);
+    const [toolset, { preloaded, replyChain }] = await Promise.all([
+      measure('tools_ready', () => buildToolset(runContext)),
+      (async () => {
+        // 直近を先に取る (鎖のたどり先がキャッシュに載るので API を叩かずに済む)
+        const preloaded = await measure('recent', () => fetchRecent(message.channel, {
+          exclude: new Set([message.id, thinking.messageId].filter((id): id is string => Boolean(id))),
+          selfId: client.user.id,
+          limit: agentConfig.preloadMessages
+        }));
+        const replyChain = await measure('reply_chain', () => fetchReplyChain(message, message.channel.name));
+        return { preloaded, replyChain };
+      })()
+    ]);
+    timings.prepared = performance.now() - startedAt;
 
     // 鎖に入ったものは背景から抜く。同じ発言を2回載せてもトークンだけ増える。
     const inChain = new Set(replyChain.map((entry) => entry.messageId));
@@ -515,31 +520,32 @@ export async function handleAgentRequest(
 
     const system = buildSystemPrompt(runContext, toolset);
     const request = stripMention(message.content, client.user.id);
-    // 自発参加では、依頼の代わりに「呼ばれていない」ことを伝える前置きを付ける (想起や検索は発言そのもので行う)
-    const prompt = ambient ? `${ambient.continuation ? CONTINUE_HINT : AMBIENT_HINT}\n${request}` : request;
-    // 呼ばれたときの想起: 名前の照合 + 意味の近い記憶 (間に合わなければ名前だけ)
-    // 直前の会話 (LLM に見せている会話文。system は含めない) も意味検索の手がかりにする
-    const conversation = conversationText(recent);
-    const recalled = toolset.memoryAvailable ? await recallSafely(guild.id, request, replyChain, recent, conversation) : null;
+    const bareCall = !ambient && replyChain.length === 0 && vexConfig.call && isBareNameCall(request);
+    const recall = toolset.memoryAvailable ? memoryReader(guild.id, {
+      request: bareCall ? '' : request,
+      reply: replyChain.at(-1)?.content ?? ''
+    }) : null;
     const userContent = buildUserContent({
       ctx: runContext,
-      prompt,
-      // 依頼に貼られた画像・埋め込み・スタンプ。中身は読めないが、存在を
-      // 伝えないと「これ何？」に対して直近の会話の話をしてしまう。
-      extras: describeExtras(message),
+      requestText: request,
+      ...(ambient ? { ambientHint: ambient.continuation ? CONTINUE_HINT : AMBIENT_HINT } : {}),
       recent,
       replyChain,
       requestMessage: { ...fromDiscordMessage(message), referenceState: replyChain.referenceState },
-      refs,
-      recall: recalled?.text ?? ''
+      refs
     });
 
     let toolUsed = false;
+    let recalledMemory = false;
     const result = await runAgent({
       model,
       guildId: guild.id,
-      // 考えている途中の想起: 往復ごとに、いま調べていることに近い記憶のうち、まだ出していないものを足す
-      ...(toolset.memoryAvailable ? { memory: { read: meaningReader(guild.id, { request, shown: recalled ?? undefined, conversation }) } } : {}),
+      // 初回も途中も runtime がモデルを呼ぶ前に同じ検索を使う。
+      ...(recall ? { memory: { read: async (query) => {
+        const memory = await measure('recall', () => recall(query));
+        recalledMemory = Boolean(memory);
+        return memory;
+      } } } : {}),
       // Discord input identity survives a process restart, so an unfinished
       // run resumes from its checkpoint instead of starting over. Completed
       // runs still use the runtime's default reuseCompleted=false behavior if
@@ -550,6 +556,10 @@ export async function handleAgentRequest(
       userContent,
       toolset,
       usage,
+      onModelElapsed: (elapsedMs) => {
+        modelCalls++;
+        timings.model = (timings.model ?? 0) + elapsedMs;
+      },
       // 予算は実際の請求額 (OpenRouter の usage.cost) で数える。単位はマイクロドル。
       // 1回ぶんの暴走ガードと、その人の残りのうち小さい方。
       // 管理者は残りが Infinity なので、暴走ガードだけが効く。
@@ -562,7 +572,7 @@ export async function handleAgentRequest(
       deadlineAt: Date.now() + agentConfig.deadlineMs,
       weigh: weighCost,
       // 事実を聞かれたのに何も調べずに答えそうなら、答える前に1回だけ確かめさせる (lookup.ts)
-      ...(toolset.definitions.length > 0 ? { validate: lookupGuard({ request, known: (recalled?.paths.size ?? 0) > 0, usedTool: () => toolUsed }) } : {}),
+      ...(toolset.definitions.length > 0 ? { validate: lookupGuard({ request, known: () => recalledMemory, usedTool: () => toolUsed }) } : {}),
       onToolCall: (name, args) => { if (countsAsLookup(name)) toolUsed = true; thinking.setStatus(toolLabel(name, args)); }
     });
 
@@ -588,6 +598,7 @@ export async function handleAgentRequest(
     const text = typeof result.text === 'string' ? result.text.trim() : '';
     // 自発参加で返す価値が無いと判断した (または何も書けなかった) ときは何も送らない
     if (ambient && (!text || isPassAnswer(text))) {
+      outcome = 'passed';
       ambient.report('passed');
       return;
     }
@@ -612,6 +623,7 @@ export async function handleAgentRequest(
 
     // 送る直前にもう一度。調べている間に誰かが話し始めていたら割り込まない
     if (ambient && !(await ambient.stillLatest().catch(() => false))) {
+      outcome = 'moved_on';
       ambient.report('moved_on');
       return;
     }
@@ -638,10 +650,12 @@ export async function handleAgentRequest(
       const sent = index === 0
         ? await replyOrSend(message, payload)
         : await message.channel.send(payload);
+      if (index === 0 && sent) timings.first_reply = performance.now() - startedAt;
 
       // これへのリプライを会話の続きとして受け付ける
       rememberOwnReply(sent?.id, reservation.id);
     }
+    outcome = timings.first_reply === undefined ? 'send_failed' : 'sent';
     ambient?.report('sent');
   } catch (error) {
     console.error('Agent request failed:', error);
@@ -661,6 +675,12 @@ export async function handleAgentRequest(
       });
     }
   } finally {
+    const ms = Object.fromEntries(Object.entries({ ...timings, total: performance.now() - startedAt })
+      .map(([phase, duration]) => [phase, Math.round(duration)]));
+    console.info('Agent timings', JSON.stringify({
+      mode: ambient ? 'ambient' : 'requested', model, modelCalls, outcome,
+      inputTokens: usage.prompt_tokens, ms
+    }));
     // 取りこぼしの保険。stop() は何度呼んでも安全。
     await indicator?.stop();
     // 隔離タブは実行ごとに捨てる。残すと次の人が中身を読める。
@@ -689,21 +709,4 @@ function citedMessageLabel(guild: { members: { cache: { get(id: string): { displ
     try { name = archiveDb.prepare<[string], { author_name: string }>('SELECT author_name FROM messages WHERE message_id = ?').get(entry.messageId)?.author_name; } catch { name = undefined; }
   }
   return name ? `${name}のメッセージ` : null;
-}
-
-/**
- * 依頼と返信先を強い手がかり、直近の会話を弱い手がかりにして思い出す。
- * 記憶が読めなくても会話は止めない。
- */
-async function recallSafely(guildId: string, request: string, replyChain: AgentMessage[], recent: AgentMessage[], conversation: string): Promise<RecallParts | null> {
-  try {
-    return await recallWithMeaning(guildId, {
-      request: [request, ...replyChain.map((entry) => entry.content ?? '')].join('\n'),
-      context: recent.slice(-10).map((entry) => entry.content ?? '').join('\n'),
-      conversation
-    });
-  } catch (error) {
-    console.error('Memory recall failed:', error);
-    return null;
-  }
 }

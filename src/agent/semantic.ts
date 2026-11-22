@@ -19,10 +19,11 @@ import { fetchChunks, scanChunksTopK, type ChunkFilters } from '../archive/vecto
 import { embedConfig } from '../embed/config.js';
 import { embedTexts, isDisabled, type EmbedReply } from '../embed/worker.js';
 import { agentConfig } from './config.js';
-import { shortTime, truncate } from './format.js';
+import { createConversationFormatter, fromArchiveRow, shortTime, truncate } from './format.js';
+import { resolveCachedDisplay } from './prompt.js';
 import { errorMessage, type AgentContext } from './types.js';
 
-type SemanticContext = Pick<AgentContext, 'guild' | 'refs' | 'channelScope'>;
+type SemanticContext = Pick<AgentContext, 'guild' | 'refs' | 'channelScope' | 'client' | 'member' | 'viewer'>;
 
 // embed/config.js の値は env から来るので、数として読み直す
 const maxCandidates = Number(embedConfig.maxCandidates);
@@ -38,12 +39,6 @@ export async function semanticAvailable(guildId: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-/** 参加者を「たこ/さば/りん」の形にする。3人を超えたら数で出す。 */
-function participantLabel(rows: MessageRow[]): string {
-  const names = [...new Set(rows.map((row) => row.author_name || 'unknown'))];
-  return names.length <= 3 ? names.join('/') : `${names.slice(0, 3).join('/')}他${names.length - 3}人`;
 }
 
 /**
@@ -123,8 +118,8 @@ export async function runSemanticSearch(ctx: SemanticContext, {
   // 本当に近いまとまりまで切り落とす。
   const scoreById = new Map(hits.map((hit) => [hit.cid, hit.score]));
   const loaded = chunks
-    .map((chunk) => ({ chunk, rows: chunkMessages(chunk), score: scoreById.get(chunk.chunk_id) ?? 0 }))
-    .filter(({ rows }) => !(excludeId && rows.some((row) => row.message_id === excludeId)));
+    .map((chunk) => ({ chunk, rows: chunkMessages(chunk).filter((row) => row.guild_id === ctx.guild.id), score: scoreById.get(chunk.chunk_id) ?? 0 }))
+    .filter(({ rows }) => rows.length && !(excludeId && rows.some((row) => row.message_id === excludeId)));
 
   if (loaded.length === 0) {
     return escalated ? '(意味検索も走らせたが0件)' : '意味の近い会話は見つかりませんでした。';
@@ -145,33 +140,9 @@ export async function runSemanticSearch(ctx: SemanticContext, {
   // 時系列に並べ直す。立場の変遷では時系列そのものが答えになる。
   const ordered = [...picked].sort((a, b) => a.chunk.from_ms - b.chunk.from_ms);
 
-  const lines = ordered.map(({ chunk, rows, score }) => {
-    // 参照番号はまとまりの先頭の発言に付ける。URL がやり取りの入口を指す。
-    const ref = ctx.refs.add({
-      guildId: chunk.guild_id,
-      channelId: chunk.channel_id,
-      channelName: channelLabel(ctx, chunk.channel_id),
-      messageId: chunk.from_id,
-      authorId: rows[0]?.author_id ?? '0',
-      authorName: rows[0]?.author_name ?? 'unknown',
-      content: rows.map((row) => row.content).join(' / '),
-      createdAt: chunk.from_ms
-    });
-
-    const head = [
-      shortTime(chunk.from_ms),
-      `#${channelLabel(ctx, chunk.channel_id)}`,
-      `${chunk.msg_count}件`,
-      participantLabel(rows)
-    ].join(' ');
-
-    const body = truncate(
-      rows.map((row) => `${row.author_name}: ${row.content}`).join(' / '),
-      agentConfig.messageChars * 2
-    );
-
-    return `${ref}) [${head}] ${body} 近さ#${ranks.get(chunk.chunk_id)}(${score.toFixed(2)})`;
-  });
+  const transcripts = formatSemanticConversations(ctx, ordered.map(({ chunk, rows, score }) => ({
+    rows, score, rank: ranks.get(chunk.chunk_id) ?? 0, count: chunk.msg_count
+  })));
 
   return [
     `意味が近い会話 ${ordered.length} 件 (類似度 ${top.toFixed(2)}〜${(picked[picked.length - 1]?.score ?? top).toFixed(2)}、候補 ${result.total.toLocaleString()} 件)`,
@@ -181,12 +152,45 @@ export async function runSemanticSearch(ctx: SemanticContext, {
     '類似度は相対値。無関係な文でも 0.78 前後になるので、順位で見ること。',
     // 自動で走らせたぶんは「一致した結果」と読まれると困る。毎回言う。
     escalated ? '以下は文字列一致ではない。断定する前に read で前後を読むこと。' : '',
-    '--- 時系列順 (番号はその会話の先頭の発言) ---',
-    ...lines,
-    '会話まるごと読むなら read の at にその番号を渡す。'
+    '--- 会話の候補 (古い順) ---',
+    transcripts,
+    '会話を続けて読むなら、起点の発言番号を read の at に渡す。'
   ].filter(Boolean).join('\n');
 }
 
 function channelLabel(ctx: SemanticContext, channelId: string): string {
   return ctx.guild.channels.cache.get(channelId)?.name ?? channelId;
+}
+
+/** 会話の候補の先頭を、キーワード検索や read と同じ発言形式で渡す。 */
+export function formatSemanticConversations(ctx: SemanticContext, candidates: readonly {
+  rows: readonly MessageRow[]; score: number; rank: number; count: number;
+}[]): string {
+  const blocks = candidates.flatMap(({ rows, score, rank, count }) => {
+    let remaining = agentConfig.messageChars * 2;
+    const preview = [];
+    for (const row of rows) {
+      const bodyChars = Math.max(0, remaining - row.author_name.length - 5);
+      if (preview.length && bodyChars === 0) break;
+      const message = fromArchiveRow(row, channelLabel(ctx, row.channel_id));
+      preview.push({ message, bodyChars });
+      remaining = bodyChars - message.content.length;
+    }
+    const first = preview[0]?.message;
+    if (!first) return [];
+    // まとまりを検索の手がかりにできるよう、起点の参照に元の会話を残す。
+    const anchor = ctx.refs.add({ ...first, content: rows.map((row) => row.content).join(' / ') });
+    for (const { message } of preview) ctx.refs.add(message);
+    return [{ head: `### 会話（起点 ${anchor}・表示 ${preview.length}/${count}件・近さ#${rank} ${score.toFixed(2)}）`, preview }];
+  });
+  if (!blocks.length) return '';
+  const displayed = blocks.flatMap(({ preview }) => preview.map(({ message }) => message));
+  const formatter = createConversationFormatter(displayed, {
+    refs: ctx.refs, selfId: ctx.client?.user?.id, resolveDisplay: resolveCachedDisplay(ctx)
+  });
+  const sections = blocks.map(({ head, preview }) => [
+    head,
+    ...preview.map(({ message, bodyChars }) => formatter.render([message], { bodyChars, showChannel: true }))
+  ].join('\n'));
+  return [formatter.speakers, ...sections].join('\n\n');
 }

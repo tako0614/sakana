@@ -1,20 +1,12 @@
-// 記憶のメモリパック (主張の索引・語彙検索・融合・入口の門・再順位づけ) の検証。埋め込みと判定モデルは偽物で、AI は呼ばない。
-//
-// 固定したいこと:
-//   - 主張 (wrong 以外) だけが索引に入り、「[誰 / 時期 / 種類] 本文」の形で埋め込まれる
-//   - 語彙の検索 (文字 3-gram) が効き、埋め込みと RRF で融合できる
-//   - 入口の門: 依頼が記憶に触れなければ空 (何も足さない)。判定モデルが使えなければ null (従来の想起に任せる)
-//   - 判定が低い候補は出さない / 同じ文の重複・同じ出来事ばかりは畳む / wrong は出ない / 冗談は冗談と分かる
-//   - 依頼にメンションされた人の主張が候補に入る
-//
-// ARCHIVE_DB_PATH / MEMORY_DB_PATH を一時ファイルに向けて呼ぶこと。
+// v2 の主張・出来事を使った会話の自動想起を、ローカルの偽ベクトルで検証する。
 
+import assert from 'node:assert/strict';
 import { memoryDb, resetTree } from '../src/memory/store.js';
 import { ensureV2Schema } from '../src/memory/v2/schema.js';
-import { lexicalClaims, rrf, syncClaimFts, trigramMatch, claimEmbedText, allClaims } from '../src/memory/claims.js';
+import { claimEmbedText, allClaims } from '../src/memory/claims.js';
 import { hasKind, meaningOf, setEmbedder, syncMemoryVectors } from '../src/memory/vectors.js';
-import { recallPack, splitRequest } from '../src/memory/pack.js';
-import { judgeQuestions } from '../src/memory/rerank.js';
+import { memoryReader } from '../src/memory/recall.js';
+import { runAgent, withRecallTarget } from '../src/ai/runtime.js';
 
 const fail = (message) => { throw new Error(message); };
 const equal = (actual, expected, label) => {
@@ -53,6 +45,7 @@ const sabaEntity = Number(entity.run(GUILD, SABA, 'さば', 'people/さば').las
 const episode = d.prepare('INSERT INTO episodes (id, guild_id, kind, title, summary, channel_id, at_ms, end_ms, sources, importance, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
 episode.run(1, GUILD, 'レスバ', 'Rust と Go の言い合い', 'たこが Rust、さばが Go を推して 1 時間言い合った → 決着せず', 'c', T, T + 1000, '[]', 2, T);
 episode.run(2, GUILD, '事件', 'テトリス杯の決勝', 'さばがテトリス杯で優勝し、賞品の nitro を受け取った', 'c', T + 86_400_000, T + 86_401_000, '[]', 3, T);
+episode.run(3, GUILD, '記録', 'Rust 長い主張の根拠', '長い主張を記録した。原文は episode で確認できる。', 'c', T + 2 * 86_400_000, T + 2 * 86_400_000 + 1000, '[]', 2, T);
 const claim = d.prepare(`
   INSERT INTO v2_claims (guild_id, section_id, episode_id, ord, about_kind, about_key, category, text, type, modality, as_of, verdict, hedged, entity_id)
   VALUES (?, 1, ?, ?, 'person', ?, 'people', ?, ?, ?, ?, ?, ?, ?)
@@ -62,7 +55,14 @@ const add = (epId, who, entityId, text, type, modality, verdict = 'ok', hedged =
   Number(claim.run(GUILD, epId, ord += 1, who, text, type, modality, T, verdict, hedged, entityId).lastInsertRowid);
 const rust = add(1, TAKO, takoEntity, 'Rust 派で、型の堅さを気に入っている', 'stance', 'self_report');
 const rustDup = add(1, TAKO, takoEntity, 'Rust 派で型の堅さを気に入っている', 'stance', 'plain');   // ほぼ同じ文
-const go = add(1, TAKO, takoEntity, 'Go の手軽さも認めている', 'stance', 'plain');
+const rustSaba = add(1, SABA, sabaEntity, 'Rust 派で、型の堅さを気に入っている', 'stance', 'self_report');
+const rustOpposite = add(1, SABA, sabaEntity, 'Rust 派で、型の堅さを気に入っていない', 'stance', 'self_report');
+const longClaim = add(1, TAKO, takoEntity, `Rust 長文主張。${'説明を続ける'.repeat(80)}`, 'fact', 'plain');
+const uncuttableClaim = add(3, TAKO, takoEntity, `Rust 長い主張${'説明を続ける'.repeat(80)}`, 'fact', 'plain');
+const go = add(1, TAKO, takoEntity, 'Go の手軽さも認めている', 'stance', 'plain', 'ok', 1);
+const goCertain = add(1, TAKO, takoEntity, 'Go の手軽さも認めている', 'stance', 'plain');
+const negativeTen = add(1, TAKO, takoEntity, '数値は-10', 'fact', 'plain');
+const positiveTen = add(1, TAKO, takoEntity, '数値は10', 'fact', 'plain');
 const tetris = add(2, SABA, sabaEntity, 'テトリス杯で優勝した', 'fact', 'plain');
 const nitro = add(2, SABA, sabaEntity, '賞品の nitro を受け取った', 'outcome', 'plain');
 const onigiri = add(null, SABA, sabaEntity, 'おにぎりを 10 個食べたと言い張る', 'trait', 'joke');
@@ -75,62 +75,139 @@ if (!text.startsWith('[たこ / 2025-03 / 立場') || !text.endsWith('Rust 派�
 if (!claimEmbedText(allClaims(GUILD).find((c) => c.id === onigiri)).includes('冗談')) fail('冗談は埋め込む文にも冗談と入る');
 const synced = await syncMemoryVectors(GUILD, { sleepMs: 0 });
 if (!hasKind(GUILD, 'claim')) fail('主張のベクトルが振られる');
-if (synced.embedded < 6) fail(`主張 6 件 + 出来事 2 件が振られる: ${synced.embedded}`);
-equal(syncClaimFts(GUILD), 6, '語彙の索引は wrong 以外の主張');
-equal(syncClaimFts(GUILD), 6, '変わっていなければ作り直さない');
+if (synced.embedded < 16) fail(`主張 13 件 + 出来事 3 件が振られる: ${synced.embedded}`);
 
-// ---- 語彙・融合 ----
-if (trigramMatch('は') !== null) fail('3 文字未満からは 3-gram が取れない');
-if (!trigramMatch('テトリス杯で').includes('"テトリ"')) fail('文字 3-gram の MATCH 式');
-equal(lexicalClaims(GUILD, 'テトリス杯の優勝者は？', 5)[0], tetris, '語彙で引ける');
-equal(lexicalClaims(GUILD, 'ウソの主張', 5).includes(lie), false, '語彙の検索でも wrong は出ない');
-equal(rrf([[1, 2, 3], [3, 1]], [1, 1]).slice(0, 2), [1, 3], '逆順位の融合 (両方に出るものが上)');
-equal(splitRequest(`<@${SABA}> のこと教えて https://example.com`), { text: 'のこと教えて', mentioned: [SABA] }, 'メンションを分ける');
-equal(judgeQuestions(['a', 'b']).q1.type, 'noul', '判定の質問');
-equal(Object.keys(judgeQuestions(['a', 'b'])), ['gate', 'q0', 'q1'], '門 + 候補ごとの質問');
-
-// ---- メモリパック ----
-let calls = 0;
-const judgeBy = (rules) => async (request, items) => {
-  calls += 1;
-  return { gate: /Rust|テトリス|さば|たこ/.test(request) ? 0.9 : 0.05, scores: items.map((item) => rules(request, item)) };
+const unit = (dimension) => {
+  const vector = new Float32Array(64);
+  vector[dimension] = 1;
+  return Buffer.from(vector.buffer);
 };
-const rulesBasic = (request, item) => (/Rust/.test(request) && /Rust/.test(item) ? 0.9 : /テトリス/.test(request) && /(テトリス|nitro)/.test(item) ? 0.8 : 0.1);
-const embed = async (value) => fakeVector(value);
+const writeVector = d.prepare('UPDATE memory_vectors SET vec = ? WHERE guild_id = ? AND kind = ? AND id = ?');
+const assign = (kind, ids, dimension) => ids.forEach((id) => writeVector.run(unit(dimension), GUILD, kind, id));
+assign('claim', [rust, rustDup], 0);
+assign('claim', [tetris, nitro], 1);
+assign('claim', [onigiri], 2);
+assign('claim', [longClaim, uncuttableClaim], 3);
+assign('claim', [go, goCertain], 4);
+assign('claim', [rustSaba, rustOpposite, negativeTen, positiveTen], 5);
+assign('episode', [1], 0);
+assign('episode', [2], 1);
+assign('episode', [3], 3);
+assert.equal(d.prepare("SELECT 1 FROM memory_vectors WHERE guild_id = ? AND kind = 'claim' AND id = ?").get(GUILD, lie), undefined);
+assert.equal(hasKind(GUILD, 'chunk'), false, 'v2 indexes claims in place of page fragments');
 
-const pack = await recallPack(GUILD, { request: 'たこは Rust をどう思ってる？' }, { embed, judge: judgeBy(rulesBasic) });
-if (!pack || !pack.text) fail('関係する記憶が出る');
-if (!pack.text.includes('Rust 派') || !pack.text.includes('[e1]')) fail(`主張と出典の出来事が出る: ${pack.text}`);
-if (pack.text.includes('おにぎり') || pack.text.includes('ウソ')) fail('関係の低い主張・wrong は出ない');
-equal((pack.text.match(/Rust 派/g) ?? []).length, 1, 'ほぼ同じ文の主張は畳む');
-if (!pack.paths.has('people/たこ') || !pack.episodeIds.has(1)) fail('出した指し先を控える');
-if (pack.text.length > 1800) fail('予算に収まる');
+const queries = [];
+const selectQuery = (value) => {
+  if (/テトリス/.test(value)) return 1;
+  if (/おにぎり/.test(value)) return 2;
+  if (/長い/.test(value)) return 3;
+  if (/Go/.test(value)) return 4;
+  if (/Rust/.test(value)) return 0;
+  return 63;
+};
+setEmbedder(async (texts) => {
+  queries.push([...texts]);
+  return { dim: 64, vectors: texts.map((value) => unit(selectQuery(value)).toString('base64')) };
+});
+const originalFetch = globalThis.fetch;
+let networkCalls = 0;
+globalThis.fetch = async () => { networkCalls += 1; throw new Error('automatic recall must stay local'); };
+try {
+  const plain = { observations: [] };
+  const read = memoryReader(GUILD, { request: 'たこは Rust をどう思ってる？' });
+  const initial = await read(plain);
+  assert.match(initial?.text, /本人申告.*Rust 派.*\[e1\]/);
+  assert.equal((initial.text.match(/Rust 派/g) ?? []).length, 1, 'same sourced claim appears once');
+  assert.equal(await read(plain), initial, 'identical input reuses one result');
+  assert.equal(queries.length, 1);
 
-const quiet = await recallPack(GUILD, { request: 'おはよう！今日もいい天気' }, { embed, judge: judgeBy(rulesBasic) });
-equal(quiet?.text, '', '記憶に触れない依頼は空 (null ではない)');
+  const focused = await read({ ...plain, thought: 'memory_focus.context: おにぎりの件' });
+  assert.match(focused?.text, /冗談.*おにぎり.*\[\[people\/さば\]\]/);
+  assert.deepEqual(queries.at(-1), ['おにぎりの件']);
+  assert.equal(await read(plain), initial, 'the focus only changes one request');
 
-const down = await recallPack(GUILD, { request: 'Rust の話' }, { embed, judge: async () => ({ gate: null, scores: null }) });
-equal(down, null, '判定モデルが使えなければ null (従来の想起へ)');
+  assert.equal(await memoryReader(GUILD, { request: '今日の天気は？' })(plain), null, 'low-similarity candidates are not injected');
+  assert.equal(await memoryReader(GUILD, { request: 'Rust', maxChars: 10 })(plain), null, 'budget lower than the heading means no work');
+  const reply = await memoryReader(GUILD, { request: 'あの件は？', reply: `<@!${SABA}> のテトリス杯` })(plain);
+  assert.deepEqual(queries.at(-1), ['あの件は？ さば のテトリス杯']);
+  assert.match(reply?.text, /テトリス.*\[e2\]/);
 
-const noVector = await recallPack(GUILD, { request: 'Rust の話' }, { embed: async () => null, judge: judgeBy(rulesBasic) });
-equal(noVector, null, '埋め込みが間に合わなければ null');
+  const long = await memoryReader(GUILD, { request: '長いメモ', maxChars: 150 })(plain);
+  assert.ok(long && long.text.length <= 150 && long.text.includes('[e1]'), 'the budget keeps complete source pointers');
+  const fromTranscript = await memoryReader(GUILD, { request: 'その結果は？' })({
+    observations: [`tool:read: 話者（この資料内）:\n${'話者の情報 '.repeat(28)}\n1) 18:30 u1:\n> テトリス杯で優勝した\n| 添付 未読`]
+  });
+  assert.deepEqual(queries.at(-1), ['その結果は？ テトリス杯で優勝した']);
+  assert.match(fromTranscript?.text, /テトリス.*\[e2\]/);
 
-const mention = await recallPack(GUILD, { request: `<@${SABA}> のこと教えて` }, { embed, judge: async (_request, items) => ({ gate: 0.9, scores: items.map((item) => (/テトリス|nitro/.test(item) ? 0.9 : 0.1)) }) });
-if (!mention?.text.includes('テトリス杯で優勝した')) fail(`メンションされた人の主張が候補に入る: ${mention?.text}`);
+  const structured = await memoryReader(GUILD, { request: 'その結果は？' })({
+    observations: ['tool:read: 話者（この資料内）:\n1) 18:30 u1:\n> Rust 派である\n2) 18:31 u2:\n> テトリス杯で優勝した'],
+    readTarget: 'テトリス杯で優勝した'
+  });
+  assert.deepEqual(queries.at(-1), ['その結果は？ テトリス杯で優勝した'], 'authorized target replaces the chronological neighbor');
+  assert.match(structured?.text, /テトリス.*\[e2\]/);
+  await memoryReader(GUILD, { request: 'その結果は？' })({
+    observations: ['tool:read: 話者（この資料内）:\n1) 18:30 u1:\n> Rust 派である'], readTarget: null
+  });
+  assert.deepEqual(queries.at(-1), ['その結果は？'], 'a read without its actual target cannot borrow a neighbor');
 
-const joke = await recallPack(GUILD, { request: 'さばのおにぎりの話' }, { embed, judge: async (_request, items) => ({ gate: 0.9, scores: items.map((item) => (/おにぎり/.test(item) ? 0.9 : 0.1)) }) });
-if (!joke?.text.includes('冗談')) fail(`冗談は冗談と分かる: ${joke?.text}`);
+  const count = queries.length;
+  assert.equal(await memoryReader('no-vectors', { request: 'Rust' })(plain), null);
+  assert.equal(await memoryReader(GUILD, { request: '' })(plain), null);
+  assert.equal(queries.length, count, 'empty calls and guilds without indexed vectors skip embedding');
 
-const loose = await recallPack(GUILD, { request: 'Rust Go テトリス' }, { embed, judge: async (_request, items) => ({ gate: 0.9, scores: items.map(() => 0.95) }) });
-const lines = (loose?.text.match(/^- /gm) ?? []).length;
-if (lines > 6 + 2) fail(`出す件数は上限まで: ${lines}`);
-if (calls < 2) fail('判定は呼ばれる');
-void [rustDup, go, nitro];
+  let rounds = 0;
+  const result = await runAgent({
+    guildId: GUILD, system: 's', userContent: 'Rust の話', memory: { read: memoryReader(GUILD, { request: 'Rust の話' }) },
+    toolset: { definitions: [{ type: 'function', function: { name: 'lookup', parameters: { type: 'object' } } }], call: () => '大会結果を確認' },
+    request: ({ messages }) => {
+      const memory = messages.find((m) => typeof m.content === 'string' && m.content.startsWith('REFERENCE MEMORY'));
+      rounds += 1;
+      if (rounds === 1) {
+        assert.match(memory?.content, /Rust 派.*\[e1\]/, 'same reader runs before the first answer');
+        return { choices: [{ message: { reasoning: '次にテトリス杯の話を確認', tool_calls: [{ id: 'lookup-1', type: 'function', function: { name: 'lookup', arguments: '{}' } }] } }] };
+      }
+      assert.match(memory?.content, /テトリス.*\[e2\]/);
+      assert.match(queries.at(-1)[0], /Rust の話.*テトリス杯.*大会結果を確認/);
+      return { choices: [{ message: { content: '完了' } }] };
+    }
+  });
+  assert.equal(result.text, '完了');
+  assert.equal(rounds, 2);
+  assert.equal(queries.length, count + 2, 'initial and reasoning rounds each embed one query');
+  assert.equal(networkCalls, 0);
 
-// 主張のある記憶では、意味検索 (memory ツール・考え中の想起) も主張を 1 つの知識として引く
-const meaning = await meaningOf(GUILD, 'Rust 派で型の堅さを気に入っている', { chunkLimit: 3 });
-equal(meaning?.chunks[0]?.path, 'people/たこ', '意味検索は主張を断片として返す');
-equal(meaning?.chunks[0]?.episodeIds, [1], '主張の出典の出来事');
-if (d.prepare("SELECT 1 FROM memory_vectors WHERE guild_id = ? AND kind = 'chunk'").get(GUILD)) fail('主張のある記憶では断片を振らない');
+  const seenTargets = [];
+  let readCalls = 0;
+  let postReadAttempts = 0;
+  const readOptions = {
+    guildId: GUILD, runId: 'structured-recall-resume', system: 's', userContent: 'read a post',
+    toolset: { readOnly: true, definitions: [{ type: 'function', function: { name: 'read', parameters: { type: 'object' } } }],
+      call: () => { readCalls += 1; return withRecallTarget('1) neighbor\n> Rust\n2) target\n> テトリス杯', 'テトリス杯'); } },
+    memory: { read: (query) => { seenTargets.push(query.readTarget); return null; } },
+    request: ({ messages }) => {
+      if (!messages.some((message) => message.role === 'tool')) return { choices: [{ message: {
+        tool_calls: [{ id: 'read-1', function: { name: 'read', arguments: '{}' } }] } }] };
+      assert.equal(messages.find((message) => message.role === 'tool')?.content, '1) neighbor\n> Rust\n2) target\n> テトリス杯');
+      assert.equal(JSON.stringify(messages).includes('recallTarget'), false, 'host hint stays out of provider messages');
+      if (postReadAttempts++ === 0) throw new Error('retry after saved read');
+      return { choices: [{ message: { content: 'done' } }] };
+    }
+  };
+  await assert.rejects(runAgent(readOptions), /retry after saved read/);
+  assert.equal((await runAgent(readOptions)).text, 'done');
+  assert.equal(readCalls, 1, 'checkpoint resume does not repeat the read');
+  assert.deepEqual(seenTargets, [undefined, 'テトリス杯', 'テトリス杯'], 'actual target survives a saved checkpoint');
 
-console.log('memory-pack checks passed');
+  let failures = 0;
+  setEmbedder(async () => { failures += 1; throw new Error('worker unavailable'); });
+  const offline = memoryReader(GUILD, { request: 'Rust' });
+  assert.equal(await offline(plain), null);
+  assert.equal(await offline(plain), null);
+  assert.equal(failures, 1, 'embedder failure adds no memory and does not retry the same query');
+} finally {
+  globalThis.fetch = originalFetch;
+}
+
+assert.ok((await meaningOf(GUILD, '', { chunkLimit: 3 })) === null);
+console.log('memory recall ok (初回・CoT・焦点・出典・低スコアの棄却・外部判定なし)');

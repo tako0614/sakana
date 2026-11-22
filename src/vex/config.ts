@@ -21,7 +21,7 @@ const origin = (() => {
 })();
 
 /**
- * 名前 (vex) が出た発言をどう扱うか。
+ * 呼び名が出た発言をどう扱うか。
  *   off     何もしない
  *   mention メンションと同じ。確定で答える (判定モデルは使わない)
  *   judge   判定モデルに文脈で決めさせる (確定では答えない)
@@ -69,7 +69,7 @@ function callMode(value: string | undefined): CallMode {
 export function loadVexConfig(env: NodeJS.ProcessEnv = process.env): VexConfig {
   const mode = callMode(env.VEX_CALL);
   return {
-    names: list(env.VEX_NAMES ?? 'vex').map((name) => name.toLowerCase()),
+    names: list(env.VEX_NAMES ?? 'vexちゃん').map((name) => name.toLowerCase()),
     callMode: mode,
     call: mode !== 'off',
     ambient: flag(env.VEX_AMBIENT, false),

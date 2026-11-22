@@ -544,7 +544,8 @@ await memoryCommand.execute(episodeInsider);
 assert.match(embedText(episodeInsider.calls[1][1]), /秘密の作戦会議/);
 assert.match(embedText(episodeInsider.calls[1][1]), secretLink);
 // agent の memory ツール: 依頼した人の channelScope を渡すと、その人が読めないチャンネルの原文と引用番号を出さない
-const { runMemoryTool } = await import('../src/memory/tool.js');
+const { runMemoryTool, runMemoryToolWithMeaning } = await import('../src/memory/tool.js');
+const { RefTable } = await import('../src/agent/format.js');
 const toolRefs = { entries: [], add(entry) { this.entries.push(entry); return this.entries.length; } };
 const scoped = runMemoryTool({ guildId: GUILD, refs: toolRefs, channelScope: { mode: 'exclude', ids: [ROLE_GATED] } }, { episode: `e${gatedEpisode}` });
 assert.doesNotMatch(scoped, /秘密の作戦会議/);
@@ -552,6 +553,37 @@ assert.match(scoped, HIDDEN);
 assert.equal(toolRefs.entries.length, 0, 'no citation number for a hidden quote');
 assert.match(runMemoryTool({ guildId: GUILD, channelScope: { mode: 'all', ids: [] } }, { episode: `e${gatedEpisode}` }), /秘密の作戦会議/);
 assert.match(runMemoryTool({ guildId: GUILD }, { episode: `e${gatedEpisode}` }), /秘密の作戦会議/, 'without a scope (builder CLI) nothing changes');
+// Vex renders original sources with the shared Discord formatter. A hidden source and a
+// foreign-guild row must be filtered before the formatter allocates any citation refs.
+const MULTILINE = '1400000000000000004';
+const FOREIGN = '1400000000000000005';
+archive.prepare("INSERT OR REPLACE INTO messages (message_id, guild_id, channel_id, author_id, author_name, content, created_at, char_count) VALUES (?, ?, ?, 'u', 'たこ', ?, ?, 20)")
+  .run(MULTILINE, GUILD, CHANNEL, '一行目の根拠\n二行目の根拠', Date.now() - 1_700_000);
+archive.prepare("INSERT OR REPLACE INTO messages (message_id, guild_id, channel_id, author_id, author_name, content, created_at, char_count) VALUES (?, ?, ?, 'u', '別サーバー', '別サーバーの本文', ?, 10)")
+  .run(FOREIGN, '910000000000000099', CHANNEL, Date.now() - 1_600_000);
+const sourceEpisode = store.insertEpisode(GUILD, { title: '複数の根拠', summary: '複数チャンネルの根拠。', channelId: CHANNEL,
+  atMs: Date.now() - 1_700_000, endMs: Date.now() - 1_600_000, sources: [SECRET, MULTILINE, FOREIGN], highlights: [SECRET, MULTILINE], importance: 2 });
+const discordRefs = new RefTable();
+const vexContext = {
+  guildId: GUILD,
+  refs: discordRefs,
+  channelScope: { mode: 'exclude', ids: [ROLE_GATED] },
+  discordPresentation: { refs: discordRefs, selfId: 'bot' }
+};
+const vexSource = await runMemoryToolWithMeaning(vexContext, { episode: `e${sourceEpisode}` });
+assert.match(vexSource, /一行目の根拠/);
+assert.match(vexSource, /二行目の根拠/);
+assert.match(vexSource, /^話者（この資料内）:/m, 'Vex uses the shared speaker legend');
+assert.match(vexSource, /^> 一行目の根拠\n> 二行目の根拠$/m, 'source body retains its multiline record shape');
+assert.doesNotMatch(vexSource, /秘密の作戦会議|別サーバーの本文/);
+assert.equal(discordRefs.entries.length, 1, 'only the visible in-guild source receives a ref');
+assert.equal(discordRefs.entries[0].messageId, MULTILINE);
+assert.equal(await runMemoryToolWithMeaning(vexContext, { episode: `e${sourceEpisode}` }), vexSource, 'reopening sources reuses stable ref numbers');
+assert.equal(discordRefs.entries.length, 1, 'the shared RefTable does not allocate a duplicate ref');
+const legacyPresentation = runMemoryTool({ guildId: GUILD }, { episode: `e${sourceEpisode}` });
+assert.match(legacyPresentation, /★ .* たこ: 一行目の根拠 \/ 二行目の根拠/);
+assert.doesNotMatch(legacyPresentation, /speaker|話者一覧/i, 'the public /memory presentation stays on its existing renderer');
+assert.equal(runMemoryTool({ guildId: GUILD }, { episode: `e${sourceEpisode}` }), legacyPresentation);
 // 1つの出来事の根拠は複数のチャンネルにまたがる。NSFW のチャンネルの原文は、共有先が NSFW のときだけ
 const LEWD = '1400000000000000003';
 store.savePublicChannels(GUILD, [CHANNEL, ROLE_GATED, NSFW]);

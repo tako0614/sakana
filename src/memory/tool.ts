@@ -1,5 +1,7 @@
 import type { ToolDefinition } from '../ai/types.js';
 import { db as archive } from '../archive/db.js';
+import type { MessageRow } from '../archive/types.js';
+import { formatMessageLines, fromArchiveRow, type FormatOptions, type RefTable } from '../agent/format.js';
 import {
   topLevels, episodesFor, getEpisode, getNode, hasTree, linkedPages, listChildren, loadPublicChannels, nameOf,
   normalizePath, searchEpisodes, searchNodes, sharedEpisodes, type MemoryNode
@@ -42,6 +44,8 @@ export interface MemoryToolContext {
   refs?: MemoryRefTable | null;
   channelScope?: ChannelScope | null;
   canQuote?: QuoteFilter | null;
+  /** Internal agent presentation for Vex. The public /memory command uses runMemoryTool without this. */
+  discordPresentation?: Pick<FormatOptions, 'selfId' | 'resolveDisplay'> & { refs: RefTable };
 }
 
 /** モデル (または /memory) が渡す引数。どれも文字列のはずだが確かめてから使う。 */
@@ -126,13 +130,7 @@ function openPage(guildId: string, node: MemoryNode): string {
   return lines.join('\n');
 }
 
-interface SourceRow {
-  message_id: string;
-  channel_id: string;
-  author_id: string;
-  author_name: string;
-  content: string;
-  created_at: number;
+interface SourceRow extends MessageRow {
   channel_name: string | null;
 }
 
@@ -159,28 +157,38 @@ function openEpisode(ctx: MemoryToolContext, id: number): string {
   const open = new Set(loadPublicChannels(ctx.guildId)?.channelIds ?? []);
   const ids = [...new Set([...(episode.highlights ?? []), ...episode.sources])].slice(0, 12);
   const rows = ids.length ? archive.prepare<string[], SourceRow>(`
-    SELECT m.message_id, m.channel_id, m.author_id, m.author_name, m.content, m.created_at, c.name AS channel_name
+    SELECT m.*, c.name AS channel_name
     FROM messages m LEFT JOIN channels c ON c.channel_id = m.channel_id
-    WHERE m.message_id IN (${ids.map(() => '?').join(',')}) AND m.deleted = 0 ORDER BY m.created_at
-  `).all(...ids) : [];
+    WHERE m.guild_id = ? AND m.message_id IN (${ids.map(() => '?').join(',')}) AND m.deleted = 0 ORDER BY m.created_at, m.message_id
+  `).all(ctx.guildId, ...ids) : [];
   const readable = rows.filter((row) => open.has(row.channel_id));
   const visible = readable.filter((row) => quotable(ctx, row.channel_id));
   const hidden = readable.length - visible.length;
   if (visible.length === 0) {
     lines.push(hidden ? '根拠の発言: (見られないチャンネルの発言は省きました)' : '根拠の発言: (消されたか、非公開になって開けません)');
   } else {
-    // 決め台詞・名言として残した発言を先に (原文そのまま)
     const highlighted = new Set(episode.highlights ?? []);
-    visible.sort((a, b) => Number(highlighted.has(b.message_id)) - Number(highlighted.has(a.message_id)) || a.created_at - b.created_at);
     lines.push('根拠の発言 (★ は決め台詞として残したもの):');
-    for (const row of visible) {
-      const ref = ctx.refs?.add({
-        guildId: ctx.guildId, channelId: row.channel_id, channelName: row.channel_name ?? row.channel_id,
-        messageId: row.message_id, authorId: row.author_id, authorName: row.author_name,
-        content: row.content, createdAt: row.created_at
-      });
-      const text = row.content.replace(/\s*\n\s*/g, ' / ').slice(0, 300);
-      lines.push(`${highlighted.has(row.message_id) ? '★ ' : ''}${ref ? `${ref}) ` : ''}${minute(row.created_at)} ${row.author_name}: ${text}`);
+    if (ctx.discordPresentation) {
+      // Vex の元発言は会話順で読ませ、強調は注記で添える。
+      const messages = visible.map((row) => fromArchiveRow(row, row.channel_name ?? row.channel_id));
+      lines.push(formatMessageLines(messages, {
+        ...ctx.discordPresentation,
+        showChannel: true,
+        bodyChars: 300,
+        tailOf: (message) => highlighted.has(message.messageId) ? '★ 決め台詞として残した発言' : null
+      }));
+    } else {
+      visible.sort((a, b) => Number(highlighted.has(b.message_id)) - Number(highlighted.has(a.message_id)) || a.created_at - b.created_at);
+      for (const row of visible) {
+        const ref = ctx.refs?.add({
+          guildId: ctx.guildId, channelId: row.channel_id, channelName: row.channel_name ?? row.channel_id,
+          messageId: row.message_id, authorId: row.author_id, authorName: row.author_name,
+          content: row.content, createdAt: row.created_at
+        });
+        const text = row.content.replace(/\s*\n\s*/g, ' / ').slice(0, 300);
+        lines.push(`${highlighted.has(row.message_id) ? '★ ' : ''}${ref ? `${ref}) ` : ''}${minute(row.created_at)} ${row.author_name}: ${text}`);
+      }
     }
     if (hidden) lines.push('(見られないチャンネルの発言は省きました)');
   }
@@ -246,7 +254,7 @@ export async function runMemoryToolWithMeaning(ctx: MemoryToolContext, args: Mem
     // 断片はページの中の具体的な話なので、ページが言葉の検索に出ていても出す
     chunks: meaning.chunks
   };
-  const lines = meaningLines(fresh);
+  const lines = meaningLines(fresh, 1200);
   if (lines.length === 0) return base;
   const notFound = base.startsWith('記憶に「');
   return [notFound ? '' : base, '意味が近い記憶 (言葉は一致しないが、話が似ている):', ...lines].filter((line) => line !== '').join('\n');

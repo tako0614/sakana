@@ -13,7 +13,7 @@ import { createHash } from 'node:crypto';
 import { embedConfig } from '../embed/config.js';
 import { memoryWorker } from '../embed/worker.js';
 import { bestLine, chunkText, syncChunks } from './chunks.js';
-import { allClaims, claimEmbedText, hasClaims, loadClaims, syncClaimFts } from './claims.js';
+import { allClaims, claimEmbedText, hasClaims, loadClaims, type ClaimView } from './claims.js';
 import { memoryDb } from './store.js';
 
 type Kind = 'node' | 'episode' | 'chunk' | 'claim';
@@ -134,7 +134,6 @@ export async function syncMemoryVectors(guildId: string,
     // 先に本文から断片の表を作り直す (builder が書き直したぶんだけ変わる。SQL だけで済む)
     // 主張のある記憶 (v2) は主張が 1 つの知識なので、本文を 1 行ずつに割った断片の表は作らない (本文が数十万字になるページもある)
     if (!hasClaims(guildId)) syncChunks(guildId);
-    syncClaimFts(guildId);
     const items = itemsOf(guildId);
     const stored = new Map<string, string>();
     for (const row of db.prepare<[string, string], { kind: string; id: number; text_hash: string }>(
@@ -206,29 +205,39 @@ export function hasKind(guildId: string, kind: Kind): boolean {
 
 // ---- 引く ---------------------------------------------------------------------
 
-interface Matrix { signature: string; dim: number; ids: number[]; values: Float32Array }
+interface Matrix {
+  db: ReturnType<typeof memoryDb>;
+  model: string;
+  revision: number;
+  dim: number;
+  ids: number[];
+  values: Float32Array;
+}
 const matrices = new Map<string, Matrix>();
 
 function matrixFor(guildId: string, kind: Kind): Matrix | null {
   const db = memoryDb();
-  const summary = db.prepare<[string, string, string], { n: number; last: number | null }>(
-    'SELECT COUNT(*) AS n, MAX(updated_at) AS last FROM memory_vectors WHERE guild_id = ? AND kind = ? AND model = ?').get(guildId, kind, modelKey());
-  if (!summary || summary.n === 0) return null;
-  const signature = `${summary.n}:${summary.last}`;
+  // SQLite triggers bump this only for writes to this guild and kind, including
+  // writes made by another connection. Legacy rows have an implicit revision 0.
+  const revision = db.prepare<[string, string], { revision: number }>(
+    'SELECT revision FROM memory_vector_revisions WHERE guild_id = ? AND kind = ?').get(guildId, kind)?.revision ?? 0;
+  const model = modelKey();
   const key = `${guildId}:${kind}`;
   const cached = matrices.get(key);
-  if (cached?.signature === signature) return cached;
+  if (cached?.db === db && cached.model === model && cached.revision === revision) return cached;
 
   const rows = db.prepare<[string, string, string], { id: number; vec: Buffer }>(
-    'SELECT id, vec FROM memory_vectors WHERE guild_id = ? AND kind = ? AND model = ?').all(guildId, kind, modelKey());
+    'SELECT id, vec FROM memory_vectors WHERE guild_id = ? AND kind = ? AND model = ?').all(guildId, kind, model);
+  if (rows.length === 0) { matrices.delete(key); return null; }
   const dim = (rows[0]?.vec.byteLength ?? 0) / Float32Array.BYTES_PER_ELEMENT;
-  if (!Number.isInteger(dim) || dim <= 0) return null;
+  if (!Number.isInteger(dim) || dim <= 0) { matrices.delete(key); return null; }
   const usable = rows.filter((row) => row.vec.byteLength === dim * Float32Array.BYTES_PER_ELEMENT);
   const values = new Float32Array(usable.length * dim);
   usable.forEach((row, index) => {
     values.set(new Float32Array(row.vec.buffer.slice(row.vec.byteOffset, row.vec.byteOffset + row.vec.byteLength)), index * dim);
   });
-  const matrix: Matrix = { signature, dim, ids: usable.map((row) => row.id), values };
+  const ids = usable.map((row) => row.id);
+  const matrix: Matrix = { db, model, revision, dim, ids, values };
   matrices.set(key, matrix);
   return matrix;
 }
@@ -237,8 +246,12 @@ export interface VectorHit { id: number; score: number }
 
 /** 質問のベクトルに近い順。exclude の id は除く。 */
 export function nearest(guildId: string, kind: Kind, query: Float32Array, { limit = 5, exclude }: { limit?: number; exclude?: ReadonlySet<number> } = {}): VectorHit[] {
+  const topCount = Math.trunc(limit);
+  if (topCount === 0 || Number.isNaN(topCount)) return [];
   const matrix = matrixFor(guildId, kind);
   if (!matrix || matrix.dim !== query.length) return [];
+  // 通常は上位 5〜40 件を保持する。同点は行順。大きな limit では配列への逐次挿入を避ける。
+  const bounded = topCount > 0 && topCount <= 128;
   const hits: VectorHit[] = [];
   for (let row = 0; row < matrix.ids.length; row += 1) {
     const id = matrix.ids[row] as number;
@@ -246,26 +259,22 @@ export function nearest(guildId: string, kind: Kind, query: Float32Array, { limi
     let score = 0;
     const base = row * matrix.dim;
     for (let index = 0; index < matrix.dim; index += 1) score += (matrix.values[base + index] ?? 0) * (query[index] ?? 0);
-    hits.push({ id, score });
+    if (bounded) {
+      if (hits.length === topCount && score <= (hits[topCount - 1]?.score ?? -Infinity)) continue;
+      let low = 0;
+      let high = hits.length;
+      while (low < high) {
+        const mid = (low + high) >>> 1;
+        if (score > (hits[mid]?.score ?? -Infinity)) high = mid;
+        else low = mid + 1;
+      }
+      hits.splice(low, 0, { id, score });
+      if (hits.length > topCount) hits.pop();
+    } else {
+      hits.push({ id, score });
+    }
   }
-  return hits.sort((a, b) => b.score - a.score).slice(0, limit);
-}
-
-/** 指定した id だけの、質問への近さ。ベクトルが無い id は含まれない。 */
-export function scoresFor(guildId: string, kind: Kind, query: Float32Array, ids: readonly number[]): Map<number, number> {
-  const scores = new Map<number, number>();
-  const matrix = matrixFor(guildId, kind);
-  if (!matrix || matrix.dim !== query.length || ids.length === 0) return scores;
-  const wanted = new Set(ids);
-  for (let row = 0; row < matrix.ids.length; row += 1) {
-    const id = matrix.ids[row] as number;
-    if (!wanted.has(id)) continue;
-    let score = 0;
-    const base = row * matrix.dim;
-    for (let index = 0; index < matrix.dim; index += 1) score += (matrix.values[base + index] ?? 0) * (query[index] ?? 0);
-    scores.set(id, score);
-  }
-  return scores;
+  return bounded ? hits : hits.sort((a, b) => b.score - a.score).slice(0, limit);
 }
 
 /**
@@ -298,59 +307,10 @@ export async function embedQuery(text: string, { timeoutMs = 3000 }: { timeoutMs
   }
 }
 
-/** 埋め込みモデルが読めるのは 384 トークン (日本語で 500 字ほど)。それより長い文は後ろが切れるので、質問は短い断片ごとに分けて渡す。 */
-const SEGMENT_CHARS = 500;
-
-/**
- * 複数の質問文を、1 回の呼び出しでまとめてベクトルにする。timeoutMs で見切る (null)。
- * 戻りは入力と同じ順で、空の文は null。モデルが眠っているときは embedQuery と同じに見切る。
- */
-export async function embedQueries(texts: readonly string[], { timeoutMs = 3000 }: { timeoutMs?: number } = {}): Promise<(Float32Array | null)[] | null> {
-  const clean = texts.map((text) => text.replace(/\s+/g, ' ').trim().slice(0, SEGMENT_CHARS));
-  const wanted = clean.map((text, index) => ({ text, index })).filter((entry) => entry.text);
-  if (wanted.length === 0 || !embedConfig.enabled || memoryWorker().isDisabled()) return null;
-  const real = embedder === defaultEmbed;
-  const cold = real && memoryWorker().workerInfo() === null;
-  if (cold) {
-    memoryWorker().prewarm();
-    if (Date.now() < coldUntil) return null;
-  }
-  const work = embedder(wanted.map((entry) => entry.text), 'query').then((reply) => {
-    const out: (Float32Array | null)[] = clean.map(() => null);
-    wanted.forEach((entry, position) => { out[entry.index] = decode(reply.vectors[position] ?? '', reply.dim); });
-    return out;
-  }, () => null);
-  let timer: NodeJS.Timeout | undefined;
-  let timedOut = false;
-  const limit = new Promise<null>((resolve) => { timer = setTimeout(() => { timedOut = true; resolve(null); }, timeoutMs); });
-  try {
-    return await Promise.race([work, limit]);
-  } finally {
-    clearTimeout(timer);
-    if (cold && timedOut) coldUntil = Date.now() + COLD_SKIP_MS;
-  }
-}
-
-/** 質問の 1 本。penalty は、弱い手がかり (直前の会話など) のスコアから引く値。 */
-export interface QuerySegment { text: string; penalty?: number }
-
-/** 複数の質問のそれぞれで引き、同じものはいちばん高いスコア (penalty を引いたあと) を採って、近い順に並べる。 */
-function nearestOfAny(guildId: string, kind: Kind, queries: readonly { vector: Float32Array; penalty: number }[],
-  { limit, exclude }: { limit: number; exclude?: ReadonlySet<number> | undefined }): VectorHit[] {
-  const best = new Map<number, number>();
-  for (const { vector, penalty } of queries) {
-    for (const hit of nearest(guildId, kind, vector, { limit, ...(exclude ? { exclude } : {}) })) {
-      const score = hit.score - penalty;
-      if (score > (best.get(hit.id) ?? -Infinity)) best.set(hit.id, score);
-    }
-  }
-  return [...best].map(([id, score]) => ({ id, score })).sort((a, b) => b.score - a.score).slice(0, limit);
-}
-
 export interface MeaningNode { path: string; summary: string; score: number }
 export interface MeaningEpisode { id: number; kind: string; title: string; atMs: number; score: number }
 /** ページの中の1つの知識 (まとめた断片なら、その中で質問にいちばん近い行を line に)。episodeIds は根拠の出来事 (開くと原文までたどれる)。 */
-export interface MeaningChunk { id: number; path: string; heading: string; text: string; line: string; episodeIds: number[]; score: number; /** 同じ節で、ほかにも当たった断片の数。 */ more: number }
+export interface MeaningChunk { id: number; path: string; heading: string; text: string; line: string; episodeIds: number[]; score: number; more: number; claim?: ClaimView }
 export interface Meaning { nodes: MeaningNode[]; episodes: MeaningEpisode[]; chunks: MeaningChunk[] }
 
 // 1位からこれ以上離れたものは捨てる。e5 は無関係な文どうしでも高い値が出るので、順位と1位との差でも絞る。
@@ -369,25 +329,17 @@ const CHUNKS_PER_PAGE = 2;
 
 /**
  * 文に意味が近いページ・出来事・ページの中の1つの知識。ベクトルが無い・間に合わない・近いものが無ければ null。
- * 質問は 1 つの文でも、複数の断片 (依頼・直前の会話・思考・道具の結果) でもよい。断片は別々に埋め込んで、いちばん近いものを採る
- * (1 本につなぐと、埋め込みが読める 500 字ほどを超えた後ろが切れる)。
+ * 自動想起では minScore に関係の下限を渡し、明示的な検索では既定の下限を使う。
  */
-export async function meaningOf(guildId: string, input: string | readonly QuerySegment[],
-  { nodeLimit = 2, episodeLimit = 3, chunkLimit = 3, excludePaths, excludeEpisodes, excludeChunks, timeoutMs = 3000, queryVector }: {
+export async function meaningOf(guildId: string, text: string,
+  { nodeLimit = 2, episodeLimit = 3, chunkLimit = 3, excludePaths, excludeEpisodes, excludeChunks, timeoutMs = 3000, minScore }: {
     nodeLimit?: number; episodeLimit?: number; chunkLimit?: number; excludePaths?: ReadonlySet<string>; excludeEpisodes?: ReadonlySet<number>;
     excludeChunks?: ReadonlySet<number>; timeoutMs?: number;
-    /** 質問が 1 つの文のとき、呼び出し側で埋め込み済みのベクトル (同じ文を二度埋め込まない)。 */
-    queryVector?: Float32Array | null;
+    minScore?: number;
   } = {}): Promise<Meaning | null> {
-  if (!hasVectors(guildId)) return null;
-  const segments: QuerySegment[] = typeof input === 'string' ? [{ text: input }] : [...input];
-  const embedded = segments.length === 1 && typeof input === 'string'
-    ? [queryVector ?? await embedQuery(input, { timeoutMs })]
-    : await embedQueries(segments.map((segment) => segment.text), { timeoutMs });
-  const queries = (embedded ?? []).flatMap((vector, index) => (vector ? [{ vector, penalty: segments[index]?.penalty ?? 0 }] : []));
-  if (queries.length === 0) return null;
-  // 出す行の頭を、質問のどこにいちばん重なる行にするかの手がかり
-  const text = segments.map((segment) => segment.text).join('\n');
+  if (!text.trim() || !hasVectors(guildId)) return null;
+  const query = await embedQuery(text, { timeoutMs });
+  if (!query) return null;
   const db = memoryDb();
 
   const skipNodes = new Set<number>();
@@ -399,11 +351,11 @@ export async function meaningOf(guildId: string, input: string | readonly QueryS
   }
   const pick = (hits: VectorHit[]): VectorHit[] => {
     const best = hits[0]?.score ?? 0;
-    return hits.filter((hit) => hit.score >= floor && hit.score >= best - gap);
+    return hits.filter((hit) => hit.score >= (minScore ?? floor) && hit.score >= best - gap);
   };
   // 根 (全体の概要) は常に何かに近いので出さない
-  const nodeHits = pick(nearestOfAny(guildId, 'node', queries, { limit: nodeLimit + 1, exclude: skipNodes })).slice(0, nodeLimit);
-  const episodeHits = pick(nearestOfAny(guildId, 'episode', queries, { limit: episodeLimit + 2, exclude: excludeEpisodes ? new Set(excludeEpisodes) : undefined })).slice(0, episodeLimit);
+  const nodeHits = nodeLimit > 0 ? pick(nearest(guildId, 'node', query, { limit: nodeLimit + 1, exclude: skipNodes })).slice(0, nodeLimit) : [];
+  const episodeHits = pick(nearest(guildId, 'episode', query, { limit: episodeLimit, ...(excludeEpisodes ? { exclude: excludeEpisodes } : {}) }));
 
   const nodes: MeaningNode[] = [];
   for (const hit of nodeHits) {
@@ -421,25 +373,38 @@ export async function meaningOf(guildId: string, input: string | readonly QueryS
   const chunks: MeaningChunk[] = [];
   if (chunkLimit > 0 && hasKind(guildId, 'claim')) {
     // v2 の記憶: 1 つの知識 = 主張。ページ (entity) ごとに CHUNKS_PER_PAGE 件まで。節は無い (heading は空)
-    const raw = nearestOfAny(guildId, 'claim', queries, { limit: chunkLimit * 8, exclude: excludeChunks ? new Set(excludeChunks) : undefined });
+    const raw = nearest(guildId, 'claim', query, { limit: chunkLimit * 8, ...(excludeChunks ? { exclude: excludeChunks } : {}) });
     const best = raw[0]?.score ?? 0;
     const perPage = new Map<string, number>();
-    const claims = loadClaims(guildId, raw.map((hit) => hit.id));
-    for (const hit of raw) {
-      if (hit.score < chunkFloor || hit.score < best - chunkGap || chunks.length >= chunkLimit) continue;
+    const hits = raw.filter((hit) => hit.score >= (minScore ?? chunkFloor) && hit.score >= best - chunkGap);
+    const claims = loadClaims(guildId, hits.map((hit) => hit.id));
+    const unique = new Map<string | number, { claim: ClaimView; score: number }>();
+    for (const hit of hits) {
       const claim = claims.get(hit.id);
-      if (!claim || !claim.path) continue;
-      if ((perPage.get(claim.path) ?? 0) >= CHUNKS_PER_PAGE) continue;
-      perPage.set(claim.path, (perPage.get(claim.path) ?? 0) + 1);
-      chunks.push({ id: claim.id, path: claim.path, heading: '', text: claim.text, line: claim.text, episodeIds: claim.episodeId ? [claim.episodeId] : [], score: hit.score, more: 0 });
+      if (!claim || (!claim.path && claim.episodeId === null)) continue;
+      const text = claim.text.normalize('NFKC').toLowerCase().replace(/[\s、。]/g, '');
+      const modality = claim.modality === 'self_report' ? 'plain' : claim.modality;
+      const key = claim.entityId === null ? claim.id : JSON.stringify([claim.entityId, claim.asOf, claim.episodeId, claim.type, modality, claim.hedged, text]);
+      const previous = unique.get(key);
+      if (!previous || (previous.claim.modality === 'plain' && claim.modality === 'self_report')) unique.set(key, { claim, score: hit.score });
+    }
+    const perEpisode = new Map<number, number>();
+    for (const { claim, score } of unique.values()) {
+      if (chunks.length >= chunkLimit) break;
+      if (claim.path && (perPage.get(claim.path) ?? 0) >= CHUNKS_PER_PAGE) continue;
+      const source = claim.episodeId;
+      if (source !== null && (perEpisode.get(source) ?? 0) >= CHUNKS_PER_PAGE) continue;
+      if (source !== null) perEpisode.set(source, (perEpisode.get(source) ?? 0) + 1);
+      if (claim.path) perPage.set(claim.path, (perPage.get(claim.path) ?? 0) + 1);
+      chunks.push({ id: claim.id, path: claim.path, heading: '', text: claim.text, line: claim.text, episodeIds: source === null ? [] : [source], score, more: 0, claim });
     }
   } else if (chunkLimit > 0) {
-    const raw = nearestOfAny(guildId, 'chunk', queries, { limit: chunkLimit * 8, exclude: excludeChunks ? new Set(excludeChunks) : undefined });
+    const raw = nearest(guildId, 'chunk', query, { limit: chunkLimit * 8, ...(excludeChunks ? { exclude: excludeChunks } : {}) });
     const best = raw[0]?.score ?? 0;
     const perPage = new Map<string, number>();
     const sections = new Map<string, MeaningChunk>();
     for (const hit of raw) {
-      if (hit.score < chunkFloor || hit.score < best - chunkGap) continue;
+      if (!(hit.score >= (minScore ?? chunkFloor) && hit.score >= best - chunkGap)) continue;
       const row = db.prepare<[number], { id: number; path: string; heading: string; text: string; cites: string }>('SELECT id, path, heading, text, cites FROM memory_chunks WHERE id = ?').get(hit.id);
       if (!row || !row.path) continue;
       const section = sections.get(`${row.path}\u0000${row.heading}`);

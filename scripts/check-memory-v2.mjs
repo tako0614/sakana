@@ -74,9 +74,9 @@ const say = (channelId, author, name, content, at, extra = {}) => {
   return id;
 };
 
-// 会話 A (8 発言): 1 行目と 2 行目は同じ人が続けて書くので 1 行にまとまる
-const a1 = say(OPEN, TAKO, 'tako_old', 'Rust 好きなんだよね', T0);
-say(OPEN, TAKO, 'tako_old', '型が堅いのがいい', T0 + MIN);
+// 会話 A (8 発言): 同じ人の発言も個別行で対応し、2 行目に複数行本文がある
+const a1 = say(OPEN, TAKO, 'tako_old', 'Rust 好きなんだよね、型の堅さを気に入っている', T0);
+say(OPEN, TAKO, 'tako_old', '型が堅いのがいい\n```ts\ntype User = { id: string }\n```\n> null は入らない', T0 + MIN, { attachments: 1, kinds: 'image' });
 const a3 = say(OPEN, SABA1, 'さば', 'Go 派だけどな', T0 + 2 * MIN, { replyTo: a1 });
 say(OPEN, TAKO, 'tako_old', `<@${SABA1}> 冗談だけど OS を Rust で書く`, T0 + 3 * MIN);
 say(OPEN, SABA2, 'さば', '同名の別人です DROPME', T0 + 4 * MIN);
@@ -136,13 +136,16 @@ equal(section.labels.get('A1'), 'たこ', '表示名は最新の名前 (tako_old
 if (!/A\d=さば#0002/.test(section.text) || !/A\d=さば#0003/.test(section.text)) fail(`同名の別人は author_id の末尾で見分ける: ${section.text.split('\n')[0]}`);
 if (!/Deleted User#0004/.test(section.text)) fail('削除済みユーザーは別人として見分ける');
 if (/BOT の発言|消した発言/.test(section.text)) fail('bot・削除済みは台本に出ない');
-if (!/^1\|\d\d:\d\d A1: Rust 好きなんだよね \/ 型が堅いのがいい$/m.test(section.text)) fail(`同じ人の続けての発言は 1 行にまとまる:\n${section.text}`);
-if (!/^2\|A\d→A1: Go 派だけどな$/m.test(section.text)) fail('返信先がコードで出る');
+if (!/^1\|\d\d:\d\d A1: Rust 好きなんだよね、型の堅さを気に入っている$/m.test(section.text)) fail(`各メッセージに個別の根拠行がある:\n${section.text}`);
+if (!/^2\|A1: 型が堅いのがいい\n  \| ```ts\n  \| type User = \{ id: string \}\n  \| ```\n  \| > null は入らない$/m.test(section.text)) fail(`改行・コード・引用を台本で保つ:\n${section.text}`);
+if (!/^  \| 補足（添付等、本文ではない）: \[画像\]$/m.test(section.text)) fail('添付の記録は発言本文と区別する');
+if (!/^3\|A\d ↩#1: Go 派だけどな$/m.test(section.text)) fail('返信先が話者ではなく元の発言行を指す');
 if (!/@A2/.test(section.text)) fail('メンションが発言者コードに直る');
 equal(section.units.map((unit) => unit.conv), ['c1', 'c2', 'c3'], '会話単位は 3 つ');
 equal(section.units.map((unit) => unit.messages), [8, 9, 2], '会話単位ごとの発言数');
-equal(section.lines.get(1)?.ids.length, 2, 'まとめた行は 2 つの発言 ID');
+equal(section.lines.get(1)?.ids.length, 1, '各行は個別の発言 ID を持つ');
 equal(section.lines.get(1)?.authorId, TAKO, '行 → 発言者 (author_id)');
+equal(section.lines.get(2)?.ids.length, 1, '複数行本文も 1 件の発言 ID に対応する');
 const sameAgain = renderSection(GUILD, range);
 equal(sameAgain.text, section.text, '同じ範囲から同じ台本');
 const onlyB = renderSection(GUILD, range, { onlyConvs: new Set(['c2']) });
@@ -166,7 +169,7 @@ if (!/^## #開発 2025-03-14$/m.test(onlyB.text)) fail('onlyConvs でも日付�
     episodes: [
       { kind: 'レスバ/議論', title: 'Rust と Go', summary: '<A1> が Rust を推し、<A2> が Go を推した。', outcome: '特になし', lines: [1, 2, 99], quotes: [2], entities: ['A1', 'A2', 'Go vs Rust', 'たこ'], importance: 9 },
       { title: '範囲外', summary: '行番号が区間に無い', lines: [900] },
-      { title: '丸写し', summary: 'Rust 好きなんだよね / 型が堅いのがいい', lines: [1] }
+      { title: '丸写し', summary: 'Rust 好きなんだよね、型の堅さを気に入っている', lines: [1] }
     ],
     claims: [
       { about: 'A1', text: 'Rust 派', type: 'stance', modality: 'self_report', lines: [1], episode: 0 },
@@ -208,7 +211,7 @@ function fakeExtract(user) {
   for (const line of user.split('\n')) {
     const h = line.match(/^### (c\d+) \((\d+)発言\)/);
     if (h) { cur = { conv: h[1], n: Number(h[2]), lines: [] }; units.push(cur); continue; }
-    const m = line.match(/^(\d+)\|(?:\d\d:\d\d )?(A\d+)(?:→[^:]*)?: (.*)$/);
+    const m = line.match(/^(\d+)\|(?:\d\d:\d\d )?(A\d+)(?:\s+↩#\d+|→[^:]*)?: (.*)$/);
     if (m && cur) cur.lines.push({ n: Number(m[1]), code: m[2], text: m[3] });
   }
   const episodes = [];
@@ -421,7 +424,7 @@ for (const id of cited) {
   if (!episode) fail(`[e${id}] の出来事が開ける`);
   if (!episode.sources.length) fail('出来事は根拠の発言を持つ');
 }
-equal(JSON.parse(memoryDb().prepare('SELECT highlights FROM episodes WHERE id = ?').get(epA.id).highlights).length, 2, '決め台詞が highlights に写る (まとめた行の 2 発言)');
+equal(JSON.parse(memoryDb().prepare('SELECT highlights FROM episodes WHERE id = ?').get(epA.id).highlights).length, 1, '決め台詞の行から 1 件の元発言 ID を引く');
 if (!memoryDb().prepare('SELECT 1 FROM episode_nodes WHERE episode_id = ? AND path = ?').get(epA.id, 'people/たこ')) fail('出来事 → ページの結び目');
 if (memoryDb().prepare('SELECT COUNT(*) AS c FROM cursors WHERE guild_id = ?').get(GUILD).c < 2) fail('読み終えた位置を置く');
 if (!getNode(GUILD, '')?.body.includes('開発の場')) fail('根の本文が写る');

@@ -40,6 +40,9 @@ export const agentConfig = {
   // 本文なので、ここで切ると「読んだはずの発言」が欠けたまま答えることになる。
   // user メッセージ側なのでキャッシュの前方一致は壊さない。
   preloadChars: number(process.env.AGENT_PRELOAD_CHARS, 800),
+  // Shared cap for recent history and reply-chain material in the first user prompt.
+  // The request itself stays complete; history favors the direct reply and recent tail.
+  firstPromptHistoryChars: number(process.env.AGENT_FIRST_PROMPT_HISTORY_CHARS, 12_000),
   // 呼ばれた時点で直近メッセージを最初から渡しておく (ツール往復を1回減らす)。0 で無効。
   preloadMessages: number(process.env.AGENT_PRELOAD_MESSAGES, 30),
   // max_tokens には思考ぶんも含まれる。4000 だと reasoning_effort:high の思考で

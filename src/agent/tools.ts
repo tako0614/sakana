@@ -18,7 +18,7 @@ import { aggregateSearch, isChannelAllowed, search, searchSummary, searchThreads
 import { topTerms } from '../archive/terms.js';
 import type { FilterCondition, MessageRow, QueryNode, SearchOptions } from '../archive/types.js';
 import type { ChunkFilters } from '../archive/vectors.js';
-import type { AgentToolset } from '../ai/runtime.js';
+import { withRecallTarget, type AgentToolset } from '../ai/runtime.js';
 import { prewarm } from '../embed/worker.js';
 import { governance as governanceRecords } from './boundary.js';
 import { browserToolDefinition, runBrowserAction } from './browser.js';
@@ -30,6 +30,7 @@ import { looksLikeSentence } from './sentence.js';
 import { runSemanticSearch, semanticAvailable } from './semantic.js';
 import { cdpAvailable } from './cdp.js';
 import { agentConfig } from './config.js';
+import { resolveCachedDisplay } from './prompt.js';
 import {
   formatMessageLines,
   fromArchiveRow,
@@ -912,6 +913,7 @@ async function searchViaArchive(ctx: AgentContext, args: ToolArgs, limit: number
   lines.push(formatMessageLines(messages, {
     refs: ctx.refs,
     selfId: ctx.client?.user?.id,
+    resolveDisplay: resolveCachedDisplay(ctx),
     showChannel: true,
     bodyChars: agentConfig.messageChars
   }));
@@ -1201,6 +1203,7 @@ async function searchViaDiscord(ctx: AgentContext, args: ToolArgs, limit: number
       formatMessageLines(messages, {
         refs: ctx.refs,
         selfId: ctx.client?.user?.id,
+        resolveDisplay: resolveCachedDisplay(ctx),
         showChannel: true,
         bodyChars: agentConfig.messageChars
       })
@@ -1439,6 +1442,7 @@ async function readManyChannels(
         : formatMessageLines(messages, {
           refs: ctx.refs,
           selfId: ctx.client?.user?.id,
+          resolveDisplay: resolveCachedDisplay(ctx),
           showChannel: false,
           bodyChars: agentConfig.messageChars
         })
@@ -1686,7 +1690,7 @@ async function listThreadContainer(ctx: AgentContext, container: GuildBasedChann
   ].join('\n');
 }
 
-export async function runRead(ctx: AgentContext, rawArgs: ToolArgs): Promise<string> {
+export async function runRead(ctx: AgentContext, rawArgs: ToolArgs, onTarget?: (message: AgentMessage) => void): Promise<string> {
   const args = boundedArgs(rawArgs);
   const wanted = normalizeChannelArg(args.channel);
   const direction = lower(args.direction) || 'around';
@@ -1697,7 +1701,7 @@ export async function runRead(ctx: AgentContext, rawArgs: ToolArgs): Promise<str
   if (direction === 'replies') {
     if (anchor.kind !== 'message') return 'replies には at に参照番号かメッセージ ID を渡してください。';
     if (wanted && wanted.length > 1) return 'replies は1つの発言を起点にするので、channel を複数渡さないでください。';
-    return readReplies(ctx, anchor.messageId, args);
+    return readReplies(ctx, anchor.messageId, args, onTarget);
   }
 
   if (!isWindowDirection(direction)) {
@@ -1768,6 +1772,15 @@ export async function runRead(ctx: AgentContext, rawArgs: ToolArgs): Promise<str
     }
   }
 
+  if (anchor.kind === 'message') {
+    const target = messages.find((message) => message.messageId === anchor.messageId && message.channelId === channel.id);
+    if (target) onTarget?.(target);
+  } else if (anchor.kind === 'none') {
+    // "latest" targets the newest message in this authorized window.
+    const target = messages.at(-1);
+    if (target) onTarget?.(target);
+  }
+
   const sameChannel = channel.id === ctx.channel.id;
   const period = messages.length > 1
     ? ` ${shortTime(messages[0]?.createdAt)}〜${shortTime(messages[messages.length - 1]?.createdAt)}`
@@ -1778,6 +1791,7 @@ export async function runRead(ctx: AgentContext, rawArgs: ToolArgs): Promise<str
     formatMessageLines(messages, {
       refs: ctx.refs,
       selfId: ctx.client?.user?.id,
+      resolveDisplay: resolveCachedDisplay(ctx),
       showChannel: !sameChannel,
       bodyChars: agentConfig.messageChars
     }),
@@ -1793,7 +1807,7 @@ export async function runRead(ctx: AgentContext, rawArgs: ToolArgs): Promise<str
  * reply_to と idx_msg_reply を持っているのはこのためで、ここが初めての利用箇所。
  * 時系列に並べれば返信は必ず親より後に来るので、既存の ↩N 表示が木の形を描く。
  */
-async function readReplies(ctx: AgentContext, anchorMessageId: string, args: ToolArgs): Promise<string> {
+async function readReplies(ctx: AgentContext, anchorMessageId: string, args: ToolArgs, onTarget?: (message: AgentMessage) => void): Promise<string> {
   const limit = clampLimit(args.limit, 30, 100);
 
   let target: MessageRow | undefined;
@@ -1857,6 +1871,9 @@ async function readReplies(ctx: AgentContext, anchorMessageId: string, args: Too
     .slice(0, limit)
     .map((row) => fromArchiveRow(row, channelName(ctx, row.channel_id)));
 
+  const readTarget = messages.find((message) => message.messageId === anchorMessageId);
+  if (readTarget) onTarget?.(readTarget);
+
   const replies = messages.length - 1;
 
   return [
@@ -1864,6 +1881,7 @@ async function readReplies(ctx: AgentContext, anchorMessageId: string, args: Too
     formatMessageLines(messages, {
       refs: ctx.refs,
       selfId: ctx.client?.user?.id,
+      resolveDisplay: resolveCachedDisplay(ctx),
       showChannel: true,
       bodyChars: agentConfig.messageChars
     }),
@@ -1964,7 +1982,7 @@ async function aggregateMessages(ctx: AgentContext, args: ToolArgs): Promise<str
 /** 1つのツール。定義とハンドラを組にして持つ。 */
 interface ToolEntry {
   definition: ToolDefinition;
-  handler: (args: ToolArgs) => string | Promise<string>;
+  handler: (args: ToolArgs) => string | Promise<string> | Promise<{ text: string; recallTarget: string | null }>;
 }
 
 /** buildToolset の結果。runtime に渡す部分に加えて、プロンプトの出し分けに使う可用性を持つ。 */
@@ -1984,11 +2002,12 @@ export async function buildToolset(ctx: AgentContext): Promise<Toolset> {
   const archiveAvailable = Boolean(getGuildState(ctx.guild.id));
   // 記憶ができているサーバーだけ。根は system に、残りはこのツールでたどる
   const memoryAvailable = Boolean(hasMemory(ctx.guild.id));
-  const browserAvailable = await cdpAvailable();
   const governanceAvailable = Boolean(governanceRecords.getGovernanceGuild(ctx.guild.id));
 
   // ベクトルがあるときだけ意味検索のモードを出す。無いギルドで定義ぶんを払わない。
-  const semanticReady = archiveAvailable && await semanticAvailable(ctx.guild.id);
+  const [browserAvailable, semanticReady] = await Promise.all([
+    cdpAvailable(), archiveAvailable ? semanticAvailable(ctx.guild.id) : Promise.resolve(false)
+  ]);
 
   if (semanticReady) {
     // モデルのロードに数秒かかるので、await せず先に温めておく。
@@ -2002,7 +2021,11 @@ export async function buildToolset(ctx: AgentContext): Promise<Toolset> {
   // 「そのツールはありません」がその会話の残り全部で返り、しかも気付けない。
   const entries: ToolEntry[] = [
     { definition: searchToolDefinition(flags), handler: (args) => runSearch(ctx, args, flags) },
-    { definition: readDefinition(archiveAvailable), handler: (args) => runRead(ctx, args) },
+    { definition: readDefinition(archiveAvailable), handler: async (args) => {
+      let recallTarget: string | null = null;
+      const text = await runRead(ctx, args, (message) => { recallTarget = message.content.slice(0, 200); });
+      return { text, recallTarget };
+    } },
     { definition: channelsDefinition, handler: (args) => listChannels(ctx, args) }
   ];
   if (governanceAvailable) {
@@ -2012,7 +2035,11 @@ export async function buildToolset(ctx: AgentContext): Promise<Toolset> {
   if (memoryAvailable) {
     entries.push({
       definition: memoryToolDefinition,
-      handler: async (args) => String(await runMemoryToolWithMeaning({ guildId: ctx.guild.id, refs: ctx.refs, channelScope: ctx.channelScope }, args))
+      handler: async (args) => String(await runMemoryToolWithMeaning({
+        guildId: ctx.guild.id,
+        channelScope: ctx.channelScope,
+        discordPresentation: { refs: ctx.refs, selfId: ctx.client?.user?.id, resolveDisplay: resolveCachedDisplay(ctx) }
+      }, args))
     });
   }
   if (browserAvailable) {
@@ -2039,13 +2066,18 @@ export async function buildToolset(ctx: AgentContext): Promise<Toolset> {
     memoryAvailable,
     semanticAvailable: semanticReady,
 
-    async call(name: string, args: unknown): Promise<string> {
+    async call(name: string, args: unknown): Promise<unknown> {
       // 結果に、同じ呼び出しの繰り返し・空振りの連続への助言を足す (coach.ts)
       const handler = handlers.get(name);
       if (!handler) return coach(name, args, `そのツールはありません: ${String(name).slice(0, MAX_NAME_CHARS)}`);
 
       try {
-        return coach(name, args, String((await handler(isRecord(args) ? args : {})) ?? ''));
+        const result = await handler(isRecord(args) ? args : {});
+        if (name === 'read' && isRecord(result) && typeof result.text === 'string') {
+          return withRecallTarget(coach(name, args, result.text),
+            typeof result.recallTarget === 'string' ? result.recallTarget : null);
+        }
+        return coach(name, args, String(result ?? ''));
       } catch (error) {
         if (error instanceof QueryError) return coach(name, args, `クエリが不正です: ${error.message}`);
         console.error(`Agent tool ${name} failed:`, error);

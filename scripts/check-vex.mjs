@@ -17,6 +17,7 @@ process.env.DATABASE_PATH = dbPath;
 process.env.ARCHIVE_DB_PATH = `${dbPath}.archive`;
 process.env.OPENROUTER_API_KEY = 'check';
 process.env.VEX_CALL = '1';
+delete process.env.VEX_NAMES;
 for (const base of [dbPath, `${dbPath}.archive`]) for (const suffix of ['', '-wal', '-shm']) rmSync(`${base}${suffix}`, { force: true });
 process.on('exit', () => {
   for (const base of [dbPath, `${dbPath}.archive`]) for (const suffix of ['', '-wal', '-shm']) rmSync(`${base}${suffix}`, { force: true });
@@ -55,7 +56,7 @@ const endpoint = `http://127.0.0.1:${server.address().port}/api/alpha/decisions`
 process.env.VEX_API_URL = endpoint;
 
 const { loadVexConfig } = await import('../src/vex/config.js');
-const { isVexCall, nameHandling, visibleText } = await import('../src/vex/call.js');
+const { isBareNameCall, isVexCall, nameHandling, visibleText } = await import('../src/vex/call.js');
 const { buildVexState, cleanLine, VEX_QUESTIONS } = await import('../src/vex/questions.js');
 const { decide, resetDecideState } = await import('../src/vex/decide.js');
 const { AmbientJudge } = await import('../src/vex/ambient.js');
@@ -68,6 +69,7 @@ const { isAgentRequest } = await import('../src/agent/index.js');
 {
   const off = loadVexConfig({});
   if (off.call || off.ambient) fail('vex は既定でオフ');
+  if (off.names.join() !== 'vexちゃん') fail(`既定の呼び名: ${off.names}`);
   if (off.nameThreshold !== 0.45 || off.nameDelayMs !== 2000) fail(`名前が出たときの既定: ${off.nameThreshold} / ${off.nameDelayMs}`);
   if (off.channels.size !== 0) fail('許可チャンネルは既定で空');
   if (off.model !== 'perplexity/pplx-decider-flash-v1.2') fail(`既定のモデル: ${off.model}`);
@@ -86,14 +88,18 @@ const { isAgentRequest } = await import('../src/agent/index.js');
 // --- 名前の検出 ---
 
 {
-  const yes = ['vex', 'Vex', 'VEX', 'vex、これ教えて', 'ねえvex今日の天気は', 'hey vex?', 'vexは何か知ってる？', '(vex)', 'vex-san どう思う',
-    '<@123456789012345678> vex 見て', '> 引用の行\nvex ちょっと来て'];
-  const no = ['evex', 'Evex公式', 'vexx', 'vex2', '_vex', 'hexvex', 'ベクス', '`vex` って何', '```\nvex\n```', 'https://vex.example.com/a',
-    'https://example.com/?q=vex', '> vex が言った\nふーん', '<@123456789012345678> 見て', '', 'vexillology'];
-  for (const text of yes) if (!isVexCall(text, ['vex'])) fail(`呼びのはず: ${JSON.stringify(text)}`);
-  for (const text of no) if (isVexCall(text, ['vex'])) fail(`呼びではない: ${JSON.stringify(text)}`);
+  const yes = ['vexちゃん', 'VEXちゃん、これ教えて', 'ねえvexちゃん今日の天気は', 'hey vexちゃん?', '(vexちゃん)',
+    '<@123456789012345678> vexちゃん見て', '> 引用の行\nvexちゃんちょっと来て'];
+  const no = ['vex', 'vex どう思う？', 'evexちゃん', 'vexxちゃん', '_vexちゃん', 'vexちゃん2', 'ベクス', '`vexちゃん` って何', '```\nvexちゃん\n```',
+    'https://example.com/?q=vexちゃん', '> vexちゃんが言った\nふーん', '<@123456789012345678> 見て', ''];
+  for (const text of yes) if (!isVexCall(text)) fail(`呼びのはず: ${JSON.stringify(text)}`);
+  for (const text of no) if (isVexCall(text)) fail(`呼びではない: ${JSON.stringify(text)}`);
   if (!isVexCall('ベクスどう思う', ['vex', 'ベクス'])) fail('別名も呼びになる');
   if (isVexCall('vex', [])) fail('名前が空なら呼びは無い');
+  if (!isBareNameCall('  VEXちゃん！！  ') || !isBareNameCall('ベクス', ['ベクス'])) fail('名前だけなら検索する話題はまだ無い');
+  for (const text of ['vexちゃんについて教えて', 'vexちゃん <@123>', 'vexちゃん https://example.org', '> vexちゃん', 'vex']) {
+    if (isBareNameCall(text)) fail(`本文を含む発言は通常どおり想起する: ${text}`);
+  }
   if (visibleText('a `b` ```c``` https://x.y d').replace(/\s+/g, ' ').trim() !== 'a d') fail('コード・URL は見ない');
 }
 
@@ -105,19 +111,19 @@ const { isAgentRequest } = await import('../src/agent/index.js');
     guildId: 'g', content, author: { id: 'u', bot: false }, webhookId: null,
     mentions: { has: () => false }, reference: null, ...extra
   });
-  if (!isAgentRequest(message('vex 教えて'), client)) fail('vex と呼べば起動する');
-  if (!isAgentRequest(message('vex'), client)) fail('名前だけでも起動する');
-  if (isAgentRequest(message('evex 教えて'), client)) fail('evex は呼びではない');
-  if (isAgentRequest(message('`vex` って何'), client)) fail('コードの中は呼びではない');
-  if (isAgentRequest(message('vex 教えて', { author: { id: 'u', bot: true } }), client)) fail('bot の発言では起動しない');
-  if (isAgentRequest(message('vex 教えて', { webhookId: 'w' }), client)) fail('webhook では起動しない');
-  if (isAgentRequest(message('vex 教えて', { guildId: null }), client)) fail('サーバーの外では起動しない');
+  if (!isAgentRequest(message('vexちゃん教えて'), client)) fail('vexちゃんと呼べば起動する');
+  if (!isAgentRequest(message('vexちゃん'), client)) fail('名前だけでも起動する');
+  if (isAgentRequest(message('vex 教えて'), client)) fail('旧名だけでは起動しない');
+  if (isAgentRequest(message('evexちゃん教えて'), client)) fail('evexちゃんは呼びではない');
+  if (isAgentRequest(message('`vexちゃん` って何'), client)) fail('コードの中は呼びではない');
+  if (isAgentRequest(message('vexちゃん教えて', { author: { id: 'u', bot: true } }), client)) fail('bot の発言では起動しない');
+  if (isAgentRequest(message('vexちゃん教えて', { webhookId: 'w' }), client)) fail('webhook では起動しない');
+  if (isAgentRequest(message('vexちゃん教えて', { guildId: null }), client)) fail('サーバーの外では起動しない');
   const mention = { mentions: { has: () => true } };
   if (!isAgentRequest(message('教えて', mention), client)) fail('メンションは従来どおり起動する');
   // 設定ごとの名前の扱い (judge は確定にしない・off は何もしない)
-  const handling = (mode) => nameHandling('vex 教えて', { names: ['vex'], callMode: mode });
+  const handling = (mode) => nameHandling('vexちゃん教えて', { names: ['vexちゃん'], callMode: mode });
   if (handling('mention') !== 'mention' || handling('judge') !== 'judge' || handling('off') !== null) fail('名前の扱い');
-  if (nameHandling('evex 教えて', { names: ['vex'], callMode: 'mention' }) !== null) fail('evex は数えない');
 }
 
 // --- 「返す価値が無い」の見分け ---
@@ -325,7 +331,7 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
   if (!state.includes('vexちゃんおやすみ') || state.includes('呼ばれたあとに来た')) fail(`その発言までを見せる: ${state}`);
   if (actions('free-channel') !== 'joined:named') fail(`台帳: ${actions('free-channel')}`);
   // 続けて呼んでも冷却は掛からない
-  judge.observe(say(channel, 'vex どう思う？'));
+  judge.observe(say(channel, 'vexちゃんどう思う？'));
   await sleep(250);
   if (joins.length !== 2) fail('名前が出た発言に冷却は掛けない');
 
@@ -333,7 +339,7 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
   for (const [p, expectJoin] of [[0.44, false], [0.45, true]]) {
     const before = joins.length;
     api.respond = () => ({ status: 200, p });
-    judge.observe(say(channel, 'vexにするか'));
+    judge.observe(say(channel, 'vexちゃんにするか'));
     await sleep(250);
     if ((joins.length - before === 1) !== expectJoin) fail(`名前が出たときの閾値 p=${p}`);
   }
@@ -341,15 +347,16 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
 
   // 名前が出ていても判定に回さない発言 / 名前が出ていない発言 (許可チャンネルの外)
   api.calls.length = 0;
-  judge.observe(say(channel, 'vex が言ってた', { bot: true }));
+  judge.observe(say(channel, 'vexちゃんが言ってた', { bot: true }));
   judge.observe(say(makeChannel('x', { nsfw: true }), 'これってどうなってるの？誰か分かる人いる？'));
-  judge.observe(say(channel, 'evex どう思う？'));
+  judge.observe(say(channel, 'evexちゃんどう思う？'));
+  judge.observe(say(channel, 'vex どう思う？'));
   judge.observe(say(channel, 'これってどうなってるの？誰か分かる人いる？'));
   await sleep(250);
   if (api.calls.length) fail('bot・名前が出ていない NSFW の発言・名前が出ていない発言は、許可チャンネルの外では判定しない');
   // 名前で呼ばれたら、NSFW のチャンネルでも判定する (呼んだのは本人)
-  judge.observe(say(makeChannel('x', { nsfw: true }), 'vex どう思う？'));
-  judge.observe(say(makeChannel('nsfw-room'), 'vex どう思う？'));
+  judge.observe(say(makeChannel('x', { nsfw: true }), 'vexちゃんどう思う？'));
+  judge.observe(say(makeChannel('nsfw-room'), 'vexちゃんどう思う？'));
   await sleep(250);
   if (api.calls.length < 2) fail(`名前で呼ばれたら NSFW でも判定する: ${api.calls.length}`);
   api.calls.length = 0;
@@ -357,7 +364,7 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
   // オフ・メンション扱いのときは、名前が出ても判定しない (メンション扱いは isAgentRequest が確定で起動するので重ねない)
   for (const mode of ['0', '1']) {
     const other = makeJudge(ambientConfig({ VEX_CALL: mode, VEX_AMBIENT: '0', VEX_CHANNELS: '' }));
-    other.judge.observe(say(channel, 'vex どう思う？'));
+    other.judge.observe(say(channel, 'vexちゃんどう思う？'));
     await sleep(250);
     if (api.calls.length || other.joins.length) fail(`VEX_CALL=${mode} なら判定しない`);
   }
@@ -366,9 +373,9 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
   db.exec("DELETE FROM vex_decisions");
   api.respond = () => ({ status: 200, p: 0.9, cost: 0.2 });
   const budget = makeJudge(ambientConfig({ VEX_AMBIENT: '0', VEX_CHANNELS: '', VEX_DAILY_USD: '0.1' }));
-  budget.judge.observe(say(channel, 'vex どう思う？'));
+  budget.judge.observe(say(channel, 'vexちゃんどう思う？'));
   await sleep(250);
-  budget.judge.observe(say(channel, 'vex もう一回'));
+  budget.judge.observe(say(channel, 'vexちゃんもう一回'));
   await sleep(250);
   if (budget.joins.length !== 1 || !actions('free-channel').endsWith('joined:named,skipped:daily_budget')) fail(`費用の上限: ${actions('free-channel')}`);
 
@@ -377,7 +384,7 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
   resetDecideState(); api.calls.length = 0;
   api.respond = () => ({ status: 200, p: 0.9 });
   const both = makeJudge(ambientConfig());
-  both.judge.observe(say(makeChannel('chan1'), 'vex これって誰か答えられる？'));
+  both.judge.observe(say(makeChannel('chan1'), 'vexちゃんこれって誰か答えられる？'));
   await sleep(300);
   if (both.joins.length !== 1 || both.joins[0].join !== null || api.calls.length !== 1) fail(`名前と自発参加を重ねない: joins=${both.joins.length} calls=${api.calls.length}`);
 }
@@ -438,7 +445,7 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
   if (!ok('<@bot-self> これってどうなってるの？', { mentions: ['bot-self'] })) fail('自分宛てのメンションだけなら回す (呼びは別経路で扱う)');
   if (ok('これってどうなってるの？', { webhookId: 'w' })) fail('webhook は回さない');
   if (judge.worthJudging(say(makeChannel('chan5', { nsfw: true }), 'これってどうなってるの？'))) fail('呼ばれていない発言は NSFW に回さない');
-  if (!judge.worthJudging(say(makeChannel('chan5', { nsfw: true }), 'vex どう思う？'), true)) fail('名前で呼ばれたら NSFW でも回す');
+  if (!judge.worthJudging(say(makeChannel('chan5', { nsfw: true }), 'vexちゃんどう思う？'), true)) fail('名前で呼ばれたら NSFW でも回す');
   if (judge.worthJudging(say(makeChannel('chan5', { name: 'nsfw-art' }), 'これってどうなってるの？'))) fail('名前に nsfw があれば回さない');
 }
 
@@ -749,9 +756,9 @@ const actions = (channelId) => ledger(channelId).map((row) => row.action + (row.
 
   if (!settings.setCallMode('judge', 'admin')) fail('judge に切り替えられる');
   if (vexConfig.callMode !== 'judge' || !vexConfig.call) fail('call=judge が config に反映される');
-  if (nameHandling('vex どう思う？') !== 'judge') fail('切り替えが名前の扱いにすぐ効く (judge)');
+  if (nameHandling('vexちゃんどう思う？') !== 'judge') fail('切り替えが名前の扱いにすぐ効く (judge)');
   if (settings.setCallMode('bogus', 'admin') || vexConfig.callMode !== 'judge') fail('知らないモードは受け付けない');
-  if (!settings.setCallMode('off', 'admin') || vexConfig.call || nameHandling('vex どう思う？') !== null) fail('off にすると名前に反応しない');
+  if (!settings.setCallMode('off', 'admin') || vexConfig.call || nameHandling('vexちゃんどう思う？') !== null) fail('off にすると名前に反応しない');
 
   settings.setArbiter(false, 'admin');
   if (vexConfig.arbiter) fail('審判を切れる');

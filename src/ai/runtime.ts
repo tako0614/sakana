@@ -73,6 +73,7 @@ function mergeDeliveries(deliveries: readonly unknown[]): MemoryDelivery {
 interface StateMessage extends ChatMessage {
   toolName?: unknown;
   memoryDelivery?: unknown;
+  recallTarget?: string | null;
 }
 
 const isStateMessage = (value: unknown): value is StateMessage => isRecord(value) && typeof value.role === 'string';
@@ -80,8 +81,18 @@ const isStateMessage = (value: unknown): value is StateMessage => isRecord(value
 function providerMessage(message: StateMessage): ChatMessage {
   // Internal delivery assertions are durable in agent_runs, but are never part
   // of the OpenAI-compatible message schema sent to a provider.
-  const { memoryDelivery: _memoryDelivery, toolName: _toolName, ...visible } = message;
+  const { memoryDelivery: _memoryDelivery, toolName: _toolName, recallTarget: _recallTarget, ...visible } = message;
   return visible;
+}
+
+const recallOutput: unique symbol = Symbol('sakana.tool.recall-output');
+interface RecallToolOutput { [recallOutput]: true; content: string; target: string | null }
+/** Host-only hint carried with the actual read result, never shown as tool output. */
+export function withRecallTarget(content: string, target: string | null): object {
+  return { [recallOutput]: true, content, target };
+}
+function isRecallToolOutput(value: unknown): value is RecallToolOutput {
+  return typeof value === 'object' && value !== null && recallOutput in value;
 }
 const memoryStateTool: ToolDefinition = { type: 'function', function: { name: 'memory_focus',
   description: '次の往復の前に、いま思い出したいこと (人・話題・出来事) を伝える。それに近い記憶の指し先 (見出しと番号) が足される。context は話の流れ、thought は気になっていること (短く)。調べものや事実認定はしない。',
@@ -217,6 +228,11 @@ function memoryObservations(state: AgentState): string[] {
     .slice(-2).map((entry) => `tool:${String(entry.toolName || 'unknown')}: ${String(entry.content ?? '').slice(0, 2000)}`);
 }
 
+function latestReadTarget(state: AgentState): string | null | undefined {
+  const lastTool = state.messages.findLast((entry) => entry.role === 'tool' && entry.toolName !== 'memory_focus');
+  return lastTool?.toolName === 'read' && 'recallTarget' in lastTool ? lastTool.recallTarget : undefined;
+}
+
 /** host が持つ道具。call の結果は tool の観察として会話に入る (文字列でなければ JSON)。 */
 export interface AgentToolset {
   definitions: readonly ToolDefinition[];
@@ -234,7 +250,7 @@ export interface AgentToolset {
 export interface AgentMemory {
   assertCurrent?: (delivery?: MemoryDelivery) => unknown;
   recordUse?: (refs: string[], meta: { eventId: string }) => unknown;
-  read?: (query: { context: string; thought: string | undefined; observations: string[]; reasoning?: string | undefined }) => unknown;
+  read?: (query: { context: string; thought: string | undefined; observations: string[]; reasoning?: string | undefined; readTarget?: string | null | undefined }) => unknown;
 }
 
 /** provider への1回の依頼。戻り値は provider の応答 (choices / usage)。 */
@@ -486,13 +502,16 @@ export async function runAgent({ guildId, system, userContent, toolset = { defin
           state.steps += 1;
         }
         const delivered = deliveryOf(output);
-        const content = typeof output === 'string' ? output || '(結果なし)' : JSON.stringify(output ?? null);
+        const recallTarget = name === 'read' && isRecallToolOutput(output) ? output.target : undefined;
+        const content = isRecallToolOutput(output) ? output.content || '(結果なし)'
+          : typeof output === 'string' ? output || '(結果なし)' : JSON.stringify(output ?? null);
         const same = toolset.readOnly && state.messages.find((entry) => entry.role === 'tool' && entry.content === content);
         state.messages.push({ role: 'tool', tool_call_id: isRecord(call) ? call.id : undefined, toolName: name,
           // Keep the first complete observation. Repeated identical reads can
           // reference it without discarding any evidence from the model context.
           content: same ? JSON.stringify({ sameResultAs: same.tool_call_id, note: 'This read completed with the identical full result retained above.' }) : content,
-          ...(!same && delivered.refs.length ? { memoryDelivery: delivered } : {}) });
+          ...(!same && delivered.refs.length ? { memoryDelivery: delivered } : {}),
+          ...(recallTarget !== undefined ? { recallTarget } : {}) });
         state.toolInFlight = false;
         // Persist the cursor with the observation, before another tool/model call.
         state.pendingIndex += 1;
@@ -510,7 +529,8 @@ export async function runAgent({ guildId, system, userContent, toolset = { defin
         // memory_focus call only adds a one-shot retrieval hint below; it never
         // replaces the current task context.
         context: liveMemoryContext(state),
-        thought: memoryFocusThought(state), observations: memoryObservations(state), reasoning: latestReasoning(state) });
+        thought: memoryFocusThought(state), observations: memoryObservations(state), reasoning: latestReasoning(state),
+        readTarget: latestReadTarget(state) });
       const recalledText = isRecord(recalled) ? recalled.text : undefined;
       if (stepsUsed() >= maximumSteps || toolset.exhausted?.()) { state.phase = 'final'; final = true; }
       const messages = state.messages.map(providerMessage);

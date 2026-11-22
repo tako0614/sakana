@@ -49,7 +49,7 @@ assert.ok(!lookupAdvised('<@123>', {}), 'a bare mention is not a question');
 async function run({ request, known = false, toolFirst = false }) {
   let used = false;
   const requests = [];
-  const guard = lookupGuard({ request, known, usedTool: () => used });
+  const guard = lookupGuard({ request, known: () => known, usedTool: () => used });
   const result = await runAgent({
     guildId: 'g', runId: `coach-${Math.random()}`, system: 's', userContent: request, validate: guard,
     onToolCall: () => { used = true; },
@@ -75,7 +75,7 @@ const checked = await run({ request: 'さかなのやらかしエピ教えて', 
 assert.equal(checked.requests.length, 2, 'a run that already used a tool is not asked again');
 // 2回目は何を答えてもよい (やり直しは1回だけ)
 let answers = 0;
-const guard = lookupGuard({ request: 'Aについて教えて', known: false, usedTool: () => false });
+const guard = lookupGuard({ request: 'Aについて教えて', known: () => false, usedTool: () => false });
 assert.throws(() => guard({ content: 'x' }), (error) => error.governanceRetryHint === LOOKUP_HINT);
 assert.equal(guard({ content: 'y' }), 'y');
 answers += 1;

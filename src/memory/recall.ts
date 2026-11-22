@@ -1,14 +1,14 @@
 import {
-  episodesFor, getNode, linkedPages, nodeNames, recentEpisodesFor, searchEpisodes, searchNodes, sharedEpisodes,
-  type NodeName
+  episodesFor, getNode, linkedPages, memoryDb, nodeNames, recentEpisodesFor, searchEpisodes, searchNodes, sharedEpisodes,
+  type EpisodeHit, type NodeName
 } from './store.js';
-import { recallPack } from './pack.js';
-import { embedQuery, hasVectors, meaningOf, scoresFor, type Meaning, type MeaningChunk, type QuerySegment } from './vectors.js';
+import { MODALITY_LABEL, TYPE_LABEL, monthOf } from './claims.js';
+import { meaningOf, type Meaning, type MeaningChunk } from './vectors.js';
 
 // 思い出す。会話に出た名前や言葉を手がかりに、関係するページと出来事を数件だけ引く。
 // 同期の recallFor は名前・別名の照合 + 全文検索。手がかりから1段だけ
 // つながりをたどる: 2人の名前が出たら、その2人が両方関わった出来事を出す。
-// 非同期の recallWithMeaning / meaningReader は、そのあとに意味の近い記憶 (vectors.ts) を足す。
+// 会話 agent は memory.read を通して、どの往復でも同じベクトル検索を使う。
 //
 // 書く側 (build.js) も同じ照合で「この区切りに出てくる既知のページ」を見つけ、
 // 書く前に渡す (重複を避け、変化として書かせ、前の出来事と結ばせる)。
@@ -59,24 +59,6 @@ const termsOf = (text: unknown): string[] => [...new Set(String(text ?? '')
   .split(/[\s　、。！？!?「」『』()（）:：,，.]+/)
   .filter((term) => [...term].length >= 3 && [...term].length <= 20))].slice(0, 6);
 
-/** 思い出した文面と、そこに出したページ・出来事 (あとの想起で同じものを繰り返さないため)。 */
-export interface RecallParts {
-  text: string;
-  paths: Set<string>;
-  episodeIds: Set<number>;
-  /** 意味で引いた断片 (ページの中の1つの知識) のうち、出したもの。 */
-  chunkIds: Set<number>;
-}
-
-/**
- * 会話 agent の入力に足す「思い出したこと」。何も当たらなければ空文字 (何も足さない)。
- * request: いま話しかけられた文 (と返信先)。context: 直近の会話 (弱い手がかり)。
- */
-export function recallFor(guildId: string,
-  { request = '', context = '', maxChars = 1800 }: { request?: string; context?: string; maxChars?: number } = {}): string {
-  return recallParts(guildId, { request, context, maxChars }).text;
-}
-
 /**
  * 直近の会話に出てくる名前のページを、どれだけ手がかりにするか。0 なら使わない。
  * 本番の実行記録 (2026-10-18、29 件) では、0.4 にしていたせいで、依頼に名前が無いと直近の会話の常連 (t3tra・たこ・さかな)
@@ -84,11 +66,9 @@ export function recallFor(guildId: string,
  */
 const CONTEXT_WEIGHT = Number(process.env.MEMORY_RECALL_CONTEXT_WEIGHT ?? 0);
 
-/** ページに出す出来事の候補を、依頼に近い順に絞る。渡さなければ、ページの重要度順の上位 2 件 (従来どおり)。 */
-export type EpisodeRanker = <T extends { id: number }>(episodes: T[]) => T[];
-
-export function recallParts(guildId: string,
-  { request = '', context = '', maxChars = 1800, rank }: { request?: string; context?: string; maxChars?: number; rank?: EpisodeRanker } = {}): RecallParts {
+/** memory-tree recall コマンドの語彙検索。 */
+export function recallFor(guildId: string,
+  { request = '', context = '', maxChars = 1800 }: { request?: string; context?: string; maxChars?: number } = {}): string {
   const scores = new Map<string, number>();
   const add = (path: string, value: number): void => { scores.set(path, (scores.get(path) ?? 0) + value); };
   for (const { path, score } of matchPages(guildId, request)) add(path, score);
@@ -101,40 +81,42 @@ export function recallParts(guildId: string,
   const episodeHits = terms ? searchEpisodes(guildId, terms, 3) : [];
 
   const pages = [...scores].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([path]) => path);
-  if (pages.length === 0 && episodeHits.length === 0) return { text: '', paths: new Set(), episodeIds: new Set(), chunkIds: new Set() };
-
-  const lines = ['思い出したこと (記憶の見出しだけ。中身は memory ツールで path / episode を開いて読む):'];
-  const shown = new Set<number>();
-  for (const path of pages) {
-    const node = getNode(guildId, path);
-    if (!node) continue;
-    // 見出しだけ。中身 (説明・本文) は入れない: 読みたければ memory ツールで path / episode を開く
-    lines.push(`- [[${path}]]`);
-    const episodes = (rank ? rank(episodesFor(guildId, path, 16)) : episodesFor(guildId, path, 2)).filter((episode) => !shown.has(episode.id)).slice(0, 2);
+  let text = '';
+  const paths = new Set<string>();
+  const episodeIds = new Set<number>();
+  const append = (line: string): boolean => {
+    const next = `${text || HEADINGS}\n${line}`;
+    if (next.length > maxChars) return false;
+    text = next;
+    return true;
+  };
+  const addEpisodes = (episodes: EpisodeHit[], limit: number, heading = ''): void => {
+    let count = 0;
     for (const episode of episodes) {
-      shown.add(episode.id);
-      lines.push(`  e${episode.id} ${date(episode.at_ms)}${episode.kind ? ` [${episode.kind}]` : ''} ${episode.title}`);
+      if (episodeIds.has(episode.id)) continue;
+      const kind = !heading && episode.kind ? ` [${episode.kind}]` : '';
+      const line = `  e${episode.id} ${date(episode.at_ms)}${kind} ${episode.title}`;
+      if (!append(heading && count === 0 ? `${heading}\n${line}` : line)) continue;
+      episodeIds.add(episode.id);
+      count += 1;
+      if (count >= limit) break;
     }
+  };
+  for (const path of pages) {
+    if (!getNode(guildId, path) || !append(`- [[${path}]]`)) continue;
+    paths.add(path);
+    addEpisodes(episodesFor(guildId, path, 2), 2);
   }
   // 2つ以上思い出したら、その間で起きたこと (複数のページをまたぐ出来事)
-  const [firstPage, secondPage] = pages;
+  const [firstPage, secondPage] = paths;
   if (firstPage !== undefined && secondPage !== undefined) {
-    const shared = (rank ? rank(sharedEpisodes(guildId, firstPage, secondPage, 12)) : sharedEpisodes(guildId, firstPage, secondPage, 3)).filter((episode) => !shown.has(episode.id)).slice(0, 3);
-    if (shared.length > 0) {
-      lines.push(`- [[${firstPage}]] と [[${secondPage}]] の両方が関わった出来事:`);
-      for (const episode of shared) { shown.add(episode.id); lines.push(`  e${episode.id} ${date(episode.at_ms)} ${episode.title}`); }
-    }
+    addEpisodes(sharedEpisodes(guildId, firstPage, secondPage, 3), 3, `- [[${firstPage}]] と [[${secondPage}]] の両方が関わった出来事:`);
   }
-  const extra = episodeHits.filter((episode) => !shown.has(episode.id));
-  if (extra.length > 0) {
-    lines.push('- 言葉が一致した出来事:');
-    for (const episode of extra) lines.push(`  e${episode.id} ${date(episode.at_ms)} ${episode.title}`);
-  }
-  const text = lines.join('\n');
-  return { text: text.length > maxChars ? `${text.slice(0, maxChars)}…` : text, paths: new Set(pages), episodeIds: shown, chunkIds: new Set() };
+  addEpisodes(episodeHits, 3, '- 言葉が一致した出来事:');
+  return text;
 }
 
-const MEANING_HEAD = '- 意味が近い記憶 (言葉は一致しないが、話が似ている。§ はページの中の節で、path と section で開ける。e は根拠の出来事):';
+const HEADINGS = '思い出したこと (記憶の見出しだけ。中身は memory ツールで path / episode を開いて読む):';
 /** 想起に出す断片の頭の長さ。中身を入れるためではなく、どの話が当たったかが分かる程度。0 なら出さず、ページと節と出来事の番号だけ。 */
 const SNIPPET_CHARS = Number(process.env.MEMORY_CHUNK_SNIPPET ?? 60);
 /** 1つの断片に添える根拠の出来事の数。 */
@@ -143,149 +125,115 @@ const CHUNK_EPISODES = 2;
 const clip = (text: string, limit: number): string => ([...text].length > limit ? `${[...text].slice(0, limit).join('')}…` : text);
 
 /** 断片に添える根拠の出来事 (想起の行に出す分)。 */
-export const shownEpisodes = (chunk: MeaningChunk): number[] => chunk.episodeIds.slice(0, CHUNK_EPISODES);
-
-function chunkLine(chunk: MeaningChunk): string {
+function chunkLine(chunk: MeaningChunk, room: number): string {
+  const { claim } = chunk;
+  if (claim) {
+    const modality = claim.modality === 'self_report' ? '本人申告' : MODALITY_LABEL[claim.modality] ?? claim.modality;
+    const tags = [TYPE_LABEL[claim.type] ?? claim.type, modality, claim.hedged ? '根拠弱' : ''].filter(Boolean).join('・');
+    const prefix = `- ${claim.who ? `${claim.who} ` : ''}(${monthOf(claim.asOf)}・${tags})`;
+    const citation = claim.episodeId !== null ? `[e${claim.episodeId}]` : `[[${claim.path}]]`;
+    const full = `${prefix} ${claim.text} ${citation}`;
+    if (full.length <= room) return full;
+    const remaining = room - prefix.length - citation.length - 3;
+    let end = 0;
+    for (const mark of claim.text.matchAll(/[。！？]|[.!?](?=\s|$)/gu)) {
+      if (mark.index + 1 > remaining) break;
+      end = mark.index + 1;
+    }
+    return end ? `${prefix} ${claim.text.slice(0, end)}… ${citation}` : `${prefix} ${citation}`;
+  }
   const snippet = SNIPPET_CHARS > 0 ? ` — ${clip(chunk.line, SNIPPET_CHARS)}` : '';
   const more = chunk.more > 0 ? ` (同じ節にほか ${chunk.more} 件)` : '';
-  return `  [[${chunk.path}]]${chunk.heading ? ` §${chunk.heading}` : ''}${snippet}${more}${shownEpisodes(chunk).map((id) => ` e${id}`).join('')}`;
+  return `  [[${chunk.path}]]${chunk.heading ? ` §${chunk.heading}` : ''}${snippet}${more}${chunk.episodeIds.slice(0, CHUNK_EPISODES).map((id) => ` e${id}`).join('')}`;
 }
 
-/** 意味で引いた記憶を、想起の1節にする。何も無ければ空配列。 */
-export function meaningLines(meaning: Meaning | null): string[] {
+/** 意味で引いた行を組み立てる。予算は各行の先頭の改行込み。 */
+export function meaningLines(meaning: Meaning | null, available = Infinity): string[] {
   if (!meaning) return [];
-  // 断片が出たページは、断片の行に任せる (ページの行を重ねない)
-  const chunked = new Set(meaning.chunks.map((chunk) => chunk.path));
-  return [
-    ...meaning.chunks.map(chunkLine),
-    ...meaning.nodes.filter((node) => !chunked.has(node.path)).map((node) => `  [[${node.path}]]`),
-    ...meaning.episodes.map((episode) => `  e${episode.id} ${date(episode.atMs)}${episode.kind ? ` [${episode.kind}]` : ''} ${episode.title}`)
-  ];
-}
-
-/** 出したものを、あとの想起で繰り返さないよう控える。 */
-function remember(shown: RecallParts, meaning: Meaning): void {
-  for (const node of meaning.nodes) shown.paths.add(node.path);
-  for (const episode of meaning.episodes) shown.episodeIds.add(episode.id);
+  const lines: string[] = [];
+  const append = (line: string): boolean => {
+    if (line.length + 1 > available) return false;
+    available -= line.length + 1;
+    lines.push(line);
+    return true;
+  };
+  const paths = new Set<string>();
+  const episodes = new Set<number>();
   for (const chunk of meaning.chunks) {
-    shown.chunkIds.add(chunk.id);
-    shown.paths.add(chunk.path);
-    for (const id of shownEpisodes(chunk)) shown.episodeIds.add(id);
+    if (!append(chunkLine(chunk, available - 1))) continue;
+    paths.add(chunk.path);
+    for (const id of chunk.episodeIds.slice(0, CHUNK_EPISODES)) episodes.add(id);
   }
+  for (const node of meaning.nodes) {
+    if (!paths.has(node.path)) append(`  [[${node.path}]]`);
+  }
+  for (const episode of meaning.episodes) {
+    if (!episodes.has(episode.id)) append(`  e${episode.id} ${date(episode.atMs)}${episode.kind ? ` [${episode.kind}]` : ''} ${episode.title}`);
+  }
+  return lines;
 }
 
-/**
- * 直前の会話を意味検索の手がかりにするか (MEMORY_CONVERSATION_CLUE=1 で有効。既定はオフ)。
- * 本番の #雑談 で測ったところ (docs/memory-chunks.md)、会話文を埋め込むと、記憶に関係があるかどうかにかかわらず 1 位が 0.88〜0.91 に
- * 集まり (発言者の名前を外しても 0.88 前後)、スコアで選り分けられない。「あの9.9は…」のように話題が会話にある依頼は引けるが、
- * 記憶と関係ない雑談では的外れが増える。話題が会話にある依頼は、モデルが memory_focus で言い直すほうが確かなので、既定では使わない。
- */
-const conversationClue = (): boolean => !['', '0', 'false', 'no', 'off'].includes(String(process.env.MEMORY_CONVERSATION_CLUE ?? '').toLowerCase());
-/** 有効にしたとき、直前の会話の手がかりが依頼より弱い分。 */
-/** 名前で見つけたページの出来事を出す、依頼への近さの下限 (意味で引く出来事の下限と同じ)。 */
-const PAGE_EPISODE_FLOOR = Number(process.env.MEMORY_PAGE_EPISODE_FLOOR ?? process.env.MEMORY_RECALL_FLOOR ?? 0.85);
-const CONVERSATION_PENALTY = Number(process.env.MEMORY_CONVERSATION_PENALTY ?? 0.01);
+const RECALL_SCORE = Number(process.env.MEMORY_AUTO_RECALL_FLOOR || 0.86);
+const RECALL_CHARS = 1800;
+const RECALL_HEAD = '現在の話に近い記憶。根拠は memory の episode または path で開ける。';
 
-/**
- * 直前の会話 (LLM に見せている会話文のうち、依頼の前の数発言) を、想起の手がかりの 1 本の文にする。
- * 「名前: 本文」を古い順に並べ、URL・メンションを除き、長ければ近い (後ろの) ほうを残す。system プロンプトは含めない。
- * 「あの件どうなった？」「それって誰？」のように、話題が依頼文でなく直前の会話にあるときに効く。
- */
-export function conversationText(messages: readonly { authorName?: string | undefined; content?: string | undefined }[], { limit = 6, chars = 500 }: { limit?: number; chars?: number } = {}): string {
-  const lines = messages.slice(-limit).flatMap((message) => {
-    const body = String(message.content ?? '').replace(/https?:\/\/\S+/g, '').replace(/<[@#&!]*\d+>/g, '').replace(/\s+/g, ' ').trim();
-    return body ? [`${message.authorName ?? ''}: ${body}`] : [];
-  });
-  const text = lines.join('\n');
-  return text.length > chars ? text.slice(-chars) : text;
+function clue(text: string | undefined): string {
+  return (text ?? '').replace(/https?:\/\/\S+/g, ' ').replace(/<[@#][!&]?\d+>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-/**
- * 呼ばれたときの想起: 名前の照合に、意味の近い記憶を足す。
- * conversation (直前の会話) があれば、依頼とは別の手がかりとして足す (少し弱く)。
- * 質問側の埋め込みが間に合わない・ベクトルが無いときは、名前の想起だけを返す (遅くしない)。
- */
-export async function recallWithMeaning(guildId: string,
-  { request = '', context = '', conversation = '', maxChars = 2400, timeoutMs = 3000 }: { request?: string; context?: string; conversation?: string; maxChars?: number; timeoutMs?: number } = {}): Promise<RecallParts> {
-  // v2 の記憶 (主張の索引がある) は、メモリパック: 入口の門 → 候補 → 判定モデルの再順位づけ → 関係する主張そのものを渡す。
-  // 索引が無い・判定モデルが使えないときは null で、従来の見出しの想起に落ちる
-  const pack = await recallPack(guildId, { request }).catch((error: unknown) => {
-    console.error('Memory pack failed:', error);
-    return null;
+function requestClue(guildId: string, request: string): string {
+  const named = request.replace(/<@!?(\d{15,25})>/g, (_mention, id: string) => {
+    const db = memoryDb();
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'v2_entities'").get()) return ' ';
+    return db.prepare<[string, string], { name: string }>(
+      "SELECT name FROM v2_entities WHERE guild_id = ? AND kind = 'person' AND key = ?"
+    ).get(guildId, id)?.name ?? ' ';
   });
-  if (pack) return pack;
-  // 名前で見つけたページの出来事は、重要度順でなく依頼に近い順に選ぶ (近いものが無ければ見出しだけ)。
-  // 質問側の埋め込みが間に合わない・ベクトルが無いときは、従来の重要度順。
-  const vector = hasVectors(guildId) && request.trim() ? await embedQuery(request, { timeoutMs }) : null;
-  const rank: EpisodeRanker | undefined = vector
-    ? (episodes) => {
-      const near = scoresFor(guildId, 'episode', vector, episodes.map((episode) => episode.id));
-      return episodes.filter((episode) => (near.get(episode.id) ?? 0) >= PAGE_EPISODE_FLOOR)
-        .sort((a, b) => (near.get(b.id) ?? 0) - (near.get(a.id) ?? 0));
+  return clue(named);
+}
+
+/** 依頼・思考・ツール結果から、モデルを呼ぶ前に同じ局所検索を行う。 */
+export function memoryReader(guildId: string, { request, reply = '', timeoutMs = 2000, maxChars = RECALL_CHARS }: {
+  request: string; reply?: string; timeoutMs?: number; maxChars?: number;
+}): (input: { observations: string[]; reasoning?: string | undefined; thought?: string | undefined; readTarget?: string | null | undefined }) => Promise<{ text: string } | null> {
+  let base: string | undefined;
+  // 依頼だけの結果を控えておくと、単発の memory_focus が終わっても再検索せず戻れる。
+  let initial: { text: string } | null | undefined;
+  let latest: { query: string; result: { text: string } | null } | undefined;
+  return async ({ observations, reasoning, thought, readTarget }) => {
+    if (maxChars <= RECALL_HEAD.length) return null;
+    try {
+      if (base === undefined) {
+        const message = requestClue(guildId, request);
+        const quoted = requestClue(guildId, reply);
+        base = quoted ? [message.slice(0, 250), quoted.slice(0, 200)].filter(Boolean).join(' ') : message.slice(0, 480);
+      }
+      const focus = clue(thought?.replace(/^memory_focus\.(?:context|thought):\s*/gm, '')).slice(0, 480);
+      const toolText = observations.at(-1)?.replace(/^tool:[^:]*:\s*/, '') ?? '';
+      // Typed read results identify the authorized anchor actually returned.
+      // null means the read had no visible target; never infer one from neighbors.
+      // Older/generic plain tools keep their existing observation behavior.
+      const source = readTarget === undefined
+        ? toolText.includes('話者（この資料内）:')
+          ? toolText.match(/^(?:> [^\n]*(?:\n|$)){1,3}/m)?.[0]?.replace(/^> /gm, '')
+          : toolText
+        : readTarget ?? '';
+      const observation = clue(source);
+      const hint = [clue(reasoning).slice(-150), observation.slice(0, 90)].filter(Boolean).join(' ');
+      const query = focus || (hint ? [base.slice(0, 240), hint].filter(Boolean).join(' ') : base);
+      if (!query) return null;
+      if (query === base && initial !== undefined) return initial;
+      if (query === latest?.query) return latest.result;
+      const found = await meaningOf(guildId, query, { nodeLimit: 0, episodeLimit: 2, chunkLimit: 4, minScore: RECALL_SCORE, timeoutMs });
+      const lines = meaningLines(found, maxChars - RECALL_HEAD.length);
+      const result = lines.length ? { text: [RECALL_HEAD, ...lines].join('\n') } : null;
+      latest = { query, result };
+      if (query === base) initial = result;
+      return result;
+    } catch (error) {
+      console.error('Memory recall failed:', error);
+      return null;
     }
-    : undefined;
-  const parts = recallParts(guildId, { request, context, maxChars: 1800, ...(rank ? { rank } : {}) });
-  const query: string | QuerySegment[] = conversation.trim() && conversationClue() ? [{ text: request }, { text: conversation, penalty: CONVERSATION_PENALTY }] : request;
-  const meaning = await meaningOf(guildId, query, { excludePaths: parts.paths, excludeEpisodes: parts.episodeIds, excludeChunks: parts.chunkIds, timeoutMs, queryVector: typeof query === 'string' ? vector : null });
-  const lines = meaningLines(meaning);
-  if (lines.length === 0 || !meaning) return parts;
-  const head = parts.text || '思い出したこと (記憶の見出しだけ。中身は memory ツールで path / episode を開いて読む):';
-  const text = [head, MEANING_HEAD, ...lines].join('\n');
-  remember(parts, meaning);
-  return { text: text.length > maxChars ? `${text.slice(0, maxChars)}…` : text, paths: parts.paths, episodeIds: parts.episodeIds, chunkIds: parts.chunkIds };
-}
-
-/** memory_focus の中身 (runtime が「memory_focus.context: …」の形で渡す) から、ラベルを外した本文。 */
-export const focusOf = (thought: string | undefined): string => (thought ?? '')
-  .replace(/^memory_focus\.(?:context|thought):\s*/gm, '')
-  .replace(/\s+/g, ' ')
-  .trim()
-  .slice(0, 700);
-
-const union = <T>(...sets: ReadonlySet<T>[]): Set<T> => new Set(sets.flatMap((set) => [...set]));
-
-/**
- * 考えている途中の想起 (runtime が往復ごとに呼ぶ)。依頼と、モデルが直前に考えていたこと (CoT)、いま調べていること
- * (道具の結果) から、まだ出していない記憶だけを足す。最初の往復 (道具の結果がまだ無い) は、呼ばれたときの想起が済んでいるので何も足さない。
- * 思考は provider が文章で返したときだけ (暗号化されたものは読めない) で、無ければ依頼と道具の結果で引く。
- *
- * モデルが memory_focus で「いま思い出したいこと」を示したら、それを最優先の手がかりにして選び直す (想起は受動のまま、向きだけ変える)。
- * 焦点は runtime が次の 1 回のモデル呼び出しにだけ使い、応答が返ったら捨てる (one-shot)。モデルが明示的に選び直したのだから、
- * 前の往復で出した指し先も出し直す (往復ごとの想起はその往復にしか付かず、入力にはもう残っていない)。
- * 焦点が無い往復は、途中で出したものを繰り返さない。入力に残っている開始時の想起 (seed.shown) は、どちらでも出さない。
- */
-export function meaningReader(guildId: string, seed: { request: string; shown?: RecallParts | undefined; conversation?: string | undefined }):
-  (query: { observations: string[]; reasoning?: string | undefined; thought?: string | undefined }) => Promise<{ text: string } | null> {
-  const start: RecallParts = { text: '', paths: new Set(seed.shown?.paths), episodeIds: new Set(seed.shown?.episodeIds), chunkIds: new Set(seed.shown?.chunkIds) };
-  const mid: RecallParts = { text: '', paths: new Set(), episodeIds: new Set(), chunkIds: new Set() };
-  return async ({ observations, reasoning, thought }) => {
-    const focus = focusOf(thought);
-    if (observations.length === 0 && !focus) return null;
-    // 既定: 手がかりを順につないで 1 本の質問にする。(焦点) → 依頼 → モデル自身が直前に考えていたこと (CoT。読めるときだけ) → 道具が返した内容。
-    // 埋め込みが読めるのは 500 字ほどなので、実際に効くのは前のほう (焦点・依頼・思考の頭) で、後ろの道具の結果は切れる。
-    // 道具の結果を別に埋め込むと、7〜9 割が下限を超えて毎往復の想起が的外れで埋まるので (docs/memory-chunks.md)、そうしていない。
-    const noticed = observations.map((observation) => observation.replace(/^tool:[^:]*:\s*/, '').slice(0, 300));
-    const chained = [...(focus ? [focus] : []), seed.request.slice(0, 300), ...(reasoning ? [reasoning.slice(-600)] : []), ...noticed].join('\n').slice(0, 1600);
-    // 直前の会話の手がかりを有効にしたときだけ、別々に埋め込んでいちばん近いものを採る (会話は少し弱く)
-    const query: string | QuerySegment[] = seed.conversation?.trim() && conversationClue()
-      ? [
-        ...(focus ? [{ text: focus }] : []),
-        { text: seed.request.slice(0, 300) },
-        { text: seed.conversation, penalty: CONVERSATION_PENALTY },
-        ...(reasoning ? [{ text: reasoning.slice(-600) }] : []),
-        ...noticed.map((text) => ({ text }))
-      ]
-      : chained;
-    // 焦点があるときは、途中で出したものも出し直す (その往復にしか付いていなかったので、もう入力に無い)
-    const skip = focus ? start : { paths: union(start.paths, mid.paths), episodeIds: union(start.episodeIds, mid.episodeIds), chunkIds: union(start.chunkIds, mid.chunkIds) };
-    const meaning = await meaningOf(guildId, query, { nodeLimit: 2, episodeLimit: 2, chunkLimit: 2, excludePaths: skip.paths, excludeEpisodes: skip.episodeIds, excludeChunks: skip.chunkIds, timeoutMs: 2000 });
-    const lines = meaningLines(meaning);
-    if (lines.length === 0 || !meaning) return null;
-    remember(mid, meaning);
-    const head = focus
-      ? 'あなたが示した焦点に近い記憶 (見出しだけ。§ は節で、path と section で開ける。中身は memory ツールで path / episode を開いて読む):'
-      : '調べている内容に近い記憶 (見出しだけ。まだ出していないもの。§ は節で、path と section で開ける。中身は memory ツールで path / episode を開いて読む):';
-    return { text: [head, ...lines].join('\n') };
   };
 }
 

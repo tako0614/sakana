@@ -345,6 +345,32 @@ export function memoryDb(): Database.Database {
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (guild_id, kind, id)
     );
+    -- A revision per vector group lets recall validate its in-memory matrix
+    -- without scanning BLOBs or invalidating it on unrelated memory writes.
+    -- Existing rows start at revision 0 until their first mutation.
+    CREATE TABLE IF NOT EXISTS memory_vector_revisions (
+      guild_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      PRIMARY KEY (guild_id, kind)
+    );
+    CREATE TRIGGER IF NOT EXISTS memory_vectors_revision_insert AFTER INSERT ON memory_vectors BEGIN
+      INSERT INTO memory_vector_revisions (guild_id, kind, revision) VALUES (NEW.guild_id, NEW.kind, 1)
+      ON CONFLICT (guild_id, kind) DO UPDATE SET revision = revision + 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS memory_vectors_revision_update AFTER UPDATE ON memory_vectors BEGIN
+      INSERT INTO memory_vector_revisions (guild_id, kind, revision) VALUES (NEW.guild_id, NEW.kind, 1)
+      ON CONFLICT (guild_id, kind) DO UPDATE SET revision = revision + 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS memory_vectors_revision_move AFTER UPDATE OF guild_id, kind ON memory_vectors
+      WHEN OLD.guild_id <> NEW.guild_id OR OLD.kind <> NEW.kind BEGIN
+      INSERT INTO memory_vector_revisions (guild_id, kind, revision) VALUES (OLD.guild_id, OLD.kind, 1)
+      ON CONFLICT (guild_id, kind) DO UPDATE SET revision = revision + 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS memory_vectors_revision_delete AFTER DELETE ON memory_vectors BEGIN
+      INSERT INTO memory_vector_revisions (guild_id, kind, revision) VALUES (OLD.guild_id, OLD.kind, 1)
+      ON CONFLICT (guild_id, kind) DO UPDATE SET revision = revision + 1;
+    END;
   `);
 
   // 種類名と決め台詞の列 (2026-10-15 に追加)。古い DB には足す

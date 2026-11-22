@@ -44,7 +44,7 @@ function statusText(): string {
   const channels = [...vexConfig.channels];
   return [
     '**vex の状態**',
-    `名前 (vex): **${vexConfig.callMode}** — ${MODE_TEXT[vexConfig.callMode]}`,
+    `呼び名 (${vexConfig.names.join('、') || 'なし'}): **${vexConfig.callMode}** — ${MODE_TEXT[vexConfig.callMode]}`,
     `自発参加: **${vexConfig.ambient ? 'オン' : 'オフ'}** — チャンネル: ${channels.length ? channels.map((id) => `<#${id}>`).join(' ') : 'なし (どこにも入らない)'}`,
     `審判 (LLM が会話の履歴と記憶の概要を読んで最終判断): **${vexConfig.arbiter ? 'オン' : 'オフ'}**`,
     `閾値 ${vexConfig.threshold} (名前が出たとき ${vexConfig.nameThreshold}) / 静かになってから ${Math.round(vexConfig.quietMs / 1000)} 秒 / `
@@ -80,7 +80,7 @@ export const vexCommands = [
       .addSubcommand((sub) => sub.setName('status').setDescription('いまの状態と、直近 24 時間の判定を表示します'))
       .addSubcommand((sub) => sub
         .setName('call')
-        .setDescription('「vex」と名前が出た発言の扱いを変えます')
+        .setDescription('呼び名が出た発言の扱いを変えます')
         .addStringOption((option) => option
           .setName('mode')
           .setDescription('off=何もしない / mention=確定で答える / judge=判定モデルが文脈で決める')
@@ -127,7 +127,7 @@ export const vexCommands = [
       if (sub === 'call') {
         const mode = interaction.options.getString('mode', true);
         if (!setCallMode(mode, by)) { await say(`その値は使えません: ${mode}`); return; }
-        await say(`名前 (vex) の扱いを **${mode}** にしました。${MODE_TEXT[mode as CallMode]}\n\n${statusText()}`);
+        await say(`呼び名の扱いを **${mode}** にしました。${MODE_TEXT[mode as CallMode]}\n\n${statusText()}`);
         return;
       }
       if (sub === 'ambient') {

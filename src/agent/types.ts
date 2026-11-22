@@ -15,7 +15,7 @@ import type { RefTable } from './format.js';
 export type { ChannelScope, MessageStructure };
 export type { ToolDefinition } from '../ai/types.js';
 
-/** 返信の鎖をどこで止めたか。プロンプトでは reference.availability に載る。 */
+/** 返信の鎖をどこで止めたか。個々の発言の返信先の取得状態とは別。 */
 export type ReferenceState =
   | 'not_applicable' | 'snapshot' | 'cycle' | 'unavailable' | 'deleted' | 'resolved' | 'depth_limit';
 

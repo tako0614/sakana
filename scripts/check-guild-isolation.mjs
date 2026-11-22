@@ -15,6 +15,7 @@ process.env.AGENT_BROWSER = '0';
 const { db, saveMessage, upsertChannel } = await import('../src/archive/db.js');
 const { toRecord } = await import('../src/archive/indexer.js');
 const { buildToolset, runRead, runSearch } = await import('../src/agent/tools.js');
+const { formatSemanticConversations } = await import('../src/agent/semantic.js');
 const { ChannelType, PermissionFlagsBits } = await import('discord.js');
 const { runInfo } = await import('../src/agent/info.js');
 const { RefTable } = await import('../src/agent/format.js');
@@ -137,7 +138,7 @@ try {
   await check('discord search says nothing about hits in channels the caller cannot read', async () => {
     const hit = (id, channelId, content) => [{ id, channel_id: channelId, hit: true, content,
       timestamp: '2024-01-01T00:00:00.000Z', author: { id: 'author-1', username: 'someone' } }];
-    const visible = hit('200000000000000001', 'public-a', 'VISIBLE_HIT');
+    const visible = hit('200000000000000001', 'public-a', 'VISIBLE_HIT\n    SEARCH_INDENT');
     const hidden = hit('200000000000000002', 'private-a', 'HIDDEN_HIT');
     // 出力には「いま観測した時刻」(observedAt、ミリ秒) が入る。2回の実行が1ミリ秒ずれるだけで文字列が変わり、
     // 比較が確率で落ちていた (2026-10-17)。比べたいのは隠れた側の有無なので、時刻だけ外して比べる
@@ -145,12 +146,74 @@ try {
       toolCtx([publicChannel, privateChannel], { client: { user: { id: 'bot' }, rest: { get: async () => ({ messages: groups }) } } }),
       { query: 'sentinel', limit }, { archiveAvailable: false, semanticAvailable: false })).replace(/"observedAt":\d+/g, '"observedAt":0');
     const mixed = await run([visible, hidden], 2);
-    assert.match(mixed, /VISIBLE_HIT/);
+    assert.match(mixed, /話者（この資料内）/);
+    assert.match(mixed, /> VISIBLE_HIT\n>     SEARCH_INDENT/);
     assert.doesNotMatch(mixed, /HIDDEN_HIT|読めない|除外|除いた/);
     // 1件は隠れているので「limit ぶん埋まった」とも言わない。隠れた側の有無で出力が変わらないこと
     assert.equal(mixed, await run([visible], 2), 'a hidden hit must not change the output at all');
     assert.equal(await run([hidden], 2), await run([], 2), 'only hidden hits looks exactly like no hits');
     assert.match(await run([], 2), /該当するメッセージはありませんでした/);
+  });
+
+  await check('a search reference opens multiline Discord evidence with the same number', async () => {
+    const id = '200000000000000001';
+    const body = 'VISIBLE_HIT\n    SEARCH_INDENT';
+    const searches = { messages: [[{ id, channel_id: 'public-a', hit: true, content: body,
+      timestamp: '2024-01-01T00:00:00.000Z', author: { id: 'shared-user', username: 'shared-user' } }]] };
+    const readChannel = fakeChannel('public-a', true, ChannelType.GuildText, {
+      messages: { fetch: async (options) => {
+        assert.equal(options.around, id);
+        return new Map([[id, message(id, 'guild-a', 'public-a', body)]]);
+      } }
+    });
+    const ctx = toolCtx([readChannel], { channel: readChannel,
+      client: { user: { id: 'bot' }, rest: { get: async () => searches } } });
+    const searched = await runSearch(ctx, { query: 'VISIBLE_HIT' }, { archiveAvailable: false, semanticAvailable: false });
+    assert.match(searched, /^1\) .*\bu1[: ]/m);
+    const read = await runRead(ctx, { at: '1' });
+    assert.match(read, /^1\) .*\bu1[: ]/m);
+    assert.match(read, /> VISIBLE_HIT\n>     SEARCH_INDENT/);
+    assert.equal(ctx.refs.get(1)?.messageId, id);
+    assert.equal(ctx.refs.entries.length, 1);
+  });
+
+  await check('read recall target is the authorized anchor, not an adjacent timeline entry', async () => {
+    const anchorId = '200000000000000021';
+    const before = message('200000000000000020', 'guild-a', 'public-a', 'NEIGHBOR_BEFORE', { createdTimestamp: 1 });
+    const anchor = message(anchorId, 'guild-a', 'public-a', 'TARGET_TETRIS', { createdTimestamp: 2 });
+    const after = message('200000000000000022', 'guild-a', 'public-a', 'NEIGHBOR_AFTER', { createdTimestamp: 3 });
+    let returned = [before, anchor, after];
+    const readChannel = fakeChannel('public-a', true, ChannelType.GuildText, {
+      messages: { fetch: async () => new Map(returned.map((entry) => [entry.id, entry])) }
+    });
+    const ctx = toolCtx([readChannel], { channel: readChannel });
+    ctx.refs.add({ messageId: anchorId, channelId: 'public-a', guildId: 'guild-a' });
+    const targets = [];
+    const output = await runRead(ctx, { at: '1' }, (entry) => targets.push(entry.content));
+    assert.match(output, /NEIGHBOR_BEFORE.*TARGET_TETRIS.*NEIGHBOR_AFTER/s);
+    assert.deepEqual(targets, ['TARGET_TETRIS']);
+    returned = [before, after];
+    await runRead(ctx, { at: '1' }, (entry) => targets.push(entry.content));
+    assert.deepEqual(targets, ['TARGET_TETRIS'], 'a missing anchor does not substitute either neighbor');
+    await runRead(ctx, {}, (entry) => targets.push(entry.content));
+    assert.deepEqual(targets, ['TARGET_TETRIS', 'NEIGHBOR_AFTER'], 'a latest read selects its newest visible message');
+  });
+
+  await check('semantic previews keep rank, source numbers and the shared conversation format', () => {
+    const first = '200000000000000011';
+    const second = '200000000000000012';
+    const parent = message(first, 'guild-a', 'public-a', 'if ready:\n    deploy()');
+    const child = message(second, 'guild-a', 'public-a', '確認した', {
+      reference: { messageId: first, channelId: 'public-a' }
+    });
+    const ctx = toolCtx([publicChannel]);
+    const preview = formatSemanticConversations(ctx, [{ rows: [toRecord(parent), toRecord(child)], score: 0.92, rank: 2, count: 2 }]);
+    assert.match(preview, /話者（この資料内）/);
+    assert.match(preview, /起点 1・表示 2\/2件・近さ#2 0\.92/);
+    assert.match(preview, /> if ready:\n>     deploy\(\)/);
+    assert.match(preview, /^2\) .*↩1:/m);
+    assert.equal(ctx.refs.get(1)?.messageId, first);
+    assert.equal(ctx.refs.get(2)?.messageId, second);
   });
 
   await check('active forum posts the caller cannot read are not listed', async () => {
