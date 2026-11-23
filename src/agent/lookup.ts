@@ -4,16 +4,13 @@
 // ような事実を聞く依頼を記憶や推測で答えると、作り話が混ざる。依頼が事実を聞いていて、まだ何も調べていないときだけ、
 // 最初の答えを1回やり直させる (2回目は何を答えてもよい)。
 
-// 事実・過去・人物を聞く言い回し
-const ASKING = /(教えて|について|とは[？?\s]|って(何|なに|誰|だれ|どんな|いつ|どこ)|どんな(人|やつ|話|奴)|誰|だれ|いつ|なんで|なぜ|エピ|やらかし|弱み|黒歴史|過去|昔|前に|探して|調べて|知ってる|覚えてる|どうなの|どういう|何をした|何した)/;
+const LOOKUP_REQUEST = /(?:教えて|探して|調べて|掘り返して|昔の話を?して)(?:くれ(?:る)?|ください|ほしい|もらえる)?[。！!？?\s]*$/u;
+const FACT_QUESTION = /(?:って\s*(?:誰|だれ|何|なに|どんな人|いつ[^。！？?\n]{0,24})|(?:黒歴史|やらかし|エピソード)(?:って)?(?:は|が)?ある|(?:誰|だれ)が(?:言った|決めた)|何を?した)[。！？?\s]*$/u;
 
-/** 事実を聞いていそうか。known は依頼に関係する想起があったときに使う。 */
-export function lookupAdvised(request: string, { known = false }: { known?: boolean } = {}): boolean {
+/** 明示的な調査依頼や、根拠が要る具体的な質問だけを強制調査の対象にする。 */
+export function lookupAdvised(request: string): boolean {
   const text = request.replace(/<@!?\d+>/g, '').replace(/https?:\/\/\S+/g, '').trim();
-  if (text.length < 4) return false;
-  if (ASKING.test(text)) return true;
-  // 知っている名前が出て、疑問の形のとき (「たこってダブスタじゃない？」)
-  return known && /[？?]/.test(text);
+  return text.length >= 4 && (LOOKUP_REQUEST.test(text) || FACT_QUESTION.test(text));
 }
 
 /**
@@ -22,17 +19,18 @@ export function lookupAdvised(request: string, { known = false }: { known?: bool
  */
 export const countsAsLookup = (toolName: string): boolean => toolName !== 'memory_focus';
 
-export const LOOKUP_HINT = '事実が絡む話なのに、まだ何も調べていない。答える前に、過去ログ (search) か記憶 (memory) で1回確かめて。確かめても材料が無ければ、そう言って答えていい。';
+export const LOOKUP_HINT = '依頼で聞かれた事実を、答える前に適切なツールで1回確かめて。分かったことから簡潔に答える。';
 
 /**
  * runtime の validate に渡す関数を作る。最初の答えが道具なしで、依頼が事実を聞いているときだけ1回やり直させる
  * (runtime は投げられたエラーの governanceRetryHint を「RETRY: …」として足して、もう1往復させる)。
  */
-export function lookupGuard({ request, known, usedTool }: { request: string; known: () => boolean; usedTool: () => boolean }):
+export function lookupGuard({ request, usedTool }: { request: string; usedTool: () => boolean }):
   (message: { content?: unknown }) => unknown {
+  const shouldCheck = lookupAdvised(request);
   let asked = false;
   return (message) => {
-    if (!asked && !usedTool() && lookupAdvised(request, { known: known() })) {
+    if (shouldCheck && !asked && !usedTool()) {
       asked = true;
       throw Object.assign(new Error('lookup advised'), { governanceRetryHint: LOOKUP_HINT });
     }

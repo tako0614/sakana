@@ -536,16 +536,11 @@ export async function handleAgentRequest(
     });
 
     let toolUsed = false;
-    let recalledMemory = false;
     const result = await runAgent({
       model,
       guildId: guild.id,
       // 初回も途中も runtime がモデルを呼ぶ前に同じ検索を使う。
-      ...(recall ? { memory: { read: async (query) => {
-        const memory = await measure('recall', () => recall(query));
-        recalledMemory = Boolean(memory);
-        return memory;
-      } } } : {}),
+      ...(recall ? { memory: { read: (query) => measure('recall', () => recall(query)) } } : {}),
       // Discord input identity survives a process restart, so an unfinished
       // run resumes from its checkpoint instead of starting over. Completed
       // runs still use the runtime's default reuseCompleted=false behavior if
@@ -571,8 +566,8 @@ export async function handleAgentRequest(
       // 超えてもツールが外れるだけなので、答えはその場の材料で必ず書かれる。
       deadlineAt: Date.now() + agentConfig.deadlineMs,
       weigh: weighCost,
-      // 事実を聞かれたのに何も調べずに答えそうなら、答える前に1回だけ確かめさせる (lookup.ts)
-      ...(toolset.definitions.length > 0 ? { validate: lookupGuard({ request, known: () => recalledMemory, usedTool: () => toolUsed }) } : {}),
+      // 明示的な依頼だけ、調べずに答えそうなときに1回確かめさせる (lookup.ts)。
+      ...(!ambient && toolset.definitions.length > 0 ? { validate: lookupGuard({ request, usedTool: () => toolUsed }) } : {}),
       onToolCall: (name, args) => { if (countsAsLookup(name)) toolUsed = true; thinking.setStatus(toolLabel(name, args)); }
     });
 
