@@ -323,6 +323,7 @@ if (recalled.length > 1900) fail('recall must stay bounded');
 const root = memoryRootPrompt(GUILD);
 if (!root.includes('## 記憶') || !root.includes('sakana-bot')) fail('root prompt must carry the root body:\n' + root);
 if (!/- people\/ \(2\): (たこ|さば), (たこ|さば)/.test(root)) fail('root prompt must list top-level pages:\n' + root);
+if (!root.split('\n').slice(1).every((line) => line.startsWith('> '))) fail('each line of stored memory must be labelled as reference data');
 if (memoryRootPrompt('nobody') !== '') fail('a guild without memory must add nothing to the prompt');
 
 // ---- 小物 ------------------------------------------------------------------

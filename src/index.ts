@@ -5,6 +5,7 @@ import {
   GatewayIntentBits,
   EmbedBuilder,
   MessageFlags,
+  MessageType,
   Partials,
   type GuildMember,
   type Interaction,
@@ -331,6 +332,8 @@ async function handleMessageCreate(message: Message): Promise<void> {
   if (!message.inGuild() || !isAllowedGuild(message.guildId)) {
     return;
   }
+  // 依頼からスレッドを立てると、Discord が元の依頼を指すシステムメッセージを作る。
+  if (message.type === MessageType.ThreadStarterMessage) return;
 
   // インデックス済みのサーバーなら、新しい発言もそのままアーカイブに足していく。
   // bot の発言も検索対象にしたいのでここで先に呼ぶ。

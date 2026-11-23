@@ -220,10 +220,20 @@ const first = buildSystemPrompt(ctx, toolset);
 if (buildSystemPrompt(ctx, toolset) !== first) {
   fail('system プロンプトが呼ぶたびに変わっている (キャッシュの前方一致が壊れる)');
 }
-if (!first.includes('指定のない雑談はだいたい1〜2文') || !first.includes('完成した文書を求められたら') || !first.includes('そのまま使える本文')) {
-  fail('短い既定と、依頼された詳しさ・完成した文書の指示を両立する');
+const sections = [...first.matchAll(/^## (.+)$/gm)].map((match) => match[1]);
+if (sections.join('|') !== '役割と口調|返す範囲|判断の例|書き方|会話と根拠|ツール') {
+  fail('口調と依頼の判断を先に置き、文体と参照資料の扱いをツールの説明から区別する');
 }
-if (!first.includes('軽い下ネタやブラックジョーク') || !first.includes('答えられる部分には自然に返し')) {
+if (!first.includes('「どうだった？」') || !first.includes(`${formatModule.CHAT_REPLY_CHARS}文字以内が目安`) || !first.includes('送信側がスレッドに入れる')) {
+  fail('短い質問と会話の続きには答え、必要な詳しい返事はスレッドに送る');
+}
+if (!first.includes('話のまとまりごとに適度に改行') || !first.includes('Markdownはコードや出典リンクなど必要な箇所に使う')) {
+  fail('適度な改行を使い、Markdownは必要な箇所に絞る');
+}
+if (!first.includes('作業を丸ごと任されたらツールは使わず') || !first.includes('作業一式の依頼には、先の一言で返す')) {
+  fail('調査レポートの依頼には、調べず会話として一言返す指示を渡す');
+}
+if (!first.includes('軽い下ネタやブラックジョーク') || !first.includes('答えられる部分には普通に返し')) {
   fail('きわどい雑談にも、その場で返せる範囲で普通に返す指示を渡す');
 }
 
@@ -659,24 +669,59 @@ const { chunkForDiscord } = await import('../src/agent/format.js');
   if (plain.length !== 1 || plain[0] !== '短い答え。') fail(`短い答えは1通のまま: ${JSON.stringify(plain)}`);
   if (chunkForDiscord('あ'.repeat(10_000)).at(-1).includes('```')) fail('コードでないのにフェンスを足している');
 
-  const ordinary = formatModule.planAnswerDelivery('通常の回答。'.repeat(450), true);
-  if (ordinary.chunks.length !== 2 || ordinary.markdown !== null) fail('通常の長めの説明は本文で分割して返す');
-  const markdown = `# 完成した文書\n\n日本語の本文と 🐙 を保つ。\n\n\`\`\`ts\n${code.repeat(4)}\n\`\`\``;
-  const attached = formatModule.planAnswerDelivery(markdown, true);
-  if (attached.chunks.length !== 1 || !attached.chunks[0].includes('Markdown')) fail('長文添付時はチャットに案内を出す');
-  if (attached.markdown !== markdown) fail('長文添付は Unicode と Markdown 全文をそのまま保つ');
-  const completeSplit = formatModule.planAnswerDelivery('あ'.repeat(10_000), false);
-  if (completeSplit.chunks.join('').length !== 10_000) fail('添付できない場合も表示枠に収まる長文を最後まで送る');
-  const bounded = formatModule.planAnswerDelivery('あ'.repeat(13_000), false);
-  if (bounded.chunks.length !== 6 || !bounded.chunks.at(-1).includes('以降を省略')) fail('添付権限が無い長文は上限内で分割して省略を明示する');
-  if (formatModule.planAnswerDelivery('短い答え。', true).markdown !== null) fail('短文は添付にしない');
+  const { clipChatReply, CHAT_REPLY_CHARS, expandCitationsDetailed } = formatModule;
+  const footer = '\n\n-# test-model';
+  const opening = '答え。\n\n';
+  const atLimit = opening + 'あ'.repeat(300 - footer.length - opening.length);
+  if (CHAT_REPLY_CHARS !== 300 || clipChatReply(atLimit, footer.length) !== atLimit) fail('モデル名込みで300文字の本文は改行ごとそのまま返す');
+  if (!clipChatReply(`${atLimit}い`, footer.length).includes('以降を省略')) fail('スレッドを作れない場合は301文字から短縮する');
+  const body = clipChatReply(`最初の話 [1]。${'🐙'.repeat(400)}後の話 [2]。`, footer.length);
+  const bounded = expandCitationsDetailed(body, tableOf(2), { label: 'test-model', labels: { below: true } });
+  if (bounded.text.length > CHAT_REPLY_CHARS || !bounded.text.endsWith(footer) || !bounded.text.isWellFormed()) fail('短い返信に収め、文字とモデル名を保つ');
+  if (!bounded.text.includes('以降を省略') || bounded.messages.map((m) => m.url).join() !== msgUrl(1)) fail('省略を明示し、表示した範囲だけに根拠を付ける');
+  const clippedCode = clipChatReply(`\`\`\`js\n${code}\n\`\`\``);
+  if ((clippedCode.match(/```/g) ?? []).length !== 2) fail('スレッドが作れなくてもコードフェンスを閉じる');
 }
 
 console.log('chunking ok (コードブロックを跨いで壊さない)');
 
 // --- 断り文を次の会話に混ぜない ---
 
-const { isAgentNotice } = await import('../src/agent/index.js');
+const { isAgentNotice, sendLongReply } = await import('../src/agent/index.js');
+
+{
+  const { ChannelType } = await import('discord.js');
+  const permissionsFor = () => ({ has: () => true });
+  const calls = [];
+  const sent = [];
+  const thread = { id: 'thread', parentId: 'parent', type: ChannelType.PublicThread, isThread: () => true, permissionsFor,
+    send: async (payload) => { calls.push(['thread', payload]); return { id: `t${calls.length}` }; } };
+  const parent = { id: 'parent', type: ChannelType.GuildText, isThread: () => false, permissionsFor,
+    threads: { fetch: async (id) => { calls.push(['fetch', id]); return thread; } } };
+  const message = { id: 'request', channel: parent, hasThread: false, thread: null,
+    startThread: async () => { calls.push(['create']); return thread; },
+    reply: async (payload) => { calls.push(['reply', payload]); return { id: `p${calls.length}` }; } };
+  const body = { content: 'あ'.repeat(2050), components: [{ example: true }] };
+  const remember = (outgoing) => sent.push(outgoing.id);
+  if (!await sendLongReply(message, {}, body, remember)) fail('長文を親から作ったスレッドで送信する');
+  if (calls.map(([action]) => action).join() !== 'create,thread,thread,reply') fail('親に残すのはスレッドの案内だけ');
+  if (calls[1][1].components || calls[2][1].components !== body.components || calls[3][1].components) fail('根拠は本文の最後に一度だけ付ける');
+  if (!calls[3][1].content.includes('<#thread>') || sent.join() !== 't2,t3,p4') fail('スレッドを案内し、どの返信からでも続けられる');
+
+  calls.length = 0;
+  if (!await sendLongReply({ ...message, channel: thread }, {}, body, remember) || calls.map(([action]) => action).join() !== 'reply,thread') fail('既存のスレッドで聞かれたらその中で返す');
+  calls.length = 0;
+  if (!await sendLongReply({ ...message, hasThread: true }, {}, body, remember) || calls.map(([action]) => action).join() !== 'fetch,thread,thread,reply') fail('キャッシュに無い既存スレッドを取り直す');
+  calls.length = 0;
+  const blocked = { ...parent, permissionsFor: () => ({ has: () => false }) };
+  if (await sendLongReply({ ...message, channel: blocked }, {}, body, remember) || calls.length) fail('スレッド権限がなければ長文を送信しない');
+
+  const interrupted = { ...thread, send: async (payload) => {
+    if (calls.length) throw new Error('simulated send failure');
+    return thread.send(payload);
+  } };
+  if (await sendLongReply({ ...message, thread: interrupted, hasThread: true }, {}, body, remember) || calls.length !== 1) fail('途中で送れなくなった長文は完了扱いせず短い返信に戻す');
+}
 
 {
   const self = '111';

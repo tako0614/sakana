@@ -34,11 +34,11 @@ assert.match(coach('search', { author: 'y', query: 'x' }, '1 件ヒット'), /�
 assert.equal(coach('read', { at: 1 }, 'ok'), 'ok', 'another tool is not a repeat');
 
 // ---- lookup: 事実を聞いているか ---------------------------------------------------
-for (const asking of ['Rayの弱み掘り返して', 'えだまめの黒歴史ある？', 'Amex2190について教えて', 'さかなのやらかしエピ教えて', 'たこって誰？', '<@123> 恋人疑惑のある人探して', 'えだまめっていつ参加した', '昔の話して']) {
+for (const asking of ['Rayの弱み掘り返して', 'えだまめの黒歴史ある？', 'Amex2190の発言を教えて', 'さかなのやらかしエピ教えて', 'たこって誰？', '<@123> 昨日の発言を探して', 'えだまめっていつ参加した', '昔の話して']) {
   assert.ok(lookupAdvised(asking), asking);
 }
 for (const chat of ['なんか面白いことないの', 'ころすよ', 'どっちのがいい？', 'おはよう', 'うける', 'はい',
-  'たこってダブスタじゃない？', 'なんでそうなるんだよｗ', '前に言ってたやらかし思い出したわ', '誰がそんなもん買うんだよ', '<@123>', '調べて']) {
+  'たこってダブスタじゃない？', 'なんでそうなるんだよｗ', '前に言ってたやらかし思い出したわ', '誰がそんなもん買うんだよ', '<@123>', '調べて', 'Robloxって何？', '昨日の会議どうだった？']) {
   assert.ok(!lookupAdvised(chat), chat);
 }
 
@@ -64,11 +64,15 @@ async function run({ request, memory, toolFirst = false }) {
 }
 const factual = await run({ request: 'さかなのやらかしエピ教えて' });
 assert.equal(factual.requests.length, 3, 'answer without tools → one retry → tool call → final answer');
-assert.ok(factual.requests[1].some((line) => line.startsWith('user:RETRY: 依頼で聞かれた事実')), 'the hint is handed to the model');
+assert.ok(factual.requests[1].some((line) => line.startsWith('user:RETRY: 会話で答えるのに必要な事実')), 'the hint is handed to the model');
 assert.equal(factual.result.text, '答え3');
 const chatty = await run({ request: 'なんか面白いことないの' });
 assert.equal(chatty.requests.length, 1, 'banter is answered at once');
 assert.equal(chatty.result.text, '答え1');
+const research = await run({ request: 'Robloxで稼ぎたい。人気ジャンルとビジネスモデルをまとめてほしい。\n収益の受け取り方と税金まで本気で調べて。' });
+assert.equal(research.requests.length, 1, 'a short reply to a research assignment must not trigger a lookup retry');
+const mixed = await run({ request: '先月の経緯を全チャンネルからまとめてレポートにして。最後に、誰が決めた？' });
+assert.equal(mixed.requests.length, 1, 'a factual question at the end of a report assignment must not trigger a retry');
 const recalledBanter = await run({ request: 'たこってダブスタじゃない？', memory: 'たこの過去の発言 [e12]' });
 assert.equal(recalledBanter.requests.length, 1, 'automatic recall must not force a search for a rhetorical question');
 assert.ok(recalledBanter.requests[0].some((line) => line.startsWith('user:REFERENCE MEMORY')));
@@ -76,7 +80,7 @@ const checked = await run({ request: 'さかなのやらかしエピ教えて', 
 assert.equal(checked.requests.length, 2, 'a run that already used a tool is not asked again');
 // 2回目は何を答えてもよい (やり直しは1回だけ)
 let answers = 0;
-const guard = lookupGuard({ request: 'Aについて教えて', usedTool: () => false });
+const guard = lookupGuard({ request: 'Aの発言を教えて', usedTool: () => false });
 assert.throws(() => guard({ content: 'x' }), (error) => error.governanceRetryHint === LOOKUP_HINT);
 assert.equal(guard({ content: 'y' }), 'y');
 answers += 1;

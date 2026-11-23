@@ -740,6 +740,9 @@ function fenceLeftOpen(text: string): boolean {
   return ((text.match(/```/g) ?? []).length % 2) === 1;
 }
 
+const OMISSION_NOTE = '\n\n*(長すぎるため以降を省略しました)*';
+export const CHAT_REPLY_CHARS = 300;
+
 /**
  * Discord の 2000 文字制限に合わせて切る。段落・行の境目を優先する。
  *
@@ -760,8 +763,10 @@ export function chunkForDiscord(text: unknown, limit = 1900, maxChunks = 3): str
       break;
     }
 
-    // 閉じの ``` を足す余地を残す
-    const room = limit - prefix.length - 4;
+    // 閉じの ``` と、最後のチャンクに付く省略通知の余地を残す。
+    const lastChunk = chunks.length + 1 === maxChunks;
+    const room = limit - prefix.length - 4 - (lastChunk ? OMISSION_NOTE.length : 0);
+    if (room <= 0) break;
     const window = rest.slice(0, room);
     const cut = Math.max(window.lastIndexOf('\n\n'), window.lastIndexOf('\n'));
     let at = cut > room * 0.5 ? cut : room;
@@ -773,6 +778,10 @@ export function chunkForDiscord(text: unknown, limit = 1900, maxChunks = 3): str
         if (start > room * 0.3) at = start;
       }
     }
+    const beforeCut = rest.charCodeAt(at - 1);
+    const afterCut = rest.charCodeAt(at);
+    if (beforeCut >= 0xd800 && beforeCut <= 0xdbff && afterCut >= 0xdc00 && afterCut <= 0xdfff) at--;
+    if (at <= 0) break;
 
     let piece = prefix + rest.slice(0, at).trim();
     rest = rest.slice(at).trim();
@@ -790,27 +799,13 @@ export function chunkForDiscord(text: unknown, limit = 1900, maxChunks = 3): str
   // 打ち切ったことを黙っていると、途中で切れた回答を完結したものと読まれてしまう。
   const last = chunks.length - 1;
   if (rest.length > 0 && last >= 0) {
-    chunks[last] = `${chunks[last] ?? ''}\n\n*(長すぎるため以降を省略しました)*`;
+    chunks[last] = `${chunks[last] ?? ''}${OMISSION_NOTE}`;
   }
 
   return chunks.filter(Boolean);
 }
 
-export interface AnswerDeliveryPlan {
-  /** Discord に送る本文。長文添付時は案内文のみ。 */
-  chunks: string[];
-  /** 添付権限がありチャットの表示枠を超える場合の、欠落のない Markdown 本文。 */
-  markdown: string | null;
-}
-
-/**
- * 通常は本文をチャットで返す。分割しても長い場合は Markdown 添付にする。
- * 添付できない場面では、表示枠を広げて分割する。
- */
-export function planAnswerDelivery(text: string, canAttach: boolean): AnswerDeliveryPlan {
-  const content = text.trim();
-  if (!canAttach) return { chunks: chunkForDiscord(content, 1900, 6), markdown: null };
-  const chunks = chunkForDiscord(content, 1900, 4);
-  if (chunks.length <= 3) return { chunks, markdown: null };
-  return { chunks: ['全文は添付の Markdown にまとめたよ。'], markdown: content };
+/** 出典の変換前に切り、送る本文に出てくる根拠だけを残す。 */
+export function clipChatReply(text: string, footerChars = 0): string {
+  return chunkForDiscord(stripTrailingSubtext(text), CHAT_REPLY_CHARS - footerChars, 1)[0] ?? '';
 }

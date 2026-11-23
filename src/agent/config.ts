@@ -47,7 +47,7 @@ export const agentConfig = {
   preloadMessages: number(process.env.AGENT_PRELOAD_MESSAGES, 30),
   // max_tokens には思考ぶんも含まれる。4000 だと reasoning_effort:high の思考で
   // 使い切って本文が空のまま返り、「うまく答えをまとめられませんでした」になる。
-  // Discord の長い回答は Markdown 添付へ送れるので、出力枠は回答の長さに合わせて使う。
+  // 長い Discord の返信はスレッドで送る。本文の送信枠は別途制限する。
   maxOutputTokens: number(process.env.AGENT_MAX_OUTPUT_TOKENS, 40_000),
   // 1回の HTTP 呼び出しに掛かるタイムアウト。「ソケットが死んだときの保険」で、
   // 超えても失敗にはせず retryable として callModel が引き直す。

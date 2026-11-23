@@ -471,12 +471,17 @@ export function fitShared(view: MemoryView): MemoryView {
   return view;
 }
 
-/**
- * エージェントの回答に付ける「根拠を開く」メニュー。選ぶと、その出来事・記事の画面 (explore と同じ) を、選んだ人にだけ出す。
- * 回答の本文は [出来事の題] [たこの記事] というラベルだけ置き、本文の文字は押せないので、同じラベルをここに並べる。サイトが無くても開ける。
- */
-export function citeMenu(guildId: string, sources: readonly { kind: 'episode' | 'page'; id: number; label: string }[]): MenuRow | null {
+/** 根拠が1件なら小さなボタン、複数ならひとつのメニューにする。 */
+export function citeControl(
+  guildId: string,
+  { sources, messages }: { sources: readonly { kind: 'episode' | 'page'; id: number; label: string }[]; messages: readonly { url: string; label: string }[] }
+): ButtonRow | MenuRow | null {
   const options: MenuOption[] = [];
+  for (const entry of messages) {
+    const match = /^https:\/\/discord\.com\/channels\/(\d+)\/(\d{1,20})\/(\d{1,20})$/.exec(entry.url);
+    if (!match || match[1] !== guildId) continue;
+    options.push({ label: clip(entry.label || '発言', 100), description: '発言', value: `m:${match[2]}:${match[3]}` });
+  }
   for (const entry of sources) {
     if (entry.kind === 'page') {
       const node = nodeById(guildId, entry.id);
@@ -488,25 +493,10 @@ export function citeMenu(guildId: string, sources: readonly { kind: 'episode' | 
     if (!episode) continue;
     options.push({ label: clip(`[${entry.label}]`, 100), description: clip(`${day(episode.at_ms)}${episode.kind ? ` ${episode.kind}` : ''} ${episode.title}`, 100), value: `e:${episode.id}` });
   }
-  return options.length ? select(`${PREFIX}:cite`, '📜 根拠を開く', options) : null;
-}
-
-/**
- * 回答の下の「根拠」。発言は、押すとその発言に飛ぶリンクボタン (1 行 5 個。最大 2 行)、出来事・記事は citeMenu のメニュー。
- * 本文には出典の目印を置かず、ここだけに並べる。何も無ければ空 (行を足さない)。
- */
-export function citeRows(
-  guildId: string,
-  { sources, messages }: { sources: readonly { kind: 'episode' | 'page'; id: number; label: string }[]; messages: readonly { url: string; label: string }[] }
-): (ButtonRow | MenuRow)[] {
-  const rows: (ButtonRow | MenuRow)[] = [];
-  const links = messages
-    .filter((entry) => /^https:\/\/discord\.com\/channels\/\d+\/\d+\/\d+$/.test(entry.url))
-    .map((entry) => new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(entry.url).setLabel(clip(entry.label, 80)));
-  for (let i = 0; i < links.length && rows.length < 2; i += 5) rows.push(buttonRow(...links.slice(i, i + 5)));
-  const menu = citeMenu(guildId, sources);
-  if (menu) rows.push(menu);
-  return rows;
+  const choices = uniqueOptions(options);
+  if (!choices.length) return null;
+  if (choices.length === 1 && choices[0]) return buttonRow(button(`${PREFIX}:cite:${choices[0].value}`, '根拠'));
+  return select(`${PREFIX}:cite`, '根拠', choices);
 }
 
 /** 原文を出してよいかを調べるチャンネル。アーカイブ済みのスレッドはキャッシュに無いので親で判定する (非公開スレッドは出さない)。 */
@@ -607,9 +597,17 @@ export async function handleMemoryComponent(interaction: MemoryInteraction): Pro
     const viewerQuotes = viewerQuoteFilter(interaction);
     const sharedQuotes = sharedQuoteFilter(interaction);
     if (action === 'noop') { await interaction.deferUpdate(); return true; }
-    // 回答の根拠のメニュー: 回答は書き換えず、選んだ人にだけ出来事の画面を出す
+    // 回答の根拠は、選んだ人にだけ出す。
     if (action === 'cite') {
-      const picked = interaction.isStringSelectMenu?.() ? interaction.values[0] ?? '' : '';
+      const picked = interaction.isStringSelectMenu?.() ? interaction.values[0] ?? '' : rest.join(':');
+      const [, channelId, messageId] = /^m:(\d{1,20}):(\d{1,20})$/.exec(picked) ?? [];
+      if (channelId && messageId) {
+        const content = viewerQuotes(channelId)
+          ? `[元の発言を開く](<https://discord.com/channels/${guildId}/${channelId}/${messageId}>)`
+          : 'この発言は開けません。';
+        await interaction.reply({ content, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+        return true;
+      }
       if (!/^[en]:\d{1,12}$/.test(picked)) { await interaction.deferUpdate(); return true; }
       await reply(fitShared(viewFor(guildId, picked, { canQuote: viewerQuotes })), { ephemeral: true });
       return true;

@@ -9,7 +9,11 @@
 import { DEFAULT_AGENT_ENGINE, agentModelFor, isAgentEngine } from './engines.js';
 import {
   AttachmentBuilder,
+  ChannelType,
   MessageReferenceType,
+  PermissionFlagsBits,
+  ThreadAutoArchiveDuration,
+  type AnyThreadChannel,
   type Client,
   type GuildMember,
   type Message,
@@ -18,7 +22,7 @@ import {
 } from 'discord.js';
 import { canBotAttach, canBotSpeak, canManageIndex, getChannelScope, getPublicChannelScope } from '../archive/permissions.js';
 import { memoryReader } from '../memory/recall.js';
-import { citeRows } from '../memory/explore.js';
+import { citeControl } from '../memory/explore.js';
 import { getEpisode, getNode, nameOf } from '../memory/store.js';
 import type { MeaningTrace } from '../memory/vectors.js';
 import { db as archiveDb } from '../archive/db.js';
@@ -36,10 +40,12 @@ import { softenUnverifiedQuotes } from './quotes.js';
 import { dropRestartedAnswer } from './repeat.js';
 import { agentConfig, agentEnabled } from './config.js';
 import {
+  CHAT_REPLY_CHARS,
   RefTable,
+  chunkForDiscord,
+  clipChatReply,
   expandCitationsDetailed,
-  fromDiscordMessage,
-  planAnswerDelivery
+  fromDiscordMessage
 } from './format.js';
 import { runAgent } from './llm.js';
 import { buildSystemPrompt, buildUserContent } from './prompt.js';
@@ -272,6 +278,56 @@ async function replyOrSend(message: Message<true>, payload: MessageReplyOptions)
     console.error('reply failed, sending to the channel instead:', errorMessage(error));
     return await message.channel.send(payload).catch(() => null);
   }
+}
+
+/** 長い返事は既存のスレッド内か、依頼メッセージから作ったスレッドに送る。 */
+export async function sendLongReply(
+  message: Message<true>,
+  me: GuildMember,
+  payload: MessageReplyOptions & { content: string },
+  onSent: (message: Message<true>) => void
+): Promise<boolean> {
+  const channel = message.channel;
+  let thread: AnyThreadChannel | null = channel.isThread() ? channel : message.thread;
+  if (!thread && (channel.type === ChannelType.GuildText || channel.type === ChannelType.GuildAnnouncement)) {
+    if (message.hasThread) {
+      thread = await channel.threads.fetch(message.id).catch(() => null);
+    } else if (channel.permissionsFor(me)?.has([PermissionFlagsBits.CreatePublicThreads, PermissionFlagsBits.SendMessagesInThreads])) {
+      thread = await message.startThread({ name: 'Vexちゃんの回答', autoArchiveDuration: ThreadAutoArchiveDuration.OneHour })
+        .catch((error: unknown) => {
+          console.warn('Could not open an answer thread:', errorMessage(error));
+          return null;
+        });
+    }
+  }
+  if (!thread || thread.locked || !canBotSpeak(thread, me)) return false;
+  const inThread = thread.id === channel.id;
+  if (!inThread && thread.parentId !== channel.id) return false;
+
+  const chunks = chunkForDiscord(payload.content);
+  if (!chunks.length) return false;
+  for (const [index, content] of chunks.entries()) {
+    const last = index === chunks.length - 1;
+    const parts: MessageReplyOptions = {
+      content,
+      allowedMentions: inThread && index === 0 ? PING_ASKER : NO_MENTIONS,
+      ...(last && payload.files?.length ? { files: payload.files } : {}),
+      ...(last && payload.components?.length ? { components: payload.components } : {})
+    };
+    const sent = inThread && index === 0
+      ? await replyOrSend(message, parts)
+      : await thread.send(parts).catch((error: unknown) => {
+        console.warn('Could not send in an answer thread:', errorMessage(error));
+        return null;
+      });
+    if (!sent) return false;
+    onSent(sent);
+  }
+  if (!inThread) {
+    const link = await replyOrSend(message, { content: `詳しい返事は <#${thread.id}> に置いたよ。`, allowedMentions: PING_ASKER });
+    if (link) onSent(link);
+  }
+  return true;
 }
 
 async function fetchRecent(
@@ -590,7 +646,7 @@ export async function handleAgentRequest(
       // 超えてもツールが外れるだけなので、答えはその場の材料で必ず書かれる。
       deadlineAt: Date.now() + agentConfig.deadlineMs,
       weigh: weighCost,
-      // 明示的な依頼だけ、調べずに答えそうなときに1回確かめさせる (lookup.ts)。
+      // 過去ログなど具体的な事実を聞かれたときだけ、根拠を1回確かめさせる (lookup.ts)。
       ...(!ambient && toolset.definitions.length > 0 ? { validate: lookupGuard({ request, usedTool: () => toolUsed }) } : {}),
       onToolCall: (name, args) => { if (countsAsLookup(name)) toolUsed = true; thinking.setStatus(toolLabel(name, args)); }
     });
@@ -621,26 +677,23 @@ export async function handleAgentRequest(
       ambient.report('passed');
       return;
     }
+    // 撮った・作ったのに貼れないときは黙らない (画像が出ている前提で読まれる)
+    const imageNotice = runContext.images.length > 0 && !runContext.canAttach
+      ? '\n\n-# (画像は用意したけど、このチャンネルにファイルを添付する権限が無くて貼れなかった)'
+      : '';
+    const label = modelLabel(model);
+    const body = softenUnverifiedQuotes(stripAddressNarration(dropRestartedAnswer(text), member.displayName), result.observed);
     // 出典は本文に残さず、回答の下の「根拠」に並べる (モデルは [3] / [e12] / [p:people/たこ] を書くだけ。ラベルはコードが作る)。
     // 発言は元の発言へ飛ぶリンクボタン、出来事・記事はメニューから Discord の中で開く (サイトが無くても開ける)
-    const expanded = text
-      ? expandCitationsDetailed(softenUnverifiedQuotes(stripAddressNarration(dropRestartedAnswer(text), member.displayName), result.observed), refs, {
-        label: modelLabel(model), selfId: client.user.id,
+    const renderReply = (content: string) => {
+      const expanded = content ? expandCitationsDetailed(content, refs, {
+        label, selfId: client.user.id,
         labels: { below: true, message: (entry) => citedMessageLabel(guild, entry), episode: (id) => memoryEpisodeLabel(guild.id, id), page: (path) => memoryPageLabel(guild.id, path) }
-      })
-      : null;
-    const answer = expanded ? expanded.text : 'うまく答えをまとめられませんでした。条件を絞ってもう一度聞いてください。';
-    const citeRowList = expanded ? citeRows(guild.id, expanded) : [];
-
-    // 撮った・作ったのに貼れないときは黙らない (画像が出ている前提で読まれる)
-    const blocked = runContext.images.length > 0 && !runContext.canAttach;
-    const delivery = planAnswerDelivery(
-      blocked
-        ? `${answer}\n\n-# (画像は用意したけど、このチャンネルにファイルを添付する権限が無くて貼れなかった)`
-        : answer,
-      runContext.canAttach
-    );
-    const chunks = delivery.chunks;
+      }) : null;
+      const evidence = expanded ? citeControl(guild.id, expanded) : null;
+      const rendered = expanded?.text ?? 'うまく答えをまとめられませんでした。条件を絞ってもう一度聞いてください。';
+      return { content: rendered + imageNotice, ...(evidence ? { components: [evidence] } : {}) };
+    };
 
     // 送る直前にもう一度。調べている間に誰かが話し始めていたら割り込まない
     if (ambient && !(await ambient.stillLatest().catch(() => false))) {
@@ -656,28 +709,17 @@ export async function handleAgentRequest(
         return file;
       })
       : [];
-    if (delivery.markdown !== null) {
-      files.push(new AttachmentBuilder(Buffer.from(delivery.markdown, 'utf8'), { name: 'answer.md' }));
-    }
-
-    for (const [index, chunk] of chunks.entries()) {
-      const payload: MessageReplyOptions = {
-        content: chunk,
-        // 1通目だけ聞いた人に通知する。2通目以降で鳴らすと同じ答えで2回鳴る。
-        // モデルの文章に @everyone / ロールが入っていても、どちらも parse が空なので通知にならない。
-        allowedMentions: index === 0 && !ambient ? PING_ASKER : NO_MENTIONS,
-        // 添付と根拠のメニューは最後のメッセージにまとめてつける
-        ...(index === chunks.length - 1 && files.length > 0 ? { files } : {}),
-        ...(index === chunks.length - 1 && citeRowList.length > 0 ? { components: citeRowList } : {})
-      };
-
-      const sent = index === 0
-        ? await replyOrSend(message, payload)
-        : await message.channel.send(payload);
-      if (index === 0 && sent) timings.first_reply = performance.now() - startedAt;
-
-      // これへのリプライを会話の続きとして受け付ける
-      rememberOwnReply(sent?.id, reservation.id);
+    const onSent = (sent: Message<true>) => {
+      timings.first_reply ??= performance.now() - startedAt;
+      rememberOwnReply(sent.id, reservation.id);
+    };
+    const full = renderReply(body);
+    const long = full.content.length > CHAT_REPLY_CHARS;
+    const attachments = files.length ? { files } : {};
+    if (!long || ambient || !(await sendLongReply(message, me, { ...full, ...attachments }, onSent))) {
+      const reply = long ? renderReply(clipChatReply(body, `\n\n-# ${label}`.length + imageNotice.length)) : full;
+      const sent = await replyOrSend(message, { ...reply, ...attachments, allowedMentions: ambient ? NO_MENTIONS : PING_ASKER });
+      if (sent) onSent(sent);
     }
     outcome = timings.first_reply === undefined ? 'send_failed' : 'sent';
     ambient?.report('sent');

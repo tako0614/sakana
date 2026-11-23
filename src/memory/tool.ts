@@ -267,15 +267,7 @@ export async function runMemoryToolWithMeaning(ctx: MemoryToolContext, args: Mem
 export function memoryRootPrompt(guildId: string): string {
   if (!hasMemory(guildId)) return '';
   const root = getNode(guildId, '');
-  const lines = [
-    '## 記憶',
-    'このサーバーの過去ログ (公開チャンネル) を整理した「記憶」の根。会話に出た名前から思い出したことは入力に添える。'
-      + '足りなければ memory ツールでページ・つながり・出来事をたどり、根拠が要るときは episode で元の発言を開いて引用番号で示す。'
-      + '思い出したいことが決まっているが探す当てが無いときは、memory_focus で伝えると近い記憶の指し先が次の往復で足される。'
-      + '記憶は要約なので、言い切る前に根拠を確かめる。'
-  ];
-  if (root?.body) lines.push('', root.body);
-  lines.push('');
+  const lines = root?.body ? [root.body, ''] : [];
   for (const top of topLevels(guildId)) {
     const children = listChildren(guildId, top, 30);
     if (children.length === 0) continue;
@@ -287,6 +279,7 @@ export function memoryRootPrompt(guildId: string): string {
     }
     lines.push(line.replace(/,$/, ''));
   }
-  const text = lines.join('\n');
+  const quoted = lines.join('\n').split('\n').map((line) => `> ${line}`).join('\n');
+  const text = `## 記憶の目次（参照資料）\n${quoted}`;
   return text.length > ROOT_PROMPT_CHARS ? `${text.slice(0, ROOT_PROMPT_CHARS)}…` : text;
 }

@@ -224,7 +224,7 @@ assert.match(embedText(search.calls[1][1]), /統治機能を作った/);
 }
 
 // explore: メニューでたどる。部品は Discord の制限内で組み立てられる
-const { citeMenu, citeRows, handleMemoryComponent, rootView } = await import('../src/memory/explore.js');
+const { citeControl, handleMemoryComponent, rootView } = await import('../src/memory/explore.js');
 const explore = interaction({ sub: 'explore', admin: false, options: { path: '' } });
 await memoryCommand.execute(explore);
 const first = explore.calls[1][1];
@@ -340,12 +340,12 @@ assert.deepEqual(siteButtons(episodeJson).map((b) => b.custom_id), [`memx:site:e
   assert.equal(siteButtons(json(open.updates[0])).length, 1, 'the button is back once the site is on');
 }
 {
-  // 回答の根拠のメニュー: 本文に [出来事の題] と書いた出来事を並べ、選ぶと、選んだ人にだけ出来事の画面を出す (サイトが off でも)
+  // 回答の根拠は同じメニューに並び、選んだ人にだけ開く (サイトが off でも)
   store.setSiteAccess(GUILD, 'off');
-  const row = citeMenu(GUILD, [
+  const row = citeControl(GUILD, { messages: [], sources: [
     { kind: 'episode', id: episodeId, label: '統治機能を作った' }, { kind: 'episode', id: 999999, label: '無い出来事' },
     { kind: 'page', id: Number(siteNodeId), label: 'たこの記事' }, { kind: 'page', id: 999999, label: '無い記事' }
-  ]);
+  ] });
   assert.ok(row, 'an existing episode makes a menu');
   const menu = row.toJSON().components[0];
   assert.equal(menu.custom_id, 'memx:cite');
@@ -354,8 +354,8 @@ assert.deepEqual(siteButtons(episodeJson).map((b) => b.custom_id), [`memx:site:e
   assert.match(menu.options[0].description, /統治機能を作った/);
   assert.equal(menu.options[1].label, '[たこの記事]');
   assert.match(menu.options[1].description, /^記事 people\/たこ/);
-  assert.equal(citeMenu(GUILD, [{ kind: 'episode', id: 999999, label: 'x' }, { kind: 'page', id: 999999, label: 'y' }]), null, 'no menu without anything to open');
-  assert.equal(citeMenu(GUILD, []), null);
+  assert.equal(citeControl(GUILD, { messages: [], sources: [{ kind: 'episode', id: 999999, label: 'x' }, { kind: 'page', id: 999999, label: 'y' }] }), null, 'no menu without anything to open');
+  assert.equal(citeControl(GUILD, { messages: [], sources: [] }), null);
 
   const pick = click({ customId: 'memx:cite', values: [`e:${episodeId}`], allowReply: true });
   assert.equal(await handleMemoryComponent(pick), true);
@@ -367,20 +367,37 @@ assert.deepEqual(siteButtons(episodeJson).map((b) => b.custom_id), [`memx:site:e
   assert.deepEqual(siteButtons(shown), [], 'no site button while the site is off');
   checkLimits(shown, 'cite');
 
-  // 回答の下の根拠: 発言はリンクボタン (1 行 5 個・最大 2 行)、そのあとにメニュー。中身が無ければ行を足さない
+  // 発言と記憶が混ざっていても同じ1行に入る。発言のリンクを出す前に選んだ人の権限を確認する
   const messageUrl = (n) => `https://discord.com/channels/${GUILD}/${CHANNEL}/14000000000000000${String(n).padStart(2, '0')}`;
-  const rowsOf = citeRows(GUILD, {
+  const mixed = citeControl(GUILD, {
     sources: [{ kind: 'episode', id: episodeId, label: '統治機能を作った' }],
-    messages: Array.from({ length: 7 }, (_, i) => ({ url: messageUrl(i + 1), label: `たこのメッセージ${i ? '②' : ''}` }))
-  }).map((r) => r.toJSON());
-  assert.deepEqual(rowsOf.map((r) => r.components.length), [5, 2, 1], 'buttons 5 + 2, then the menu');
-  assert.equal(rowsOf[0].components[0].style, 5, 'a link button');
-  assert.equal(rowsOf[0].components[0].url, messageUrl(1));
-  assert.equal(rowsOf[0].components[0].custom_id, undefined, 'a link button has no custom id');
-  assert.equal(rowsOf[2].components[0].custom_id, 'memx:cite');
-  assert.equal(citeRows(GUILD, { sources: [], messages: [] }).length, 0, 'nothing to show, no rows');
-  assert.equal(citeRows(GUILD, { sources: [], messages: [{ url: 'https://evil.example/x', label: 'x' }] }).length, 0, 'only Discord message links become buttons');
-  assert.ok(citeRows(GUILD, { sources: [], messages: Array.from({ length: 14 }, (_, i) => ({ url: messageUrl(i + 1), label: `m${i}` })) }).length <= 2, 'at most two rows of buttons');
+    messages: Array.from({ length: 7 }, (_, i) => ({ url: messageUrl(i + 1), label: `たこのメッセージ${i + 1}` }))
+  }).toJSON();
+  assert.equal(mixed.components.length, 1);
+  const mixedMenu = mixed.components[0];
+  assert.equal(mixedMenu.placeholder, '根拠');
+  assert.equal(mixedMenu.options.length, 8);
+  assert.equal(mixedMenu.options[0].value, `m:${CHANNEL}:1400000000000000001`);
+  assert.equal(mixedMenu.options.at(-1).value, `e:${episodeId}`);
+  assert.equal(citeControl(GUILD, { sources: [], messages: [
+    { url: 'https://evil.example/x', label: 'x' },
+    { url: messageUrl(1).replace(GUILD, '910000000000000002'), label: '別のサーバー' }
+  ] }), null, 'only message links to this guild can be selected');
+
+  const original = click({ customId: 'memx:cite', values: [mixedMenu.options[0].value], allowReply: true });
+  await handleMemoryComponent(original);
+  assert.equal(original.replies[0].flags, MessageFlags.Ephemeral);
+  assert.equal(original.replies[0].content, `[元の発言を開く](<${messageUrl(1)}>)`);
+  const single = citeControl(GUILD, { sources: [], messages: [{ url: messageUrl(1), label: '発言' }] }).toJSON().components[0];
+  assert.equal(single.type, 2, 'one source uses a small button');
+  assert.equal(single.label, '根拠');
+  const pressed = click({ customId: single.custom_id, allowReply: true });
+  await handleMemoryComponent(pressed);
+  assert.deepEqual(pressed.replies, original.replies, 'the button uses the same private link');
+  const hidden = click({ customId: 'memx:cite', values: [`m:${ROLE_GATED}:1400000000000000001`], allowReply: true });
+  await handleMemoryComponent(hidden);
+  assert.equal(hidden.replies[0].flags, MessageFlags.Ephemeral);
+  assert.equal(hidden.replies[0].content, 'この発言は開けません。');
 
   // 記事を選ぶと、その記事の画面が選んだ人にだけ出る
   const pickPage = click({ customId: 'memx:cite', values: [`n:${siteNodeId}`], allowReply: true });
