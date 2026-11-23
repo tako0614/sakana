@@ -38,7 +38,8 @@ import { agentEnabled } from './agent/config.js';
 import { sweepStaleIndicators } from './agent/indicators.js';
 import { isAgentBanned, pruneCalls } from './agent/ratelimit.js';
 import { sweepEnabledGuilds } from './archive/embed-job.js';
-import { sweepMemoryVectors } from './memory/vectors.js';
+import { hasVectors, sweepMemoryVectors } from './memory/vectors.js';
+import { memoryWorker } from './embed/worker.js';
 import { embedConfig } from './embed/config.js';
 import { governanceConfig } from './governance/config.js';
 import { handleGovernanceComponent } from './governance/commands.js';
@@ -167,6 +168,18 @@ client.once(Events.ClientReady, (readyClient) => {
       ? 'AI agent is enabled. Mention the bot to use it.'
       : 'OPENROUTER_API_KEY is not set. The AI agent is disabled.'
   );
+
+  // 起動後の最初の記憶検索でモデル cold start を避ける。利用可能な記憶ベクトルが
+  // 許可サーバーにあり、エージェントと意味検索が有効な場合だけ、バックグラウンドで一度起動する。
+  if (agentEnabled && embedConfig.enabled && embedConfig.prewarm) {
+    try {
+      if (readyClient.guilds.cache.some((guild) => isAllowedGuild(guild.id) && hasVectors(guild.id))) {
+        memoryWorker().prewarm();
+      }
+    } catch (error) {
+      console.error('Failed to check memory vectors before worker prewarm:', error);
+    }
+  }
 
   // 許可していないサーバーに入っていたら出る
   enforceGuildAllowlist(readyClient).catch((error: unknown) => {

@@ -20,7 +20,9 @@ import { canBotAttach, canBotSpeak, canManageIndex, getChannelScope, getPublicCh
 import { memoryReader } from '../memory/recall.js';
 import { citeRows } from '../memory/explore.js';
 import { getEpisode, getNode, nameOf } from '../memory/store.js';
+import type { MeaningTrace } from '../memory/vectors.js';
 import { db as archiveDb } from '../archive/db.js';
+import { isChannelAllowed } from '../archive/search.js';
 import { isSelfHosted } from '../mimic/client.js';
 import { engineFor } from '../mimic/prefs.js';
 import { handleMimicRequest } from '../mimic/respond.js';
@@ -35,9 +37,9 @@ import { dropRestartedAnswer } from './repeat.js';
 import { agentConfig, agentEnabled } from './config.js';
 import {
   RefTable,
-  chunkForDiscord,
   expandCitationsDetailed,
-  fromDiscordMessage
+  fromDiscordMessage,
+  planAnswerDelivery
 } from './format.js';
 import { runAgent } from './llm.js';
 import { buildSystemPrompt, buildUserContent } from './prompt.js';
@@ -447,6 +449,10 @@ export async function handleAgentRequest(
   let indicator: Indicator | null = null;
   let ctx: AgentContext | null = null;
   const timings: Record<string, number> = {};
+  const recallOutcomes = new Map<MeaningTrace['status'], number>();
+  let recallCandidates = 0;
+  let recallSelected = 0;
+  let recallShown = 0;
   let modelCalls = 0;
   let outcome = 'failed';
   const measure = async <T>(phase: string, work: () => Promise<T>): Promise<T> => {
@@ -521,9 +527,23 @@ export async function handleAgentRequest(
     const system = buildSystemPrompt(runContext, toolset);
     const request = stripMention(message.content, client.user.id);
     const bareCall = !ambient && replyChain.length === 0 && vexConfig.call && isBareNameCall(request);
+    const requestMessage = { ...fromDiscordMessage(message), referenceState: replyChain.referenceState };
+    const canBorrowContext = requestMessage.structure?.reference.kind === 'none'
+      && isChannelAllowed(message.channelId, runContext.channelScope);
     const recall = toolset.memoryAvailable ? memoryReader(guild.id, {
       request: bareCall ? '' : request,
-      reply: replyChain.at(-1)?.content ?? ''
+      reply: replyChain.at(-1)?.content ?? '',
+      recent: canBorrowContext ? recent.filter((entry) => !entry.isBot && !entry.structure?.webhookId && !entry.deleted
+        && entry.createdAt <= requestMessage.createdAt && entry.createdAt > requestMessage.createdAt - 15 * 60_000)
+        .slice(-3).map((entry) => entry.content) : [],
+      callNames: vexConfig.call ? vexConfig.names : [],
+      onTrace: ({ status, embedMs, searchMs, candidateCounts, selectedCounts }) => {
+        recallOutcomes.set(status, (recallOutcomes.get(status) ?? 0) + 1);
+        timings.recall_embed = (timings.recall_embed ?? 0) + embedMs;
+        timings.recall_search = (timings.recall_search ?? 0) + searchMs;
+        recallCandidates += candidateCounts.episode + candidateCounts.claim + candidateCounts.chunk;
+        recallSelected += selectedCounts.episode + selectedCounts.claim + selectedCounts.chunk;
+      }
     }) : null;
     const userContent = buildUserContent({
       ctx: runContext,
@@ -531,7 +551,7 @@ export async function handleAgentRequest(
       ...(ambient ? { ambientHint: ambient.continuation ? CONTINUE_HINT : AMBIENT_HINT } : {}),
       recent,
       replyChain,
-      requestMessage: { ...fromDiscordMessage(message), referenceState: replyChain.referenceState },
+      requestMessage,
       refs
     });
 
@@ -540,7 +560,11 @@ export async function handleAgentRequest(
       model,
       guildId: guild.id,
       // 初回も途中も runtime がモデルを呼ぶ前に同じ検索を使う。
-      ...(recall ? { memory: { read: (query) => measure('recall', () => recall(query)) } } : {}),
+      ...(recall ? { memory: { read: async (query) => {
+        const memory = await measure('recall', () => recall(query));
+        if (memory) recallShown++;
+        return memory;
+      } } } : {}),
       // Discord input identity survives a process restart, so an unfinished
       // run resumes from its checkpoint instead of starting over. Completed
       // runs still use the runtime's default reuseCompleted=false behavior if
@@ -610,11 +634,13 @@ export async function handleAgentRequest(
 
     // 撮った・作ったのに貼れないときは黙らない (画像が出ている前提で読まれる)
     const blocked = runContext.images.length > 0 && !runContext.canAttach;
-    const chunks = chunkForDiscord(
+    const delivery = planAnswerDelivery(
       blocked
         ? `${answer}\n\n-# (画像は用意したけど、このチャンネルにファイルを添付する権限が無くて貼れなかった)`
-        : answer
+        : answer,
+      runContext.canAttach
     );
+    const chunks = delivery.chunks;
 
     // 送る直前にもう一度。調べている間に誰かが話し始めていたら割り込まない
     if (ambient && !(await ambient.stillLatest().catch(() => false))) {
@@ -630,6 +656,9 @@ export async function handleAgentRequest(
         return file;
       })
       : [];
+    if (delivery.markdown !== null) {
+      files.push(new AttachmentBuilder(Buffer.from(delivery.markdown, 'utf8'), { name: 'answer.md' }));
+    }
 
     for (const [index, chunk] of chunks.entries()) {
       const payload: MessageReplyOptions = {
@@ -674,7 +703,10 @@ export async function handleAgentRequest(
       .map(([phase, duration]) => [phase, Math.round(duration)]));
     console.info('Agent timings', JSON.stringify({
       mode: ambient ? 'ambient' : 'requested', model, modelCalls, outcome,
-      inputTokens: usage.prompt_tokens, ms
+      inputTokens: usage.prompt_tokens, ms,
+      ...(recallOutcomes.size ? {
+        recall: { outcomes: Object.fromEntries(recallOutcomes), candidates: recallCandidates, selected: recallSelected, injectedRounds: recallShown }
+      } : {})
     }));
     // 取りこぼしの保険。stop() は何度呼んでも安全。
     await indicator?.stop();

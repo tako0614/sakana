@@ -68,6 +68,8 @@ export interface WorkerSettings {
   threads: number;
   microBatch: number;
   nice: number;
+  /** ワーカー固有の idle lifetime。未指定なら会話ログ用の設定を使う。 */
+  idleMs?: number;
   prefixQuery?: string | undefined;
   prefixPassage?: string | undefined;
 }
@@ -131,7 +133,7 @@ export function createEmbedWorker(settings: WorkerSettings): EmbedWorker {
 
     idleTimer = setTimeout(() => {
       if (pending.size === 0 && queue.length === 0) shutdown();
-    }, embedConfig.idleMs);
+    }, settings.idleMs ?? embedConfig.idleMs);
     idleTimer.unref?.();
   }
 
@@ -436,7 +438,7 @@ let memory: EmbedWorker | null = null;
 /** 記憶用のワーカー。記憶のモデルが会話ログと同じなら、同じワーカーを使う (python を二つ起こさない)。 */
 export function memoryWorker(): EmbedWorker {
   if (embedConfig.memory.modelName === embedConfig.modelName) return archiveWorker;
-  memory ??= createEmbedWorker(embedConfig.memory);
+  memory ??= createEmbedWorker({ ...embedConfig.memory, idleMs: embedConfig.memoryIdleMs });
   return memory;
 }
 

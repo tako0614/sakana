@@ -38,6 +38,9 @@ export const embedConfig = {
   queryTimeoutMs: number(process.env.SEMANTIC_QUERY_TIMEOUT_MS, 20_000),
   // 使われない間は落とす。24時間 1GiB 常駐させない。
   idleMs: number(process.env.SEMANTIC_IDLE_MS, 600_000),
+  // 記憶検索は起動後の最初の質問で cold start を避けるため、検索が続く間は長めに保つ。
+  // 会話ログ用ワーカーの既定 idleMs には影響させない。
+  memoryIdleMs: number(process.env.MEMORY_EMBED_IDLE_MS, 30 * 60_000),
   prewarm: flag(process.env.SEMANTIC_PREWARM, true),
 
   // 埋め込む対象の絞り込み。

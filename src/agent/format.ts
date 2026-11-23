@@ -795,3 +795,22 @@ export function chunkForDiscord(text: unknown, limit = 1900, maxChunks = 3): str
 
   return chunks.filter(Boolean);
 }
+
+export interface AnswerDeliveryPlan {
+  /** Discord に送る本文。長文添付時は案内文のみ。 */
+  chunks: string[];
+  /** 添付権限がありチャットの表示枠を超える場合の、欠落のない Markdown 本文。 */
+  markdown: string | null;
+}
+
+/**
+ * 通常は本文をチャットで返す。分割しても長い場合は Markdown 添付にする。
+ * 添付できない場面では、表示枠を広げて分割する。
+ */
+export function planAnswerDelivery(text: string, canAttach: boolean): AnswerDeliveryPlan {
+  const content = text.trim();
+  if (!canAttach) return { chunks: chunkForDiscord(content, 1900, 6), markdown: null };
+  const chunks = chunkForDiscord(content, 1900, 4);
+  if (chunks.length <= 3) return { chunks, markdown: null };
+  return { chunks: ['全文は添付の Markdown にまとめたよ。'], markdown: content };
+}

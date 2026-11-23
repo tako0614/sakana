@@ -286,19 +286,24 @@ export function nearest(guildId: string, kind: Kind, query: Float32Array, { limi
 let coldUntil = 0;
 const COLD_SKIP_MS = 30_000;
 
-export async function embedQuery(text: string, { timeoutMs = 3000 }: { timeoutMs?: number } = {}): Promise<Float32Array | null> {
+type QueryEmbedding = { vector: Float32Array | null; status: 'ok' | 'cold_or_timeout' | 'embed_failure' };
+
+async function queryEmbedding(text: string, timeoutMs: number): Promise<QueryEmbedding> {
   const clean = text.replace(/\s+/g, ' ').trim().slice(0, 1200);
-  if (!clean || !embedConfig.enabled || memoryWorker().isDisabled()) return null;
+  if (!clean || !embedConfig.enabled || memoryWorker().isDisabled()) return { vector: null, status: 'embed_failure' };
   const real = embedder === defaultEmbed;
   const cold = real && memoryWorker().workerInfo() === null;
   if (cold) {
     memoryWorker().prewarm();
-    if (Date.now() < coldUntil) return null;
+    if (Date.now() < coldUntil) return { vector: null, status: 'cold_or_timeout' };
   }
-  const work = embedder([clean], 'query').then((reply) => decode(reply.vectors[0] ?? '', reply.dim), () => null);
+  const work = embedder([clean], 'query').then((reply): QueryEmbedding => {
+    const vector = decode(reply.vectors[0] ?? '', reply.dim);
+    return { vector, status: vector ? 'ok' : 'embed_failure' };
+  }, (): QueryEmbedding => ({ vector: null, status: 'embed_failure' }));
   let timer: NodeJS.Timeout | undefined;
   let timedOut = false;
-  const limit = new Promise<null>((resolve) => { timer = setTimeout(() => { timedOut = true; resolve(null); }, timeoutMs); });
+  const limit = new Promise<QueryEmbedding>((resolve) => { timer = setTimeout(() => { timedOut = true; resolve({ vector: null, status: 'cold_or_timeout' }); }, timeoutMs); });
   try {
     return await Promise.race([work, limit]);
   } finally {
@@ -307,11 +312,24 @@ export async function embedQuery(text: string, { timeoutMs = 3000 }: { timeoutMs
   }
 }
 
+export async function embedQuery(text: string, { timeoutMs = 3000 }: { timeoutMs?: number } = {}): Promise<Float32Array | null> {
+  return (await queryEmbedding(text, timeoutMs)).vector;
+}
+
 export interface MeaningNode { path: string; summary: string; score: number }
 export interface MeaningEpisode { id: number; kind: string; title: string; atMs: number; score: number }
 /** ページの中の1つの知識 (まとめた断片なら、その中で質問にいちばん近い行を line に)。episodeIds は根拠の出来事 (開くと原文までたどれる)。 */
 export interface MeaningChunk { id: number; path: string; heading: string; text: string; line: string; episodeIds: number[]; score: number; more: number; claim?: ClaimView }
 export interface Meaning { nodes: MeaningNode[]; episodes: MeaningEpisode[]; chunks: MeaningChunk[] }
+export interface MeaningTrace {
+  status: 'no_vectors' | 'cold_or_timeout' | 'embed_failure' | 'no_candidates' | 'below_cutoff' | 'matched';
+  embedMs: number;
+  searchMs: number;
+  candidateCounts: { node: number; episode: number; claim: number; chunk: number };
+  selectedCounts: { node: number; episode: number; claim: number; chunk: number };
+}
+
+export interface AutoRecallAnchor { anchorText: string; mentionedUserIds?: readonly string[] }
 
 // 1位からこれ以上離れたものは捨てる。e5 は無関係な文どうしでも高い値が出るので、順位と1位との差でも絞る。
 // 本番の実データで測った (2026-10-17、ページ 4,242 件・出来事 11,917 件): 関係のある質問の1位は 0.87〜0.91、
@@ -327,19 +345,146 @@ const chunkFloor = Number(process.env.MEMORY_CHUNK_FLOOR ?? 0.865);
 /** 1ページから出す節の上限 (同じページの似た節で枠を埋めない)。 */
 const CHUNKS_PER_PAGE = 2;
 
+const emptyCounts = (): MeaningTrace['candidateCounts'] => ({ node: 0, episode: 0, claim: 0, chunk: 0 });
+const normalized = (text: string): string => text.normalize('NFKC').toLowerCase();
+
+// Only the request/reply anchor supplies exact evidence. Unquoted common prose
+// never lowers the semantic floor. Cap both the number of terms and the bonus.
+interface AnchorEvidence { quoted: string[]; latin: RegExp[]; months: ReadonlySet<string>; people: ReadonlySet<string> }
+
+function anchorEvidence(anchor: AutoRecallAnchor): AnchorEvidence {
+  const raw = anchor.anchorText.slice(0, 1200).normalize('NFKC');
+  const text = raw.toLowerCase();
+  const quoted = [...text.matchAll(/[「『"`']([^」』"`']{3,40})[」』"`']/g)]
+    .map((match) => match[1]?.trim() ?? '').filter((term) => /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(term)).slice(0, 6);
+  const latin = [...new Set((raw.match(/\b(?:[A-Z][A-Za-z0-9_.-]{3,30}|[A-Za-z][A-Za-z0-9]*[._-][A-Za-z0-9._-]{2,30})\b/g) ?? [])
+    .map(normalized))].slice(0, 8).map((term) => new RegExp(`(^|[^a-z0-9])${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^a-z0-9])`, 'i'));
+  const months = new Set([...new Set(text.match(/\b20\d{2}-(?:0[1-9]|1[0-2])\b/g) ?? [])].slice(0, 4));
+  for (const match of text.matchAll(/(20\d{2})年(1[0-2]|0?[1-9])月/g)) {
+    if (months.size >= 4) break;
+    months.add(`${match[1]}-${(match[2] ?? '').padStart(2, '0')}`);
+  }
+  return { quoted, latin, months, people: new Set(anchor.mentionedUserIds ?? []) };
+}
+
+function anchorBonus(text: string, atMs: number, evidence: AnchorEvidence, personId?: string | null): number {
+  const body = evidence.quoted.length || evidence.latin.length ? normalized(text) : '';
+  let bonus = 0;
+  if (evidence.quoted.some((term) => body.includes(term))) bonus += 0.03;
+  for (const term of evidence.latin) if (term.test(body)) bonus += 0.015;
+  if (personId && evidence.people.has(personId)) bonus += 0.035;
+  if (evidence.months.size) {
+    const date = new Date(atMs + 9 * 3_600_000);
+    if (Number.isFinite(date.getTime()) && evidence.months.has(date.toISOString().slice(0, 7))) bonus += 0.005;
+  }
+  return Math.min(0.035, bonus);
+}
+
+function autoMeaning(guildId: string, query: Float32Array, anchor: AutoRecallAnchor,
+  { episodeLimit, chunkLimit, excludeEpisodes, excludeChunks, minScore }: {
+    episodeLimit: number; chunkLimit: number; excludeEpisodes?: ReadonlySet<number>; excludeChunks?: ReadonlySet<number>; minScore?: number;
+  }, counts: MeaningTrace['candidateCounts']): Meaning {
+  const db = memoryDb();
+  const episodeRaw = episodeLimit > 0 ? nearest(guildId, 'episode', query, { limit: 32, exclude: excludeEpisodes }) : [];
+  const claimRaw = chunkLimit > 0 ? nearest(guildId, 'claim', query, { limit: 64, exclude: excludeChunks }) : [];
+  counts.episode = episodeRaw.length;
+  counts.claim = claimRaw.length;
+  const evidence = anchorEvidence(anchor);
+  const bestClaim = claimRaw[0]?.score ?? -Infinity;
+  const base = minScore ?? chunkFloor;
+  const hasClaimAnchor = evidence.quoted.length > 0 || evidence.latin.length > 0 || evidence.people.size > 0;
+  const possibleClaims = claimRaw.filter((hit) =>
+    (hit.score >= base && hit.score >= bestClaim - chunkGap) || (hasClaimAnchor && hit.score >= base - 0.02));
+  const claims = loadClaims(guildId, possibleClaims.map((hit) => hit.id));
+  const ranked = possibleClaims.flatMap((hit) => {
+    const claim = claims.get(hit.id);
+    if (!claim || (!claim.path && claim.episodeId === null)) return [];
+    const bonus = anchorBonus(`${claim.who} ${claim.text}`, claim.asOf, evidence, claim.personId);
+    const semantic = hit.score >= base && hit.score >= bestClaim - chunkGap;
+    const anchored = bonus > 0.005 && hit.score >= base - Math.min(0.02, bonus);
+    return semantic || anchored ? [{ claim, score: hit.score, rank: hit.score + bonus }] : [];
+  }).sort((a, b) => b.rank - a.rank || b.score - a.score);
+  const unique = new Map<string, (typeof ranked)[number]>();
+  for (const item of ranked) {
+    const c = item.claim;
+    const modality = c.modality === 'self_report' ? 'plain' : c.modality;
+    const key = c.entityId === null ? String(c.id) : JSON.stringify([c.entityId, c.episodeId, c.type, c.asOf, modality, c.hedged, normalized(c.text).replace(/[\s、。]/g, '')]);
+    const previous = unique.get(key);
+    if (!previous || (previous.claim.modality === 'plain' && c.modality === 'self_report')) unique.set(key, item);
+  }
+  const chunks: MeaningChunk[] = [];
+  const used = new Set<number>();
+  const perPage = new Map<string, number>();
+  const perEpisode = new Map<number, number>();
+  // One claim per source first; a second pass fills remaining slots without
+  // letting repeated claims from one episode crowd out independent evidence.
+  for (const sourceCap of [1, 2]) for (const { claim, score } of unique.values()) {
+    if (chunks.length >= chunkLimit || used.has(claim.id)) continue;
+    if (claim.path && (perPage.get(claim.path) ?? 0) >= CHUNKS_PER_PAGE) continue;
+    const source = claim.episodeId;
+    if (source !== null && (perEpisode.get(source) ?? 0) >= sourceCap) continue;
+    used.add(claim.id);
+    if (claim.path) perPage.set(claim.path, (perPage.get(claim.path) ?? 0) + 1);
+    if (source !== null) perEpisode.set(source, (perEpisode.get(source) ?? 0) + 1);
+    chunks.push({ id: claim.id, path: claim.path, heading: '', text: claim.text, line: claim.text, episodeIds: source === null ? [] : [source], score, more: 0, claim });
+  }
+  const selectedSources = new Set(chunks.flatMap((chunk) => chunk.episodeIds));
+  const availableEpisodes = episodeRaw.filter((hit) => !selectedSources.has(hit.id));
+  const bestEpisode = availableEpisodes[0]?.score ?? -Infinity;
+  const episodeFloor = minScore ?? floor;
+  const episodes: MeaningEpisode[] = [];
+  const hasEpisodeAnchor = evidence.quoted.length > 0 || evidence.latin.length > 0;
+  const possibleEpisodes = availableEpisodes.filter((hit) =>
+    (hit.score >= episodeFloor && hit.score >= bestEpisode - gap) || (hasEpisodeAnchor && hit.score >= episodeFloor - 0.02));
+  const readEpisode = db.prepare<[string, number], { id: number; kind: string; title: string; summary: string; at_ms: number }>(
+    'SELECT id, kind, title, summary, at_ms FROM episodes WHERE guild_id = ? AND id = ?');
+  const rankedEpisodes = possibleEpisodes.flatMap((hit) => {
+    const row = readEpisode.get(guildId, hit.id);
+    if (!row) return [];
+    const bonus = anchorBonus(`${row.title} ${row.kind} ${row.summary ?? ''}`, row.at_ms, evidence);
+    const semantic = hit.score >= episodeFloor && hit.score >= bestEpisode - gap;
+    const anchored = bonus > 0.005 && hit.score >= episodeFloor - Math.min(0.02, bonus);
+    return semantic || anchored ? [{ row, score: hit.score, rank: hit.score + bonus }] : [];
+  }).sort((a, b) => b.rank - a.rank || b.score - a.score);
+  for (const { row, score } of rankedEpisodes.slice(0, episodeLimit)) {
+    episodes.push({ id: row.id, kind: row.kind, title: row.title, atMs: row.at_ms, score });
+  }
+  return { nodes: [], episodes, chunks };
+}
+
 /**
  * 文に意味が近いページ・出来事・ページの中の1つの知識。ベクトルが無い・間に合わない・近いものが無ければ null。
  * 自動想起では minScore に関係の下限を渡し、明示的な検索では既定の下限を使う。
  */
 export async function meaningOf(guildId: string, text: string,
-  { nodeLimit = 2, episodeLimit = 3, chunkLimit = 3, excludePaths, excludeEpisodes, excludeChunks, timeoutMs = 3000, minScore }: {
+  { nodeLimit = 2, episodeLimit = 3, chunkLimit = 3, excludePaths, excludeEpisodes, excludeChunks, timeoutMs = 3000, minScore, autoRecall, onTrace }: {
     nodeLimit?: number; episodeLimit?: number; chunkLimit?: number; excludePaths?: ReadonlySet<string>; excludeEpisodes?: ReadonlySet<number>;
     excludeChunks?: ReadonlySet<number>; timeoutMs?: number;
-    minScore?: number;
+    minScore?: number; autoRecall?: AutoRecallAnchor; onTrace?: (trace: MeaningTrace) => void;
   } = {}): Promise<Meaning | null> {
-  if (!text.trim() || !hasVectors(guildId)) return null;
-  const query = await embedQuery(text, { timeoutMs });
-  if (!query) return null;
+  const candidateCounts = emptyCounts();
+  const selectedCounts = emptyCounts();
+  let embedMs = 0;
+  let searchMs = 0;
+  const emit = (status: MeaningTrace['status']): void => {
+    try { onTrace?.({ status, embedMs, searchMs, candidateCounts, selectedCounts }); } catch { /* diagnostics cannot fail recall */ }
+  };
+  if (!text.trim()) { emit('no_candidates'); return null; }
+  if (!hasVectors(guildId)) { emit('no_vectors'); return null; }
+  const embedStart = performance.now();
+  const embedded = await queryEmbedding(text, timeoutMs);
+  embedMs = performance.now() - embedStart;
+  if (!embedded.vector) { emit(embedded.status === 'cold_or_timeout' ? 'cold_or_timeout' : 'embed_failure'); return null; }
+  const query = embedded.vector;
+  const searchStart = performance.now();
+  if (autoRecall && hasKind(guildId, 'claim')) {
+    const result = autoMeaning(guildId, query, autoRecall, { episodeLimit, chunkLimit, excludeEpisodes, excludeChunks, minScore }, candidateCounts);
+    searchMs = performance.now() - searchStart;
+    selectedCounts.episode = result.episodes.length;
+    selectedCounts.claim = result.chunks.length;
+    emit(result.episodes.length || result.chunks.length ? 'matched' : candidateCounts.episode || candidateCounts.claim ? 'below_cutoff' : 'no_candidates');
+    return result.episodes.length || result.chunks.length ? result : null;
+  }
   const db = memoryDb();
 
   const skipNodes = new Set<number>();
@@ -354,8 +499,12 @@ export async function meaningOf(guildId: string, text: string,
     return hits.filter((hit) => hit.score >= (minScore ?? floor) && hit.score >= best - gap);
   };
   // 根 (全体の概要) は常に何かに近いので出さない
-  const nodeHits = nodeLimit > 0 ? pick(nearest(guildId, 'node', query, { limit: nodeLimit + 1, exclude: skipNodes })).slice(0, nodeLimit) : [];
-  const episodeHits = pick(nearest(guildId, 'episode', query, { limit: episodeLimit, ...(excludeEpisodes ? { exclude: excludeEpisodes } : {}) }));
+  const rawNodes = nodeLimit > 0 ? nearest(guildId, 'node', query, { limit: nodeLimit + 1, exclude: skipNodes }) : [];
+  const rawEpisodes = episodeLimit > 0 ? nearest(guildId, 'episode', query, { limit: episodeLimit, ...(excludeEpisodes ? { exclude: excludeEpisodes } : {}) }) : [];
+  candidateCounts.node = rawNodes.length;
+  candidateCounts.episode = rawEpisodes.length;
+  const nodeHits = pick(rawNodes).slice(0, nodeLimit);
+  const episodeHits = pick(rawEpisodes);
 
   const nodes: MeaningNode[] = [];
   for (const hit of nodeHits) {
@@ -374,6 +523,7 @@ export async function meaningOf(guildId: string, text: string,
   if (chunkLimit > 0 && hasKind(guildId, 'claim')) {
     // v2 の記憶: 1 つの知識 = 主張。ページ (entity) ごとに CHUNKS_PER_PAGE 件まで。節は無い (heading は空)
     const raw = nearest(guildId, 'claim', query, { limit: chunkLimit * 8, ...(excludeChunks ? { exclude: excludeChunks } : {}) });
+    candidateCounts.claim = raw.length;
     const best = raw[0]?.score ?? 0;
     const perPage = new Map<string, number>();
     const hits = raw.filter((hit) => hit.score >= (minScore ?? chunkFloor) && hit.score >= best - chunkGap);
@@ -400,6 +550,7 @@ export async function meaningOf(guildId: string, text: string,
     }
   } else if (chunkLimit > 0) {
     const raw = nearest(guildId, 'chunk', query, { limit: chunkLimit * 8, ...(excludeChunks ? { exclude: excludeChunks } : {}) });
+    candidateCounts.chunk = raw.length;
     const best = raw[0]?.score ?? 0;
     const perPage = new Map<string, number>();
     const sections = new Map<string, MeaningChunk>();
@@ -418,5 +569,11 @@ export async function meaningOf(guildId: string, text: string,
       sections.set(`${row.path}\u0000${row.heading}`, chunk);
     }
   }
-  return nodes.length || episodes.length || chunks.length ? { nodes, episodes, chunks } : null;
+  searchMs = performance.now() - searchStart;
+  selectedCounts.node = nodes.length;
+  selectedCounts.episode = episodes.length;
+  selectedCounts[hasKind(guildId, 'claim') ? 'claim' : 'chunk'] = chunks.length;
+  const matched = nodes.length || episodes.length || chunks.length;
+  emit(matched ? 'matched' : Object.values(candidateCounts).some(Boolean) ? 'below_cutoff' : 'no_candidates');
+  return matched ? { nodes, episodes, chunks } : null;
 }

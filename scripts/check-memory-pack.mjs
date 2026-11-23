@@ -98,6 +98,7 @@ assert.equal(hasKind(GUILD, 'chunk'), false, 'v2 indexes claims in place of page
 
 const queries = [];
 const selectQuery = (value) => {
+  if (/手がかりなし/.test(value)) return 63;
   if (/テトリス/.test(value)) return 1;
   if (/おにぎり/.test(value)) return 2;
   if (/長い/.test(value)) return 3;
@@ -123,14 +124,24 @@ try {
 
   const focused = await read({ ...plain, thought: 'memory_focus.context: おにぎりの件' });
   assert.match(focused?.text, /冗談.*おにぎり.*\[\[people\/さば\]\]/);
-  assert.deepEqual(queries.at(-1), ['おにぎりの件']);
+  assert.deepEqual(queries.at(-1), ['たこは Rust をどう思ってる？ おにぎりの件'], 'focus adds a hint without replacing the current request');
+  assert.equal(await read({ ...plain, thought: 'memory_focus.context: 手がかりなし' }), initial,
+    'an unsuccessful refinement still delivers the relevant initial memory');
   assert.equal(await read(plain), initial, 'the focus only changes one request');
 
   assert.equal(await memoryReader(GUILD, { request: '今日の天気は？' })(plain), null, 'low-similarity candidates are not injected');
   assert.equal(await memoryReader(GUILD, { request: 'Rust', maxChars: 10 })(plain), null, 'budget lower than the heading means no work');
-  const reply = await memoryReader(GUILD, { request: 'あの件は？', reply: `<@!${SABA}> のテトリス杯` })(plain);
+  const reply = await memoryReader(GUILD, { request: 'あの件は？', reply: `<@!${SABA}> のテトリス杯`, recent: ['周りでは Rust の話をしていた'] })(plain);
   assert.deepEqual(queries.at(-1), ['あの件は？ さば のテトリス杯']);
   assert.match(reply?.text, /テトリス.*\[e2\]/);
+
+  const nearby = ['先ほどテトリス杯の結果が出た', '了解'];
+  await memoryReader(GUILD, { request: 'VEXちゃん、あの件どうなった？', recent: nearby, callNames: ['vexちゃん'] })(plain);
+  assert.deepEqual(queries.at(-1), ['VEXちゃん、あの件どうなった？ 先ほどテトリス杯の結果が出た']);
+  await memoryReader(GUILD, { request: '今日の天気は？', recent: nearby })(plain);
+  assert.deepEqual(queries.at(-1), ['今日の天気は？'], 'an independent question does not borrow the previous topic');
+  await memoryReader(GUILD, { request: 'た'.repeat(249) + '？', reply: 'テトリス杯は先週に開催' })({ ...plain, reasoning: '新しく考えた補足' });
+  assert.match(queries.at(-1)[0], /テトリス杯は先週に開催 新しく考えた補足$/, 'adding a hint preserves the direct reply even after a long request');
 
   const long = await memoryReader(GUILD, { request: '長いメモ', maxChars: 150 })(plain);
   assert.ok(long && long.text.length <= 150 && long.text.includes('[e1]'), 'the budget keeps complete source pointers');
@@ -205,6 +216,21 @@ try {
   assert.equal(await offline(plain), null);
   assert.equal(await offline(plain), null);
   assert.equal(failures, 1, 'embedder failure adds no memory and does not retry the same query');
+
+  let attempts = 0;
+  const statuses = [];
+  setEmbedder(async () => {
+    attempts += 1;
+    if (attempts === 1) return new Promise(() => {});
+    return { dim: 64, vectors: [unit(0).toString('base64')] };
+  });
+  const warming = memoryReader(GUILD, { request: 'Rust', timeoutMs: 25, onTrace: (trace) => statuses.push(trace.status) });
+  assert.equal(await warming(plain), null);
+  const ready = await warming(plain);
+  assert.match(ready?.text, /Rust 派/, 'a timing miss can recover on a later model round');
+  assert.equal(await warming(plain), ready);
+  assert.deepEqual(statuses, ['cold_or_timeout', 'matched']);
+  assert.equal(attempts, 2);
 } finally {
   globalThis.fetch = originalFetch;
 }

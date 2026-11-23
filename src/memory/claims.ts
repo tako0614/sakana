@@ -35,21 +35,23 @@ export interface ClaimView {
   entityId: number | null;
   who: string;
   path: string;
+  personId: string | null;
 }
 
 interface ClaimRow {
   id: number; text: string; type: string; modality: string; hedged: number; as_of: number; episode_id: number | null;
-  who: string | null; path: string | null; entity_id: number | null; about_key: string; verdict: string
+  who: string | null; path: string | null; entity_id: number | null; about_key: string; about_kind: string; verdict: string
 }
 
 const SELECT = `
-  SELECT c.id, c.text, c.type, c.modality, c.hedged, c.as_of, c.episode_id, c.entity_id, e.name AS who, e.path AS path, c.about_key, c.verdict
+  SELECT c.id, c.text, c.type, c.modality, c.hedged, c.as_of, c.episode_id, c.entity_id, e.name AS who, e.path AS path, c.about_key, c.about_kind, c.verdict
   FROM v2_claims c LEFT JOIN v2_entities e ON e.id = c.entity_id
 `;
 
 const view = (row: ClaimRow): ClaimView => ({
   id: row.id, text: row.text, type: row.type, modality: row.modality, hedged: row.hedged === 1, asOf: row.as_of, episodeId: row.episode_id,
-  entityId: row.entity_id, who: row.who ?? (row.about_key.length > 12 ? '' : row.about_key), path: row.path ?? ''
+  entityId: row.entity_id, who: row.who ?? (row.about_key.length > 12 ? '' : row.about_key), path: row.path ?? '',
+  personId: row.about_kind === 'person' ? row.about_key : null
 });
 
 /** 検索の索引に入れる主張 (wrong 以外)。 */

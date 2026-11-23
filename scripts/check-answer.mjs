@@ -220,6 +220,12 @@ const first = buildSystemPrompt(ctx, toolset);
 if (buildSystemPrompt(ctx, toolset) !== first) {
   fail('system プロンプトが呼ぶたびに変わっている (キャッシュの前方一致が壊れる)');
 }
+if (!first.includes('指定のない雑談はだいたい1〜2文') || !first.includes('完成した文書を求められたら') || !first.includes('そのまま使える本文')) {
+  fail('短い既定と、依頼された詳しさ・完成した文書の指示を両立する');
+}
+if (!first.includes('軽い下ネタやブラックジョーク') || !first.includes('答えられる部分には自然に返し')) {
+  fail('きわどい雑談にも、その場で返せる範囲で普通に返す指示を渡す');
+}
 
 // 2回続けて呼ぶだけでは分解能の粗い時刻を捕まえられない (同じ分のうちに終わるので)。
 // 時計を1年以上進めて、分・日・月・年のどれを混ぜても落ちるようにする。
@@ -652,6 +658,18 @@ const { chunkForDiscord } = await import('../src/agent/format.js');
   const plain = chunkForDiscord('短い答え。');
   if (plain.length !== 1 || plain[0] !== '短い答え。') fail(`短い答えは1通のまま: ${JSON.stringify(plain)}`);
   if (chunkForDiscord('あ'.repeat(10_000)).at(-1).includes('```')) fail('コードでないのにフェンスを足している');
+
+  const ordinary = formatModule.planAnswerDelivery('通常の回答。'.repeat(450), true);
+  if (ordinary.chunks.length !== 2 || ordinary.markdown !== null) fail('通常の長めの説明は本文で分割して返す');
+  const markdown = `# 完成した文書\n\n日本語の本文と 🐙 を保つ。\n\n\`\`\`ts\n${code.repeat(4)}\n\`\`\``;
+  const attached = formatModule.planAnswerDelivery(markdown, true);
+  if (attached.chunks.length !== 1 || !attached.chunks[0].includes('Markdown')) fail('長文添付時はチャットに案内を出す');
+  if (attached.markdown !== markdown) fail('長文添付は Unicode と Markdown 全文をそのまま保つ');
+  const completeSplit = formatModule.planAnswerDelivery('あ'.repeat(10_000), false);
+  if (completeSplit.chunks.join('').length !== 10_000) fail('添付できない場合も表示枠に収まる長文を最後まで送る');
+  const bounded = formatModule.planAnswerDelivery('あ'.repeat(13_000), false);
+  if (bounded.chunks.length !== 6 || !bounded.chunks.at(-1).includes('以降を省略')) fail('添付権限が無い長文は上限内で分割して省略を明示する');
+  if (formatModule.planAnswerDelivery('短い答え。', true).markdown !== null) fail('短文は添付にしない');
 }
 
 console.log('chunking ok (コードブロックを跨いで壊さない)');
@@ -746,7 +764,8 @@ try {
   // 短い追撃は落とさない。ここを落とすと「続きを聞く」機能そのものが死ぬ。
   for (const content of [
     'なんで？', 'なんで', 'もっと詳しく', 'ソースは', 'それ本当？', 'なるほど？',
-    'なるほど、じゃあ次は', 'ありがとう、あと1つ聞きたい'
+    'なるほど、じゃあ次は', 'ありがとう、あと1つ聞きたい',
+    'それ完全に下ネタじゃんw', 'そのブラックジョーク嫌いじゃないけど、もう一個ない？'
   ]) {
     if (!isAgentRequest(ask({ replyTo: ANSWER_ID, content }), client)) {
       fail(`追撃では起動する: ${JSON.stringify(content)}`);

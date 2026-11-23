@@ -3,7 +3,7 @@ import {
   type EpisodeHit, type NodeName
 } from './store.js';
 import { MODALITY_LABEL, TYPE_LABEL, monthOf } from './claims.js';
-import { meaningOf, type Meaning, type MeaningChunk } from './vectors.js';
+import { meaningOf, type Meaning, type MeaningChunk, type MeaningTrace } from './vectors.js';
 
 // 思い出す。会話に出た名前や言葉を手がかりに、関係するページと出来事を数件だけ引く。
 // 同期の recallFor は名前・別名の照合 + 全文検索。手がかりから1段だけ
@@ -192,23 +192,44 @@ function requestClue(guildId: string, request: string): string {
   return clue(named);
 }
 
+const contextOpening = /^(?:で[、,\s]+|じゃあ[、,\s]*|結局[、,\s]*)?(?:これ|それ|あれ|[こそあ]の(?:件|話|企画|前|とき|人|やつ)|例の|さっきの|前の|続き)/u;
+const followup = /[?？]|どう(?:な|いう)|教えて|詳しく|覚えてる|続き/u;
+
+function needsRecentContext(text: string, callNames: readonly string[]): boolean {
+  const lower = text.toLowerCase();
+  const address = callNames.find((name) => name && lower.startsWith(name.toLowerCase()));
+  const question = address ? text.slice(address.length).replace(/^[\s、,:：!！]+/u, '') : text;
+  return question.length <= 80 && contextOpening.test(question) && followup.test(question);
+}
+
 /** 依頼・思考・ツール結果から、モデルを呼ぶ前に同じ局所検索を行う。 */
-export function memoryReader(guildId: string, { request, reply = '', timeoutMs = 2000, maxChars = RECALL_CHARS }: {
-  request: string; reply?: string; timeoutMs?: number; maxChars?: number;
+export function memoryReader(guildId: string, {
+  request, reply = '', recent = [], callNames = [], timeoutMs = 2000, maxChars = RECALL_CHARS, onTrace
+}: {
+  request: string; reply?: string; recent?: readonly string[]; callNames?: readonly string[];
+  timeoutMs?: number; maxChars?: number; onTrace?: (trace: MeaningTrace) => void;
 }): (input: { observations: string[]; reasoning?: string | undefined; thought?: string | undefined; readTarget?: string | null | undefined }) => Promise<{ text: string } | null> {
   let base: string | undefined;
+  let mentionedUserIds: readonly string[] = [];
   // 依頼だけの結果を控えておくと、単発の memory_focus が終わっても再検索せず戻れる。
   let initial: { text: string } | null | undefined;
   let latest: { query: string; result: { text: string } | null } | undefined;
+  const timedOutQueries = new Set<string>();
   return async ({ observations, reasoning, thought, readTarget }) => {
     if (maxChars <= RECALL_HEAD.length) return null;
     try {
       if (base === undefined) {
         const message = requestClue(guildId, request);
-        const quoted = requestClue(guildId, reply);
-        base = quoted ? [message.slice(0, 250), quoted.slice(0, 200)].filter(Boolean).join(' ') : message.slice(0, 480);
+        // 明示された返信先を優先し、短い指示語付きの質問にだけ周辺の一発言を借りる。
+        const nearby = !reply && needsRecentContext(message, callNames)
+          ? recent.findLast((text) => clue(text).length >= 12) ?? ''
+          : '';
+        const source = reply || nearby;
+        const context = requestClue(guildId, source);
+        base = context ? [message.slice(0, 250), context.slice(0, 200)].filter(Boolean).join(' ') : message.slice(0, 480);
+        mentionedUserIds = [...new Set([...`${request}\n${source}`.matchAll(/<@!?(\d{15,25})>/gu)].map((match) => match[1]!))];
       }
-      const focus = clue(thought?.replace(/^memory_focus\.(?:context|thought):\s*/gm, '')).slice(0, 480);
+      const focus = clue(thought?.replace(/^memory_focus\.(?:context|thought):\s*/gm, '')).slice(0, 160);
       const toolText = observations.at(-1)?.replace(/^tool:[^:]*:\s*/, '') ?? '';
       // Typed read results identify the authorized anchor actually returned.
       // null means the read had no visible target; never infer one from neighbors.
@@ -219,16 +240,27 @@ export function memoryReader(guildId: string, { request, reply = '', timeoutMs =
           : toolText
         : readTarget ?? '';
       const observation = clue(source);
-      const hint = [clue(reasoning).slice(-150), observation.slice(0, 90)].filter(Boolean).join(' ');
-      const query = focus || (hint ? [base.slice(0, 240), hint].filter(Boolean).join(' ') : base);
+      const hints = focus ? [focus] : [clue(reasoning).slice(-100), observation.slice(0, 100)];
+      const anchorText = base;
+      const query = [anchorText, ...hints.filter((hint) => hint && !anchorText.includes(hint))].filter(Boolean).join(' ');
       if (!query) return null;
       if (query === base && initial !== undefined) return initial;
       if (query === latest?.query) return latest.result;
-      const found = await meaningOf(guildId, query, { nodeLimit: 0, episodeLimit: 2, chunkLimit: 4, minScore: RECALL_SCORE, timeoutMs });
+      let timeout = false;
+      const found = await meaningOf(guildId, query, {
+        nodeLimit: 0, episodeLimit: 2, chunkLimit: 4, minScore: RECALL_SCORE, timeoutMs,
+        autoRecall: { anchorText, mentionedUserIds },
+        onTrace: (trace) => { timeout = trace.status === 'cold_or_timeout'; onTrace?.(trace); }
+      });
       const lines = meaningLines(found, maxChars - RECALL_HEAD.length);
-      const result = lines.length ? { text: [RECALL_HEAD, ...lines].join('\n') } : null;
-      latest = { query, result };
-      if (query === base) initial = result;
+      const result = lines.length ? { text: [RECALL_HEAD, ...lines].join('\n') } : (query !== base ? initial ?? null : null);
+      // コールドスタートの失敗なら、モデルが起きる次の往復で同じ検索を一度だけ試せる。
+      if (!timeout || timedOutQueries.has(query)) {
+        latest = { query, result };
+        if (query === base) initial = result;
+      } else {
+        timedOutQueries.add(query);
+      }
       return result;
     } catch (error) {
       console.error('Memory recall failed:', error);

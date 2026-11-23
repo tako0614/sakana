@@ -356,6 +356,85 @@ vectors.setEmbedder(async () => { throw new Error('worker down'); });
 assert.equal(await vectors.embedQuery('壊れたワーカー'), null, 'a failing worker is the same as no meaning');
 vectors.setEmbedder(fakeEmbed);
 
+// Automatic recall keeps the semantic floor for unanchored facts. Exact words
+// from the request/reply may admit one close miss, and independent sources fill
+// the limited slots before repeat claims from the same episode.
+{
+  const db = store.memoryDb();
+  (await import('../src/memory/v2/schema.js')).ensureV2Schema(db);
+  const model = (await import('../src/embed/config.js')).embedConfig.memory.modelName;
+  const guild = '920000000000000099';
+  const sourceA = store.insertEpisode(guild, { kind: '事実', title: '赤い月', summary: '赤い月の記録', channelId: CHANNEL, atMs: at, endMs: at, sources: ['21'], importance: 2 });
+  const sourceB = store.insertEpisode(guild, { kind: '事実', title: '青い星', summary: '青い星の記録', channelId: CHANNEL, atMs: at, endMs: at, sources: ['22'], importance: 2 });
+  const sourceC = store.insertEpisode(guild, { kind: '事実', title: '緑の雲', summary: '緑の雲の記録', channelId: CHANNEL, atMs: at, endMs: at, sources: ['23'], importance: 2 });
+  const sourceD = store.insertEpisode(guild, { kind: '事実', title: '別の話', summary: '別の話の記録', channelId: CHANNEL, atMs: at, endMs: at, sources: ['24'], importance: 2 });
+  const sourceE = store.insertEpisode(guild, { kind: '事実', title: 'もう一つの話', summary: 'もう一つの話の記録', channelId: CHANNEL, atMs: at, endMs: at, sources: ['25'], importance: 2 });
+  const claim = (ord, text, episodeId, aboutKey = 'person-2') => Number(db.prepare(`
+    INSERT INTO v2_claims (guild_id, section_id, ord, about_kind, about_key, text, type, as_of, episode_id)
+    VALUES (?, 1, ?, 'person', ?, ?, 'fact', ?, ?)
+  `).run(guild, ord, aboutKey, text, at, episodeId).lastInsertRowid);
+  const exact = claim(1, '赤い月は三日間見えた', sourceA, 'person-1');
+  const repeat = claim(2, '三日間の観測を続けた', sourceA);
+  const independent = claim(3, '青い星を観測した', sourceB);
+  const third = claim(4, '緑の雲を観測した', sourceC);
+  const unrelated = claim(5, '別の季節の話', sourceD);
+  const tooLow = claim(6, '赤い月は遠くにも見えた', sourceE);
+  const put = db.prepare(`INSERT INTO memory_vectors (guild_id, kind, id, model, text_hash, vec, updated_at) VALUES (?, ?, ?, ?, 'test', ?, ?)`);
+  const add = (kind, id, score) => {
+    const vector = new Float32Array([score, Math.sqrt(1 - score * score)]);
+    put.run(guild, kind, id, model, Buffer.from(vector.buffer), Date.now());
+  };
+  for (const [id, score] of [[exact, 0.845], [repeat, 0.87], [independent, 0.868], [third, 0.865], [unrelated, 0.82], [tooLow, 0.825]]) add('claim', id, score);
+  for (const [id, score] of [[sourceA, 0.9], [sourceB, 0.898], [sourceC, 0.897], [sourceD, 0.895], [sourceE, 0.89]]) add('episode', id, score);
+  vectors.setEmbedder(async (texts) => ({ dim: 2, vectors: texts.map(() => Buffer.from(new Float32Array([1, 0]).buffer).toString('base64')) }));
+  const traces = [];
+  const options = { nodeLimit: 0, episodeLimit: 2, chunkLimit: 3, minScore: 0.86, autoRecall: { anchorText: '「赤い月」を覚えている？' }, onTrace: (trace) => traces.push(trace) };
+  const found = await vectors.meaningOf(guild, '観測した話', options);
+  assert.deepEqual(found.chunks.map((entry) => entry.id), [exact, independent, third], 'a quoted exact fact near the floor joins independent sources before a repeated source');
+  assert.deepEqual(found.episodes.map((entry) => entry.id), [sourceD, sourceE], 'episode slots refill with evidence not already represented by claims');
+  assert.deepEqual([traces[0].status, traces[0].candidateCounts.claim, traces[0].selectedCounts.claim], ['matched', 6, 3]);
+  assert.ok(!found.chunks.some((entry) => entry.id === tooLow), 'exact words cannot admit a claim more than 0.02 below the floor');
+  assert.equal(/赤い月|920000000000000099|person-1/.test(JSON.stringify(traces[0])), false, 'trace has counts and timing, no content or IDs');
+  const unanchored = await vectors.meaningOf(guild, '観測した話', { ...options, autoRecall: { anchorText: '' } });
+  assert.ok(!unanchored?.chunks.some((entry) => entry.id === exact), 'the same close miss does not pass without anchor evidence');
+  const mentioned = await vectors.meaningOf(guild, '観測した話', { ...options, autoRecall: { anchorText: '', mentionedUserIds: ['person-1'] } });
+  assert.ok(mentioned?.chunks.some((entry) => entry.id === exact), 'a supplied exact person ID can admit a nearby fact');
+  const episodeAnchor = await vectors.meaningOf(guild, '観測した話', { ...options, chunkLimit: 0, minScore: 0.9, autoRecall: { anchorText: '「もう一つの話」' } });
+  assert.ok(episodeAnchor?.episodes.some((entry) => entry.id === sourceE), 'episode title evidence admits a close miss');
+  const episodeNoAnchor = await vectors.meaningOf(guild, '観測した話', { ...options, chunkLimit: 0, minScore: 0.9, autoRecall: { anchorText: '' } });
+  assert.ok(!episodeNoAnchor?.episodes.some((entry) => entry.id === sourceE), 'the episode keeps its floor without an anchor');
+  const japaneseMonth = await vectors.meaningOf(guild, '観測した話', { ...options, chunkLimit: 0, minScore: 0.9, autoRecall: { anchorText: `「もう一つの話」 ${new Date(at + 9 * 3_600_000).toISOString().slice(0, 7).replace('-', '年').replace(/(\d{2})$/, '$1月')}` } });
+  assert.ok(japaneseMonth?.episodes.some((entry) => entry.id === sourceE), 'Japanese year-month anchors are accepted');
+  await vectors.meaningOf(guild, '観測した話', { ...options, minScore: 0.99 });
+  assert.equal(traces.at(-1).status, 'below_cutoff');
+  await vectors.meaningOf(guild, '観測した話', { ...options, excludeEpisodes: new Set([sourceA, sourceB, sourceC, sourceD, sourceE]), excludeChunks: new Set([exact, repeat, independent, third, unrelated, tooLow]) });
+  assert.equal(traces.at(-1).status, 'no_candidates');
+  await vectors.meaningOf('920000000000000098', '観測した話', options);
+  assert.equal(traces.at(-1).status, 'no_vectors');
+  const entityId = Number(db.prepare("INSERT INTO v2_entities (guild_id, kind, key, name) VALUES (?, 'person', 'person-3', '観測者')").run(guild).lastInsertRowid);
+  const duplicate = (ord, modality, hedged) => Number(db.prepare(`
+    INSERT INTO v2_claims (guild_id, section_id, ord, about_kind, about_key, text, type, modality, hedged, as_of, episode_id, entity_id)
+    VALUES (?, 1, ?, 'person', 'person-3', '同じ観測結果', 'fact', ?, ?, ?, ?, ?)
+  `).run(guild, ord, modality, hedged, at, sourceD, entityId).lastInsertRowid);
+  const plain = duplicate(7, 'plain', 0);
+  const selfReport = duplicate(8, 'self_report', 0);
+  const joke = duplicate(9, 'joke', 0);
+  const hedged = duplicate(10, 'plain', 1);
+  for (const [id, score] of [[plain, 0.89], [selfReport, 0.88], [joke, 0.87], [hedged, 0.865]]) add('claim', id, score);
+  const originalClaims = new Set([exact, repeat, independent, third, unrelated, tooLow]);
+  const distinct = await vectors.meaningOf(guild, '観測した話', { ...options, episodeLimit: 0, excludeChunks: originalClaims, autoRecall: { anchorText: '' } });
+  assert.deepEqual(distinct?.chunks.map((entry) => entry.id), [selfReport, joke], 'self-report wins its plain duplicate; a joke remains distinct');
+  const distinctHedge = await vectors.meaningOf(guild, '観測した話', { ...options, episodeLimit: 0, excludeChunks: new Set([...originalClaims, plain, selfReport]), autoRecall: { anchorText: '' } });
+  assert.deepEqual(distinctHedge?.chunks.map((entry) => entry.id), [joke, hedged], 'hedged and joke claims remain distinct');
+  vectors.setEmbedder(() => new Promise(() => {}));
+  await vectors.meaningOf(guild, '観測した話', { ...options, timeoutMs: 20 });
+  assert.equal(traces.at(-1).status, 'cold_or_timeout');
+  vectors.setEmbedder(async () => { throw new Error('worker down'); });
+  await vectors.meaningOf(guild, '観測した話', options);
+  assert.equal(traces.at(-1).status, 'embed_failure');
+  vectors.setEmbedder(fakeEmbed);
+}
+
 // ---- memory ツール -------------------------------------------------------------
 const ctx = { guildId: GUILD };
 const byWords = await runMemoryToolWithMeaning(ctx, { query: 'レビュー' });
